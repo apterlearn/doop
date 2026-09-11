@@ -23,13 +23,30 @@ export let db: Db
    from anywhere (tests spawn it from a temp working directory) */
 const MIGRATIONS = path.join(path.dirname(fileURLToPath(import.meta.url)), 'migrations')
 
+/* PGlite holds the cluster in memory and syncs it to ./data/pg periodically.
+   A process that exits without closing leaves that sync half-done: pg_control
+   can name a checkpoint whose WAL record never reached disk, and the next boot
+   PANICs in recovery ("could not locate a valid checkpoint record"). Closing
+   shuts the cluster down cleanly and flushes it, so the next boot has nothing
+   to replay. Set by initDb; awaited from the server's shutdown handler. */
+let teardown: (() => Promise<void>) | null = null
+
+export async function closeDb(): Promise<void> {
+  const close = teardown
+  teardown = null
+  await close?.()
+}
+
 export async function initDb(): Promise<void> {
   const url = process.env.DATABASE_URL
   if (url) {
     const { drizzle } = await import('drizzle-orm/node-postgres')
-    db = drizzle(url, { schema })
+    const pgDb = drizzle(url, { schema })
+    db = pgDb
     const { migrate } = await import('drizzle-orm/node-postgres/migrator')
     await migrate(db, { migrationsFolder: MIGRATIONS })
+    const pool = pgDb.$client
+    teardown = () => pool.end()
   } else {
     const { PGlite } = await import('@electric-sql/pglite')
     const { drizzle } = await import('drizzle-orm/pglite')
@@ -40,5 +57,6 @@ export async function initDb(): Promise<void> {
     const { migrate } = await import('drizzle-orm/pglite/migrator')
     await migrate(pgliteDb, { migrationsFolder: MIGRATIONS })
     db = pgliteDb as unknown as Db
+    teardown = () => client.close()
   }
 }

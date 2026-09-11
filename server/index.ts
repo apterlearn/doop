@@ -15,7 +15,7 @@ import { auth, initAuth, syncAdmins, getUserName, PUBLIC_ORIGIN, loginProvidersC
 import { adminRouter } from './admin.ts'
 import { communityRouter, parseListing, publishableFrames } from './community.ts'
 import * as demo from './demo.ts'
-import { db, initDb } from './db/index.ts'
+import { closeDb, db, initDb } from './db/index.ts'
 import * as authSchema from './db/auth-schema.ts'
 import * as persist from './db/persist.ts'
 import { handleMcpRequest } from './mcp.ts'
@@ -109,14 +109,20 @@ process.on('unhandledRejection', (reason) => {
   console.error('[unhandled-rejection]', reason)
 })
 
-/* flush debounced frame writes before the process dies — with a hard-exit
-   timeout so a wedged DB can never keep the process (and the port) alive */
+/* Flush debounced frame writes, then shut the DB down, before the process
+   dies — with a hard-exit timeout so a wedged DB can never keep the process
+   (and the port) alive. The close matters for PGlite: it holds the cluster in
+   memory and syncs it to ./data/pg, so exiting without it can leave pg_control
+   naming a checkpoint whose WAL record never reached disk — the next boot then
+   PANICs in recovery. */
 for (const sig of ['SIGINT', 'SIGTERM'] as const) {
   process.once(sig, () => {
     setTimeout(() => process.exit(0), 1500).unref()
     persist
       .flush((id) => store.getFrame(id))
       .catch((err) => console.error('flush on shutdown failed', err))
+      .then(() => closeDb())
+      .catch((err) => console.error('db close on shutdown failed', err))
       .finally(() => process.exit(0))
   })
 }
