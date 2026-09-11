@@ -22,9 +22,12 @@ export function GhostFrames() {
       tasks.some((t) => t.queuedBy && t.agentName === p.name && !t.endedAt && !t.failedAt && !t.cancelledAt),
   )
   if (working.length === 0) return null
-  /* mirror store.createFrame's auto-placement: right of the right-most frame */
-  const rightmost = canvas.frames.reduce((mx, f) => Math.max(mx, f.x + f.width), 0)
-  const baseX = canvas.frames.length ? rightmost + 80 : 120
+  /* mirror store.createFrame's auto-placement: right of the right-most frame
+     on the first page — the page the server's auto-place targets */
+  const firstPageId = canvas.pages?.[0]?.id
+  const pageFrames = firstPageId ? canvas.frames.filter((f) => f.pageId === firstPageId) : canvas.frames
+  const rightmost = pageFrames.reduce((mx, f) => Math.max(mx, f.x + f.width), 0)
+  const baseX = pageFrames.length ? rightmost + 80 : 120
   return (
     <>
       {working.map((p, i) => (

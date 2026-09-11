@@ -1,4 +1,4 @@
-import type { ActivityItem, Canvas, CanvasMeta, CommunityCategory, CommunityItem, Frame } from '../../shared/types'
+import type { ActivityItem, Canvas, CanvasMeta, CommunityCategory, CommunityItem, Frame, Page } from '../../shared/types'
 
 export type HomeActivity = ActivityItem & { canvasId: string; canvasName: string }
 
@@ -283,6 +283,21 @@ export const api = {
     req<Frame>('/api/frames/' + frameId, { method: 'PATCH', body: JSON.stringify({ ...patch, actor: actor() }) }),
   deleteFrame: (frameId: string) =>
     req('/api/frames/' + frameId, { method: 'DELETE', body: JSON.stringify({ actor: actor() }) }),
+  /* pages: ordered sub-canvases grouping the canvas's frames */
+  createPage: (canvasId: string, name: string) =>
+    req<Page>(`/api/canvases/${canvasId}/pages`, {
+      method: 'POST',
+      body: JSON.stringify({ name, actor: actor() }),
+    }),
+  updatePage: (pageId: string, patch: { name?: string; position?: number }) =>
+    req<{ pages: Page[] }>('/api/pages/' + pageId, {
+      method: 'PATCH',
+      body: JSON.stringify({ ...patch, actor: actor() }),
+    }),
+  deletePage: (pageId: string) =>
+    req<{ ok: true; deletedFrameIds: string[] }>('/api/pages/' + pageId, { method: 'DELETE' }),
+  duplicatePage: (pageId: string) =>
+    req<{ page: Page; frames: Frame[] }>(`/api/pages/${pageId}/duplicate`, { method: 'POST' }),
   sendTaskFeedback: (taskId: string, text: string) =>
     req(`/api/tasks/${taskId}/feedback`, { method: 'POST', body: JSON.stringify({ text, from: getIdentity().name }) }),
   importPage: (canvasId: string, url: string) =>

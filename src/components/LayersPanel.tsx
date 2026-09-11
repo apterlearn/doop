@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type HTMLAttributes, type KeyboardEvent, type ReactNode } from 'react'
 import type { Frame } from '../../shared/types'
-import { useStore } from '../lib/store'
+import { useStore, visibleFrames } from '../lib/store'
 import { getIdentity } from '../lib/identity'
 import { deleteFramesTracked } from '../lib/history'
 import { ancestorsOf, buildLayerTree, elementHtml, filterLayers, type LayerNode } from '../lib/layers'
@@ -83,11 +83,14 @@ function visibleRows(frames: Frame[], query: string, expanded: Set<string>): Vis
   return rows
 }
 
-/** The Layers rail: every frame on the canvas, opening into the element tree
- *  of its HTML. Selection runs both ways — a row selects the element in the
- *  frame, a click in the frame highlights its row. */
+/** The Layers rail: every frame on the page being viewed, opening into the
+ *  element tree of its HTML. Selection runs both ways — a row selects the
+ *  element in the frame, a click in the frame highlights its row. */
 export function LayersPanel({ onAddFrame }: { onAddFrame: () => void }) {
-  const frames = useStore((s) => s.canvas?.frames ?? [])
+  const canvas = useStore((s) => s.canvas)
+  const activePageId = useStore((s) => s.activePageId)
+  /* the tree lists the page being viewed, like the stage */
+  const frames = useMemo(() => visibleFrames({ canvas, activePageId }), [canvas, activePageId])
   const selectedId = useStore((s) => s.selectedId)
   const selectedElement = useStore((s) => s.selectedElement)
   const setLayersOpen = useStore((s) => s.setLayersOpen)
@@ -283,7 +286,9 @@ export function LayersPanel({ onAddFrame }: { onAddFrame: () => void }) {
  *  control and the Layers mark carrying the frame count, as in the design. */
 export function LayersRailToggle() {
   const setLayersOpen = useStore((s) => s.setLayersOpen)
-  const count = useStore((s) => s.canvas?.frames.length ?? 0)
+  const canvas = useStore((s) => s.canvas)
+  const activePageId = useStore((s) => s.activePageId)
+  const count = visibleFrames({ canvas, activePageId }).length
   return (
     <nav
       aria-label="Layers panel"

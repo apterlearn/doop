@@ -10,11 +10,24 @@ export interface Frame {
   createdAt: number
   updatedAt: number
   updatedBy: string
+  /** the page this frame sits on (Canvas.pages); always set after boot backfill */
+  pageId?: string
   /** product-made onboarding/example content (welcome demo, seeded frames) —
    *  not the user's work; agents must never read it as the canvas's style */
   demo?: boolean
 }
 
+/** A page: an ordered sub-canvas grouping frames. Pages are filters over the
+ *  canvas's frames, not coordinate offsets — every canvas keeps ≥1 page. */
+export interface Page {
+  id: string
+  canvasId: string
+  name: string
+  /** dense 0..n-1 order within Canvas.pages, renumbered on reorder */
+  position: number
+  createdAt: number
+  updatedAt: number
+}
 export interface CanvasMeta {
   id: string
   name: string
@@ -97,6 +110,8 @@ export interface Canvas {
   guidelines?: GuidelineDoc[]
   /** frames pinned to Memory as style exemplars — HTML snapshotted at pin time */
   references?: MemoryReference[]
+  /** ordered sub-canvases; the server guarantees ≥1 page after boot backfill */
+  pages?: Page[]
 }
 
 /* ---- design memory ---- */
@@ -387,6 +402,9 @@ export type ServerMessage =
   /** the distiller proposed a rule, or a proposal was accepted/dismissed */
   | { type: 'proposal'; proposal: MemoryProposal }
   | { type: 'canvas:deleted' }
+  /** the ordered page list changed (create/rename/reorder/delete/duplicate) —
+   *  carries the full list so clients can replace canvas.pages wholesale */
+  | { type: 'pages'; pages: Page[]; actor: Actor }
   | { type: 'activity'; item: ActivityItem }
 
 export const CURSOR_PALETTE = [

@@ -56,6 +56,17 @@ export function hasFrameClip(): boolean {
   return !!localStorage.getItem(CLIP_KEY)
 }
 
+/** World coordinates of the stage's center — where preset frames and pasted
+ *  clips land. Screen→world is (screen − rect.left − viewport.x) / zoom; at
+ *  the rect's center rect.left cancels, leaving the half-size over the view. */
+export function stageCenterWorld(): { x: number; y: number } {
+  const rect = document.querySelector('.stage')?.getBoundingClientRect()
+  const vp = useStore.getState().viewport
+  const w = rect?.width ?? window.innerWidth
+  const h = rect?.height ?? window.innerHeight
+  return { x: (w / 2 - vp.x) / vp.zoom, y: (h / 2 - vp.y) / vp.zoom }
+}
+
 /** Overall size of the copied group, for centring it in the view. */
 function clipBounds(frames: ClipFrame[]) {
   return {
@@ -93,6 +104,8 @@ function createFromClip(canvasId: string, x: number, y: number) {
         height: f.height,
         x: Math.round(x + f.x),
         y: Math.round(y + f.y),
+        /* a paste lands on the page being viewed, never the copied one */
+        pageId: useStore.getState().activePageId,
       },
     })),
   ).then((created) => {
@@ -201,6 +214,7 @@ export async function uploadImageFrames(
         height: slot.height,
         x: Math.round(slot.x),
         y: Math.round(cy - slot.height / 2),
+        pageId: useStore.getState().activePageId,
       })
     }),
   )
@@ -228,6 +242,7 @@ export function duplicateFrames(frames: Frame[]) {
         y: frame.y + 40,
         width: frame.width,
         height: frame.height,
+        pageId: useStore.getState().activePageId,
       },
     })),
   ).then((created) => {

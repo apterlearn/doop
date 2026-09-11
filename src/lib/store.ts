@@ -9,6 +9,7 @@ import type {
   GuidelineDoc,
   MemoryProposal,
   MemoryReference,
+  Page,
   Presence,
   TaskFeedback,
 } from '../../shared/types'
@@ -80,6 +81,9 @@ interface State {
   /** a request for the Stage to glide the camera to a frame — the prompt bar
    *  raises it so a first deliverable streams in on-screen, never off-canvas */
   flyTo: { frameId: string; at: number } | null
+  /** the page tab being viewed — every frame surface filters to it; unset
+   *  means show all frames (back-compat with canvases before pages) */
+  activePageId?: string
 
   setCanvas(c: Canvas | null): void
   setConnected(v: boolean): void
@@ -115,6 +119,10 @@ interface State {
   setLimitWall(v: boolean): void
   allowanceChanged(): void
   requestFlyTo(frameId: string): void
+  setActivePage(id?: string): void
+  /** replace canvas.pages wholesale (a ws 'pages' broadcast); repairs the
+   *  active tab when the new list no longer contains it */
+  setPagesLocal(pages: Page[]): void
   select(id: string | null): void
   /** ⇧-click: add the frame to the selection, or drop it if already in */
   toggleSelect(id: string): void
@@ -131,6 +139,15 @@ interface State {
   setSnapGuides(guides: SnapGuide[]): void
   flash(frameId: string, color: string): void
   setStream(frameId: string, actor: { name: string; color: string } | null): void
+}
+
+/** Frames the current surface shows: the active page's frames, or all of them
+ *  when no page is active (unset tab, or a canvas that has no pages). */
+export function visibleFrames(s: { canvas: Canvas | null; activePageId?: string }): Frame[] {
+  const c = s.canvas
+  if (!c) return []
+  if (!s.activePageId || !c.pages?.length) return c.frames
+  return c.frames.filter((f) => f.pageId === s.activePageId)
 }
 
 const LAYERS_OPEN_KEY = 'doop:layers-open'
@@ -173,6 +190,17 @@ export const useStore = create<State>((set, get) => ({
   streams: {},
 
   setCanvas: (canvas) => set({ canvas }),
+  setActivePage: (activePageId) => set({ activePageId }),
+  setPagesLocal: (pages) =>
+    set((s) => {
+      if (!s.canvas) return {}
+      return {
+        canvas: { ...s.canvas, pages },
+        /* a page another actor deleted must not leave this client on a
+           ghost tab: fall back to the first page (or none) */
+        activePageId: pages.some((p) => p.id === s.activePageId) ? s.activePageId : pages[0]?.id,
+      }
+    }),
   setConnected: (connected) => set({ connected }),
   setUpdateReady: (updateReady) => set({ updateReady }),
   setPresences: (list) => set({ presences: Object.fromEntries(list.map((p) => [p.clientId, p])) }),

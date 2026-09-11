@@ -1234,7 +1234,16 @@ export function appendFrameHtml(
 
 export function createFrame(
   canvasId: string,
-  input: { name: string; x?: number; y?: number; width?: number; height?: number; html?: string; demo?: boolean },
+  input: {
+    name: string
+    x?: number
+    y?: number
+    width?: number
+    height?: number
+    html?: string
+    demo?: boolean
+    pageId?: string
+  },
   actor: Actor,
 ): Frame | undefined {
   if (input.html !== undefined) input = { ...input, html: repairEscapedHtml(input.html) }
@@ -1341,6 +1350,98 @@ export function renameCanvas(canvasId: string, name: string, actor: Actor) {
   broadcast(canvasId, { type: 'canvas:renamed', name, actor })
   logActivity(canvasId, actor, `renamed the canvas to “${name}”`)
   return canvas
+}
+
+/* ------------------------------------------------------------------ */
+/* Pages: ordered sub-canvases on a canvas. Any page mutation          */
+/* broadcasts the full ordered list; frame moves ride frame:updated.   */
+/* ------------------------------------------------------------------ */
+
+export function createPage(canvasId: string, name: string, actor: Actor) {
+  const page = store.createPage(canvasId, name)
+  if (!page) return undefined
+  const canvas = store.getCanvas(canvasId)!
+  broadcast(canvasId, { type: 'pages', pages: canvas.pages!, actor })
+  logActivity(canvasId, actor, `created page “${page.name}”`)
+  return page
+}
+
+export function renamePage(pageId: string, name: string, actor: Actor) {
+  const page = store.renamePage(pageId, name)
+  if (!page) return undefined
+  const canvas = store.getCanvas(page.canvasId)!
+  broadcast(page.canvasId, { type: 'pages', pages: canvas.pages!, actor })
+  logActivity(page.canvasId, actor, `renamed a page to “${page.name}”`)
+  return page
+}
+
+export function reorderPage(pageId: string, position: number, actor: Actor) {
+  const pages = store.reorderPage(pageId, position)
+  if (!pages) return undefined
+  const canvasId = store.getPage(pageId)!.canvas.id
+  broadcast(canvasId, { type: 'pages', pages, actor })
+  logActivity(canvasId, actor, 'reordered pages')
+  return pages
+}
+
+export function deletePage(pageId: string, actor: Actor) {
+  const result = store.deletePage(pageId)
+  if (!result) return undefined
+  const { canvas, page, frames } = result
+  for (const f of frames) {
+    thumbs.purge(f.id)
+    broadcast(canvas.id, { type: 'frame:deleted', frameId: f.id, actor })
+  }
+  broadcast(canvas.id, { type: 'pages', pages: canvas.pages!, actor })
+  logActivity(canvas.id, actor, `deleted page “${page.name}” (${frames.length} frame${frames.length === 1 ? '' : 's'})`)
+  return { page, deletedFrameIds: frames.map((f) => f.id) }
+}
+
+export function duplicatePage(pageId: string, actor: Actor) {
+  const result = store.duplicatePage(pageId, nameForCopy(store.getPage(pageId)?.page.name ?? 'Page'))
+  if (!result) return undefined
+  const canvasId = result.page.canvasId
+  broadcast(canvasId, { type: 'pages', pages: store.getCanvas(canvasId)!.pages!, actor })
+  for (const f of result.frames) broadcast(canvasId, { type: 'frame:created', frame: f, actor })
+  logActivity(canvasId, actor, `duplicated a page as “${result.page.name}”`)
+  return result
+}
+
+export function moveFrameToPage(frameId: string, pageId: string, actor: Actor) {
+  const frame = store.moveFrameToPage(frameId, pageId)
+  if (!frame) return undefined
+  const page = store.getPage(pageId)!.page
+  broadcast(frame.canvasId, { type: 'frame:updated', frame, actor })
+  logActivity(frame.canvasId, actor, `moved frame “${frame.name}” to page “${page.name}”`)
+  return frame
+}
+
+export function duplicateFrame(
+  frameId: string,
+  overrides: { name?: string; x?: number; y?: number },
+  actor: Actor,
+): Frame | undefined {
+  const source = store.getFrame(frameId)
+  if (!source) return undefined
+  const frame = createFrame(
+    source.canvasId,
+    {
+      name: overrides.name ?? `${source.name} copy`,
+      x: overrides.x ?? source.x + 40,
+      y: overrides.y ?? source.y + 40,
+      width: source.width,
+      height: source.height,
+      html: source.html,
+      pageId: source.pageId,
+    },
+    actor,
+  )
+  if (frame) logActivity(source.canvasId, actor, `duplicated frame “${source.name}”`)
+  return frame
+}
+
+function nameForCopy(name: string): string {
+  return name.length <= 74 ? `${name} copy` : `${name.slice(0, 74)} copy`
 }
 
 /* ------------------------------------------------------------------ */

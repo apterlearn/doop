@@ -1222,11 +1222,76 @@ app.post(
   },
 )
 
+
+/* ---- pages: ordered sub-canvases on a canvas ---- */
+
+const pageName = (raw: unknown) => String(raw ?? '').trim().slice(0, 80) || 'Untitled'
+
+app.post('/api/canvases/:id/pages', (req, res) => {
+  if (!requireCanvas(req, res, req.params.id)) return
+  const { name } = req.body ?? {}
+  const actor = actions.resolveActor({ name: req.user!.name, kind: 'user' })
+  const page = actions.createPage(req.params.id, pageName(name), actor)
+  if (!page) return res.status(404).json({ error: 'canvas not found' })
+  res.status(201).json(page)
+})
+
+app.patch('/api/pages/:id', (req, res) => {
+  const found = store.getPage(req.params.id)
+  if (!found) return res.status(404).json({ error: 'page not found' })
+  if (!requireCanvas(req, res, found.canvas.id)) return
+  if (!found.canvas.pages?.some((p) => p.id === req.params.id)) return res.status(404).json({ error: 'page not found' })
+  const { name, position } = req.body ?? {}
+  const actor = actions.resolveActor({ name: req.user!.name, kind: 'user' })
+  if (typeof name === 'string') actions.renamePage(req.params.id, pageName(name), actor)
+  if (position !== undefined) {
+    const pos = Number(position)
+    if (!Number.isInteger(pos)) return res.status(400).json({ error: 'position must be an integer' })
+    actions.reorderPage(req.params.id, pos, actor)
+  }
+  res.json({ pages: store.getCanvas(found.canvas.id)!.pages })
+})
+
+app.delete('/api/pages/:id', (req, res) => {
+  const found = store.getPage(req.params.id)
+  if (!found) return res.status(404).json({ error: 'page not found' })
+  if (!requireCanvas(req, res, found.canvas.id)) return
+  if (!found.canvas.pages || found.canvas.pages.length < 2)
+    return res.status(409).json({ error: 'cannot delete the only page' })
+  const actor = actions.resolveActor({ name: req.user!.name, kind: 'user' })
+  const result = actions.deletePage(req.params.id, actor)
+  if (!result) return res.status(404).json({ error: 'page not found' })
+  res.json({ ok: true, deletedFrameIds: result.deletedFrameIds })
+})
+
+app.post('/api/pages/:id/duplicate', (req, res) => {
+  const found = store.getPage(req.params.id)
+  if (!found) return res.status(404).json({ error: 'page not found' })
+  if (!requireCanvas(req, res, found.canvas.id)) return
+  const actor = actions.resolveActor({ name: req.user!.name, kind: 'user' })
+  const result = actions.duplicatePage(req.params.id, actor)
+  if (!result) return res.status(404).json({ error: 'page not found' })
+  res.status(201).json(result)
+})
 app.post('/api/canvases/:id/frames', (req, res) => {
   if (!requireCanvas(req, res, req.params.id)) return
-  const { name, x, y, width, height, html } = req.body ?? {}
+  const { name, x, y, width, height, html, pageId } = req.body ?? {}
+  if (pageId !== undefined && !store.getCanvas(req.params.id)?.pages?.some((p) => p.id === pageId))
+    return res.status(404).json({ error: 'page not found' })
   const actor = actions.resolveActor({ name: req.user!.name, kind: 'user' })
-  const frame = actions.createFrame(req.params.id, { name: String(name || 'Frame'), x, y, width, height, html }, actor)
+  const frame = actions.createFrame(
+    req.params.id,
+    {
+      name: String(name || 'Frame'),
+      x,
+      y,
+      width,
+      height,
+      html,
+      ...(pageId !== undefined ? { pageId } : {}),
+    },
+    actor,
+  )
   if (!frame) return res.status(404).json({ error: 'canvas not found' })
   res.json(frame)
 })
@@ -1235,7 +1300,7 @@ app.patch('/api/frames/:id', (req, res) => {
   if (!requireFrame(req, res, req.params.id)) return
   const { actor: _ignored, ...patch } = req.body ?? {}
   const actor = actions.resolveActor({ name: req.user!.name, kind: 'user' })
-  const allowed = ['name', 'x', 'y', 'width', 'height', 'html'] as const
+  const allowed = ['name', 'x', 'y', 'width', 'height', 'html', 'pageId'] as const
   const clean: Record<string, unknown> = {}
   for (const k of allowed) if (patch[k] !== undefined) clean[k] = patch[k]
   const frame = actions.updateFrame(req.params.id, clean, actor)

@@ -84,6 +84,10 @@ function handle(msg: ServerMessage) {
         else if (loadedBuild !== msg.serverBuild) s.setUpdateReady(true)
       }
       s.setCanvas(msg.canvas)
+      /* land on the first page tab on a fresh load, and repair a tab left
+         over from a previously viewed canvas */
+      if (!msg.canvas.pages?.some((p) => p.id === s.activePageId))
+        s.setActivePage(msg.canvas.pages?.[0]?.id)
       s.setPresences(msg.presences)
       s.setActivity(msg.activity)
       s.setTasks(msg.tasks)
@@ -155,6 +159,9 @@ function handle(msg: ServerMessage) {
     case 'canvas:deleted':
       /* the room only receives this for the canvas it's viewing */
       location.href = '/'
+      break
+    case 'pages':
+      s.setPagesLocal(msg.pages)
       break
     case 'activity':
       s.pushActivity(msg.item)

@@ -21,7 +21,7 @@ import { createImportedWebpageFrame } from './webpageImport.ts'
 import { normalizeImportUrl } from './importer.ts'
 import { websiteAccessErrorMessage } from './websiteAccess.ts'
 import { roleName } from '../shared/agents.ts'
-import type { AgentTask } from '../shared/types.ts'
+import type { AgentTask, Page } from '../shared/types.ts'
 
 const INSTRUCTIONS = `Doop is a shared multiplayer design canvas: humans and AI agents design together in real time. Canvases contain frames — artboards that render complete HTML documents live for everyone viewing.
 
@@ -31,6 +31,7 @@ You MUST call get_guide({ topic: "doop-instructions" }) once before using other 
 - Identity: pick an agent_name and reuse the SAME name on every call — your presence and edits are attributed live.
 - Narrate: call set_status with a one-line summary when you start a task and whenever your focus shifts — people watching the canvas see it live next to your name.
 - Creating: create_frame, then stream the design with append_frame_html one complete section at a time (~1–4 KB chunks; start=true on the first, done=true on the last). Each chunk renders the moment it arrives — viewers watch you work.
+- Pages: canvases contain ordered pages — sub-canvases that group frames. For multi-screen flows, create one page per screen with create_page and target it via the page param on create_frame (or move_frame later); get_canvas lists every page and which page each frame sits on.
 - Review: after every create or significant edit you MUST call get_frame_screenshot and fix what looks wrong before moving on.
 - Small edits: edit_frame_html (exact find/replace — the change morphs into the rendered frame in place). Full redesigns: set_frame_html or a new stream. Rename/move/resize: update_frame.
 - Images: real imagery makes designs. search_images finds stock photos (you SEE thumbnails and pick), search_icons finds 200k+ UI icons as hotlinkable SVGs, search_logos finds real company logos by brand name or domain — call it once per brand BEFORE writing any logo wall, integration row, press bar or testimonial, and never ship a placeholder tile, "LOGO" text or an invented wordmark in its place, list_backgrounds shows a page of curated hero/section/bento backgrounds (glows, grainy meshes, aurora, painterly scenes) as thumbnails — browse it when a section wants atmosphere rather than defaulting to a flat CSS gradient, judge by eye whether one fits the frame, and draw your own when none does, upload_asset stores your own file (remote file → source_url; local file → local_file=true, returns a curl command) and returns a permanent URL. Never inline images as data: URIs.
@@ -176,10 +177,11 @@ function frameSummary(f: {
   updatedBy: string
   html: string
   demo?: boolean
-}) {
+}, page?: { name: string }) {
   return {
     id: f.id,
     name: f.name,
+    ...(page ? { page: page.name } : {}),
     ...(f.demo ? { demo: true } : {}),
     x: f.x,
     y: f.y,
@@ -216,6 +218,29 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
   }
   const noCanvas = (id: string) => err(`no canvas with id ${id} accessible to this account`)
   const noFrame = (id: string) => err(`no frame with id ${id} accessible to this account`)
+  /* Page resolution for agents: by id first, then by exact name within the
+     canvas — an ambiguous name is an error naming the candidate ids. */
+  const pageForId = (pageId: string) => {
+    const found = store.getPage(pageId)
+    return found && canAccessCanvas(ownerId, found.canvas) ? found : undefined
+  }
+  const resolvePage = (
+    canvasId: string,
+    page: string,
+  ): { page: Page; error?: undefined } | { page?: undefined; error: string } => {
+    const pages = store.getCanvas(canvasId)?.pages ?? []
+    const byId = pages.find((p) => p.id === page)
+    if (byId) return { page: byId }
+    const matches = pages.filter((p) => p.name === page)
+    if (matches.length === 1) return { page: matches[0] as Page }
+    if (matches.length > 1)
+      return {
+        error: `page "${page}" is ambiguous — the canvas has several pages with that name (${matches.map((p) => p.id).join(', ')}); use the page id`,
+      }
+    return { error: `no page "${page}" on this canvas — try a page id from get_canvas` }
+  }
+  /* Server contract: trim, clamp to 80 chars, fall back when empty. */
+  const pageName = (name: string | undefined, fallback: string) => (name ?? '').trim().slice(0, 80) || fallback
   /* Reads count as arrival: presence (and with it every "your agent is
      connected" confirmation in the UI) must appear on an agent's FIRST
      canvas-scoped call, not only once it mutates something. */
@@ -324,7 +349,7 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
     'get_canvas',
     {
       description:
-        'Get a canvas: its name and every frame with position, size and metadata (not the HTML — use get_frame for that). Use this to see the current layout before adding or editing frames. Pass your agent_name so any human feedback waiting for you is delivered with the result.',
+        'Get a canvas: its name, its ordered pages, and every frame with position, size and metadata (not the HTML — use get_frame for that). Use this to see the current layout before adding or editing frames. Pass your agent_name so any human feedback waiting for you is delivered with the result.',
       inputSchema: { canvas_id: z.string(), agent_name: agentName.optional() },
     },
     async ({ canvas_id, agent_name }) => {
@@ -365,7 +390,13 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
           /* demo frames (the Doop welcome show, seeded examples) are product
              content, not user work — hidden so agents never mistake them for
              the canvas's established style */
-          frames: c.frames.filter((f) => !f.demo).map(frameSummary),
+          frames: c.frames.filter((f) => !f.demo).map((f) => frameSummary(f, c.pages?.find((p) => p.id === f.pageId))),
+          pages: (c.pages ?? []).map((p) => ({
+            id: p.id,
+            name: p.name,
+            position: p.position,
+            frameCount: c.frames.filter((f) => f.pageId === p.id).length,
+          })),
           guidelines: docs.map((d) => ({
             name: d.name,
             title: actions.guidelineTitle(d),
@@ -923,17 +954,28 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
         y: z.number().optional(),
         width: z.number().optional().describe('Default 640'),
         height: z.number().optional().describe('Default 480'),
+        page: z
+          .string()
+          .optional()
+          .describe("Target page by id or exact name (see get_canvas). Defaults to the canvas's first page."),
         agent_name: agentName,
       },
     },
-    async ({ canvas_id, name, html, x, y, width, height, agent_name }) => {
-      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
-      const frame = actions.createFrame(canvas_id, { name, html, x, y, width, height }, actorFrom(agent_name))
+    async ({ canvas_id, name, html, x, y, width, height, page, agent_name }) => {
+      const c = canvasFor(canvas_id)
+      if (!c) return noCanvas(canvas_id)
+      let pageId: string | undefined
+      if (page) {
+        const resolved = resolvePage(canvas_id, page)
+        if (resolved.error !== undefined) return err(resolved.error)
+        pageId = resolved.page.id
+      }
+      const frame = actions.createFrame(canvas_id, { name, html, x, y, width, height, pageId }, actorFrom(agent_name))
       if (!frame) return noCanvas(canvas_id)
       const result = withEscapeNote(
         frame.html.length > 0
-          ? textWithNudge({ ok: true, frame: frameSummary(frame) }, REVIEW_NUDGE)
-          : text({ ok: true, frame: frameSummary(frame) }),
+          ? textWithNudge({ ok: true, frame: frameSummary(frame, c.pages?.find((p) => p.id === frame.pageId)) }, REVIEW_NUDGE)
+          : text({ ok: true, frame: frameSummary(frame, c.pages?.find((p) => p.id === frame.pageId)) }),
         html,
       )
       return withGuidelinesNudge(
@@ -943,6 +985,202 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
           actorFrom(agent_name),
         ),
         canvas_id,
+        actorFrom(agent_name),
+      )
+    },
+  )
+
+  server.registerTool(
+    'create_page',
+    {
+      description:
+        'Create a new page on a canvas. Pages are ordered sub-canvases that group frames — use them to build multi-screen flows, one page per screen. The page is appended at the end and starts empty.',
+      inputSchema: {
+        canvas_id: z.string(),
+        name: z.string().optional().describe('Page title, e.g. "Checkout". Defaults to "Page N".'),
+        agent_name: agentName.optional(),
+      },
+    },
+    async ({ canvas_id, name, agent_name }) => {
+      const c = canvasFor(canvas_id)
+      if (!c) return noCanvas(canvas_id)
+      arrive(canvas_id, agent_name)
+      const page = actions.createPage(canvas_id, pageName(name, `Page ${(c.pages?.length ?? 0) + 1}`), actorFrom(agent_name))
+      if (!page) return err('could not create the page')
+      return withGuidelinesNudge(
+        withStatusNudge(
+          withStopped(
+            withFeedback(
+              text({ id: page.id, name: page.name, position: page.position }),
+              canvas_id,
+              actorFrom(agent_name),
+            ),
+            canvas_id,
+            actorFrom(agent_name),
+          ),
+          canvas_id,
+          actorFrom(agent_name),
+        ),
+        canvas_id,
+        actorFrom(agent_name),
+      )
+    },
+  )
+
+  server.registerTool(
+    'rename_page',
+    {
+      description:
+        'Rename a page. Pass the page id from get_canvas; the new name is trimmed and capped at 80 characters.',
+      inputSchema: {
+        page_id: z.string(),
+        name: z.string().describe('New page title, e.g. "Checkout"'),
+        agent_name: agentName.optional(),
+      },
+    },
+    async ({ page_id, name, agent_name }) => {
+      const found = pageForId(page_id)
+      if (!found) return err(`no page with id ${page_id} accessible to this account`)
+      arrive(found.canvas.id, agent_name)
+      const page = actions.renamePage(page_id, pageName(name, 'Untitled'), actorFrom(agent_name))
+      if (!page) return err('could not rename the page')
+      return withGuidelinesNudge(
+        withStatusNudge(
+          withStopped(
+            withFeedback(
+              text({ id: page.id, name: page.name, position: page.position }),
+              found.canvas.id,
+              actorFrom(agent_name),
+            ),
+            found.canvas.id,
+            actorFrom(agent_name),
+          ),
+          found.canvas.id,
+          actorFrom(agent_name),
+        ),
+        found.canvas.id,
+        actorFrom(agent_name),
+      )
+    },
+  )
+
+  server.registerTool(
+    'delete_page',
+    {
+      description:
+        'Deletes the page AND every frame on it. The canvas keeps ≥1 page — deleting the last one is refused. Rescue frames you still need with move_frame first.',
+      inputSchema: { page_id: z.string(), agent_name: agentName.optional() },
+    },
+    async ({ page_id, agent_name }) => {
+      const found = pageForId(page_id)
+      if (!found) return err(`no page with id ${page_id} accessible to this account`)
+      arrive(found.canvas.id, agent_name)
+      const result = actions.deletePage(page_id, actorFrom(agent_name))
+      if (!result)
+        return err('cannot delete the only page on this canvas — a canvas always keeps at least one page')
+      return withGuidelinesNudge(
+        withStatusNudge(
+          withStopped(
+            withFeedback(
+              text({ ok: true, deletedPageId: result.page.id, deletedFrameIds: result.deletedFrameIds }),
+              found.canvas.id,
+              actorFrom(agent_name),
+            ),
+            found.canvas.id,
+            actorFrom(agent_name),
+          ),
+          found.canvas.id,
+          actorFrom(agent_name),
+        ),
+        found.canvas.id,
+        actorFrom(agent_name),
+      )
+    },
+  )
+
+  server.registerTool(
+    'move_frame',
+    {
+      description:
+        'Move a frame to another page of its canvas (page by id or exact name — get_canvas lists both), optionally repositioning it with x/y in the same call. Use this to arrange screens across a multi-page flow.',
+      inputSchema: {
+        frame_id: z.string(),
+        page: z.string().describe('Target page by id or exact name (see get_canvas)'),
+        x: z.number().optional(),
+        y: z.number().optional(),
+        agent_name: agentName.optional(),
+      },
+    },
+    async ({ frame_id, page, x, y, agent_name }) => {
+      const f = frameFor(frame_id)
+      if (!f) return noFrame(frame_id)
+      arrive(f.canvasId, agent_name)
+      const resolved = resolvePage(f.canvasId, page)
+      if (resolved.error !== undefined) return err(resolved.error)
+      const moved = actions.moveFrameToPage(frame_id, resolved.page.id, actorFrom(agent_name))
+      if (!moved) return err('could not move the frame to the page')
+      let frame = moved
+      const reposition: { x?: number; y?: number } = {}
+      if (x !== undefined) reposition.x = x
+      if (y !== undefined) reposition.y = y
+      if (reposition.x !== undefined || reposition.y !== undefined)
+        frame = actions.updateFrame(frame_id, reposition, actorFrom(agent_name)) ?? moved
+      const c = store.getCanvas(f.canvasId)
+      return withGuidelinesNudge(
+        withStatusNudge(
+          withStopped(
+            withFeedback(
+              text({ ok: true, frame: frameSummary(frame, c?.pages?.find((p) => p.id === frame.pageId)) }),
+              f.canvasId,
+              actorFrom(agent_name),
+            ),
+            f.canvasId,
+            actorFrom(agent_name),
+          ),
+          f.canvasId,
+          actorFrom(agent_name),
+        ),
+        f.canvasId,
+        actorFrom(agent_name),
+      )
+    },
+  )
+
+  server.registerTool(
+    'duplicate_frame',
+    {
+      description:
+        'Duplicate a frame: a full copy (same size and HTML) lands 40px below-right of the original, on the same page. Override the name and/or x/y to place it yourself.',
+      inputSchema: {
+        frame_id: z.string(),
+        name: z.string().optional().describe('Title for the copy. Defaults to "<original> copy"'),
+        x: z.number().optional(),
+        y: z.number().optional(),
+        agent_name: agentName.optional(),
+      },
+    },
+    async ({ frame_id, name, x, y, agent_name }) => {
+      const f = frameFor(frame_id)
+      if (!f) return noFrame(frame_id)
+      arrive(f.canvasId, agent_name)
+      const frame = actions.duplicateFrame(frame_id, { name, x, y }, actorFrom(agent_name))
+      if (!frame) return err('could not duplicate the frame')
+      const c = store.getCanvas(f.canvasId)
+      return withGuidelinesNudge(
+        withStatusNudge(
+          withStopped(
+            withFeedback(
+              text({ ok: true, frame: frameSummary(frame, c?.pages?.find((p) => p.id === frame.pageId)) }),
+              frame.canvasId,
+              actorFrom(agent_name),
+            ),
+            frame.canvasId,
+            actorFrom(agent_name),
+          ),
+          frame.canvasId,
+          actorFrom(agent_name),
+        ),
+        frame.canvasId,
         actorFrom(agent_name),
       )
     },

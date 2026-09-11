@@ -17,6 +17,7 @@ import type {
   GuidelineDoc,
   MemoryProposal,
   MemoryReference,
+  Page,
   RepoCardKind,
   RepoCardPayload,
   TaskFeedback,
@@ -61,6 +62,19 @@ export async function saveCanvasCopy(c: Canvas): Promise<void> {
   await db.transaction(async (tx) => {
     await tx.insert(t.canvases).values({ id: c.id, ...canvasColumns(c), createdAt: c.createdAt })
 
+    if (c.pages?.length) {
+      await tx.insert(t.pages).values(
+        c.pages.map((page) => ({
+          id: page.id,
+          canvasId: c.id,
+          name: page.name,
+          position: page.position,
+          createdAt: page.createdAt,
+          updatedAt: page.updatedAt,
+        })),
+      )
+    }
+
     if (c.frames.length) {
       await tx.insert(t.frames).values(
         c.frames.map((frame) => ({
@@ -76,6 +90,7 @@ export async function saveCanvasCopy(c: Canvas): Promise<void> {
           updatedAt: frame.updatedAt,
           updatedBy: frame.updatedBy,
           demo: frame.demo ?? null,
+          pageId: frame.pageId ?? null,
         })),
       )
     }
@@ -160,6 +175,26 @@ export function saveGuideline(canvasId: string, doc: GuidelineDoc) {
 
 export function deleteGuideline(canvasId: string, name: string) {
   swallow(db.delete(t.guidelines).where(and(eq(t.guidelines.canvasId, canvasId), eq(t.guidelines.name, name))))
+}
+
+export function savePage(canvasId: string, page: Page) {
+  swallow(
+    db
+      .insert(t.pages)
+      .values({ id: page.id, canvasId, name: page.name, position: page.position, createdAt: page.createdAt, updatedAt: page.updatedAt })
+      .onConflictDoUpdate({
+        target: t.pages.id,
+        set: { name: page.name, position: page.position, updatedAt: page.updatedAt },
+      }),
+  )
+}
+
+export function deletePage(pageId: string) {
+  swallow(db.delete(t.pages).where(eq(t.pages.id, pageId)))
+}
+
+export function setFramePage(frameId: string, pageId: string) {
+  swallow(db.update(t.frames).set({ pageId }).where(eq(t.frames.id, frameId)))
 }
 
 /* Append-only doc history: a snapshot per save, '' marks a deletion. */
@@ -302,6 +337,7 @@ async function writeFrame(f: Frame) {
     updatedAt: f.updatedAt,
     updatedBy: f.updatedBy,
     demo: f.demo ?? null,
+    pageId: f.pageId ?? null,
   }
   const { id, createdAt, ...set } = row
   await db.insert(t.frames).values(row).onConflictDoUpdate({ target: t.frames.id, set })
@@ -344,6 +380,7 @@ export function deleteCanvas(canvasId: string) {
   swallow(db.delete(t.memoryReferences).where(eq(t.memoryReferences.canvasId, canvasId)))
   swallow(db.delete(t.decisions).where(eq(t.decisions.canvasId, canvasId)))
   swallow(db.delete(t.memoryProposals).where(eq(t.memoryProposals.canvasId, canvasId)))
+  swallow(db.delete(t.pages).where(eq(t.pages.canvasId, canvasId)))
   swallow(db.delete(t.canvasMembers).where(eq(t.canvasMembers.canvasId, canvasId)))
   swallow(db.delete(t.canvases).where(eq(t.canvases.id, canvasId)))
 }
@@ -554,6 +591,7 @@ export async function hydrate(): Promise<Hydrated> {
     decisionRows,
     proposalRows,
     memberRows,
+    pageRows,
   ] = await Promise.all([
     db.select().from(t.canvases),
     db.select().from(t.frames),
@@ -566,6 +604,7 @@ export async function hydrate(): Promise<Hydrated> {
     db.select().from(t.decisions).orderBy(desc(t.decisions.at)),
     db.select().from(t.memoryProposals).orderBy(desc(t.memoryProposals.at)),
     db.select().from(t.canvasMembers).orderBy(t.canvasMembers.addedAt),
+    db.select().from(t.pages).orderBy(t.pages.position),
   ])
 
   const canvases: Canvas[] = canvasRows.map((c) => ({
@@ -586,8 +625,10 @@ export async function hydrate(): Promise<Hydrated> {
     const c = byId.get(m.canvasId)
     if (c) (c.memberIds ??= []).push(m.userId)
   }
-  for (const f of frameRows) byId.get(f.canvasId)?.frames.push({ ...f, demo: f.demo ?? undefined })
-  for (const c of canvases) c.frames.sort((a, b) => a.createdAt - b.createdAt)
+  for (const f of frameRows) {
+    const { pageId, ...rest } = f
+    byId.get(f.canvasId)?.frames.push({ ...rest, demo: f.demo ?? undefined, ...(pageId ? { pageId } : {}) })
+  }
   for (const r of referenceRows) {
     const c = byId.get(r.canvasId)
     if (!c) continue
@@ -616,6 +657,37 @@ export async function hydrate(): Promise<Hydrated> {
     })
   }
 
+  /* Pages backfill: every canvas keeps ≥1 page and every frame carries a
+     pageId. Canvases written before the pages table (or frames whose page
+     row vanished) get a default "Page 1"; the fix is written back so the
+     next boot reads clean. */
+  {
+    const now = Date.now()
+    for (const c of canvases) {
+      const rows = pageRows.filter((p) => p.canvasId === c.id)
+      c.pages = rows.map((p) => ({
+        id: p.id,
+        canvasId: p.canvasId,
+        name: p.name,
+        position: p.position,
+        createdAt: p.createdAt,
+        updatedAt: p.updatedAt,
+      }))
+      if (!c.pages.length) {
+        const page: Page = { id: nanoid(10), canvasId: c.id, name: 'Page 1', position: 0, createdAt: now, updatedAt: now }
+        c.pages.push(page)
+        swallow(db.insert(t.pages).values({ ...page }))
+      }
+      const firstPageId = c.pages[0]!.id
+      const validIds = new Set(c.pages.map((p) => p.id))
+      for (const f of c.frames) {
+        if (!f.pageId || !validIds.has(f.pageId)) {
+          f.pageId = firstPageId
+          swallow(db.update(t.frames).set({ pageId: firstPageId }).where(eq(t.frames.id, f.id)))
+        }
+      }
+    }
+  }
   const now = Date.now()
   const interruptedReason = 'The agent stopped before finishing. Retry when you are ready.'
   const tasks = new Map<string, AgentTask[]>()

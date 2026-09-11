@@ -56,8 +56,27 @@ export const frames = pgTable(
     updatedBy: text('updated_by').notNull(),
     /** product-made onboarding/example content; null = a real user frame */
     demo: boolean('demo'),
+    /** the page this frame sits on (pages table id); backfilled at hydrate */
+    pageId: text('page_id'),
   },
   (t) => [index('frames_canvas_idx').on(t.canvasId)],
+)
+
+/** Canvas pages: ordered sub-canvases grouping frames. A page is a filter over
+ *  a canvas's frames (frames carry page_id), not a coordinate offset. Every
+ *  canvas keeps ≥1 page — hydrate() backfills "Page 1" for legacy canvases. */
+export const pages = pgTable(
+  'pages',
+  {
+    id: text('id').primaryKey(),
+    canvasId: text('canvas_id').notNull(),
+    name: text('name').notNull(),
+    /** dense 0..n-1 order within Canvas.pages, renumbered on reorder */
+    position: integer('position').notNull(),
+    createdAt: bigint('created_at', { mode: 'number' }).notNull(),
+    updatedAt: bigint('updated_at', { mode: 'number' }).notNull(),
+  },
+  (t) => [index('pages_canvas_idx').on(t.canvasId)],
 )
 
 /** Design-sync keys: the write-only capability behind the /ingest endpoint.

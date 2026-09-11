@@ -215,6 +215,14 @@ Viewers watch designs assemble live. Stream with append_frame_html:
   component 480×360, square social post 640×640. Set width/height on create_frame, or
   adjust later with update_frame.
 
+## Pages — one screen per page
+
+Canvases hold ordered pages: sub-canvases that group frames (get_canvas lists each
+page and which page every frame sits on). For multi-screen flows, create one page
+per screen with create_page and target it via the page param on create_frame, or
+move an existing screen there with move_frame. Deleting a page deletes the frames
+on it; a canvas always keeps at least one page.
+
 ## GitHub-imported frames — the repo is the source of truth
 
 Frames whose HTML carries a "doop-github-screen" marker meta were imported from a

@@ -15,8 +15,9 @@ import { navigate } from '../App'
 import type { AgentTask } from '../../shared/types'
 import { DoopMark, Logo } from '../components/Logo'
 import { ensureTab } from '../lib/desktop'
-import { Stage } from '../components/Stage'
 import { Board } from '../components/Board'
+import { PagesBar } from '../components/PagesBar'
+import { Stage } from '../components/Stage'
 import { Inspector } from '../components/Inspector'
 import { ElementPanel } from '../components/ElementPanel'
 import { ActivityPanel } from '../components/ActivityPanel'
@@ -37,6 +38,7 @@ import {
   hasFrameClip,
   pasteFrameCentered,
   pasteImagesCentered,
+  stageCenterWorld,
 } from '../lib/frameClipboard'
 import { clearHistory, deleteFramesTracked, recordCreate, redo, undo } from '../lib/history'
 import { authClient } from '../lib/auth'
@@ -164,6 +166,11 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
         void redo()
         return
       }
+      if (e.key.toLowerCase() === 'f') {
+        e.preventDefault()
+        void addFrame({ width: 640, height: 480 })
+        return
+      }
       if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey) {
         /* ⌘C and ⌘D act on the whole selection */
         const frames = useStore.getState().canvas?.frames.filter((f) => selectedIds.includes(f.id)) ?? []
@@ -275,10 +282,28 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
     }
   }, [latestDecision])
 
-  async function addFrame() {
+  async function addFrame(preset?: { width: number; height: number }) {
+    const s = useStore.getState()
     const n = (canvas?.frames.length ?? 0) + 1
+    /* a preset lands centered in the view on the page being watched; without
+       one the server auto-places — but only on the first page, so when a
+       human is looking at a later page the frame follows them there */
+    const onFirstPage = !s.activePageId || canvas?.pages?.[0]?.id === s.activePageId
+    const pageId = onFirstPage ? undefined : s.activePageId
+    const centered = preset
+      ? (() => {
+          const c = stageCenterWorld()
+          return { x: Math.round(c.x - preset.width / 2), y: Math.round(c.y - preset.height / 2) }
+        })()
+      : {}
     try {
-      const frame = await api.createFrame(canvasId, { name: `Frame ${n}`, html: STARTER_HTML })
+      const frame = await api.createFrame(canvasId, {
+        name: `Frame ${n}`,
+        html: STARTER_HTML,
+        ...preset,
+        ...centered,
+        ...(pageId ? { pageId } : {}),
+      })
       posthog.capture('frame_created')
       recordCreate(frame)
       select(frame.id)
@@ -467,6 +492,7 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
           <Board canvasId={canvasId} />
         ) : (
           <>
+            <PagesBar />
             <Stage onAddFrame={addFrame} />
             <div
               className={cn(

@@ -1,12 +1,18 @@
 import { nanoid } from 'nanoid'
 import * as persist from './db/persist.ts'
-import type { Canvas, CommunityCategory, Frame, GuidelineDoc, MemoryReference } from '../shared/types.ts'
+import type { Canvas, CommunityCategory, Frame, GuidelineDoc, MemoryReference, Page } from '../shared/types.ts'
 
 /**
  * In-memory canvas/frame state — the hot path for reads, reveals and
  * broadcasts. Every committed mutation is mirrored to the database via
  * the write-through helpers in db/persist.ts; boot hydrates from there.
  */
+
+/** A fresh page row for in-memory use; the caller mirrors it via persist. */
+function newPage(canvasId: string, name: string, now: number): Page {
+  return { id: nanoid(10), canvasId, name, position: 0, createdAt: now, updatedAt: now }
+}
+
 class Store {
   canvases = new Map<string, Canvas>()
   private frameIndex = new Map<string, string>() // frameId -> canvasId
@@ -67,8 +73,10 @@ class Store {
   createCanvas(name: string, ownerId?: string): Canvas {
     const now = Date.now()
     const canvas: Canvas = { id: nanoid(10), name, ownerId, createdAt: now, updatedAt: now, frames: [] }
+    canvas.pages = [newPage(canvas.id, 'Page 1', now)]
     this.canvases.set(canvas.id, canvas)
     persist.saveCanvas(canvas)
+    for (const page of canvas.pages) persist.savePage(canvas.id, page)
     return canvas
   }
 
@@ -89,10 +97,15 @@ class Store {
     const canvasId = nanoid(10)
     const sourceFrames = options.dropDemo ? source.frames.filter((frame) => !frame.demo) : source.frames
     const frameIds = new Map(sourceFrames.map((frame) => [frame.id, nanoid(10)]))
+    const pages = source.pages?.map((page) => ({ id: nanoid(10), canvasId, name: page.name, position: page.position, createdAt: now, updatedAt: now }))
+    const pageIdMap = new Map(
+      source.pages?.map((page, i) => [page.id, pages![i]!.id]) ?? [],
+    )
     const frames = sourceFrames.map((frame) => ({
       ...frame,
       id: frameIds.get(frame.id)!,
       canvasId,
+      ...(frame.pageId ? { pageId: pageIdMap.get(frame.pageId)! } : {}),
       createdAt: now,
       updatedAt: now,
       updatedBy: by,
@@ -114,6 +127,7 @@ class Store {
       frames,
       ...(guidelines?.length ? { guidelines } : {}),
       ...(references?.length ? { references } : {}),
+      ...(pages?.length ? { pages } : {}),
     }
     await persist.saveCanvasCopy(canvas)
     this.canvases.set(canvas.id, canvas)
@@ -332,6 +346,122 @@ class Store {
     return ref
   }
 
+
+  getPage(pageId: string): { canvas: Canvas; page: Page } | undefined {
+    for (const c of this.canvases.values()) {
+      const page = c.pages?.find((p) => p.id === pageId)
+      if (page) return { canvas: c, page }
+    }
+    return undefined
+  }
+
+  createPage(canvasId: string, name: string): Page | undefined {
+    const c = this.canvases.get(canvasId)
+    if (!c) return undefined
+    const page = { ...newPage(canvasId, name, Date.now()), position: c.pages?.length ?? 0 }
+    this.renumber(c.pages ??= [])
+    c.pages.push(page)
+    this.renumber(c.pages)
+    c.updatedAt = Date.now()
+    persist.savePage(canvasId, page)
+    persist.saveCanvas(c)
+    return page
+  }
+
+  renamePage(pageId: string, name: string): Page | undefined {
+    const found = this.getPage(pageId)
+    if (!found) return undefined
+    found.page.name = name
+    found.page.updatedAt = Date.now()
+    found.canvas.updatedAt = found.page.updatedAt
+    persist.savePage(found.canvas.id, found.page)
+    persist.saveCanvas(found.canvas)
+    return found.page
+  }
+
+  reorderPage(pageId: string, position: number): Page[] | undefined {
+    const found = this.getPage(pageId)
+    if (!found) return undefined
+    const pages = found.canvas.pages!
+    const from = pages.indexOf(found.page)
+    const to = Math.max(0, Math.min(pages.length - 1, position))
+    if (from === to) return pages
+    pages.splice(from, 1)
+    pages.splice(to, 0, found.page)
+    this.renumber(pages)
+    found.canvas.updatedAt = Date.now()
+    for (const p of pages) persist.savePage(found.canvas.id, p)
+    persist.saveCanvas(found.canvas)
+    return pages
+  }
+
+  /** Remove a page and every frame on it. Refuses the canvas's only page —
+   *  callers surface that as a 409. */
+  deletePage(pageId: string): { canvas: Canvas; page: Page; frames: Frame[] } | undefined {
+    const found = this.getPage(pageId)
+    if (!found) return undefined
+    const c = found.canvas
+    if (!c.pages || c.pages.length < 2) return undefined
+    const idx = c.pages.indexOf(found.page)
+    c.pages.splice(idx, 1)
+    this.renumber(c.pages)
+    const frames = c.frames.filter((f) => f.pageId === pageId)
+    c.frames = c.frames.filter((f) => f.pageId !== pageId)
+    for (const f of frames) this.frameIndex.delete(f.id)
+    for (const f of frames) persist.deleteFrame(f.id)
+    persist.deletePage(pageId)
+    c.updatedAt = Date.now()
+    persist.saveCanvas(c)
+    return { canvas: c, page: found.page, frames }
+  }
+
+  /** Copy a page and every frame on it to a new page appended at the end. */
+  duplicatePage(pageId: string, name: string): { page: Page; frames: Frame[] } | undefined {
+    const found = this.getPage(pageId)
+    if (!found) return undefined
+    const c = found.canvas
+    const now = Date.now()
+    const page: Page = { ...newPage(c.id, name, now), position: c.pages!.length }
+    const frames = c.frames
+      .filter((f) => f.pageId === pageId)
+      .map((f) => ({
+        ...f,
+        id: nanoid(10),
+        pageId: page.id,
+        createdAt: now,
+        updatedAt: now,
+        updatedBy: f.updatedBy,
+      }))
+    c.pages!.push(page)
+    for (const f of frames) {
+      c.frames.push(f)
+      this.frameIndex.set(f.id, c.id)
+      persist.saveFrame(f, true)
+    }
+    persist.savePage(c.id, page)
+    c.updatedAt = now
+    persist.saveCanvas(c)
+    return { page, frames }
+  }
+
+  moveFrameToPage(frameId: string, pageId: string): Frame | undefined {
+    const frame = this.getFrame(frameId)
+    if (!frame) return undefined
+    const c = this.canvases.get(frame.canvasId)!
+    if (!c.pages?.some((p) => p.id === pageId)) return undefined
+    frame.pageId = pageId
+    frame.updatedAt = Date.now()
+    c.updatedAt = frame.updatedAt
+    persist.saveFrame(frame)
+    persist.saveCanvas(c)
+    return frame
+  }
+
+  /** Keep positions dense 0..n-1 after any insertion/removal/reorder. */
+  private renumber(pages: Page[]) {
+    pages.forEach((p, i) => (p.position = i))
+  }
+
   getFrame(frameId: string): Frame | undefined {
     const canvasId = this.frameIndex.get(frameId)
     if (!canvasId) return undefined
@@ -340,18 +470,29 @@ class Store {
 
   createFrame(
     canvasId: string,
-    input: { name: string; x?: number; y?: number; width?: number; height?: number; html?: string; demo?: boolean },
+    input: {
+      name: string
+      x?: number
+      y?: number
+      width?: number
+      height?: number
+      html?: string
+      demo?: boolean
+      pageId?: string
+    },
     by: string,
   ): Frame | undefined {
     const c = this.canvases.get(canvasId)
     if (!c) return undefined
     const now = Date.now()
-    // auto-place: to the right of the right-most frame
+    const pageId = input.pageId ?? c.pages?.[0]?.id
+    // auto-place: to the right of the right-most frame on the same page
     let x = input.x
     let y = input.y
     if (x === undefined || y === undefined) {
-      const rightmost = c.frames.reduce((mx, f) => Math.max(mx, f.x + f.width), 0)
-      x ??= c.frames.length ? rightmost + 80 : 120
+      const pageFrames = c.frames.filter((f) => f.pageId === pageId)
+      const rightmost = pageFrames.reduce((mx, f) => Math.max(mx, f.x + f.width), 0)
+      x ??= pageFrames.length ? rightmost + 80 : 120
       y ??= 120
     }
     const frame: Frame = {
@@ -366,6 +507,7 @@ class Store {
       createdAt: now,
       updatedAt: now,
       updatedBy: by,
+      ...(pageId ? { pageId } : {}),
     }
     if (input.demo) frame.demo = true
     c.frames.push(frame)
@@ -378,7 +520,7 @@ class Store {
 
   updateFrame(
     frameId: string,
-    patch: Partial<Pick<Frame, 'name' | 'x' | 'y' | 'width' | 'height' | 'html'>>,
+    patch: Partial<Pick<Frame, 'name' | 'x' | 'y' | 'width' | 'height' | 'html' | 'pageId'>>,
     by: string,
   ): Frame | undefined {
     const frame = this.getFrame(frameId)

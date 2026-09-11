@@ -8,7 +8,7 @@ import { posthog } from './posthog'
  *  remote actors' work is never undone from here. */
 
 type Patch = Partial<Pick<Frame, 'name' | 'html' | 'x' | 'y' | 'width' | 'height'>>
-type Snapshot = Pick<Frame, 'canvasId' | 'name' | 'html' | 'x' | 'y' | 'width' | 'height'>
+type Snapshot = Pick<Frame, 'canvasId' | 'name' | 'html' | 'x' | 'y' | 'width' | 'height'> & { pageId?: string }
 
 type Entry =
   | { type: 'update'; frameId: string; before: Patch; after: Patch; at: number }
@@ -46,7 +46,7 @@ function push(entry: Entry) {
 }
 
 function snapshot(f: Frame): Snapshot {
-  return { canvasId: f.canvasId, name: f.name, html: f.html, x: f.x, y: f.y, width: f.width, height: f.height }
+  return { canvasId: f.canvasId, name: f.name, html: f.html, x: f.x, y: f.y, width: f.width, height: f.height, pageId: f.pageId }
 }
 
 type UpdateEntry = Extract<Entry, { type: 'update' }>

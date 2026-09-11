@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { useStore } from '../lib/store'
+import { useStore, visibleFrames } from '../lib/store'
 import { FRAME_BOOTSTRAP } from '../lib/frameRuntime'
 import { Button } from './ui/button'
 import { XIcon } from './ui/icons'
@@ -8,7 +8,7 @@ import { XIcon } from './ui/icons'
    on ink) at native resolution scaled to fit, still connected to the room so
    edits streaming in render live. Esc closes. */
 export function PresentMode({ frameId, onClose }: { frameId: string; onClose: () => void }) {
-  const frame = useStore((s) => s.canvas?.frames.find((f) => f.id === frameId))
+  const frame = useStore((s) => visibleFrames(s).find((f) => f.id === frameId))
   const iframeRef = useRef<HTMLIFrameElement>(null)
   const [ready, setReady] = useState(false)
   const [viewport, setViewport] = useState(() => ({ w: window.innerWidth, h: window.innerHeight }))

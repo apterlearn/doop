@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { useStore } from '../lib/store'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useStore, visibleFrames } from '../lib/store'
 import { sendWs } from '../lib/ws'
 import { throttle } from '../lib/throttle'
 import { FrameView } from './FrameView'
@@ -14,21 +14,42 @@ import { hasFrameClip, pasteFrameAtScreen } from '../lib/frameClipboard'
 import { MenuHint } from './ui/menu'
 import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger } from './ui/context-menu'
 import { Toolbar, ToolbarButton, ToolbarDivider, ToolbarValue } from './ui/toolbar'
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from './ui/dropdown-menu'
 
 const MIN_ZOOM = 0.08
 const MAX_ZOOM = 3
 
 const sendCursor = throttle((x: number, y: number) => sendWs({ type: 'cursor', x, y }), 50)
 
-export function Stage({ onAddFrame }: { onAddFrame: () => void }) {
+
+/** Fixed sizes a new frame can start at; Auto (no preset) lets the server
+ *  auto-place a 640×480 frame to the right of the page's rightmost frame. */
+export interface FramePreset {
+  width: number
+  height: number
+}
+
+const FRAME_PRESETS: { label: string; size: FramePreset }[] = [
+  { label: 'Desktop', size: { width: 1440, height: 900 } },
+  { label: 'Laptop', size: { width: 1280, height: 800 } },
+  { label: 'Tablet', size: { width: 768, height: 1024 } },
+  { label: 'Mobile', size: { width: 390, height: 844 } },
+  { label: 'Square', size: { width: 1080, height: 1080 } },
+]
+
+export function Stage({ onAddFrame }: { onAddFrame: (preset?: FramePreset) => void }) {
   const ref = useRef<HTMLDivElement>(null)
   const worldRef = useRef<HTMLDivElement>(null)
   const gridRef = useRef<HTMLDivElement>(null)
   const zoomLabelRef = useRef<HTMLSpanElement>(null)
   const setViewport = useStore((s) => s.setViewport)
   const canvas = useStore((s) => s.canvas)
-  const select = useStore((s) => s.select)
+  const activePageId = useStore((s) => s.activePageId)
+  /* the page tab filters what the stage renders — other pages' frames stay
+     in the store, out of sight */
+  const frames = useMemo(() => visibleFrames({ canvas, activePageId }), [canvas, activePageId])
   const panMode = useStore((s) => s.panMode)
+  const select = useStore((s) => s.select)
   const [panning, setPanning] = useState(false)
   /* the selection rectangle being dragged out, in world coordinates */
   const [marquee, setMarquee] = useState<{ x: number; y: number; width: number; height: number } | null>(null)
@@ -133,9 +154,13 @@ export function Stage({ onAddFrame }: { onAddFrame: () => void }) {
 
   const fit = useCallback(() => {
     const el = ref.current
-    const c = useStore.getState().canvas
-    if (!el || !c) return
-    const boxes = c.frames.map((f) => ({ x: f.x, y: f.y - 30, w: f.width, h: f.height + 30 }))
+    if (!el || !useStore.getState().canvas) return
+    const boxes = visibleFrames(useStore.getState()).map((f) => ({
+      x: f.x,
+      y: f.y - 30,
+      w: f.width,
+      h: f.height + 30,
+    }))
     if (!boxes.length) {
       setViewport({ x: 80, y: 80, zoom: 1 })
       return
@@ -158,14 +183,36 @@ export function Stage({ onAddFrame }: { onAddFrame: () => void }) {
     })
   }, [setViewport])
 
+  /* switching page tabs re-fits the camera to what became visible. The first
+     change (ws init defaulting the tab) is skipped: the deep-link effect
+     below owns that first landing. */
+  const lastPageId = useRef<string | undefined>(undefined)
+  useEffect(() => {
+    if (!fitted.current) {
+      lastPageId.current = activePageId
+      return
+    }
+    if (lastPageId.current === activePageId) return
+    lastPageId.current = activePageId
+    fit()
+  }, [activePageId, fit])
+
   /* zoom-to-fit once the canvas arrives — unless the URL deep-links a frame */
   useEffect(() => {
     if (!canvas || fitted.current) return
     fitted.current = true
     const focusId = new URLSearchParams(location.search).get('frame')
     const target = focusId ? canvas.frames.find((f) => f.id === focusId) : null
-    if (target) focusFrame(target)
-    else fit()
+    if (target) {
+      /* a shared link to a frame on another page lands on that page */
+      if (target.pageId && canvas.pages?.length && target.pageId !== lastPageId.current) {
+        lastPageId.current = target.pageId
+        useStore.getState().setActivePage(target.pageId)
+      }
+      focusFrame(target)
+    } else {
+      fit()
+    }
   }, [canvas, fit, focusFrame])
 
   /* wheel: pan / pinch-zoom — needs a non-passive listener. Trackpads fire
@@ -422,7 +469,7 @@ export function Stage({ onAddFrame }: { onAddFrame: () => void }) {
         height: Math.abs(cur.y - origin.y),
       }
       setMarquee(rect)
-      const frames = useStore.getState().canvas?.frames ?? []
+      const frames = visibleFrames(useStore.getState())
       const hits = frames
         .filter(
           (f) =>
@@ -490,10 +537,12 @@ export function Stage({ onAddFrame }: { onAddFrame: () => void }) {
             {/* `world` is likewise a behaviour hook: pan hit-testing checks
             classList.contains('world') to tell background from frame */}
             <div className="world absolute left-0 top-0 origin-top-left will-change-transform" ref={worldRef}>
-              {canvas?.frames.map((f) => (
+              {frames.map((f) => (
                 <FrameView key={f.id} frame={f} raster={raster} />
               ))}
-              <GhostFrames />
+              {/* ghost placement mirrors the server's auto-place, which lands
+                 on the first page — only show it while viewing that page */}
+              {(!canvas?.pages?.length || activePageId === canvas.pages?.[0]?.id) && <GhostFrames />}
               <FlowOverlay />
               <SnapGuides />
               <Cursors />
@@ -508,7 +557,25 @@ export function Stage({ onAddFrame }: { onAddFrame: () => void }) {
         </ContextMenuTrigger>
 
         <Toolbar className="absolute bottom-[calc(8px+env(safe-area-inset-bottom))] left-1/2 z-[35] -translate-x-1/2 sm:bottom-4">
-          <ToolbarButton onClick={onAddFrame}>+ Frame</ToolbarButton>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <ToolbarButton>+ Frame</ToolbarButton>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="center">
+              <DropdownMenuItem onSelect={() => onAddFrame()}>
+                Auto
+                <MenuHint>640×480</MenuHint>
+              </DropdownMenuItem>
+              {FRAME_PRESETS.map((p) => (
+                <DropdownMenuItem key={p.label} onSelect={() => onAddFrame(p.size)}>
+                  {p.label}
+                  <MenuHint>
+                    {p.size.width}×{p.size.height}
+                  </MenuHint>
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
           <ToolbarDivider />
           <ToolbarButton
             aria-label="Zoom out"
@@ -544,7 +611,7 @@ export function Stage({ onAddFrame }: { onAddFrame: () => void }) {
               Paste
               <MenuHint>{MOD_KEY}V</MenuHint>
             </ContextMenuItem>
-            <ContextMenuItem onSelect={onAddFrame}>New frame</ContextMenuItem>
+            <ContextMenuItem onSelect={() => onAddFrame()}>New frame</ContextMenuItem>
           </ContextMenuContent>
         )}
       </ContextMenu>
