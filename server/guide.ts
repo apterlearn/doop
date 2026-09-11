@@ -5,7 +5,18 @@
 
 import { AGENT_ROLES } from '../shared/agents.ts'
 
-export const GUIDE_TOPICS = ['doop-instructions'] as const
+export const GUIDE_TOPICS = ['doop-instructions', 'streaming', 'review', 'images', 'redesign'] as const
+export type GuideTopic = (typeof GUIDE_TOPICS)[number]
+
+/** Topic -> the `## ` heading(s) of DOOP_GUIDE that answer it. An empty list
+ *  means the whole guide. Sliced at read time so the text can never drift. */
+const TOPIC_SECTIONS: Record<GuideTopic, string[]> = {
+  'doop-instructions': [],
+  streaming: ['Streaming — how to write designs', 'Frames and HTML'],
+  review: ['Review checkpoints — MANDATORY'],
+  images: ['Images — search first, then upload'],
+  redesign: ['Redesigns — audit first, then two drafts'],
+}
 
 /** The taste doctrine every design surface shares. The MCP guide serves it to
  *  external agents and the resident system prompt embeds it verbatim, so the
@@ -353,5 +364,21 @@ The URL re-renders on change, so an embedded link stays current as the frame ite
   edit or delete another actor's frame unless asked to (human feedback you picked up
   counts as being asked).
 - Put new work in new frames beside existing ones; omit x/y to auto-place.
+- Never delete or rewrite a frame another agent is actively streaming into — call
+  stop_work if a run is going wrong, and let a human decide what happens to the work.
+  Deleting a frame out from under a working agent loses its work and looks like a crash.
+- When you finish a note a human pinned to an element, answer it with reply_to_comment
+  and close it with resolve_comment. Use add_comment to ask a human a question about
+  one specific element instead of burying it in a chat message.
 - Keep the SAME agent_name for your whole session. It is your identity in the room.
 `
+
+/** The guide, or one topic's sections sliced out of it by heading. Slicing at
+ *  read time is what keeps an excerpt from drifting from the full text. */
+export function guideFor(topic: GuideTopic): string {
+  const wanted = TOPIC_SECTIONS[topic]
+  if (wanted.length === 0) return DOOP_GUIDE
+  const parts = DOOP_GUIDE.split(/\n(?=## )/)
+  const picked = parts.filter((p) => wanted.some((h) => p.startsWith(`## ${h}`)))
+  return `Excerpt of the Doop guide — topic "${topic}". The full guide is get_guide({ topic: "doop-instructions" }).\n\n${picked.join('\n\n')}`
+}

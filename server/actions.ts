@@ -39,9 +39,16 @@ type AgentTouch = (
 let broadcast: Broadcast = () => {}
 let agentTouch: AgentTouch = () => {}
 
-export function wire(b: Broadcast, t: AgentTouch) {
+/** Abort the in-flight resident run(s) on a canvas. Absent when the resident
+ *  team is not wired — the no-op keeps every other behaviour intact. */
+type Cancel = (canvasId: string) => void
+
+let cancel: Cancel = () => {}
+
+export function wire(b: Broadcast, t: AgentTouch, c?: Cancel) {
   broadcast = b
   agentTouch = t
+  cancel = c ?? (() => {})
 }
 
 const activityLog = new Map<string, ActivityItem[]>() // canvasId -> items (newest first)
@@ -72,7 +79,8 @@ function failInterruptedWork() {
   const now = Date.now()
   for (const [canvasId, list] of taskLog) {
     for (const t of list) {
-      if (t.endedAt || t.failedAt || !t.agentName) continue
+      /* a stopped card is a human's decision, not an interrupted run */
+      if (t.endedAt || t.failedAt || t.cancelledAt || !t.agentName) continue
       if (t.queuedBy) {
         /* a claimed card whose run died — retryable */
         t.failedAt = now
@@ -177,7 +185,7 @@ export function pendingWorkAgents(canvasId: string): string[] {
   }
   /* oldest first so a queue is worked in the order humans filled it */
   for (const card of [...(taskLog.get(canvasId) ?? [])].reverse()) {
-    if (card.queuedBy && !card.agentName && !card.failedAt && !card.endedAt) add(stageAgent(card))
+    if (card.queuedBy && !card.agentName && !card.failedAt && !card.endedAt && !card.cancelledAt) add(stageAgent(card))
   }
   for (const f of [...(feedbackLog.get(canvasId) ?? [])].reverse()) {
     if (!f.deliveredAt && !f.failedAt) add(f.targetAgent ?? roleName(DEFAULT_ROLE_ID))
@@ -207,7 +215,14 @@ export function nextWorkPayer(canvasId: string, agentName: string, skip?: Readon
     if (!oldest || at < oldest.at) oldest = { at, payer }
   }
   for (const card of taskLog.get(canvasId) ?? []) {
-    if (card.queuedBy && !card.agentName && !card.failedAt && !card.endedAt && stageAgent(card) === agentName) {
+    if (
+      card.queuedBy &&
+      !card.agentName &&
+      !card.failedAt &&
+      !card.endedAt &&
+      !card.cancelledAt &&
+      stageAgent(card) === agentName
+    ) {
       consider(card.startedAt, card.queuedByUserId)
     }
   }
@@ -444,7 +459,7 @@ export function findComment(commentId: string): ElementComment | undefined {
 export function addElementComment(
   frameId: string,
   input: { selector: string; snippet: string; text: string },
-  from: string,
+  actor: Actor,
   fromUserId?: string,
 ): ElementComment | undefined {
   const frame = store.getFrame(frameId)
@@ -453,7 +468,7 @@ export function addElementComment(
     frame,
     { selector: String(input.selector ?? '').slice(0, 300), snippet: String(input.snippet ?? '').slice(0, 400) },
     input.text,
-    from,
+    actor,
     fromUserId,
   )
 }
@@ -463,7 +478,7 @@ export function addElementComment(
 export function replyToComment(
   commentId: string,
   text: string,
-  from: string,
+  actor: Actor,
   fromUserId?: string,
 ): ElementComment | undefined {
   const open = openThread(commentId)
@@ -473,7 +488,7 @@ export function replyToComment(
     frame,
     { selector: root.selector, snippet: root.snippet, parentId: root.id },
     text,
-    from,
+    actor,
     fromUserId,
   )
 }
@@ -495,7 +510,7 @@ function postComment(
   frame: Frame,
   anchor: { selector: string; snippet: string; parentId?: string },
   text: string,
-  from: string,
+  actor: Actor,
   fromUserId?: string,
 ): ElementComment | undefined {
   const clean = text.trim()
@@ -512,12 +527,13 @@ function postComment(
     frameId: frame.id,
     selector: anchor.selector,
     snippet: anchor.snippet,
-    from,
+    from: actor.name,
     ...(fromUserId ? { fromUserId } : {}),
     text: clean,
     at,
     ...(mentioned ? { forAgent: true, targetAgent: mentioned.name } : {}),
     ...(anchor.parentId ? { parentId: anchor.parentId } : {}),
+    ...(actor.kind === 'agent' ? { fromKind: 'agent' as const } : {}),
   }
   list.unshift(comment)
   if (list.length > 100) list.length = 100
@@ -527,7 +543,7 @@ function postComment(
   const excerpt = clean.length > 80 ? clean.slice(0, 77) + '…' : clean
   logActivity(
     frame.canvasId,
-    resolveActor({ name: from, kind: 'user' }),
+    resolveActor({ name: actor.name, kind: actor.kind }),
     anchor.parentId
       ? `replied to a comment in “${frame.name}”: “${excerpt}”`
       : `commented on an element in “${frame.name}”: “${excerpt}”`,
@@ -603,7 +619,7 @@ export function retryComment(commentId: string, by: string): ElementComment | un
   return undefined
 }
 
-export function resolveComment(commentId: string, by: string): ElementComment | undefined {
+export function resolveComment(commentId: string, actor: Actor): ElementComment | undefined {
   for (const [canvasId, list] of commentLog) {
     const c = list.find((x) => x.id === commentId)
     if (!c) continue
@@ -612,7 +628,7 @@ export function resolveComment(commentId: string, by: string): ElementComment | 
        resolved pin would be invisible yet still queued for an agent */
     const closing = c.parentId ? [c] : list.filter((x) => x.id === c.id || (x.parentId === c.id && !x.resolvedAt))
     for (const item of closing) {
-      item.resolvedBy = by
+      item.resolvedBy = actor.name
       item.resolvedAt = Date.now()
       persist.saveComment(item)
       broadcast(canvasId, { type: 'comment', comment: item })
@@ -624,7 +640,7 @@ export function resolveComment(commentId: string, by: string): ElementComment | 
           source: 'comment',
           frameId: item.frameId,
           from: item.from,
-          agentName: item.claimedBy ?? (by !== item.from ? by : undefined),
+          agentName: item.claimedBy ?? (actor.name !== item.from ? actor.name : undefined),
         })
       }
     }
@@ -677,19 +693,21 @@ function endAutoTask(canvasId: string, actor: Actor) {
 
 /** Close an agent's open tasks, e.g. when its presence expires. */
 export function endAgentTasks(canvasId: string, agentName: string) {
+  const now = Date.now()
   for (const t of taskLog.get(canvasId) ?? []) {
-    if (t.agentName === agentName && !t.endedAt) {
-      if (t.queuedBy) {
-        /* Interrupted cards pause for a human decision; never auto-retry. */
-        if (t.failedAt) continue
-        t.failedAt = Date.now()
-        t.failureReason = `${agentName} disconnected before finishing. Retry when you are ready.`
-      } else {
-        t.endedAt = Date.now()
-      }
-      persist.saveTask(canvasId, t)
-      broadcast(canvasId, { type: 'task', task: t })
+    if (t.agentName !== agentName || t.endedAt || t.cancelledAt) continue
+    if (t.queuedBy) {
+      /* A card the run already failed keeps its failure: the crash is the
+         actionable story, and overwriting it with "the agent went away" would
+         hide why. Only a card still open when the agent vanished is stopped. */
+      if (t.failedAt) continue
+      t.cancelledAt = now
+      delete t.failureReason
+    } else {
+      t.endedAt = now
     }
+    persist.saveTask(canvasId, t)
+    broadcast(canvasId, { type: 'task', task: t })
   }
 }
 
@@ -697,6 +715,85 @@ export function endAgentTasks(canvasId: string, agentName: string) {
 /* Board cards: humans queue work; agents claim it. Same AgentTask     */
 /* object — queuedBy set, agentName empty until claimed.               */
 /* ------------------------------------------------------------------ */
+
+/* canvasId -> agentName -> when a stop was requested. Kept so the MCP
+   result-nudge layer can tell a stopped agent to stop, and so nothing
+   re-claims the work before the run has actually unwound. */
+const cancellations = new Map<string, Map<string, number>>()
+
+/** How long a stop keeps being reported to the agent it was aimed at.
+ *
+ *  A resident run clears its own record as it unwinds. An external MCP agent
+ *  has no run we control, so the record has to age out on its own — without
+ *  this, one stop would mute that agent name on this canvas forever. */
+const STOP_TTL_MS = 10 * 60_000
+
+/** True while a stop request is outstanding for this agent on this canvas. */
+export function wasStopped(canvasId: string, agentName: string): boolean {
+  const at = cancellations.get(canvasId)?.get(agentName)
+  if (at === undefined) return false
+  if (Date.now() - at > STOP_TTL_MS) {
+    cancellations.get(canvasId)?.delete(agentName)
+    return false
+  }
+  return true
+}
+
+/** Clear the record when a fresh run claims work, so a stop cannot leak into a
+ *  later, unrelated session under the same agent name. Called by the resident
+ *  runner right after it claims (server/resident.ts). */
+export function clearStop(canvasId: string, agentName: string) {
+  cancellations.get(canvasId)?.delete(agentName)
+}
+
+/** Stop every run this agent has in flight on a canvas.
+ *
+ *  Open board cards go to a terminal cancelledAt (never failedAt): a human
+ *  stopped this, so it needs an explicit Retry, not a failure. Open status
+ *  tasks simply end. The model call is aborted if it is still streaming.
+ *  Returns how many open tasks were stopped. */
+export function cancelAgentWork(canvasId: string, agentName: string, by: string): number {
+  const byName = cancellations.get(canvasId) ?? new Map<string, number>()
+  cancellations.set(canvasId, byName)
+  byName.set(agentName, Date.now())
+  const now = Date.now()
+  let stopped = 0
+  for (const t of taskLog.get(canvasId) ?? []) {
+    if (t.agentName !== agentName || t.endedAt || t.cancelledAt) continue
+    if (t.queuedBy) {
+      /* a card the run already failed keeps its failure: that is the actionable
+         story, and rewriting it as a stop would hide why it died */
+      if (t.failedAt) continue
+      t.cancelledAt = now
+      t.cancelledBy = by
+    } else {
+      t.endedAt = now
+    }
+    persist.saveTask(canvasId, t)
+    broadcast(canvasId, { type: 'task', task: t })
+    stopped++
+  }
+  /* no work was stopped — do not abort whatever run happens to be live */
+  if (stopped > 0) {
+    cancel(canvasId)
+    logActivity(canvasId, resolveActor({ name: by, kind: 'user' }), `stopped ${agentName}`)
+  }
+  return stopped
+}
+
+/** Take a card off the board entirely — what the ✕ means. Distinct from
+ *  completeCard ("this work is done") and from cancelAgentWork (stops a run but
+ *  keeps the card for a retry). */
+export function removeCard(canvasId: string, cardId: string, by: string): boolean {
+  const list = taskLog.get(canvasId) ?? []
+  const index = list.findIndex((t) => t.id === cardId && t.queuedBy)
+  if (index < 0) return false
+  const [card] = list.splice(index, 1)
+  if (card?.agentName) cancelAgentWork(canvasId, card.agentName, by)
+  persist.deleteTask(canvasId, cardId)
+  broadcast(canvasId, { type: 'task:deleted', taskId: cardId })
+  return true
+}
 
 /** A card's text is the whole prompt the agent gets — never shorten it for
  *  display here; the board clamps long headings visually. The cap only stops
@@ -710,12 +807,20 @@ export function addQueuedCard(
   agents?: unknown,
   attachments?: unknown,
   fromUserId?: string,
+  targetFrameIds?: unknown,
 ): AgentTask | undefined {
   const clean = title.trim().slice(0, MAX_CARD_CHARS)
   if (!clean || !store.getCanvas(canvasId)) return undefined
   const pipeline = normalizePipeline(agents)
   /* reference-image frame ids: only frames that actually live on this canvas */
   const refs = (Array.isArray(attachments) ? attachments : [])
+    .filter((a): a is string => typeof a === 'string')
+    .filter((id, i, arr) => arr.indexOf(id) === i && store.getFrame(id)?.canvasId === canvasId)
+    .slice(0, 4)
+  /* the frames the card is ABOUT (the human's selection when they queued it) —
+     same liveness rule as the attachments, but the opposite instruction to the
+     agent: edit these in place rather than delivering elsewhere */
+  const targets = (Array.isArray(targetFrameIds) ? targetFrameIds : [])
     .filter((a): a is string => typeof a === 'string')
     .filter((id, i, arr) => arr.indexOf(id) === i && store.getFrame(id)?.canvasId === canvasId)
     .slice(0, 4)
@@ -726,7 +831,8 @@ export function addQueuedCard(
       !t.endedAt &&
       t.status === clean &&
       pipelineOf(t).join(',') === pipeline.join(',') &&
-      (t.attachments ?? []).join(',') === refs.join(','),
+      (t.attachments ?? []).join(',') === refs.join(',') &&
+      (t.targetFrameIds ?? []).join(',') === targets.join(','),
   )
   if (duplicate) return duplicate
   const card: AgentTask = {
@@ -740,6 +846,7 @@ export function addQueuedCard(
     pipeline,
     stage: 0,
     ...(refs.length > 0 ? { attachments: refs } : {}),
+    ...(targets.length > 0 ? { targetFrameIds: targets } : {}),
   }
   list.unshift(card)
   taskLog.set(canvasId, trimTaskLog(list))
@@ -762,7 +869,7 @@ const TASK_LOG_CAP = 100
  *  failed card off the board. Open cards past the cap are kept as well. */
 export function trimTaskLog(list: AgentTask[]): AgentTask[] {
   if (list.length <= TASK_LOG_CAP) return list
-  const isOpen = (t: AgentTask) => !!t.queuedBy && !t.endedAt
+  const isOpen = (t: AgentTask) => !!t.queuedBy && !t.endedAt && !t.cancelledAt
   let room = TASK_LOG_CAP - list.filter(isOpen).length
   const kept: AgentTask[] = []
   for (const t of list) {
@@ -869,6 +976,7 @@ export function takeQueuedCardsFor(canvasId: string, agentName: string, payer?: 
       !t.agentName &&
       !t.failedAt &&
       !t.endedAt &&
+      !t.cancelledAt &&
       stageAgent(t) === agentName &&
       (payer === undefined || (t.queuedByUserId ?? '') === payer),
   )
@@ -886,7 +994,7 @@ export function takeQueuedCardsFor(canvasId: string, agentName: string, payer?: 
  *  pipeline, or complete it if that was the last one. */
 export function advanceCard(canvasId: string, cardId: string, by: Actor): AgentTask | undefined {
   const card = (taskLog.get(canvasId) ?? []).find((t) => t.id === cardId && t.queuedBy)
-  if (!card || card.endedAt) return card
+  if (!card || card.endedAt || card.cancelledAt) return card
   const pipeline = pipelineOf(card)
   const next = (card.stage ?? 0) + 1
   if (next >= pipeline.length) return completeCard(canvasId, cardId)
@@ -905,7 +1013,7 @@ export function advanceCard(canvasId: string, cardId: string, by: Actor): AgentT
 
 export function completeCard(canvasId: string, cardId: string): AgentTask | undefined {
   const card = (taskLog.get(canvasId) ?? []).find((t) => t.id === cardId && t.queuedBy)
-  if (!card || card.endedAt) return card
+  if (!card || card.endedAt || card.cancelledAt) return card
   card.endedAt = Date.now()
   persist.saveTask(canvasId, card)
   broadcast(canvasId, { type: 'task', task: card })
@@ -915,7 +1023,7 @@ export function completeCard(canvasId: string, cardId: string): AgentTask | unde
 /** An unsuccessful card stays paused until a human explicitly retries it. */
 export function failCard(canvasId: string, cardId: string, reason: string): AgentTask | undefined {
   const card = (taskLog.get(canvasId) ?? []).find((t) => t.id === cardId && t.queuedBy)
-  if (!card || card.endedAt) return card
+  if (!card || card.endedAt || card.cancelledAt) return card
   card.failedAt = Date.now()
   card.failureReason = reason
   persist.saveTask(canvasId, card)
@@ -926,11 +1034,14 @@ export function failCard(canvasId: string, cardId: string, reason: string): Agen
 export function retryCard(canvasId: string, cardId: string, by: string): AgentTask | undefined {
   const card = (taskLog.get(canvasId) ?? []).find((t) => t.id === cardId && t.queuedBy)
   if (!card || card.endedAt) return card
-  if (!card.failedAt) return card
+  if (!card.failedAt && !card.cancelledAt) return card
   card.agentName = ''
   delete card.claimedAt
   delete card.failedAt
   delete card.failureReason
+  /* a retry is the one thing that lifts a stop: the human has decided again */
+  delete card.cancelledAt
+  delete card.cancelledBy
   persist.saveTask(canvasId, card)
   broadcast(canvasId, { type: 'task', task: card })
   logActivity(canvasId, resolveActor({ name: by, kind: 'user' }), `retried a card: “${card.status}”`)
@@ -1200,6 +1311,7 @@ export function deleteCanvas(canvasId: string): boolean {
   activityLog.delete(canvasId)
   decisionLog.delete(canvasId)
   proposalLog.delete(canvasId)
+  cancellations.delete(canvasId)
   return true
 }
 

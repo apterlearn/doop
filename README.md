@@ -424,6 +424,9 @@ Steering happens at three layers (the same architecture paper.design uses, plus 
 | `set_status`           | Broadcast a one-line "what I'm working on" — shown live in the working-now strip, avatar tooltip, and activity feed |
 | `get_feedback`         | Fetch & claim open human feedback requests — for agents whose job is to poll the canvas periodically                |
 | `get_comments`         | Read element-pinned comments and replies, optionally filtered by frame or resolution state, without claiming work   |
+| `add_comment`          | Pin a note to one element in a frame — for recording a change, or asking a human about that element                 |
+| `reply_to_comment`     | Reply inside an element-comment thread, inheriting the thread's anchor                                              |
+| `resolve_comment`      | Close an element-comment thread once the note it carries has been addressed                                         |
 | `list_canvases`        | List all canvases                                                                                                   |
 | `create_canvas`        | Create a canvas, returns its shareable id                                                                           |
 | `get_canvas`           | Canvas layout: every frame's position/size/meta                                                                     |
@@ -431,12 +434,15 @@ Steering happens at three layers (the same architecture paper.design uses, plus 
 | `import_webpage`       | Import one public URL onto a canvas as an editable HTML snapshot/frame                                              |
 | `create_frame`         | Add a frame with HTML (auto-placed if no x/y)                                                                       |
 | `get_frame`            | Read a frame including its HTML                                                                                     |
+| `inspect_frame`        | Inspect the RENDERED page: semantic outline, element selectors, computed colors/type/radii/shadows                  |
+| `get_frame_html`       | Read a bounded slice of a frame's source (`query` for snippets, or `offset`/`limit` to page)                        |
 | `get_frame_screenshot` | Render the frame headlessly and return a PNG — lets agents _see_ and iterate on their design                        |
 | `set_frame_html`       | Replace a frame's design in one shot — renders live for everyone                                                    |
 | `append_frame_html`    | **Stream** a design in chunks (`start=true` first, `done=true` last) — viewers watch it build up                    |
 | `edit_frame_html`      | Targeted exact find/replace in a frame's HTML — morphs into the render in place                                     |
 | `update_frame`         | Rename / move / resize a frame                                                                                      |
 | `delete_frame`         | Remove a frame                                                                                                      |
+| `stop_work`            | Stop an agent's run on a canvas (`target_agent` for another agent, or omit to stop yourself)                        |
 
 Mutating tools accept `agent_name`; the agent then appears in the presence stack (pulsing square avatar),
 gets an "editing" ring + chip on the frame it touched, and its actions land in the activity feed. Agents
@@ -482,6 +488,29 @@ caretaker, point an agent at `get_feedback` — a non-blocking fetch-and-claim d
 "check the canvas every few minutes, address whatever humans requested" loop.
 REST equivalent: `POST /api/tasks/:id/feedback` with `{ text, from }`.
 
+### Stopping a run
+
+A run that has gone wrong — drifting from the brief, working the wrong frame, looping — can be
+stopped from either side:
+
+- **From the canvas.** A live agent's row in the Tasks tab, and its card in the board's
+  _In progress_ column, both carry a **Stop** button. Stopping ends the run, aborts the model call
+  it is streaming, and records who stopped it in the activity feed.
+- **From an agent.** `stop_work({ canvas_id, agent_name })` stops another agent's run
+  (`target_agent`) or the caller's own. It is the right move instead of deleting a frame out from
+  under a working agent — work already written stays on the canvas.
+
+A stopped card is **stopped, not failed**: it lands in the board's needs-a-decision column reading
+_Attempt stopped · stopped by ⟨name⟩_ with a working **↻ Retry**, and it is never auto-retried. An
+agent that goes silent mid-run (its presence TTL expires) stops the same way, attributed to nobody
+rather than to a person. An external agent we hold no process handle on learns it was stopped from a
+`STOPPED` block appended to its next tool result — MCP is pull-based, so a tool result is the only
+channel into it.
+
+The canvas panel's **Clients** tab, and **Settings → Connected agents**, list the MCP clients holding
+a token for your account; **Revoke** deletes that client's tokens, so its next call is refused and it
+has to be approved again.
+
 ### Reading element comments through MCP
 
 Call `get_comments({ canvas_id })` to read the canvas's retained element comments and replies
@@ -494,6 +523,11 @@ Pass `frame_id` to read only comments on a frame belonging to that canvas, or
 so conversation context remains available. An empty result is `[]`. The tool enforces the same
 canvas access permissions as other MCP reads; optional `agent_name` announces presence.
 It does not claim task feedback or comments, or mark anything resolved.
+
+Writing is a separate path: `add_comment` pins a new note to one element (`selector` from
+`inspect_frame`'s `elements[].selector`, or from an existing comment), `reply_to_comment` answers
+inside a thread, and `resolve_comment` closes one once the note has actually been addressed. Comments
+written by an agent carry `fromKind: 'agent'`, so the canvas badges them as agent-authored.
 
 ## What's in the box
 

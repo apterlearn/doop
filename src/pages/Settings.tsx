@@ -6,6 +6,7 @@ import { openCanvasTab } from '../lib/desktop'
 import { ModelAccountPanel } from '../components/ModelAccount'
 import { useAllowance } from '../components/TeamAllowance'
 import { AccountSettings } from '../components/AccountSettings'
+import { ConnectedAgents } from '../components/ConnectedAgents'
 import { AccountMenu, ConnectCard, IconBack, IconChevron, IconSpark, IconUser } from '../components/DashShell'
 import { Tabs, TabsList, TabsTrigger } from '../components/ui/tabs'
 import { Button } from '../components/ui/button'
@@ -24,7 +25,7 @@ import {
   DashTitle,
 } from '../components/ui/dash'
 
-type Pane = 'agent' | 'account'
+type Pane = 'agent' | 'account' | 'agents'
 
 /**
  * Account settings. Today it holds one thing — which model account the Doop
@@ -83,6 +84,9 @@ export function Settings() {
           <DashNavItem icon={<IconUser />} active={pane === 'account'} onClick={() => setPane('account')}>
             Your account
           </DashNavItem>
+          <DashNavItem icon={<IconSpark />} active={pane === 'agents'} onClick={() => setPane('agents')}>
+            Connected agents
+          </DashNavItem>
         </nav>
 
         <div className="min-h-6 flex-1" />
@@ -114,11 +118,15 @@ export function Settings() {
         <DashContent>
           <div className="flex items-start gap-4 md:items-end">
             <div>
-              <DashTitle>{pane === 'agent' ? 'Doop Agent' : 'Your account'}</DashTitle>
+              <DashTitle>
+                {pane === 'agent' ? 'Doop Agent' : pane === 'account' ? 'Your account' : 'Connected agents'}
+              </DashTitle>
               <DashSubtitle>
                 {pane === 'agent'
                   ? 'Which model account the agent runs on, for every canvas you work on.'
-                  : 'Who you are on every canvas — and how you get back into this one.'}
+                  : pane === 'account'
+                    ? 'Who you are on every canvas — and how you get back into this one.'
+                    : 'MCP clients acting as you — and how to cut one off.'}
               </DashSubtitle>
             </div>
           </div>
@@ -130,6 +138,9 @@ export function Settings() {
               </TabsTrigger>
               <TabsTrigger value="account">
                 <IconUser /> Your account
+              </TabsTrigger>
+              <TabsTrigger value="agents">
+                <IconSpark /> Connected agents
               </TabsTrigger>
             </TabsList>
           </Tabs>
@@ -160,8 +171,10 @@ export function Settings() {
               </CardHeader>
               <ModelAccountPanel onChange={refresh} />
             </Card>
-          ) : (
+          ) : pane === 'account' ? (
             <AccountSettings />
+          ) : (
+            <ConnectedAgents />
           )}
         </DashContent>
       </DashMain>

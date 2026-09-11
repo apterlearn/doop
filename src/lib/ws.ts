@@ -110,6 +110,9 @@ function handle(msg: ServerMessage) {
     case 'task':
       s.upsertTask(msg.task)
       break
+    case 'task:deleted':
+      s.removeTask(msg.taskId)
+      break
     case 'feedback':
       s.upsertFeedback(msg.feedback)
       break

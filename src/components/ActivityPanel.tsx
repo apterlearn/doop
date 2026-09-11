@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { AgentTask } from '../../shared/types'
 import { useStore } from '../lib/store'
-import { api } from '../lib/api'
+import { api, type ConnectedAgent } from '../lib/api'
 import { timeAgo } from '../lib/time'
 import { cn } from '@/lib/utils'
 import { AgentIcon } from './AgentIcon'
@@ -63,6 +63,9 @@ export function ActivityPanel({
             >
               Memory
             </PanelTab>
+            <PanelTab value="agents" title="MCP clients connected to your account — revoke one to cut it off">
+              Clients
+            </PanelTab>
           </PanelTabs>
           <Tooltip label="Collapse panel" side="bottom" align="end">
             <Button
@@ -84,6 +87,9 @@ export function ActivityPanel({
         </PanelTabPanel>
         <PanelTabPanel value="memory">
           <MemoryPanel />
+        </PanelTabPanel>
+        <PanelTabPanel value="agents">
+          <ClientsList />
         </PanelTabPanel>
       </PanelTabsRoot>
     </Panel>
@@ -150,7 +156,7 @@ function TaskGroup({ list }: { list: AgentTask[] }) {
         <span>
           <AgentIcon name={latest.agentName} /> {latest.agentName}
           {latest.owner && <span className="ml-1.5 text-[11px] font-medium text-ink-faint">for {latest.owner}</span>}
-          {latest.failedAt ? (
+          {latest.failedAt || latest.cancelledAt ? (
             <span className={cn(agentTag, 'font-semibold tracking-[0.08em]')}>needs retry</span>
           ) : !latest.endedAt ? (
             <span className={cn(agentTag, 'font-medium tracking-[0.1em]')}>working</span>
@@ -195,12 +201,15 @@ function TaskRow({ task }: { task: AgentTask }) {
     }
   }
 
-  const state = task.endedAt ? 'done' : task.failedAt ? 'failed' : 'active'
+  /* a stopped card is closed work with a human decision pending, so it reads
+     as failed (needs a retry) rather than done */
+  const state = task.endedAt ? 'done' : task.failedAt || task.cancelledAt ? 'failed' : 'active'
+  const live = !task.endedAt && !task.failedAt && !task.cancelledAt
 
   return (
     <div className="group">
       <div className="flex animate-[chip-in_0.25s_ease] items-baseline gap-2 py-[5px] pr-4 pl-5 text-[12.5px] leading-[1.4]">
-        {task.failedAt ? (
+        {task.failedAt || task.cancelledAt ? (
           <span className="grid size-[15px] flex-none place-items-center self-center rounded-full bg-accent-ink text-[10px] font-extrabold text-white">
             !
           </span>
@@ -226,19 +235,30 @@ function TaskRow({ task }: { task: AgentTask }) {
           {task.status}
         </span>
         <span className="flex-none font-mono text-[10.5px] text-ink-faint">
-          {task.failedAt
-            ? timeAgo(task.failedAt)
+          {task.failedAt || task.cancelledAt
+            ? timeAgo((task.failedAt ?? task.cancelledAt)!)
             : task.endedAt
               ? `${duration(task)} · ${timeAgo(task.endedAt)}`
               : duration(task)}
         </span>
-        {task.failedAt && task.queuedBy && canvasId ? (
+        {(task.failedAt || task.cancelledAt) && task.queuedBy && canvasId ? (
           <Button
             variant="danger-solid"
             size="pill"
             onClick={() => api.retryCard(canvasId, task.id).catch(reportLimit)}
           >
             ↻ Retry
+          </Button>
+        ) : null}
+        {live && canvasId ? (
+          <Button
+            variant="danger-solid"
+            size="pill"
+            className="flex-none"
+            title="Stop this agent"
+            onClick={() => api.stopAgentWork(canvasId, task.agentName).catch(reportLimit)}
+          >
+            Stop
           </Button>
         ) : null}
         {!replying && (
@@ -310,29 +330,138 @@ function TaskRow({ task }: { task: AgentTask }) {
   )
 }
 
+const activityRow = 'flex animate-[chip-in_0.25s_ease] gap-2.5 px-4 py-[9px] text-[12.5px] leading-[1.45]'
+
+/* The feed names the frame an entry is about; when that frame still exists the
+   row is a button that flies the canvas to it, so a note is one click from the
+   thing it describes. */
 function ActivityList() {
   const activity = useStore((s) => s.activity)
+  const frames = useStore((s) => s.canvas?.frames)
   return (
     <PanelBody className="py-2">
       {activity.length === 0 && <div className={emptyNote}>No activity yet. Add a frame, or connect an agent.</div>}
-      {activity.map((a) => (
-        <div
-          key={a.id}
-          className="flex animate-[chip-in_0.25s_ease] gap-2.5 px-4 py-[9px] text-[12.5px] leading-[1.45]"
-        >
-          <Dot className="mt-[5px]" style={{ background: a.actorColor }} />
-          <div>
+      {activity.map((a) => {
+        const frameId = a.frameId
+        const jumpable = !!frameId && !!frames?.some((f) => f.id === frameId)
+        const body = (
+          <>
+            <Dot className="mt-[5px]" style={{ background: a.actorColor }} />
             <div>
-              <span className="font-bold">
-                {a.actorName}
-                <span className="ml-[5px] font-mono text-[9.5px] font-medium uppercase tracking-[0.08em] text-ink-faint">
-                  {a.actorKind}
-                </span>
-              </span>{' '}
-              <span className="text-ink-soft">{a.message}</span>
+              <div>
+                <span className="font-bold">
+                  {a.actorName}
+                  <span className="ml-[5px] font-mono text-[9.5px] font-medium uppercase tracking-[0.08em] text-ink-faint">
+                    {a.actorKind}
+                  </span>
+                </span>{' '}
+                <span className="text-ink-soft">{a.message}</span>
+              </div>
+              <div className="mt-0.5 text-[11px] text-ink-faint">{timeAgo(a.at)}</div>
             </div>
-            <div className="mt-0.5 text-[11px] text-ink-faint">{timeAgo(a.at)}</div>
+          </>
+        )
+        if (!jumpable) {
+          return (
+            <div key={a.id} className={activityRow}>
+              {body}
+            </div>
+          )
+        }
+        return (
+          <button
+            key={a.id}
+            type="button"
+            title="Go to this frame"
+            className={cn(activityRow, 'w-full text-left hover:bg-paper-deep')}
+            onClick={() => {
+              useStore.getState().select(frameId)
+              useStore.getState().requestFlyTo(frameId)
+            }}
+          >
+            {body}
+          </button>
+        )
+      })}
+    </PanelBody>
+  )
+}
+
+/* The MCP clients acting as this account. Revoking deletes their tokens, which
+   is what cuts a client off: its next call is refused and it must be approved
+   again. Kept beside the Agents tab because both answer "who is working here". */
+function ClientsList() {
+  const [clients, setClients] = useState<ConnectedAgent[] | null>(null)
+  const [failed, setFailed] = useState(false)
+  const [note, setNote] = useState('')
+  const version = useStore((s) => s.allowanceVersion)
+  useEffect(() => {
+    let live = true
+    api
+      .listMcpAgents()
+      .then((list) => {
+        if (!live) return
+        setClients(list)
+        setFailed(false)
+      })
+      .catch(() => {
+        if (!live) return
+        setClients([])
+        setFailed(true)
+      })
+    return () => {
+      live = false
+    }
+  }, [version])
+
+  if (clients === null) {
+    return (
+      <PanelBody className="py-2">
+        <div className={emptyNote}>Loading connected clients…</div>
+      </PanelBody>
+    )
+  }
+  if (failed) {
+    return (
+      <PanelBody className="py-2">
+        <div className={emptyNote}>Couldn&rsquo;t load connected clients. {note}</div>
+      </PanelBody>
+    )
+  }
+  if (clients.length === 0) {
+    return (
+      <PanelBody className="py-2">
+        <div className={emptyNote}>
+          No clients connected. Connect one from a canvas&rsquo;s &ldquo;Connect AI agent&rdquo; dialog.
+        </div>
+      </PanelBody>
+    )
+  }
+  return (
+    <PanelBody className="py-2">
+      {clients.map((c) => (
+        <div key={c.clientId} className={cn(activityRow, 'items-center justify-between')}>
+          <div className="min-w-0">
+            <div className="truncate font-bold">{c.name}</div>
+            <div className="mt-0.5 text-[11px] text-ink-faint">
+              {c.liveTokens} live token{c.liveTokens === 1 ? '' : 's'} · last used {timeAgo(c.expiresAt)}
+            </div>
           </div>
+          <Button
+            variant="danger-solid"
+            size="pill"
+            className="flex-none"
+            title="Revoke this client's access"
+            onClick={() => {
+              setNote('')
+              api
+                .revokeMcpAgent(c.clientId)
+                .then(() => useStore.getState().allowanceChanged())
+                .catch(() => setNote(`Couldn't revoke ${c.name} — try again.`))
+            }}
+          >
+            Revoke
+          </Button>
         </div>
       ))}
     </PanelBody>

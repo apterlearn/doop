@@ -48,18 +48,22 @@ beforeEach(() => {
   vi.spyOn(store, 'getFrame').mockImplementation((id) => (id === FRAME.id ? FRAME : undefined))
 })
 
+/** Comment mutations take an Actor, not a bare name: an agent writing
+ *  through MCP must be attributed as one. */
+const human = (name: string) => actions.resolveActor({ name, kind: 'user' })
+
 function root() {
   return actions.addElementComment(
     FRAME.id,
     { selector: '.hero h1', snippet: '<h1>Hi</h1>', text: 'Too small' },
-    'alice',
+    human('alice'),
   )!
 }
 
 describe('replying to a comment', () => {
   it('threads the reply under the root and inherits its element', () => {
     const parent = root()
-    const reply = actions.replyToComment(parent.id, 'Agreed', 'bob')!
+    const reply = actions.replyToComment(parent.id, 'Agreed', human('bob'))!
     expect(reply.parentId).toBe(parent.id)
     expect(reply.selector).toBe(parent.selector)
     expect(reply.snippet).toBe(parent.snippet)
@@ -68,23 +72,23 @@ describe('replying to a comment', () => {
 
   it('gives every message a distinct timestamp so order survives a reload', () => {
     const parent = root()
-    const first = actions.replyToComment(parent.id, 'one', 'bob')!
-    const second = actions.replyToComment(parent.id, 'two', 'carol')!
+    const first = actions.replyToComment(parent.id, 'one', human('bob'))!
+    const second = actions.replyToComment(parent.id, 'two', human('carol'))!
     expect(first.at).toBeGreaterThan(parent.at)
     expect(second.at).toBeGreaterThan(first.at)
   })
 
   it('re-roots a reply to a reply, keeping threads one level deep', () => {
     const parent = root()
-    const first = actions.replyToComment(parent.id, 'Agreed', 'bob')!
-    const second = actions.replyToComment(first.id, 'Same', 'carol')!
+    const first = actions.replyToComment(parent.id, 'Agreed', human('bob'))!
+    const second = actions.replyToComment(first.id, 'Same', human('carol'))!
     expect(second.parentId).toBe(parent.id)
     expect(actions.commentThread(parent).map((c) => c.from)).toEqual(['alice', 'bob', 'carol'])
   })
 
   it('routes an @mention in a reply to the agent with the thread anchor', () => {
     const parent = root()
-    const reply = actions.replyToComment(parent.id, `@${DEFAULT_ROLE_ID} make it 48px`, 'alice', 'alice')!
+    const reply = actions.replyToComment(parent.id, `@${DEFAULT_ROLE_ID} make it 48px`, human('alice'), 'alice')!
     expect(reply.forAgent).toBe(true)
     expect(reply.targetAgent).toBe(AGENT)
     expect(actions.takeAgentCommentsFor(CANVAS, AGENT, 'alice').map((c) => c.id)).toEqual([reply.id])
@@ -92,33 +96,45 @@ describe('replying to a comment', () => {
 
   it('reports whether a thread can take a reply before anything is metered', () => {
     const parent = root()
-    const reply = actions.replyToComment(parent.id, 'Agreed', 'bob')!
+    const reply = actions.replyToComment(parent.id, 'Agreed', human('bob'))!
     expect(actions.openThread(reply.id)?.root.id).toBe(parent.id)
-    actions.resolveComment(parent.id, 'alice')
+    actions.resolveComment(parent.id, human('alice'))
     expect(actions.openThread(reply.id)).toBeUndefined()
     expect(actions.openThread('missing')).toBeUndefined()
   })
 
   it('refuses replies on a resolved thread or with empty text', () => {
     const parent = root()
-    expect(actions.replyToComment(parent.id, '   ', 'bob')).toBeUndefined()
-    actions.resolveComment(parent.id, 'alice')
-    expect(actions.replyToComment(parent.id, 'Late', 'bob')).toBeUndefined()
-    expect(actions.replyToComment('missing', 'Hello', 'bob')).toBeUndefined()
+    expect(actions.replyToComment(parent.id, '   ', human('bob'))).toBeUndefined()
+    actions.resolveComment(parent.id, human('alice'))
+    expect(actions.replyToComment(parent.id, 'Late', human('bob'))).toBeUndefined()
+    expect(actions.replyToComment('missing', 'Hello', human('bob'))).toBeUndefined()
   })
 
   it('resolving the root closes every open reply so none stays queued for an agent', () => {
     const parent = root()
-    const reply = actions.replyToComment(parent.id, `@${DEFAULT_ROLE_ID} bigger`, 'alice', 'alice')!
-    actions.resolveComment(parent.id, 'alice')
+    const reply = actions.replyToComment(parent.id, `@${DEFAULT_ROLE_ID} bigger`, human('alice'), 'alice')!
+    actions.resolveComment(parent.id, human('alice'))
     expect(actions.findComment(reply.id)?.resolvedAt).toBeDefined()
     expect(actions.takeAgentCommentsFor(CANVAS, AGENT, 'alice')).toEqual([])
   })
 
   it('resolving a reply leaves the thread open', () => {
     const parent = root()
-    const reply = actions.replyToComment(parent.id, `@${DEFAULT_ROLE_ID} bigger`, 'alice', 'alice')!
-    actions.resolveComment(reply.id, AGENT)
+    const reply = actions.replyToComment(parent.id, `@${DEFAULT_ROLE_ID} bigger`, human('alice'), 'alice')!
+    actions.resolveComment(reply.id, actions.resolveActor({ name: AGENT, kind: 'agent' }))
     expect(actions.findComment(parent.id)?.resolvedAt).toBeUndefined()
+    expect(actions.findComment(reply.id)?.resolvedBy).toBe(AGENT)
+  })
+
+  it('marks an agent-authored message so the canvas can badge it', () => {
+    const parent = root()
+    const fromAgent = actions.replyToComment(
+      parent.id,
+      'Raised it to 48px',
+      actions.resolveActor({ name: AGENT, kind: 'agent' }),
+    )!
+    expect(fromAgent.fromKind).toBe('agent')
+    expect(parent.fromKind).toBeUndefined()
   })
 })

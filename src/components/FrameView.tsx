@@ -1005,6 +1005,11 @@ function CommentThread({
             <div key={c.id} className={cn(i > 0 && 'mt-2 border-t border-line-soft pt-2')}>
               <div className="flex items-center justify-between gap-2 text-[12px]">
                 <b style={{ color: colorFor(c.from) }}>{c.from}</b>
+                {c.fromKind === 'agent' && (
+                  <span className="rounded-full border border-current px-[6px] font-mono text-[9px] uppercase tracking-[0.08em] text-accent-ink">
+                    agent
+                  </span>
+                )}
                 {status && <span className="whitespace-nowrap text-[11px] font-semibold text-brand">{status}</span>}
               </div>
               <div className="mt-1 break-words text-[13px] leading-[1.45] text-ink">{c.text}</div>

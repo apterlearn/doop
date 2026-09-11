@@ -11,7 +11,7 @@ import {
   roleById,
   roleName,
 } from '../../shared/agents'
-import type { AgentTask } from '../../shared/types'
+import type { AgentTask, Frame } from '../../shared/types'
 import { posthog } from '../lib/posthog'
 import { MeterLine, isResidentLimit, useAllowance } from './TeamAllowance'
 import { Button } from './ui/button'
@@ -70,6 +70,18 @@ function RepoTag({ task }: { task: AgentTask }) {
 }
 
 /** Queued cards from one import (same click on the same repo), oldest first. */
+/** What the card is about, when the human queued it from a canvas selection:
+ *  the agent edits that frame in place instead of delivering somewhere else. */
+function TargetChip({ task, frames }: { task: AgentTask; frames?: Frame[] }) {
+  const ids = task.targetFrameIds ?? []
+  if (ids.length === 0) return null
+  return (
+    <div className="mt-[9px] font-mono text-[11px] text-brand">
+      → {ids.map((id) => frames?.find((f) => f.id === id)?.name ?? id).join(', ')}
+    </div>
+  )
+}
+
 function groupImports(queued: AgentTask[]): { key: string; cards: AgentTask[] }[] {
   const groups: { key: string; cards: AgentTask[] }[] = []
   for (const t of queued) {
@@ -119,7 +131,7 @@ function Team({ tasks, onPick }: { tasks: AgentTask[]; onPick: (id: string) => v
       </div>
       <div className="flex flex-nowrap gap-2 overflow-x-auto pb-1 [scroll-snap-type:x_proximity] md:flex-wrap md:overflow-visible md:pb-0">
         {AGENT_ROLES.map((role) => {
-          const working = tasks.find((t) => t.agentName === role.name && !t.endedAt && !t.failedAt)
+          const working = tasks.find((t) => t.agentName === role.name && !t.endedAt && !t.failedAt && !t.cancelledAt)
           const waiting = tasks.filter(
             (t) => t.queuedBy && !t.agentName && !t.failedAt && !t.endedAt && pipelineOf(t)[t.stage ?? 0] === role.id,
           ).length
@@ -166,13 +178,16 @@ function Team({ tasks, onPick }: { tasks: AgentTask[]; onPick: (id: string) => v
 
 export function Board({ canvasId }: { canvasId: string }) {
   const tasks = useStore((s) => s.tasks)
+  const frames = useStore((s) => s.canvas?.frames)
   const [draft, setDraft] = useState<string | null>(null)
   const [agents, setAgents] = useState<string[]>([DEFAULT_ROLE_ID])
   const { allowance, refresh } = useAllowance()
 
-  const failed = tasks.filter((t) => t.queuedBy && t.failedAt && !t.endedAt)
-  const queued = tasks.filter((t) => t.queuedBy && !t.agentName && !t.failedAt && !t.endedAt)
-  const inProgress = tasks.filter((t) => t.agentName && !t.failedAt && !t.endedAt)
+  /* a stopped card belongs with the failures: it needs a human decision, and
+     its card body already reads "Attempt stopped" */
+  const failed = tasks.filter((t) => t.queuedBy && (t.failedAt || t.cancelledAt) && !t.endedAt)
+  const queued = tasks.filter((t) => t.queuedBy && !t.agentName && !t.failedAt && !t.cancelledAt && !t.endedAt)
+  const inProgress = tasks.filter((t) => t.agentName && !t.failedAt && !t.cancelledAt && !t.endedAt)
   const done = tasks.filter((t) => t.endedAt).slice(0, 14)
 
   /* clicking a chip appends it to the pipeline, so click order = run order */
@@ -229,7 +244,7 @@ export function Board({ canvasId }: { canvasId: string }) {
                   className={dismissCls}
                   aria-label="Remove this card"
                   title="Remove this card"
-                  onClick={() => api.completeCard(canvasId, t.id).catch(console.error)}
+                  onClick={() => api.deleteCard(canvasId, t.id).catch(console.error)}
                 >
                   ✕
                 </Button>
@@ -244,10 +259,15 @@ export function Board({ canvasId }: { canvasId: string }) {
                 <div className={metaCls}>
                   <b>Attempt stopped</b>
                   {t.agentName ? <span> · {t.agentName}</span> : null}
-                  <span> · {timeAgo(t.failedAt!)}</span>
+                  {t.cancelledAt ? (
+                    <span> · stopped{t.cancelledBy ? ` by ${t.cancelledBy}` : ' — the agent went away'}</span>
+                  ) : null}
+                  <span> · {timeAgo((t.failedAt ?? t.cancelledAt)!)}</span>
                 </div>
                 <div className="mt-[9px] text-[11.5px] leading-[1.4] text-accent-ink">
-                  {t.failureReason ?? 'The agent did not finish this task.'}
+                  {t.cancelledAt
+                    ? 'Stopped. Retry when you are ready.'
+                    : (t.failureReason ?? 'The agent did not finish this task.')}
                 </div>
                 <Button
                   variant="danger-solid"
@@ -273,7 +293,7 @@ export function Board({ canvasId }: { canvasId: string }) {
                     variant="bare"
                     className={dismissCls}
                     title={cards.length > 1 ? 'Remove these cards' : 'Remove this card'}
-                    onClick={() => Promise.all(cards.map((c) => api.completeCard(canvasId, c.id))).catch(console.error)}
+                    onClick={() => Promise.all(cards.map((c) => api.deleteCard(canvasId, c.id))).catch(console.error)}
                   >
                     ✕
                   </Button>
@@ -312,6 +332,7 @@ export function Board({ canvasId }: { canvasId: string }) {
                   <div className="mt-[9px] font-mono text-[11px] text-ink-faint">
                     ✦ waiting for {roleName(pipelineOf(t)[t.stage ?? 0])}
                   </div>
+                  <TargetChip task={t} frames={frames} />
                 </Card>
               )
             })}
@@ -443,6 +464,16 @@ export function Board({ canvasId }: { canvasId: string }) {
                   {t.queuedBy && <span> · card from {t.queuedBy}</span>}
                   <span> · {timeAgo(t.claimedAt ?? t.startedAt)}</span>
                 </div>
+                <TargetChip task={t} frames={frames} />
+                <Button
+                  variant="danger-solid"
+                  size="pill"
+                  className="mt-2.5 px-[11px] py-[5px]"
+                  title="Stop this agent"
+                  onClick={() => api.stopAgentWork(canvasId, t.agentName).catch(console.error)}
+                >
+                  Stop
+                </Button>
               </Card>
             ))}
           </div>

@@ -12,6 +12,7 @@ import {
   type SyncKeyInfo,
 } from '../lib/api'
 import { navigate } from '../App'
+import type { AgentTask } from '../../shared/types'
 import { DoopMark, Logo } from '../components/Logo'
 import { ensureTab } from '../lib/desktop'
 import { Stage } from '../components/Stage'
@@ -56,6 +57,9 @@ import { Tooltip } from '../components/ui/tooltip'
 import { Note } from '../components/ui/note'
 import { Textarea } from '../components/ui/textarea'
 import { Modal, ModalActions, ModalEyebrow, ModalLede, ModalTitle } from '../components/ui/modal'
+
+/** The timestamp a task reached a terminal state, or undefined while it runs. */
+const terminalAt = (t: AgentTask) => t.cancelledAt ?? t.failedAt ?? t.endedAt
 
 const STARTER_HTML = `<!doctype html>
 <html>
@@ -210,6 +214,49 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
   const panelTab = useStore((s) => s.panelTab)
   const [mutedProposal, setMutedProposal] = useState<string | null>(null)
 
+  /* An agent finishing, failing or being stopped is invisible unless you happen
+     to be watching the panel — surface it as a toast that jumps to the task.
+     Keyed on the whole list, not tasks[0]: upsertTask replaces a task in place,
+     so the first entry is not "the latest" and a card further down the board
+     would never announce. */
+  const tasks = useStore((s) => s.tasks)
+  /* When this page loaded. Both "landed since you arrived" toasts share it:
+     the socket delivers its history in waves, so a ref that latched on the
+     first wave would announce work that ended before the page existed. */
+  const loadedAt = useRef(0)
+  const [taskToast, setTaskToast] = useState<{ text: string; kind: 'finished' | 'failed' | 'stopped' } | null>(null)
+  const taskToastTimer = useRef<number | null>(null)
+  const announcedRef = useRef<Set<string> | null>(null)
+  useEffect(() => {
+    /* Only board cards are announced. A narration task also ends — every
+       set_status ends the previous one — so toasting those would fire "Agent
+       finished" each time an agent reworded what it is doing. A card an agent
+       abandoned silently (no cancelledBy) is not news either: the panel's
+       "needs retry" tag already covers it. */
+    const terminal = tasks.filter(
+      (t) => !!t.queuedBy && !!t.agentName && !!terminalAt(t) && !(t.cancelledAt && !t.cancelledBy),
+    )
+    if (!loadedAt.current) loadedAt.current = Date.now()
+    const announced = announcedRef.current ?? new Set<string>()
+    announcedRef.current = announced
+    const fresh = terminal.filter(
+      (t) => terminalAt(t)! > loadedAt.current && !announced.has(`${t.id}:${terminalAt(t)}`),
+    )
+    for (const t of fresh) announced.add(`${t.id}:${terminalAt(t)}`)
+    /* the newest transition wins if several land in one batch */
+    const task = fresh.sort((a, b) => terminalAt(b)! - terminalAt(a)!)[0]
+    if (!task) return
+    const kind = task.cancelledAt ? 'stopped' : task.failedAt ? 'failed' : 'finished'
+    const verb = kind === 'finished' ? 'finished' : kind === 'stopped' ? 'was stopped' : 'stopped short'
+    const line = task.status
+    setTaskToast({
+      text: `${task.agentName} ${verb} — ${line.length > 52 ? line.slice(0, 49) + '…' : line}`,
+      kind,
+    })
+    if (taskToastTimer.current) window.clearTimeout(taskToastTimer.current)
+    taskToastTimer.current = window.setTimeout(() => setTaskToast(null), 6000)
+  }, [tasks])
+
   /* a decision landing in Memory is invisible work — surface it as its own
      memory toast in the same top-right stack. Only decisions captured after
      this page loaded count, so the ws-init batch stays silent. The summarizer
@@ -217,7 +264,6 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
      upsert re-fires this effect and the toast text swaps in place. */
   const latestDecision = useStore((s) => s.decisions[0])
   const [decisionToast, setDecisionToast] = useState<string | null>(null)
-  const loadedAt = useRef(0)
   const decisionToastTimer = useRef<number | null>(null)
   useEffect(() => {
     if (!loadedAt.current) loadedAt.current = Date.now()
@@ -231,10 +277,17 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
 
   async function addFrame() {
     const n = (canvas?.frames.length ?? 0) + 1
-    const frame = await api.createFrame(canvasId, { name: `Frame ${n}`, html: STARTER_HTML })
-    posthog.capture('frame_created')
-    recordCreate(frame)
-    select(frame.id)
+    try {
+      const frame = await api.createFrame(canvasId, { name: `Frame ${n}`, html: STARTER_HTML })
+      posthog.capture('frame_created')
+      recordCreate(frame)
+      select(frame.id)
+    } catch (err) {
+      /* an unhandled rejection here was a silent no-op: the button looked
+         broken rather than the request having failed */
+      console.error(err)
+      showToast('Couldn’t create the frame — try again')
+    }
   }
 
   const me = getIdentity()
@@ -459,6 +512,30 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
                   <span>
                     <b className="block font-display text-[13px] font-semibold tracking-[-0.01em]">Saved to Memory</b>
                     <span className="mt-[1px] block text-[12px] leading-[1.4] text-ink-soft">{decisionToast}</span>
+                  </span>
+                </Button>
+              )}
+              {taskToast && (
+                <Button
+                  variant="ghost"
+                  className="max-w-full items-center gap-2.5 whitespace-normal rounded-[12px] border-line bg-surface px-3.5 py-2.5 text-left shadow-pop transition-shadow hover:bg-surface hover:shadow-card sm:max-w-[320px] [&_svg]:text-accent-ink"
+                  title="Open the task"
+                  onClick={() => {
+                    useStore.getState().setPanelTab('tasks')
+                    setShowActivity(true)
+                    setTaskToast(null)
+                  }}
+                >
+                  <SparkIcon className="size-[17px]" />
+                  <span>
+                    <b className="block font-display text-[13px] font-semibold tracking-[-0.01em]">
+                      {taskToast.kind === 'finished'
+                        ? 'Agent finished'
+                        : taskToast.kind === 'stopped'
+                          ? 'Agent stopped'
+                          : 'Agent stopped short'}
+                    </b>
+                    <span className="mt-[1px] block text-[12px] leading-[1.4] text-ink-soft">{taskToast.text}</span>
                   </span>
                 </Button>
               )}

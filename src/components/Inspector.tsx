@@ -32,7 +32,7 @@ export function Inspector({
      reads as frame properties, not a code dump; the choice sticks */
   const [showHtml, setShowHtml] = useState(() => localStorage.getItem(HTML_OPEN_KEY) === '1')
   const [draft, setDraft] = useState(frame.html)
-  const [saveState, setSaveState] = useState<'idle' | 'dirty' | 'saved'>('idle')
+  const [saveState, setSaveState] = useState<'idle' | 'dirty' | 'saved' | 'error'>('idle')
   const [copiedUrl, setCopiedUrl] = useState(false)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const saveTimer = useRef<number | null>(null)
@@ -57,9 +57,16 @@ export function Inspector({
     saveTimer.current = window.setTimeout(async () => {
       const before = useStore.getState().canvas?.frames.find((f) => f.id === frame.id)?.html
       if (before !== undefined) recordUpdate(frame.id, { html: before }, { html: value })
-      await api.updateFrame(frame.id, { html: value }).catch(console.error)
-      setSaveState('saved')
-      window.setTimeout(() => setSaveState((s) => (s === 'saved' ? 'idle' : s)), 1500)
+      /* a rejected write must not read as saved: the debounce re-arms on the
+         next keystroke, so a transient failure heals itself */
+      await api
+        .updateFrame(frame.id, { html: value })
+        .then(() => setSaveState('saved'))
+        .catch((err) => {
+          console.error(err)
+          setSaveState('error')
+        })
+      window.setTimeout(() => setSaveState((s) => (s === 'saved' || s === 'error' ? 'idle' : s)), 1500)
     }, 700)
   }
 
@@ -156,7 +163,13 @@ export function Inspector({
       </Collapsible>
       <footer className="flex items-center justify-between border-t border-line-soft px-4 py-2.5">
         <span className="font-mono text-[11px] text-ink-faint">
-          {saveState === 'dirty' ? 'saving…' : saveState === 'saved' ? 'saved ✓' : `last edit by ${frame.updatedBy}`}
+          {saveState === 'dirty'
+            ? 'saving…'
+            : saveState === 'saved'
+              ? 'saved ✓'
+              : saveState === 'error'
+                ? 'couldn’t save — check your connection'
+                : `last edit by ${frame.updatedBy}`}
         </span>
         <Button variant="bare-danger" size="sm" onClick={() => deleteFrameTracked(frame)}>
           Delete frame

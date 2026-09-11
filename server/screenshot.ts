@@ -8,6 +8,51 @@ import { guardPublicPageRequests } from './publicUrl.ts'
  * Uses the system browser via puppeteer-core — no bundled download.
  */
 
+/* how much frame source an agent may read in one go: the cap that keeps a
+   60 KB imported document from filling the context window */
+export const MAX_HTML_READ_CHARS = 30_000
+
+/** Bounded read of a frame's source HTML for agents: literal-text snippets or a
+ *  paged range. Shared by the resident team's get_frame_html and the MCP
+ *  get_frame_html so the two can never drift. */
+export function readFrameHtml(
+  html: string,
+  opts: { query?: string; offset?: number; limit?: number },
+): { text: string } | { error: string } {
+  const limit = Math.max(1000, Math.min(Number(opts.limit) || 20_000, MAX_HTML_READ_CHARS))
+  const query = String(opts.query ?? '').trim()
+  if (query) {
+    const haystack = html.toLowerCase()
+    const needle = query.toLowerCase()
+    const matches: number[] = []
+    let cursor = 0
+    while (matches.length < 5) {
+      const index = haystack.indexOf(needle, cursor)
+      if (index < 0) break
+      matches.push(index)
+      cursor = index + Math.max(needle.length, 1)
+    }
+    if (matches.length === 0) return { error: `query not found in frame HTML: ${query}` }
+    const perMatch = Math.max(1000, Math.floor(limit / matches.length))
+    const snippets = matches.map((index, match) => {
+      const start = Math.max(0, index - Math.floor(perMatch / 2))
+      const end = Math.min(html.length, start + perMatch)
+      return `--- match ${match + 1} at ${index}, chars ${start}-${end} ---\n${html.slice(start, end)}`
+    })
+    return {
+      text: `Frame HTML: ${html.length} characters; ${matches.length} match(es) for "${query}".\n${snippets.join('\n')}`,
+    }
+  }
+  const offset = Math.max(0, Math.min(Number(opts.offset) || 0, html.length))
+  const end = Math.min(html.length, offset + limit)
+  return {
+    text:
+      `Frame HTML: ${html.length} characters. Returning chars ${offset}-${end}.` +
+      (end < html.length ? ` Continue with offset=${end}, or use query for a targeted snippet.` : '') +
+      `\n\n${html.slice(offset, end)}`,
+  }
+}
+
 const CHROME_PATHS = [
   process.env.CHROME_PATH,
   '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',

@@ -19,7 +19,7 @@ export function GhostFrames() {
       p.kind === 'agent' &&
       p.status &&
       !p.activeFrameId &&
-      tasks.some((t) => t.queuedBy && t.agentName === p.name && !t.endedAt && !t.failedAt),
+      tasks.some((t) => t.queuedBy && t.agentName === p.name && !t.endedAt && !t.failedAt && !t.cancelledAt),
   )
   if (working.length === 0) return null
   /* mirror store.createFrame's auto-placement: right of the right-most frame */

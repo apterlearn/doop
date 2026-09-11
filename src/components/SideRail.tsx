@@ -3,9 +3,9 @@ import { useStore } from '../lib/store'
 import { cn } from '@/lib/utils'
 import { Button } from './ui/button'
 import { Tooltip } from './ui/tooltip'
-import { BookmarkIcon, PanelExpandRightIcon, PulseIcon, SparkIcon } from './ui/icons'
+import { BookmarkIcon, ClientsIcon, PanelExpandRightIcon, PulseIcon, SparkIcon } from './ui/icons'
 
-type PanelTab = 'tasks' | 'activity' | 'memory'
+type PanelTab = 'tasks' | 'activity' | 'memory' | 'agents'
 
 /** The collapsed side panel: a column of icon buttons pinned to the top-right
  *  of the canvas while the panel is closed. Each opens the panel on its tab;
@@ -14,7 +14,9 @@ type PanelTab = 'tasks' | 'activity' | 'memory'
  *  happening. */
 export function SideRail({ onOpen }: { onOpen: () => void }) {
   const setTab = useStore((s) => s.setPanelTab)
-  const working = useStore((s) => s.tasks.filter((t) => t.agentName && !t.endedAt && !t.failedAt).length)
+  const working = useStore(
+    (s) => s.tasks.filter((t) => t.agentName && !t.endedAt && !t.failedAt && !t.cancelledAt).length,
+  )
   const proposalPending = useStore((s) => s.proposals.some((p) => p.status === 'pending'))
 
   function show(next: PanelTab) {
@@ -45,6 +47,9 @@ export function SideRail({ onOpen }: { onOpen: () => void }) {
       </RailControl>
       <RailControl label="Activity" onClick={() => show('activity')}>
         <PulseIcon />
+      </RailControl>
+      <RailControl label="Connected clients" onClick={() => show('agents')}>
+        <ClientsIcon />
       </RailControl>
       <RailControl label={proposalPending ? 'Memory · suggestion to review' : 'Memory'} onClick={() => show('memory')}>
         <BookmarkIcon />

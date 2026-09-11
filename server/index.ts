@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import express from 'express'
-import { eq, inArray } from 'drizzle-orm'
+import { eq, inArray, and } from 'drizzle-orm'
 import { toNodeHandler, fromNodeHeaders } from 'better-auth/node'
 import { oAuthDiscoveryMetadata } from 'better-auth/plugins'
 import { WebSocketServer, WebSocket } from 'ws'
@@ -19,6 +19,10 @@ import { closeDb, db, initDb } from './db/index.ts'
 import * as authSchema from './db/auth-schema.ts'
 import * as persist from './db/persist.ts'
 import { handleMcpRequest } from './mcp.ts'
+import { groupClients } from './mcpClients.ts'
+/* static, not dynamic: nothing imports this entrypoint, so there is no cycle,
+   and the canceller must be referenceable when actions is wired below */
+import { cancelCanvasRuns, onFeedback } from './resident.ts'
 import {
   getAsset,
   reconcileAssetRefs,
@@ -76,15 +80,10 @@ seed()
    human explicitly retries them. */
 {
   const pending = [...data.tasks.entries()]
-    .filter(([, list]) => list.some((t) => t.queuedBy && !t.agentName && !t.endedAt))
+    .filter(([, list]) => list.some((t) => t.queuedBy && !t.agentName && !t.endedAt && !t.cancelledAt))
     .map(([canvasId]) => canvasId)
   pending.forEach((canvasId, i) => {
-    setTimeout(
-      () => {
-        import('./resident.ts').then((r) => r.onFeedback(canvasId)).catch(() => {})
-      },
-      5_000 + i * 30_000,
-    )
+    setTimeout(() => onFeedback(canvasId), 5_000 + i * 30_000)
   })
   if (pending.length) console.log(`[resident] ${pending.length} canvas(es) with new queued cards — starting after boot`)
 }
@@ -223,7 +222,7 @@ setInterval(() => {
   }
 }, 5000)
 
-actions.wire(broadcast, agentTouch)
+actions.wire(broadcast, agentTouch, cancelCanvasRuns)
 
 /* ------------------------------------------------- http api */
 
@@ -601,6 +600,43 @@ app.get('/api/agent-allowance', (req, res) => {
     .getAllowance(req.user!.id)
     .then((a) => res.json(a))
     .catch(() => res.status(500).json({ error: 'allowance unavailable' }))
+})
+
+/* ---- the MCP clients a user has connected.
+
+   The token IS the credential, so deleting the rows is the whole revocation:
+   the next tool call gets a 401 and re-runs the approval flow. Never touches
+   oauth_application — that row is shared across users. */
+
+app.get('/api/mcp-agents', async (req, res) => {
+  const mine = await db
+    .select({
+      clientId: authSchema.oauthAccessToken.clientId,
+      expiresAt: authSchema.oauthAccessToken.accessTokenExpiresAt,
+    })
+    .from(authSchema.oauthAccessToken)
+    .where(eq(authSchema.oauthAccessToken.userId, req.user!.id))
+  const clientIds = [...new Set(mine.map((r) => r.clientId))]
+  const apps = clientIds.length
+    ? await db
+        .select({ clientId: authSchema.oauthApplication.clientId, name: authSchema.oauthApplication.name })
+        .from(authSchema.oauthApplication)
+        .where(inArray(authSchema.oauthApplication.clientId, clientIds))
+    : []
+  res.json(groupClients(mine, new Map(apps.map((a) => [a.clientId, a.name]))))
+})
+
+app.delete('/api/mcp-agents/:clientId', async (req, res) => {
+  const revoked = await db
+    .delete(authSchema.oauthAccessToken)
+    .where(
+      and(
+        eq(authSchema.oauthAccessToken.clientId, req.params.clientId),
+        eq(authSchema.oauthAccessToken.userId, req.user!.id),
+      ),
+    )
+    .returning({ id: authSchema.oauthAccessToken.id })
+  res.json({ ok: true, revoked: revoked.length })
 })
 
 /* ---- the user's own model account: what keeps the Doop Agent running once
@@ -1241,7 +1277,7 @@ app.post('/api/frames/:id/comments', async (req, res) => {
   const comment = actions.addElementComment(
     req.params.id,
     { selector: String(selector ?? ''), snippet: String(snippet ?? ''), text: String(text ?? '') },
-    req.user!.name,
+    actions.resolveActor({ name: req.user!.name, kind: 'user' }),
     req.user!.id,
   )
   if (!comment) return res.status(404).json({ error: 'frame not found or empty text' })
@@ -1264,7 +1300,12 @@ app.post('/api/comments/:id/replies', async (req, res) => {
       return res.status(403).json({ error: 'resident_limit', used: gate.used, limit: gate.limit })
     }
   }
-  const reply = actions.replyToComment(req.params.id, text, req.user!.name, req.user!.id)
+  const reply = actions.replyToComment(
+    req.params.id,
+    text,
+    actions.resolveActor({ name: req.user!.name, kind: 'user' }),
+    req.user!.id,
+  )
   if (!reply) {
     /* the thread closed while the meter was being written: give the task
        back — a failed refund is logged, never turned into a 500 */
@@ -1282,7 +1323,7 @@ app.post('/api/comments/:id/resolve', (req, res) => {
   const found = actions.findComment(req.params.id)
   if (!found) return res.status(404).json({ error: 'comment not found' })
   if (!requireCanvas(req, res, found.canvasId)) return
-  res.json(actions.resolveComment(req.params.id, req.user!.name))
+  res.json(actions.resolveComment(req.params.id, actions.resolveActor({ name: req.user!.name, kind: 'user' })))
 })
 
 app.post('/api/comments/:id/retry', async (req, res) => {
@@ -1424,9 +1465,28 @@ app.post('/api/canvases/:id/cards', async (req, res) => {
     req.body?.agents,
     req.body?.attachments,
     req.user!.id,
+    req.body?.targetFrameIds,
   )
   if (!card) return res.status(404).json({ error: 'canvas not found or empty title' })
   res.json(card)
+})
+
+/* a human stopping agent work: ends the run, stops the card, aborts the model
+   call. Deliberately unmetered — stopping spends nothing. */
+app.post('/api/canvases/:canvasId/agents/stop', (req, res) => {
+  if (!requireCanvas(req, res, req.params.canvasId)) return
+  const agentName = String(req.body?.agentName ?? '').trim()
+  if (!agentName) return res.status(400).json({ error: 'agentName required' })
+  res.json({ ok: true, stopped: actions.cancelAgentWork(req.params.canvasId, agentName, req.user!.name) })
+})
+
+/* ✕ on the board means "take this card off the board" — not "mark it done" */
+app.delete('/api/canvases/:canvasId/cards/:id', (req, res) => {
+  if (!requireCanvas(req, res, req.params.canvasId)) return
+  if (!actions.removeCard(req.params.canvasId, req.params.id, req.user!.name)) {
+    return res.status(404).json({ error: 'card not found' })
+  }
+  res.json({ ok: true })
 })
 
 app.post('/api/canvases/:canvasId/cards/:id/done', (req, res) => {
@@ -1606,8 +1666,8 @@ wss.on('connection', (ws, upgradeReq) => {
       broadcast(msg.canvasId, { type: 'presence:join', presence }, presence.clientId)
       demo.maybePlay(msg.canvasId) // first visit to a fresh signup canvas: the demo agent performs
       /* Start never-attempted cards. Failed/interrupted cards are excluded. */
-      if (actions.getTasks(msg.canvasId).some((t) => t.queuedBy && !t.agentName && !t.endedAt)) {
-        import('./resident.ts').then((r) => r.onFeedback(msg.canvasId)).catch(() => {})
+      if (actions.getTasks(msg.canvasId).some((t) => t.queuedBy && !t.agentName && !t.endedAt && !t.cancelledAt)) {
+        onFeedback(msg.canvasId)
       }
       return
     }

@@ -49,4 +49,53 @@ describe('MCP website tool contract', () => {
       await server.close()
     }
   })
+
+  it('exposes the inspection, stop and comment tools with their contracts', async () => {
+    const server = buildMcpServer('Test Owner', 'test-owner-id')
+    const client = new Client({ name: 'doop-tool-contract-test', version: '1.0.0' })
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
+
+    await server.connect(serverTransport)
+    await client.connect(clientTransport)
+
+    try {
+      const { tools } = await client.listTools()
+      const byName = new Map(tools.map((tool) => [tool.name, tool]))
+      const schema = (name: string) => byName.get(name)!.inputSchema as ToolInputSchema
+
+      for (const name of [
+        'inspect_frame',
+        'get_frame_html',
+        'stop_work',
+        'add_comment',
+        'reply_to_comment',
+        'resolve_comment',
+      ]) {
+        expect(byName.has(name), `${name} should be registered`).toBe(true)
+      }
+
+      /* reading a frame must never be mistaken for a mutation */
+      expect(byName.get('inspect_frame')!.annotations?.readOnlyHint).toBe(true)
+      expect(byName.get('get_frame_html')!.annotations?.readOnlyHint).toBe(true)
+      expect(byName.get('stop_work')!.annotations?.readOnlyHint).not.toBe(true)
+
+      expect(new Set(schema('get_frame_html').required)).toEqual(new Set(['frame_id', 'agent_name']))
+      expect(schema('get_frame_html').properties).toHaveProperty('query')
+      expect(schema('get_frame_html').properties).toHaveProperty('limit')
+
+      /* agent_name is how human feedback reaches an agent: without it on these
+         reads the feedback channel goes silent with no error */
+      for (const name of ['get_frame', 'get_frame_screenshot', 'get_guidelines', 'list_guidelines', 'get_reference']) {
+        expect(new Set(schema(name).required), `${name} should require agent_name`).toContain('agent_name')
+      }
+      /* reading comments must never claim work, so it stays canvas-only */
+      expect(new Set(schema('get_comments').required)).toEqual(new Set(['canvas_id']))
+
+      expect(client.getInstructions()).toContain('call stop_work')
+      expect(client.getInstructions()).toContain('inspect_frame')
+    } finally {
+      await client.close()
+      await server.close()
+    }
+  })
 })

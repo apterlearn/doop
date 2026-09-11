@@ -8,8 +8,8 @@ import * as actions from './actions.ts'
 import { canAccessCanvas } from './access.ts'
 import { auth, getUserName, isBanned, PUBLIC_ORIGIN } from './auth.ts'
 import { capture, captureThrottled } from './analytics.ts'
-import { renderFrame } from './screenshot.ts'
-import { DOOP_GUIDE, GUIDE_TOPICS } from './guide.ts'
+import { inspectFrame, readFrameHtml, renderFrame } from './screenshot.ts'
+import { guideFor, GUIDE_TOPICS } from './guide.ts'
 import { describeInspiration, INSPIRATION_USAGE_NOTE, searchInspiration } from './inspiration.ts'
 import { ESCAPED_HTML_NOTE, looksEscapedHtml } from './escapedHtml.ts'
 import { describeSyncFlow, getSyncFlow } from './ingest.ts'
@@ -34,7 +34,9 @@ You MUST call get_guide({ topic: "doop-instructions" }) once before using other 
 - Images: real imagery makes designs. search_images finds stock photos (you SEE thumbnails and pick), search_icons finds 200k+ UI icons as hotlinkable SVGs, search_logos finds real company logos by brand name or domain — call it once per brand BEFORE writing any logo wall, integration row, press bar or testimonial, and never ship a placeholder tile, "LOGO" text or an invented wordmark in its place, list_backgrounds shows a page of curated hero/section/bento backgrounds (glows, grainy meshes, aurora, painterly scenes) as thumbnails — browse it when a section wants atmosphere rather than defaulting to a flat CSS gradient, judge by eye whether one fits the frame, and draw your own when none does, upload_asset stores your own file (remote file → source_url; local file → local_file=true, returns a curl command) and returns a permanent URL. Never inline images as data: URIs.
 - Websites: when a request names an existing site or URL — a redesign of it, or "like acme.com" — call import_webpage FIRST so an editable HTML snapshot lands on the canvas. Leave that source frame unchanged and design in a separate frame. view_website is only for read-only inspection when the page should not be added. If Doop cannot capture the site, do not retry with view_website because it uses the same capture path. Use your own browser or web tool and work only from content you actually observe; if that is unavailable, ask the user for screenshots or an HTML export rather than inventing content.
 - Feedback: humans reply to your tasks; their notes arrive inside your tool results as HUMAN FEEDBACK blocks — address them before continuing.
-- Comments: call get_comments to read element-pinned comments and replies on a canvas, optionally filtered by frame. This does not claim feedback or resolve comments.
+- Comments: get_comments reads element-pinned notes; reply_to_comment answers one in-thread and resolve_comment closes it once the note is addressed. add_comment pins a new note to an element — use it to ask a human a question about a specific element.
+- Inspecting: on a large or imported frame, call inspect_frame (rendered semantics, computed styles, element selectors) and get_frame_html (a bounded slice, or a query) instead of get_frame — pulling a whole document into context is the most common way to run out of room mid-design.
+- Stopping: if a run is going wrong — drifting from the brief, the wrong frame, looping — call stop_work (target_agent for another agent's run). Never delete a frame out from under a working agent.
 - Guidelines: canvases can carry named style guides (brand rules, style recipes). get_canvas lists them with one-line summaries — read the relevant ones with get_guidelines BEFORE designing and follow them.
 - Memory: canvases can also carry pinned style references — exemplar designs humans marked as "more like this". get_canvas lists them; read the relevant one with get_reference and match its look. When your human gives you design feedback in conversation and you address it, record it with save_decision so the canvas remembers their taste.`
 
@@ -125,6 +127,22 @@ function withFeedback<T extends { content: { type: 'text' | 'image'; [k: string]
   return result
 }
 
+const STOPPED_NOTE =
+  'STOPPED — a human stopped your work on this canvas. Stop now: do not call any more frame tools and do not start new work. Reply with one short sentence about where you left off. The work is not lost — a human can retry the card.'
+
+/** Tells an agent its work was stopped. Fires on every call until the next run
+ *  clears the record, so a long agent session cannot miss it. */
+function withStopped<T extends { content: { type: 'text' | 'image'; [k: string]: unknown }[] }>(
+  result: T,
+  canvasId: string,
+  actor?: Actor,
+): T {
+  if (!actor) return result
+  if (!actions.wasStopped(canvasId, actor.name)) return result
+  result.content.push({ type: 'text' as const, text: STOPPED_NOTE })
+  return result
+}
+
 /* upload rate limit per connecting user, mirroring the page-import route */
 const uploadHits = new Map<string, number[]>()
 const UPLOADS_PER_MIN = 15
@@ -167,6 +185,9 @@ function frameSummary(f: {
     updatedAt: new Date(f.updatedAt).toISOString(),
     updatedBy: f.updatedBy,
     htmlBytes: f.html.length,
+    /* a big document is the one an agent must not pull whole: the flag lets it
+       choose inspect_frame / get_frame_html before blowing its context */
+    ...(f.html.length > 60_000 ? { large: true } : {}),
     /* public render of the CURRENT design — downloadable/hotlinkable
        (append &download, or .jpg?quality=90 for JPEG) */
     image_url: `${PUBLIC_ORIGIN}/i/${f.id}.png?scale=2`,
@@ -204,12 +225,16 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
     'get_guide',
     {
       description:
-        'Read the Doop agent guide: mandatory review checkpoints, the streaming workflow, frame sizing, design-quality doctrine, and multiplayer etiquette. Call with topic "doop-instructions" ONCE before using other Doop tools; call again if a long conversation may have compressed earlier context.',
+        'Read the Doop agent guide: mandatory review checkpoints, the streaming workflow, frame sizing, design-quality doctrine, and multiplayer etiquette. Call with topic "doop-instructions" ONCE before using other Doop tools; call again if a long conversation may have compressed earlier context. Use the other topics ("streaming", "review", "images", "redesign") to re-load just one section after a compaction instead of the whole guide.',
       inputSchema: {
-        topic: z.enum(GUIDE_TOPICS).describe('Guide topic to load'),
+        topic: z
+          .enum(GUIDE_TOPICS)
+          .describe(
+            'Which part of the guide to load. "doop-instructions" is the full guide and the one to read first.',
+          ),
       },
     },
-    async () => text(DOOP_GUIDE),
+    async ({ topic }) => text(guideFor(topic)),
   )
 
   server.registerTool(
@@ -324,6 +349,11 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
               'This canvas has pinned style references — exemplar designs humans marked as "more like this". Call get_reference on the relevant one and match its look (palette, type, spacing) in what you design.',
             ]
           : []),
+        ...(c.frames.some((f) => f.html.length > 60_000)
+          ? [
+              'Frames marked large: true hold a big document — read them with get_frame_html (a bounded slice, or a query) and inspect_frame (the rendered result) instead of get_frame.',
+            ]
+          : []),
       ]
       return withFeedback(
         text({
@@ -359,8 +389,8 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
     'list_guidelines',
     {
       description:
-        "List a canvas's style guides (named markdown guidelines — brand rules, style recipes) with one-line summaries. Fetch the full text of the relevant ones with get_guidelines before designing.",
-      inputSchema: { canvas_id: z.string(), agent_name: agentName.optional() },
+        "List a canvas's style guides (named markdown guidelines — brand rules, style recipes) with one-line summaries. Fetch the full text of the relevant ones with get_guidelines before designing. Pass agent_name: it is how human feedback reaches you — a call without it never receives the notes people leave for you.",
+      inputSchema: { canvas_id: z.string(), agent_name: agentName },
     },
     async ({ canvas_id, agent_name }) => {
       if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
@@ -392,11 +422,11 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
     'get_guidelines',
     {
       description:
-        "Read one of the canvas's style guides in full: the style rules (palettes, fonts, layout recipes, asset URLs) every frame must follow. If get_canvas listed style guides, read the relevant ones with this BEFORE creating or restyling frames.",
+        "Read one of the canvas's style guides in full: the style rules (palettes, fonts, layout recipes, asset URLs) every frame must follow. If get_canvas listed style guides, read the relevant ones with this BEFORE creating or restyling frames. Pass agent_name: it is how human feedback reaches you — a call without it never receives the notes people leave for you.",
       inputSchema: {
         canvas_id: z.string(),
         name: z.string().describe('Doc name from get_canvas / list_guidelines, e.g. "feature-image"'),
-        agent_name: agentName.optional(),
+        agent_name: agentName,
       },
     },
     async ({ canvas_id, name, agent_name }) => {
@@ -411,7 +441,7 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
         )
       }
       if (agent_name) actions.markGuidelinesSeen(canvas_id, actorFrom(agent_name).name)
-      return withFeedback(text(doc.markdown), canvas_id, agent_name ? actorFrom(agent_name) : undefined)
+      return withFeedback(text(doc.markdown), canvas_id, actorFrom(agent_name))
     },
   )
 
@@ -460,11 +490,11 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
     'get_reference',
     {
       description:
-        'Read a pinned style reference in full: the HTML of a design a human marked as an exemplar ("more designs like this"). References are listed by get_canvas. Match its palette, typography and spacing when designing on this canvas — it is the ground truth for the canvas\'s style.',
+        'Read a pinned style reference in full: the HTML of a design a human marked as an exemplar ("more designs like this"). References are listed by get_canvas. Match its palette, typography and spacing when designing on this canvas — it is the ground truth for the canvas\'s style. Pass agent_name: it is how human feedback reaches you — a call without it never receives the notes people leave for you.',
       inputSchema: {
         canvas_id: z.string(),
         reference_id: z.string().describe('Reference id from get_canvas'),
-        agent_name: agentName.optional(),
+        agent_name: agentName,
       },
     },
     async ({ canvas_id, reference_id, agent_name }) => {
@@ -545,7 +575,55 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
     async ({ canvas_id, status, agent_name }) => {
       if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
       actions.setAgentStatus(canvas_id, actorFrom(agent_name), status)
-      return withFeedback(text({ ok: true, status: status.trim() || null }), canvas_id, actorFrom(agent_name))
+      /* who else is on this canvas right now — a human gets this free from the
+         working-now strip, an agent otherwise has no way to know */
+      const others = actions
+        .getTasks(canvas_id)
+        .filter((t) => t.agentName && !t.endedAt && !t.failedAt && !t.cancelledAt && t.agentName !== agent_name)
+        .map((t) => ({ agent: t.agentName, working_on: t.status }))
+      return withStopped(
+        withFeedback(
+          text({ ok: true, status: status.trim() || null, agents_working_now: others }),
+          canvas_id,
+          actorFrom(agent_name),
+        ),
+        canvas_id,
+        actorFrom(agent_name),
+      )
+    },
+  )
+
+  server.registerTool(
+    'stop_work',
+    {
+      description:
+        "Stop an agent's work on a canvas — for when a run is going wrong: a redesign that drifted from the brief, work on the wrong frame, or an agent looping. Pass target_agent to stop another agent (the name you see on the canvas), or omit it to stop yourself. Its live stream closes and its board card is marked stopped instead of failed, so a human can retry it. Frames already written stay on the canvas and are yours to edit. Use this instead of deleting a frame out from under a working agent.",
+      annotations: { destructiveHint: true },
+      inputSchema: {
+        canvas_id: z.string(),
+        agent_name: agentName,
+        target_agent: z
+          .string()
+          .optional()
+          .describe('The agent to stop, as named on the canvas. Omit to stop your own run.'),
+      },
+    },
+    async ({ canvas_id, agent_name, target_agent }) => {
+      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      /* ?? keeps an empty string: a blank target must not fall back to
+         agent_name or worse, abort whatever run happens to be live */
+      const target = (target_agent ?? agent_name).trim()
+      if (!target) return err('target_agent is empty — name the agent to stop, or omit it to stop yourself')
+      const stopped = actions.cancelAgentWork(canvas_id, target, actorFrom(agent_name).name)
+      return text({
+        ok: stopped > 0,
+        stopped_agent: target,
+        tasks_stopped: stopped,
+        note:
+          stopped > 0
+            ? `${target} was stopped. Its card is stopped, not failed — a human can retry it from the board. Frames it already wrote stay on the canvas.`
+            : `${target} had nothing running on this canvas.`,
+      })
     },
   )
 
@@ -553,7 +631,7 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
     'get_comments',
     {
       description:
-        'Read element-pinned comments and replies on a canvas, newest first, including author, text, frame, CSS selector, HTML snippet, parentId thread links, and claim/failure/resolution metadata. Includes resolved comments by default so complete conversations remain readable; set include_resolved to false for unresolved comments only. Returns the retained comment history (up to 100 entries per canvas), not an archive. Reading does not claim feedback or comments, or mark them resolved.',
+        'Read element-pinned comments and replies on a canvas, newest first, including author, text, frame, CSS selector, HTML snippet, parentId thread links, and claim/failure/resolution metadata. Includes resolved comments by default so complete conversations remain readable; set include_resolved to false for unresolved comments only. Returns the retained comment history (up to 100 entries per canvas), not an archive. Reading does not claim feedback or comments, or mark them resolved. To answer or close a comment, use reply_to_comment and resolve_comment.',
       annotations: { readOnlyHint: true },
       inputSchema: {
         canvas_id: z.string(),
@@ -575,6 +653,82 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
         .filter((comment) => include_resolved || comment.resolvedAt === undefined)
       // Deliberately omit withFeedback: inspecting comments must not claim work.
       return text(comments)
+    },
+  )
+
+  server.registerTool(
+    'add_comment',
+    {
+      title: 'Pin a comment to an element',
+      description:
+        "Leave a note pinned to one element inside a frame — use it to record what you changed and why, or to ask a human a question about a specific element. selector is a CSS selector for the element: get one from inspect_frame's elements[].selector, or from an existing comment. Pass snippet (the element's outerHTML excerpt) when you have it so the pin still makes sense if the element moves. Humans see this as a pin on the canvas.",
+      annotations: { readOnlyHint: false },
+      inputSchema: {
+        frame_id: z.string(),
+        selector: z.string().describe('CSS selector of the element to pin to'),
+        snippet: z.string().optional().describe("The element's outerHTML excerpt, for context"),
+        text: z.string().describe('The comment text'),
+        agent_name: agentName,
+      },
+    },
+    async ({ frame_id, selector, snippet, text: body, agent_name }) => {
+      const f = frameFor(frame_id)
+      if (!f) return noFrame(frame_id)
+      const comment = actions.addElementComment(
+        frame_id,
+        { selector, snippet: snippet ?? '', text: body },
+        actorFrom(agent_name),
+      )
+      if (!comment) return err('could not add the comment — empty text?')
+      return withFeedback(text(comment), f.canvasId, actorFrom(agent_name))
+    },
+  )
+
+  server.registerTool(
+    'reply_to_comment',
+    {
+      title: 'Reply in a comment thread',
+      description:
+        "Reply inside an existing element-comment thread. The reply inherits the thread's element anchor, so it stays pinned to the same thing the conversation is about. Use this to answer a human's question on your work, or to record what you did about their note. Resolve the thread with resolve_comment once the note is addressed.",
+      annotations: { readOnlyHint: false },
+      inputSchema: {
+        comment_id: z.string(),
+        text: z.string().describe('The reply text'),
+        agent_name: agentName,
+      },
+    },
+    async ({ comment_id, text: body, agent_name }) => {
+      const found = actions.findComment(comment_id)
+      if (!found) return err(`no comment with id ${comment_id}`)
+      if (!canvasFor(found.canvasId)) return noCanvas(found.canvasId)
+      const reply = actions.replyToComment(comment_id, body, actorFrom(agent_name))
+      if (!reply) {
+        return err('the thread is resolved or the text is empty — resolve_comment cannot be undone by replying')
+      }
+      return withFeedback(text(reply), found.canvasId, actorFrom(agent_name))
+    },
+  )
+
+  server.registerTool(
+    'resolve_comment',
+    {
+      title: 'Resolve a comment thread',
+      description:
+        'Mark an element-comment thread as resolved — do this once the note it carries has actually been addressed in the design. Resolving a root comment closes its whole thread. Humans can see who resolved it; nothing is deleted, and the conversation stays readable with get_comments.',
+      annotations: { readOnlyHint: false },
+      inputSchema: { comment_id: z.string(), agent_name: agentName },
+    },
+    async ({ comment_id, agent_name }) => {
+      const found = actions.findComment(comment_id)
+      if (!found) return err(`no comment with id ${comment_id}`)
+      if (!canvasFor(found.canvasId)) return noCanvas(found.canvasId)
+      const resolved = actions.resolveComment(comment_id, actorFrom(agent_name))
+      if (!resolved) return err(`no comment with id ${comment_id}`)
+      return withFeedback(
+        text({ ok: true, id: resolved.id, resolved: resolved.resolvedAt !== undefined }),
+        found.canvasId,
+        actorFrom(agent_name),
+      )
     },
   )
 
@@ -636,7 +790,11 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
         html,
       )
       return withGuidelinesNudge(
-        withStatusNudge(withFeedback(result, canvas_id, actorFrom(agent_name)), canvas_id, actorFrom(agent_name)),
+        withStatusNudge(
+          withStopped(withFeedback(result, canvas_id, actorFrom(agent_name)), canvas_id, actorFrom(agent_name)),
+          canvas_id,
+          actorFrom(agent_name),
+        ),
         canvas_id,
         actorFrom(agent_name),
       )
@@ -646,18 +804,63 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
   server.registerTool(
     'get_frame',
     {
-      description: 'Get a frame including its full HTML content.',
-      inputSchema: { frame_id: z.string(), agent_name: agentName.optional() },
+      description:
+        'Get a frame including its full HTML content. Pass agent_name: it is how human feedback reaches you — a call without it never receives the notes people leave for you. On a large or imported frame prefer get_frame_html (a bounded slice or a query) and inspect_frame (the rendered result) over pulling the whole document.',
+      inputSchema: { frame_id: z.string(), agent_name: agentName },
     },
     async ({ frame_id, agent_name }) => {
       const f = frameFor(frame_id)
       if (!f) return noFrame(frame_id)
       arrive(f.canvasId, agent_name)
-      return withFeedback(
-        text({ ...frameSummary(f), html: f.html }),
-        f.canvasId,
-        agent_name ? actorFrom(agent_name) : undefined,
-      )
+      return withFeedback(text({ ...frameSummary(f), html: f.html }), f.canvasId, actorFrom(agent_name))
+    },
+  )
+
+  server.registerTool(
+    'inspect_frame',
+    {
+      title: 'Inspect a rendered frame',
+      description:
+        "Inspect the RENDERED page instead of its source: a compact semantic element outline with each element's CSS selector, the visible text, geometry, and the computed colors, typography, radii, shadows and CSS variables actually in effect. Use this instead of get_frame on large or imported frames — it is a fraction of the size and shows what the design really looks like. Pair it with get_frame_screenshot for layout.",
+      annotations: { readOnlyHint: true },
+      inputSchema: { frame_id: z.string(), agent_name: agentName },
+    },
+    async ({ frame_id, agent_name }) => {
+      const f = frameFor(frame_id)
+      if (!f) return noFrame(frame_id)
+      arrive(f.canvasId, agent_name)
+      try {
+        return withFeedback(text(await inspectFrame(f)), f.canvasId, actorFrom(agent_name))
+      } catch (e) {
+        return err(e instanceof Error ? e.message : 'could not render this frame for inspection')
+      }
+    },
+  )
+
+  server.registerTool(
+    'get_frame_html',
+    {
+      title: 'Read a bounded slice of a frame’s HTML',
+      description:
+        "Read a bounded portion of a frame's source HTML before a targeted edit. Use query for small snippets around matching text, or offset/limit to page through the source. Prefer this over get_frame whenever the frame may be large — get_frame returns the whole document, which is the most common way to run out of context mid-design.",
+      annotations: { readOnlyHint: true },
+      inputSchema: {
+        frame_id: z.string(),
+        query: z
+          .string()
+          .optional()
+          .describe('Literal text to find; returns bounded context around up to five matches'),
+        offset: z.number().optional().describe('Character offset for a bounded read; defaults to 0'),
+        limit: z.number().optional().describe('Characters to return; defaults to 20000, capped at 30000'),
+        agent_name: agentName,
+      },
+    },
+    async ({ frame_id, query, offset, limit, agent_name }) => {
+      const f = frameFor(frame_id)
+      if (!f) return noFrame(frame_id)
+      arrive(f.canvasId, agent_name)
+      const read = readFrameHtml(f.html, { query, offset, limit })
+      return 'error' in read ? err(read.error) : withFeedback(text(read.text), f.canvasId, actorFrom(agent_name))
     },
   )
 
@@ -674,8 +877,12 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
       if (!frame) return noFrame(frame_id)
       return withGuidelinesNudge(
         withStatusNudge(
-          withFeedback(
-            withEscapeNote(textWithNudge({ ok: true, frame: frameSummary(frame) }, REVIEW_NUDGE), html),
+          withStopped(
+            withFeedback(
+              withEscapeNote(textWithNudge({ ok: true, frame: frameSummary(frame) }, REVIEW_NUDGE), html),
+              frame.canvasId,
+              actorFrom(agent_name),
+            ),
             frame.canvasId,
             actorFrom(agent_name),
           ),
@@ -1117,7 +1324,7 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
           .union([z.literal(1), z.literal(2)])
           .optional()
           .describe('Device scale factor: 1 (default) or 2 for a retina-resolution image'),
-        agent_name: agentName.optional(),
+        agent_name: agentName,
       },
     },
     async ({ frame_id, scale, agent_name }) => {
@@ -1137,7 +1344,7 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
             ],
           },
           f.canvasId,
-          agent_name ? actorFrom(agent_name) : undefined,
+          actorFrom(agent_name),
         )
       } catch (e) {
         return err(`screenshot failed: ${e instanceof Error ? e.message : String(e)}`)
@@ -1176,7 +1383,7 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
         ? withGuidelinesNudge(withEscapeNote(result, html_chunk), frame.canvasId, actorFrom(agent_name))
         : result
       return withStatusNudge(
-        withFeedback(nudged, frame.canvasId, actorFrom(agent_name)),
+        withStopped(withFeedback(nudged, frame.canvasId, actorFrom(agent_name)), frame.canvasId, actorFrom(agent_name)),
         frame.canvasId,
         actorFrom(agent_name),
       )
@@ -1204,8 +1411,12 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
         return err(`old_str occurs ${count} times — include more surrounding context so it matches exactly once.`)
       const frame = actions.updateFrame(frame_id, { html: f.html.replace(old_str, new_str) }, actorFrom(agent_name))!
       return withStatusNudge(
-        withFeedback(
-          textWithNudge({ ok: true, frame: frameSummary(frame) }, REVIEW_NUDGE),
+        withStopped(
+          withFeedback(
+            textWithNudge({ ok: true, frame: frameSummary(frame) }, REVIEW_NUDGE),
+            frame.canvasId,
+            actorFrom(agent_name),
+          ),
           frame.canvasId,
           actorFrom(agent_name),
         ),
@@ -1235,7 +1446,11 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
       if (!frameFor(frame_id)) return noFrame(frame_id)
       const frame = actions.updateFrame(frame_id, clean, actorFrom(agent_name))
       if (!frame) return noFrame(frame_id)
-      return withFeedback(text({ ok: true, frame: frameSummary(frame) }), frame.canvasId, actorFrom(agent_name))
+      return withStopped(
+        withFeedback(text({ ok: true, frame: frameSummary(frame) }), frame.canvasId, actorFrom(agent_name)),
+        frame.canvasId,
+        actorFrom(agent_name),
+      )
     },
   )
 
@@ -1249,7 +1464,7 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
       if (!frameFor(frame_id)) return noFrame(frame_id)
       const frame = actions.deleteFrame(frame_id, actorFrom(agent_name))
       if (!frame) return noFrame(frame_id)
-      return text({ ok: true, deleted: frame.name })
+      return withStopped(text({ ok: true, deleted: frame.name }), frame.canvasId, actorFrom(agent_name))
     },
   )
 

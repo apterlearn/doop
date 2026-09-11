@@ -179,7 +179,10 @@ export function LayersPanel({ onAddFrame }: { onAddFrame: () => void }) {
       default:
         return
     }
+    /* the canvas listens on window for the same keys and deletes the whole
+       selected frame — this handler already deleted what was asked for */
     e.preventDefault()
+    e.stopPropagation()
   }
 
   return (

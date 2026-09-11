@@ -358,6 +358,11 @@ export function deleteFrame(frameId: string) {
   swallow(db.delete(t.assetRefs).where(eq(t.assetRefs.frameId, frameId)))
 }
 
+/** Drop one card row. Used when a human removes a card from the board. */
+export function deleteTask(canvasId: string, taskId: string) {
+  swallow(db.delete(t.tasks).where(and(eq(t.tasks.canvasId, canvasId), eq(t.tasks.id, taskId))))
+}
+
 /** A structured card's kind + payload, or nothing when the row is a prompt
  *  card or its payload no longer parses (the card then reads as a plain one). */
 function repoCardFields(kind: string | null, payload: string | null): Pick<AgentTask, 'kind' | 'payload'> {
@@ -390,6 +395,9 @@ export function saveTask(canvasId: string, task: AgentTask) {
     attachments: task.attachments?.join(',') ?? null,
     kind: task.kind ?? null,
     payload: task.payload ? JSON.stringify(task.payload) : null,
+    cancelledAt: task.cancelledAt ?? null,
+    cancelledBy: task.cancelledBy ?? null,
+    targetFrameIds: task.targetFrameIds?.join(',') ?? null,
   }
   swallow(
     db
@@ -407,6 +415,9 @@ export function saveTask(canvasId: string, task: AgentTask) {
           failureReason: row.failureReason,
           pipeline: row.pipeline,
           stage: row.stage,
+          /* a stop lands on an already-inserted row, so it must be updatable */
+          cancelledAt: row.cancelledAt,
+          cancelledBy: row.cancelledBy,
         },
       }),
   )
@@ -466,6 +477,7 @@ export function saveComment(c: ElementComment) {
     resolvedBy: c.resolvedBy ?? null,
     resolvedAt: c.resolvedAt ?? null,
     parentId: c.parentId ?? null,
+    fromKind: c.fromKind ?? null,
   }
   swallow(
     db
@@ -612,16 +624,22 @@ export async function hydrate(): Promise<Hydrated> {
     /* A task still open across a restart belongs to an agent that's gone.
        Ordinary status tasks close; claimed board cards pause in a visible
        failed state and require a human retry. */
-    const isOpenCard = row.queuedBy != null && row.endedAt == null
+    const isOpenCard = row.queuedBy != null && row.endedAt == null && row.cancelledAt == null
+    /* A cancelled card is closed work with a human decision still pending: it
+       keeps no endedAt (that would read as "done"), so it stays on the board
+       offering a retry. */
+    const isCancelledCard = row.queuedBy != null && row.endedAt == null && row.cancelledAt != null
     /* the cap bounds history, never open work: an unfinished card older than
        the newest hundred rows still belongs on the board (same rule as
        actions.trimTaskLog keeps in memory) */
-    if (list.length >= LOG_CAP && !isOpenCard) continue
-    const endedAt = isOpenCard ? undefined : (row.endedAt ?? now)
+    if (list.length >= LOG_CAP && !isOpenCard && !isCancelledCard) continue
+    const endedAt = isOpenCard || isCancelledCard ? undefined : (row.endedAt ?? now)
     const interruptedCard = isOpenCard && !!row.agentName
     const failedAt = row.failedAt ?? (interruptedCard ? now : undefined)
     const failureReason = row.failureReason ?? (interruptedCard ? interruptedReason : undefined)
-    if (row.endedAt == null && !isOpenCard) swallow(db.update(t.tasks).set({ endedAt }).where(eq(t.tasks.id, row.id)))
+    if (row.endedAt == null && endedAt !== undefined) {
+      swallow(db.update(t.tasks).set({ endedAt }).where(eq(t.tasks.id, row.id)))
+    }
     if (interruptedCard && row.failedAt == null) {
       swallow(db.update(t.tasks).set({ failedAt, failureReason }).where(eq(t.tasks.id, row.id)))
     }
@@ -642,6 +660,9 @@ export async function hydrate(): Promise<Hydrated> {
       ...(row.pipeline ? { pipeline: row.pipeline.split(',').filter(Boolean) } : {}),
       ...(row.stage != null ? { stage: row.stage } : {}),
       ...(row.attachments ? { attachments: row.attachments.split(',').filter(Boolean) } : {}),
+      ...(row.cancelledAt != null ? { cancelledAt: row.cancelledAt } : {}),
+      ...(row.cancelledBy != null ? { cancelledBy: row.cancelledBy } : {}),
+      ...(row.targetFrameIds ? { targetFrameIds: row.targetFrameIds.split(',').filter(Boolean) } : {}),
       ...repoCardFields(row.kind, row.payload),
     })
     tasks.set(row.canvasId, list)
@@ -707,6 +728,7 @@ export async function hydrate(): Promise<Hydrated> {
       ...(row.resolvedBy != null ? { resolvedBy: row.resolvedBy } : {}),
       ...(row.resolvedAt != null ? { resolvedAt: row.resolvedAt } : {}),
       ...(row.parentId != null ? { parentId: row.parentId } : {}),
+      ...(row.fromKind === 'agent' ? { fromKind: 'agent' as const } : {}),
     })
     comments.set(row.canvasId, list)
   }

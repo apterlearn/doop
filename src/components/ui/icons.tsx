@@ -19,6 +19,16 @@ export function XIcon(props: SVGProps<SVGSVGElement>) {
   )
 }
 
+/** A plugged-in client — the connected MCP agents acting as this account. */
+export function ClientsIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg {...iconProps} {...props}>
+      <path d="M9 3v5M15 3v5M6 8h12v3a6 6 0 0 1-6 6 6 6 0 0 1-6-6z" />
+      <path d="M12 17v4" />
+    </svg>
+  )
+}
+
 export function MoreHorizontalIcon(props: SVGProps<SVGSVGElement>) {
   return (
     <svg {...iconProps} {...props}>

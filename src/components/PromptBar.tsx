@@ -44,7 +44,23 @@ export function PromptBar({ canvasId }: { canvasId: string }) {
   const [attachments, setAttachments] = useState<Attachment[]>([])
   const [busy, setBusy] = useState(false)
   const [sent, setSent] = useState(false)
+  /* the frame named in the "on it" note — captured at submit, so dismissing
+     the target chip afterwards does not rewrite what was just confirmed */
+  const [sentTarget, setSentTarget] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  /* what the card is about: the frame (and element) selected on the canvas.
+     Dismissible per selection, so "design something new" stays one ✕ away. */
+  const selectedId = useStore((s) => s.selectedId)
+  const selectedElement = useStore((s) => s.selectedElement)
+  const targetFrame = useStore((s) => s.canvas?.frames.find((f) => f.id === s.selectedId))
+  const [targetDismissed, setTargetDismissed] = useState(false)
+  const selectionKey = `${selectedId ?? ''}|${selectedElement?.selector ?? ''}`
+  const [lastSelectionKey, setLastSelectionKey] = useState(selectionKey)
+  if (selectionKey !== lastSelectionKey) {
+    setLastSelectionKey(selectionKey)
+    setTargetDismissed(false)
+  }
+  const target = targetDismissed ? undefined : targetFrame
   const inputRef = useRef<HTMLInputElement>(null)
   const fileRef = useRef<HTMLInputElement>(null)
 
@@ -126,17 +142,21 @@ export function PromptBar({ canvasId }: { canvasId: string }) {
         attachments.map((a) => a.file),
         'Attached image',
       )
+      /* the target frame stays OUT of the attachments: attachments are
+         described to the agent as source material it must not edit */
       await api.addCard(
         canvasId,
         clean,
         ['doop'],
         refFrames.map((f) => f.id),
+        target ? [target.id] : undefined,
       )
       posthog.capture('prompt_bar_submitted', { attachments: refFrames.length })
       awaiting.current = openFlyWindow(refFrames.map((f) => f.id))
       attachments.forEach((a) => URL.revokeObjectURL(a.preview))
       setAttachments([])
       setText('')
+      setSentTarget(target?.name ?? null)
       setSent(true)
       window.setTimeout(() => setSent(false), 5000)
     } catch (err) {
@@ -153,6 +173,24 @@ export function PromptBar({ canvasId }: { canvasId: string }) {
 
   return (
     <div className="absolute bottom-[68px] left-1/2 z-30 flex w-[min(560px,calc(100vw-32px))] -translate-x-1/2 flex-col gap-2 max-md:bottom-[calc(76px+env(safe-area-inset-bottom))] max-md:w-[calc(100vw-16px)] max-md:gap-1.5">
+      {target && (
+        <div className="flex items-center gap-1.5 self-start rounded-full border border-line bg-surface px-2.5 py-1 text-[11.5px] shadow-card">
+          <span className="font-mono text-brand">→</span>
+          <span className="font-semibold">{target.name}</span>
+          {selectedElement?.frameId === target.id && (
+            <span className="font-mono text-ink-faint">{selectedElement.selector}</span>
+          )}
+          <Button
+            variant="bare"
+            className="ml-0.5 size-4 justify-center rounded-full p-0 text-xs text-ink-faint hover:bg-paper-deep hover:text-ink"
+            aria-label="Clear target"
+            title="Design something new instead"
+            onClick={() => setTargetDismissed(true)}
+          >
+            ×
+          </Button>
+        </div>
+      )}
       {attachments.length > 0 && (
         <div className="flex gap-2 px-0.5">
           {attachments.map((a) => (
@@ -247,7 +285,10 @@ export function PromptBar({ canvasId }: { canvasId: string }) {
           </Note>
         ) : sent ? (
           <Note size="sm" className="text-xs text-ink-soft">
-            <DoopMark size={11} /> The Doop Agent is on it — watch the canvas
+            <DoopMark size={11} />{' '}
+            {sentTarget
+              ? `The Doop Agent is on it — watch “${sentTarget}”`
+              : 'The Doop Agent is on it — watch the canvas'}
           </Note>
         ) : (
           <MeterLine allowance={allowance} />

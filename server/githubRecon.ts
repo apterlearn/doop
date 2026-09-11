@@ -249,7 +249,12 @@ Rules the agents must follow verbatim belong here; keep it under 350 lines. No c
 
 /** Distill the repo's design system into style-guide markdown. Reuses the
  *  same seeding logic as screen closures but aimed at the system files. */
-export async function extractDesignSystem(conn: GithubConnection, paths: string[], model: AgentModel): Promise<string> {
+export async function extractDesignSystem(
+  conn: GithubConnection,
+  paths: string[],
+  model: AgentModel,
+  signal?: AbortSignal,
+): Promise<string> {
   const seeds = [
     'package.json',
     ...paths.filter((p) => !p.includes('node_modules') && /(^|\/)tailwind\.config\.[jt]s$/.test(p)).slice(0, 1),
@@ -287,6 +292,7 @@ export async function extractDesignSystem(conn: GithubConnection, paths: string[
     tools: [REQUEST_FILES_TOOL],
     messages,
     maxTokens: 16_000,
+    signal,
   })
   if (result.stop_reason === 'tool_use') {
     const calls = result.content.filter((b) => b.type === 'tool_use')
@@ -325,6 +331,7 @@ export async function extractDesignSystem(conn: GithubConnection, paths: string[
       tools: [],
       messages,
       maxTokens: 16_000,
+      signal,
     })
   }
   const md = result.content
@@ -455,6 +462,7 @@ export async function runRepoCards(
   cards: AgentTask[],
   model: AgentModel,
   actor: Actor,
+  signal?: AbortSignal,
 ): Promise<void> {
   const repoCards = cards.filter(isRepoCard)
   const byConnection = new Map<string, RepoCard[]>()
@@ -468,6 +476,9 @@ export async function runRepoCards(
   }
 
   for (const [connectionId, group] of byConnection) {
+    /* a human stopped the run: unstarted cards stay claimed for the caller to
+       release, rather than being failed as if the import had gone wrong */
+    if (signal?.aborted) break
     const repo = group[0]!.payload.repo
     const conn = await getConnection(canvasId, connectionId)
     if (!conn) {
@@ -491,13 +502,14 @@ export async function runRepoCards(
     /* the design system first: it becomes a pinned canvas guideline every
        agent follows, and it grounds the sketches below */
     for (const card of group.filter((c) => c.kind === 'design-system')) {
+      if (signal?.aborted) break
       if (accountDead) {
         actions.failCard(canvasId, card.id, accountDead)
         continue
       }
       try {
         actions.setAgentStatus(canvasId, actor, `Reading ${repo}’s design system — theme, tokens, type`)
-        const md = await extractDesignSystem(conn, paths, model)
+        const md = await extractDesignSystem(conn, paths, model, signal)
         actions.setGuideline(canvasId, designSystemSlug(repo), md, actor, undefined, `${repo} design system`)
         actions.advanceCard(canvasId, card.id, actor)
       } catch (err) {
@@ -513,6 +525,7 @@ export async function runRepoCards(
     console.log(`[github-recon] ${queue.length} screen(s) from ${repo} on ${model.label}`)
     const worker = async () => {
       for (let card = queue.shift(); card; card = queue.shift()) {
+        if (signal?.aborted) break
         if (accountDead) {
           actions.failCard(canvasId, card.id, accountDead)
           continue
@@ -526,7 +539,7 @@ export async function runRepoCards(
               ? `Importing ${screen.title} from ${repo}`
               : `Sketching ${screen.title} from ${repo}`,
           )
-          await sketchScreen(canvasId, conn, screen, paths, model, actor)
+          await sketchScreen(canvasId, conn, screen, paths, model, actor, signal)
           markSynced(conn.id)
           actions.advanceCard(canvasId, card.id, actor)
         } catch (err) {
@@ -569,6 +582,7 @@ async function sketchScreen(
   paths: string[],
   model: AgentModel,
   actor: Actor,
+  signal?: AbortSignal,
 ): Promise<void> {
   if (screen.source === 'static') {
     const html = wrapRepoHtml(await fetchRepoFile(conn, screen.sourcePath), conn, screen)
@@ -608,6 +622,7 @@ async function sketchScreen(
       tools: round < MAX_REQUEST_ROUNDS ? [REQUEST_FILES_TOOL] : [],
       messages,
       maxTokens: MODEL_MAX_TOKENS,
+      signal,
     })
     if (result.stop_reason !== 'tool_use') break
     const calls = result.content.filter((b) => b.type === 'tool_use')
@@ -677,6 +692,7 @@ async function sketchScreen(
         tools: [],
         messages,
         maxTokens: MODEL_MAX_TOKENS,
+        signal,
       })
       result = fixed
       const redo = extractHtml(fixed.content as { type: string; text?: string }[])

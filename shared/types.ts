@@ -234,6 +234,16 @@ export interface AgentTask {
    *  handing the title to the chat agent. Absent on prompt cards. */
   kind?: RepoCardKind
   payload?: RepoCardPayload
+  /** a human stopped this card's run (or the agent went silent mid-run). Terminal,
+   *  exactly like endedAt: it needs an explicit retry, never an automatic one. */
+  cancelledAt?: number
+  /** the human who stopped it; absent when the agent merely went away (TTL expiry) */
+  cancelledBy?: string
+  /** frames the human had selected when they queued the card — "make THIS
+   *  bigger", not "design something like this". Unlike attachments (reference
+   *  material the agent must leave alone), these are the card's subject and the
+   *  agent edits them in place. */
+  targetFrameIds?: string[]
 }
 
 export type RepoCardKind = 'sketch' | 'design-system'
@@ -315,6 +325,9 @@ export interface ElementComment {
   /** set on a reply: the root comment of its thread. Replies inherit the
    *  root's anchor and are listed under its pin instead of getting their own */
   parentId?: string
+  /** 'agent' when an agent wrote this through MCP — the UI badges it, and a
+   *  human reply to it reads as a reply to the agent, not to a person */
+  fromKind?: ActorKind
 }
 
 export interface ActivityItem {
@@ -356,6 +369,7 @@ export type ServerMessage =
   | { type: 'editing'; clientId: string; frameId: string | null }
   | { type: 'status'; clientId: string; status: string | null }
   | { type: 'task'; task: AgentTask }
+  | { type: 'task:deleted'; taskId: string }
   | { type: 'feedback'; feedback: TaskFeedback }
   | { type: 'comment'; comment: ElementComment }
   | { type: 'frame:drag'; clientId: string; frameId: string; x: number; y: number; width: number; height: number }

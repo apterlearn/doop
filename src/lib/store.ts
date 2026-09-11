@@ -37,7 +37,7 @@ interface State {
   proposals: MemoryProposal[]
   /** which tab the side panel shows — in the store so a Memory-suggestion
    *  toast anywhere in the app can jump straight to the Memory tab */
-  panelTab: 'tasks' | 'activity' | 'memory'
+  panelTab: 'tasks' | 'activity' | 'memory' | 'agents'
   /** every selected frame, in selection order — marquee and ⇧-click build
    *  this up; a plain click collapses it to one */
   selectedIds: string[]
@@ -94,6 +94,7 @@ interface State {
   pushActivity(item: ActivityItem): void
   setTasks(tasks: AgentTask[]): void
   upsertTask(task: AgentTask): void
+  removeTask(taskId: string): void
   setFeedback(feedback: TaskFeedback[]): void
   upsertFeedback(fb: TaskFeedback): void
   setComments(comments: ElementComment[]): void
@@ -110,7 +111,7 @@ interface State {
   pushDecision(decision: DesignDecision): void
   setProposals(proposals: MemoryProposal[]): void
   upsertProposal(proposal: MemoryProposal): void
-  setPanelTab(tab: 'tasks' | 'activity' | 'memory'): void
+  setPanelTab(tab: 'tasks' | 'activity' | 'memory' | 'agents'): void
   setLimitWall(v: boolean): void
   allowanceChanged(): void
   requestFlyTo(frameId: string): void
@@ -208,6 +209,7 @@ export const useStore = create<State>((set, get) => ({
         : [task, ...s.tasks].slice(0, 100)
       return { tasks }
     }),
+  removeTask: (taskId) => set((s) => ({ tasks: s.tasks.filter((t) => t.id !== taskId) })),
   setFeedback: (feedback) => set({ feedback }),
   setComments: (comments) => set({ comments }),
   upsertComment: (c) =>

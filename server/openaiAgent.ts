@@ -68,6 +68,8 @@ export interface TurnRequest {
   tools: Anthropic.Tool[]
   messages: Anthropic.MessageParam[]
   maxTokens: number
+  /** aborts the in-flight request when a human stops the run */
+  signal?: AbortSignal
 }
 
 export interface TurnResult {
@@ -327,6 +329,7 @@ async function runChatgpt(account: ModelAccount, req: TurnRequest): Promise<Turn
       session_id: randomUUID(),
       ...(account.accountId ? { 'chatgpt-account-id': account.accountId } : {}),
     },
+    signal: req.signal,
     body: JSON.stringify({
       model: modelFor(account),
       instructions: req.system,
@@ -348,6 +351,7 @@ async function runApiKey(account: ModelAccount, req: TurnRequest): Promise<TurnR
   const res = await fetch(OPENAI_URL, {
     method: 'POST',
     headers: { Authorization: `Bearer ${account.apiKey}`, 'Content-Type': 'application/json' },
+    signal: req.signal,
     body: JSON.stringify({
       model: modelFor(account),
       instructions: req.system,
@@ -387,6 +391,7 @@ export async function runAzureTurn(config: AzureConfig, req: TurnRequest): Promi
   const res = await fetch(azureResponsesUrl(config.endpoint), {
     method: 'POST',
     headers: { 'api-key': config.apiKey, 'Content-Type': 'application/json' },
+    signal: req.signal,
     body: JSON.stringify({
       model: config.deployment,
       instructions: req.system,

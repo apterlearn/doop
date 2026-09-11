@@ -142,6 +142,18 @@ export interface WebsiteImportResult {
   frames: Frame[]
   failures: { url: string; error: string }[]
 }
+
+/** An MCP client holding a token for the signed-in account. Mirrors
+ *  server/mcpClients.ts verbatim (the client cannot import from server/). */
+export interface ConnectedAgent {
+  clientId: string
+  /** what the client called itself at dynamic client registration */
+  name: string
+  /** newest access-token expiry across this client's rows, ms epoch */
+  expiresAt: number
+  /** how many of its tokens for this user are still live */
+  liveTokens: number
+}
 import { getIdentity } from './identity'
 
 function actor() {
@@ -299,8 +311,11 @@ export const api = {
   disconnectModelAccount: () => req<ModelAccountStatus>('/api/model-account', { method: 'DELETE' }),
   setAgentModel: (model: string) =>
     req<ModelAccountStatus>('/api/model-account', { method: 'PATCH', body: JSON.stringify({ model }) }),
-  addCard: (canvasId: string, title: string, agents: string[], attachments?: string[]) =>
-    req(`/api/canvases/${canvasId}/cards`, { method: 'POST', body: JSON.stringify({ title, agents, attachments }) }),
+  addCard: (canvasId: string, title: string, agents: string[], attachments?: string[], targetFrameIds?: string[]) =>
+    req(`/api/canvases/${canvasId}/cards`, {
+      method: 'POST',
+      body: JSON.stringify({ title, agents, attachments, targetFrameIds }),
+    }),
   completeCard: (canvasId: string, cardId: string) =>
     req(`/api/canvases/${canvasId}/cards/${cardId}/done`, { method: 'POST' }),
   retryCard: (canvasId: string, cardId: string) =>
@@ -312,6 +327,12 @@ export const api = {
   resolveComment: (commentId: string) => req(`/api/comments/${commentId}/resolve`, { method: 'POST' }),
   retryComment: (commentId: string) => req(`/api/comments/${commentId}/retry`, { method: 'POST' }),
   retryTaskFeedback: (feedbackId: string) => req(`/api/feedback/${feedbackId}/retry`, { method: 'POST' }),
+  stopAgentWork: (canvasId: string, agentName: string) =>
+    req(`/api/canvases/${canvasId}/agents/stop`, { method: 'POST', body: JSON.stringify({ agentName }) }),
+  deleteCard: (canvasId: string, cardId: string) =>
+    req(`/api/canvases/${canvasId}/cards/${cardId}`, { method: 'DELETE' }),
+  listMcpAgents: () => req<ConnectedAgent[]>('/api/mcp-agents'),
+  revokeMcpAgent: (clientId: string) => req(`/api/mcp-agents/${encodeURIComponent(clientId)}`, { method: 'DELETE' }),
 }
 
 export interface AdminCanvas extends CanvasMeta {

@@ -3,7 +3,7 @@ import { store } from './store.ts'
 import { ModelAuthError, pickModel } from './agentModel.ts'
 import { RESIDENT_TASK_LIMIT } from './allowance.ts'
 import * as actions from './actions.ts'
-import { inspectFrame, renderFrame } from './screenshot.ts'
+import { inspectFrame, MAX_HTML_READ_CHARS, readFrameHtml, renderFrame } from './screenshot.ts'
 import { AGENT_ROLES, DEFAULT_ROLE_ID, roleById, roleByAgentName, roleName } from '../shared/agents.ts'
 import type { AgentRole } from '../shared/agents.ts'
 import * as imageSearch from './imageSearch.ts'
@@ -45,13 +45,22 @@ const MAX_REDESIGN_TURNS = 40
    against a card that somehow keeps requeueing itself */
 const MAX_SWEEP_RUNS = 24
 const LARGE_HTML_CHARS = 60_000
-const MAX_HTML_READ_CHARS = 30_000
 const MAX_REWRITE_CHUNK_CHARS = 12_000
 const MAX_REWRITE_CHARS = 100_000
 
 /* one run per canvas at a time; feedback arriving mid-run queues a re-run */
 const running = new Set<string>()
 const queued = new Set<string>()
+
+/* one abort controller per canvas: a human's stop has to reach the model call
+   that is streaming right now, not just the next turn */
+const cancels = new Map<string, AbortController>()
+
+/** Abort the in-flight run(s) on this canvas. Wired into actions via
+ *  actions.wire's third argument. Safe to call with nothing running. */
+export function cancelCanvasRuns(canvasId: string) {
+  cancels.get(canvasId)?.abort()
+}
 
 export function onFeedback(canvasId: string) {
   if (running.has(canvasId)) {
@@ -87,7 +96,11 @@ async function sweep(canvasId: string) {
     }
   } finally {
     running.delete(canvasId)
-    if (queued.delete(canvasId)) onFeedback(canvasId)
+    /* the sweep owns the controller's lifetime so this check still sees it: a
+       stop must not be undone by the re-sweep it just queued */
+    const wasStopped = cancels.get(canvasId)?.signal.aborted ?? false
+    cancels.delete(canvasId)
+    if (queued.delete(canvasId) && !wasStopped) onFeedback(canvasId)
   }
 }
 
@@ -240,19 +253,37 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
   const repoCards = allCards.filter((c) => c.kind)
   const cards = allCards.filter((c) => !c.kind)
 
+  /* Registered before any model work so a human's stop reaches the call that is
+     streaming right now. A stop record left over from an earlier session is
+     cleared here — it belongs to that session, and honoring it would abandon
+     work this run has legitimately claimed. */
+  const abort = new AbortController()
+  cancels.set(canvasId, abort)
+  actions.clearStop(canvasId, role.name)
+
   /* presence otherwise only refreshes on tool activity, and the sweep's TTL
      is shorter than a big generation turn */
   const heartbeat = setInterval(() => actions.heartbeatAgent(canvasId, actor), 15_000)
 
   if (repoCards.length > 0) {
-    try {
-      await runRepoCards(canvasId, repoCards, model, actor)
-    } catch (err) {
-      /* the runner fails cards one by one; this is the backstop for a
-         failure outside any card, so none stays claimed forever */
-      console.error('[resident] repo cards errored', err)
-      for (const c of repoCards)
-        actions.failCard(canvasId, c.id, 'Doop hit a snag before finishing. Retry when you are ready.')
+    if (!abort.signal.aborted) {
+      try {
+        await runRepoCards(canvasId, repoCards, model, actor, abort.signal)
+      } catch (err) {
+        /* the runner fails cards one by one; this is the backstop for a
+           failure outside any card, so none stays claimed forever */
+        console.error('[resident] repo cards errored', err)
+        for (const c of repoCards)
+          actions.failCard(canvasId, c.id, 'Doop hit a snag before finishing. Retry when you are ready.')
+      }
+    }
+    if (abort.signal.aborted) {
+      /* the human stopped: release whatever the runner left claimed. Cards the
+         stop already marked are skipped, so their attribution survives. */
+      actions.endAgentTasks(canvasId, actor.name)
+      actions.setAgentStatus(canvasId, actor, 'Stopped')
+      clearInterval(heartbeat)
+      return 'ran'
     }
     if (claimed.length === 0 && comments.length === 0 && cards.length === 0) {
       clearInterval(heartbeat)
@@ -328,7 +359,17 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
                     `Call screenshot_frame on each BEFORE designing and build from what you see. ` +
                     `They are source material — leave them as they are and deliver in a separate frame.`
                   : ''
-              return `- from ${c.queuedBy}: "${c.status}"${route}${refs}`
+              const targets = (c.targetFrameIds ?? [])
+                .map((id) => {
+                  const f = store.getFrame(id)
+                  return f ? `${f.id} ("${f.name}")` : null
+                })
+                .filter(Boolean)
+              const subject =
+                targets.length > 0
+                  ? `\n  THIS CARD IS ABOUT: ${targets.join(', ')} — change that frame in place (rename/move/resize with update_frame, or edit its HTML). Do NOT deliver this one as a new frame elsewhere.`
+                  : ''
+              return `- from ${c.queuedBy}: "${c.status}"${route}${refs}${subject}`
             })
             .join('\n'),
       )
@@ -402,6 +443,7 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
     }
     let refused = false
     let crashed = false
+    let cancelled = false
     let staleAccount = false
     let finished = false
     let mutationNudgeSent = false
@@ -426,12 +468,25 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
         : []
       const maxTurns = REDESIGN_RE.test(workText) ? MAX_REDESIGN_TURNS : MAX_TURNS
       for (let turn = 0; turn < maxTurns; turn++) {
+        /* the human stopped this run: unwind before spending another turn */
+        if (abort.signal.aborted) {
+          cancelled = true
+          break
+        }
         const res = await model.run({
           maxTokens: 16000,
           system: [{ text: systemFor(role), cache: true }, ...guidelinesBlock],
           tools: TOOLS,
           messages,
+          signal: abort.signal,
         })
+
+        /* the stop can land mid-stream: the aborted request rejects, but a
+           provider that resolves anyway must not cost another turn */
+        if (abort.signal.aborted) {
+          cancelled = true
+          break
+        }
 
         if (res.stop_reason === 'refusal') {
           actions.setAgentStatus(canvasId, actor, "Couldn't address that feedback")
@@ -463,6 +518,7 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
             toolBlocks,
             {
               priority: (block) => (block.name === 'import_webpage' ? 1 : 0),
+              stopped: () => abort.signal.aborted,
               blocked: (block) =>
                 runState.blockedWebsiteAccess ??
                 importFailureInBatch ??
@@ -489,6 +545,11 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
               },
             },
           )
+          /* a cancel mid-batch must not feed results back and burn a turn */
+          if (abort.signal.aborted) {
+            cancelled = true
+            break
+          }
           messages.push({ role: 'user', content: results })
           continue
         }
@@ -530,19 +591,27 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
         break
       }
     } catch (err) {
-      /* An API/tool crash becomes a visible, manually retryable failure. */
-      crashed = true
-      /* a dead credential is the one crash a human can actually fix, so it
-         gets its own wording all the way through to the card — but only when
-         the credential is theirs: a server-tier run has no account to
-         reconnect, whatever error class its transport leaks */
-      staleAccount = err instanceof ModelAuthError && !!model.userId
-      console.error('[resident] run errored', err)
-      actions.setAgentStatus(
-        canvasId,
-        actor,
-        staleAccount ? 'Your model connection expired — reconnect it' : 'Hit a snag — waiting for a retry',
-      )
+      /* a stop surfaces as a transport error from the aborted request — the
+         human's decision is not a snag, so it gets no failure copy. The flag
+         only covers checkpoint unwinds: the throw can come straight out of
+         model.run mid-stream, so the signal itself must count too. */
+      if (cancelled || abort.signal.aborted) {
+        actions.setAgentStatus(canvasId, actor, 'Stopped')
+      } else {
+        /* An API/tool crash becomes a visible, manually retryable failure. */
+        crashed = true
+        /* a dead credential is the one crash a human can actually fix, so it
+           gets its own wording all the way through to the card — but only when
+           the credential is theirs: a server-tier run has no account to
+           reconnect, whatever error class its transport leaks */
+        staleAccount = err instanceof ModelAuthError && !!model.userId
+        console.error('[resident] run errored', err)
+        actions.setAgentStatus(
+          canvasId,
+          actor,
+          staleAccount ? 'Your model connection expired — reconnect it' : 'Hit a snag — waiting for a retry',
+        )
+      }
     }
 
     /* only a NATURALLY finished run completes its work — refused, crashed,
@@ -555,7 +624,7 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
       !blockedWebsiteAccess &&
       cards.length > 0 &&
       verificationFrameIds(runState).some((id) => !runState.verifiedFrames.has(id))
-    const exhausted = !finished && !refused && !crashed
+    const exhausted = !finished && !refused && !crashed && !cancelled
     if (exhausted) actions.setAgentStatus(canvasId, actor, 'Ran out of turns — waiting for a retry')
     if (blockedWebsiteAccess && !staleAccount) {
       actions.setAgentStatus(canvasId, actor, 'Website blocked — needs screenshots')
@@ -580,12 +649,14 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
     }
     if (finished && !blockedWebsiteAccess && !noMutation && !unverifiedMutation) {
       for (const f of claimed) actions.completeTaskFeedback(f.id)
-      for (const c of comments) actions.resolveComment(c.id, role.name)
+      for (const c of comments) actions.resolveComment(c.id, actor)
       /* a card moves to the next agent in its pipeline, or finishes here */
       for (const c of cards) actions.advanceCard(canvasId, c.id, actor)
     } else {
       let reason: string
-      if (staleAccount) {
+      if (cancelled) {
+        reason = 'Stopped by a human. Retry when you are ready.'
+      } else if (staleAccount) {
         reason = `${model.label} turned down the connected account. Reconnect it in Doop, then retry.${blockedWebsiteAccess ? ` ${blockedWebsiteAccess}` : ''}`
       } else if (blockedWebsiteAccess) {
         reason = blockedWebsiteAccess
@@ -636,6 +707,23 @@ const TOOLS: Anthropic.Tool[] = [
         html: { type: 'string', description: 'Complete HTML document with inline CSS' },
       },
       required: ['name', 'width', 'height', 'html'],
+    },
+  },
+  {
+    name: 'update_frame',
+    description:
+      "Change a frame's metadata without touching its design: rename it, or move/resize it on the canvas (x, y, width, height in canvas pixels). Use this when the card is about placement, naming or size — for a design change use edit_frame_html / set_frame_html instead.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        frame_id: { type: 'string' },
+        name: { type: 'string' },
+        x: { type: 'number' },
+        y: { type: 'number' },
+        width: { type: 'number' },
+        height: { type: 'number' },
+      },
+      required: ['frame_id'],
     },
   },
   {
@@ -981,6 +1069,23 @@ async function execTool(
           `created frame ${f.id} ("${f.name}", ${Math.round(f.width)}x${Math.round(f.height)}) — it is revealing to viewers now`,
         )
       }
+      case 'update_frame': {
+        const f = store.getFrame(input.frame_id)
+        if (!f || f.canvasId !== canvasId) return fail('frame not found on this canvas')
+        const raw = block.input as { name?: string; x?: number; y?: number; width?: number; height?: number }
+        const patch: { name?: string; x?: number; y?: number; width?: number; height?: number } = {}
+        if (typeof raw.name === 'string' && raw.name.trim()) patch.name = raw.name.trim().slice(0, 120)
+        for (const key of ['x', 'y', 'width', 'height'] as const) {
+          const v = raw[key]
+          if (typeof v === 'number' && Number.isFinite(v)) patch[key] = Math.round(v)
+        }
+        if (Object.keys(patch).length === 0) return fail('provide at least one of: name, x, y, width, height')
+        const updated = actions.updateFrame(input.frame_id, patch, actor)
+        if (!updated) return fail('could not update the frame')
+        runState.mutatedFrames.add(input.frame_id)
+        runState.verifiedFrames.delete(input.frame_id)
+        return ok(`updated ${updated.id}: ${JSON.stringify(patch)} — verify with screenshot_frame`)
+      }
       case 'inspect_frame': {
         const f = store.getFrame(input.frame_id)
         if (!f || f.canvasId !== canvasId) return fail('frame not found on this canvas')
@@ -992,35 +1097,8 @@ async function execTool(
         if (!f || f.canvasId !== canvasId) return fail('frame not found on this canvas')
         if (typeof f.html !== 'string') return fail('frame HTML is unavailable; retry after the frame reloads')
         const raw = block.input as { query?: string; offset?: number; limit?: number }
-        const query = String(raw.query || '').trim()
-        const limit = Math.max(1000, Math.min(Number(raw.limit) || 20_000, MAX_HTML_READ_CHARS))
-        if (query) {
-          const haystack = f.html.toLowerCase()
-          const needle = query.toLowerCase()
-          const matches: number[] = []
-          let cursor = 0
-          while (matches.length < 5) {
-            const index = haystack.indexOf(needle, cursor)
-            if (index < 0) break
-            matches.push(index)
-            cursor = index + Math.max(needle.length, 1)
-          }
-          if (matches.length === 0) return fail(`query not found in frame HTML: ${query}`)
-          const perMatch = Math.max(1000, Math.floor(limit / matches.length))
-          const snippets = matches.map((index, match) => {
-            const start = Math.max(0, index - Math.floor(perMatch / 2))
-            const end = Math.min(f.html.length, start + perMatch)
-            return `--- match ${match + 1} at ${index}, chars ${start}-${end} ---\n${f.html.slice(start, end)}`
-          })
-          return ok(
-            `Frame HTML: ${f.html.length} characters; ${matches.length} match(es) for "${query}".\n${snippets.join('\n')}`,
-          )
-        }
-        const offset = Math.max(0, Math.min(Number(raw.offset) || 0, f.html.length))
-        const end = Math.min(f.html.length, offset + limit)
-        return ok(
-          `Frame HTML: ${f.html.length} characters. Returning chars ${offset}-${end}.${end < f.html.length ? ` Continue with offset=${end}, or use query for a targeted snippet.` : ''}\n\n${f.html.slice(offset, end)}`,
-        )
+        const read = readFrameHtml(f.html, { query: raw.query, offset: raw.offset, limit: raw.limit })
+        return 'error' in read ? fail(read.error) : ok(read.text)
       }
       case 'edit_frame_html': {
         const f = store.getFrame(input.frame_id)

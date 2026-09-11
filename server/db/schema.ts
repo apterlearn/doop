@@ -169,6 +169,13 @@ export const tasks = pgTable(
     kind: text('kind'),
     /** JSON payload of a structured card — what its runner needs, never a secret */
     payload: text('payload'),
+    /** a human stopped this card's run (or the agent went silent) — terminal,
+     *  like ended_at: it needs an explicit retry, never an automatic one */
+    cancelledAt: bigint('cancelled_at', { mode: 'number' }),
+    cancelledBy: text('cancelled_by'),
+    /** comma-joined frame ids the card is about (the human's selection at queue
+     *  time) — the agent edits these in place instead of delivering elsewhere */
+    targetFrameIds: text('target_frame_ids'),
   },
   (t) => [index('tasks_canvas_idx').on(t.canvasId)],
 )
@@ -215,6 +222,9 @@ export const comments = pgTable(
     resolvedBy: text('resolved_by'),
     resolvedAt: bigint('resolved_at', { mode: 'number' }),
     parentId: text('parent_id'),
+    /** 'agent' when an agent wrote this through MCP — durable so the canvas
+     *  still badges agent-authored notes after a restart */
+    fromKind: text('from_kind'),
   },
   (t) => [index('comments_canvas_idx').on(t.canvasId)],
 )
