@@ -990,6 +990,26 @@ export function takeQueuedCardsFor(canvasId: string, agentName: string, payer?: 
   return pending
 }
 
+/** Claim one open card by id for an outside agent (an MCP connection, which
+ *  no pipeline stage names). The stage gate of takeQueuedCardsFor keeps the
+ *  resident pipeline in order; an outside claim is a human-visible takeover of
+ *  queued work — the board shows who holds the card, and Stop/Retry still work.
+ *  Throws on the specific reason so the MCP layer can report it. */
+export function claimCard(canvasId: string, cardId: string, agentName: string): AgentTask {
+  const card = (taskLog.get(canvasId) ?? []).find((t) => t.id === cardId && t.queuedBy)
+  if (!card) throw new Error(`no card with id ${cardId} on this canvas`)
+  if (card.kind) throw new Error('this is a structured import card — the resident team dispatches on it')
+  if (card.agentName) throw new Error(`card already claimed by ${card.agentName}`)
+  if (card.endedAt || card.cancelledAt) throw new Error('card is no longer open — it was completed or stopped')
+  if (card.failedAt) throw new Error('card failed and waits for a human retry')
+  card.agentName = agentName
+  card.color = colorFor(agentName)
+  card.claimedAt = Date.now()
+  persist.saveTask(canvasId, card)
+  broadcast(canvasId, { type: 'task', task: card })
+  return card
+}
+
 /** An agent finished its stage: hand the card to the next agent in the
  *  pipeline, or complete it if that was the last one. */
 export function advanceCard(canvasId: string, cardId: string, by: Actor): AgentTask | undefined {

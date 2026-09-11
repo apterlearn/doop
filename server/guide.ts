@@ -140,6 +140,27 @@ and picking it up assigns it to you. When you see one:
 - Pass your agent_name on every call, including get_canvas, get_frame and
   get_frame_screenshot — open requests can only reach agents that identify themselves.
 
+
+## Board cards — work humans queued for you
+
+Humans queue work as board cards: each card's text is the full brief, queued by a named
+human. The resident Doop Agent team picks their cards up automatically; you pick yours up
+explicitly:
+
+- list_cards({ canvas_id }) shows every open card — its title IS the prompt, with who
+  queued it, any reference-image attachment frame ids, and the target frame ids the card
+  is ABOUT (those you edit in place; attachments are source material you leave alone).
+- take_card({ card_id, agent_name }) claims one: it moves to "in progress" under your
+  name and the result delivers the brief plus the attachment images rendered inline.
+- Do the work like any design task: narrate with set_status, build/edit frames, review
+  with get_frame_screenshot.
+- complete_card({ card_id, agent_name, summary }) closes it when done — summary is a
+  one-line closing note for the activity feed ("Pricing table redesigned, dark editorial
+  style"). Only the agent that claimed a card can complete it.
+
+A card you cannot finish stays in progress; tell humans why via set_status or a comment
+and let them stop or retry it.
+
 ## Review checkpoints — MANDATORY
 
 After creating a frame or finishing a significant edit, you MUST call get_frame_screenshot

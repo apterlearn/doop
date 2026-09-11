@@ -20,6 +20,8 @@ import { viewWebsite } from './website.ts'
 import { createImportedWebpageFrame } from './webpageImport.ts'
 import { normalizeImportUrl } from './importer.ts'
 import { websiteAccessErrorMessage } from './websiteAccess.ts'
+import { roleName } from '../shared/agents.ts'
+import type { AgentTask } from '../shared/types.ts'
 
 const INSTRUCTIONS = `Doop is a shared multiplayer design canvas: humans and AI agents design together in real time. Canvases contain frames — artboards that render complete HTML documents live for everyone viewing.
 
@@ -34,6 +36,7 @@ You MUST call get_guide({ topic: "doop-instructions" }) once before using other 
 - Images: real imagery makes designs. search_images finds stock photos (you SEE thumbnails and pick), search_icons finds 200k+ UI icons as hotlinkable SVGs, search_logos finds real company logos by brand name or domain — call it once per brand BEFORE writing any logo wall, integration row, press bar or testimonial, and never ship a placeholder tile, "LOGO" text or an invented wordmark in its place, list_backgrounds shows a page of curated hero/section/bento backgrounds (glows, grainy meshes, aurora, painterly scenes) as thumbnails — browse it when a section wants atmosphere rather than defaulting to a flat CSS gradient, judge by eye whether one fits the frame, and draw your own when none does, upload_asset stores your own file (remote file → source_url; local file → local_file=true, returns a curl command) and returns a permanent URL. Never inline images as data: URIs.
 - Websites: when a request names an existing site or URL — a redesign of it, or "like acme.com" — call import_webpage FIRST so an editable HTML snapshot lands on the canvas. Leave that source frame unchanged and design in a separate frame. view_website is only for read-only inspection when the page should not be added. If Doop cannot capture the site, do not retry with view_website because it uses the same capture path. Use your own browser or web tool and work only from content you actually observe; if that is unavailable, ask the user for screenshots or an HTML export rather than inventing content.
 - Feedback: humans reply to your tasks; their notes arrive inside your tool results as HUMAN FEEDBACK blocks — address them before continuing.
+- Board: humans queue work as cards on the board. list_cards shows what is open; take_card claims one and delivers its brief (plus any reference-image attachments); complete_card closes it when done, with a one-line summary for the feed.
 - Comments: get_comments reads element-pinned notes; reply_to_comment answers one in-thread and resolve_comment closes it once the note is addressed. add_comment pins a new note to an element — use it to ask a human a question about a specific element.
 - Inspecting: on a large or imported frame, call inspect_frame (rendered semantics, computed styles, element selectors) and get_frame_html (a bounded slice, or a query) instead of get_frame — pulling a whole document into context is the most common way to run out of room mid-design.
 - Stopping: if a run is going wrong — drifting from the brief, the wrong frame, looping — call stop_work (target_agent for another agent's run). Never delete a frame out from under a working agent.
@@ -756,6 +759,150 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
         }),
         note: "These requests are now assigned to you. Address each one (a human request overrides the don't-touch-others'-frames etiquette), review with get_frame_screenshot, and update your set_status.",
       })
+    },
+  )
+
+  server.registerTool(
+    'list_cards',
+    {
+      title: 'List board cards',
+      description:
+        "Open board cards on this canvas — work humans have queued for agents. Each card's text is the full prompt. Call take_card to claim one and work it, or get going on the queue. Structured import cards (GitHub recon) are handled by the resident team and never listed here.",
+      annotations: { readOnlyHint: true },
+      inputSchema: {
+        canvas_id: z.string(),
+        agent_name: agentName.optional(),
+      },
+    },
+    async ({ canvas_id, agent_name }) => {
+      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      arrive(canvas_id, agent_name)
+      const cards = actions
+        .getTasks(canvas_id)
+        .filter((t) => t.queuedBy && !t.agentName && !t.failedAt && !t.endedAt && !t.cancelledAt && !t.kind)
+        .map((t) => ({
+          id: t.id,
+          title: t.status,
+          queued_by: t.queuedBy,
+          queued_at: new Date(t.startedAt).toISOString(),
+          stage: t.stage ?? 0,
+          waiting_for: roleName(actions.pipelineOf(t)[Math.min(t.stage ?? 0, actions.pipelineOf(t).length - 1)]),
+          attachments: t.attachments ?? [],
+          target_frames: t.targetFrameIds ?? [],
+        }))
+      if (cards.length === 0) return text({ cards: [], note: 'No open board cards right now.' })
+      return text({
+        cards,
+        note: 'Each card is a queued request from a human. take_card claims one and delivers its brief (plus reference-image attachments, if any).',
+      })
+    },
+  )
+
+  server.registerTool(
+    'take_card',
+    {
+      title: 'Claim a board card',
+      description:
+        'Claim an open board card so you can work on it: the card moves to "in progress" under your name and the result carries the full brief. Reference-image attachments arrive as images in the result — they are source material; do not edit or delete those frames. target_frames are the frames the card is ABOUT: edit them in place. When done, call complete_card.',
+      inputSchema: {
+        card_id: z.string(),
+        agent_name: agentName,
+      },
+    },
+    async ({ card_id, agent_name }) => {
+      const canvasId = actions.taskCanvasId(card_id)
+      if (!canvasId) return err(`no card with id ${card_id}`)
+      if (!canvasFor(canvasId)) return noCanvas(canvasId)
+      arrive(canvasId, agent_name)
+      actions.clearStop(canvasId, agent_name)
+      let card: AgentTask
+      try {
+        card = actions.claimCard(canvasId, card_id, agent_name)
+      } catch (e) {
+        return err(e instanceof Error ? e.message : 'card not claimable (use list_cards to see what is open)')
+      }
+      type ResultBlock = { type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string }
+      const content: ResultBlock[] = [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              ok: true,
+              card: {
+                id: card.id,
+                title: card.status,
+                queued_by: card.queuedBy,
+                target_frames: card.targetFrameIds ?? [],
+              },
+            },
+            null,
+            2,
+          ),
+        },
+        {
+          type: 'text',
+          text: 'The card text above is your full brief. Reference-image attachments (if any) follow as images — source material, leave those frames alone. target_frames are what the card is ABOUT: edit them in place. Set your set_status, do the work, review with get_frame_screenshot, then complete_card.',
+        },
+      ]
+      for (const id of card.attachments ?? []) {
+        const f = frameFor(id)
+        if (!f) {
+          content.push({ type: 'text', text: `attachment frame ${id} not found on this canvas` })
+          continue
+        }
+        try {
+          const png = await renderFrame(f, 1)
+          content.push({ type: 'image', data: png.toString('base64'), mimeType: 'image/png' })
+          content.push({ type: 'text', text: `Attachment “${f.name}” (${f.width}×${f.height})` })
+        } catch {
+          content.push({
+            type: 'text',
+            text: `attachment frame ${id} could not be rendered — call get_frame_screenshot on it`,
+          })
+        }
+      }
+      return withStopped(withFeedback({ content }, canvasId, actorFrom(agent_name)), canvasId, actorFrom(agent_name))
+    },
+  )
+
+  server.registerTool(
+    'complete_card',
+    {
+      title: 'Complete a board card',
+      description:
+        'Mark a board card you claimed with take_card as done — it moves to the board\'s "done" column and everyone sees you finished. Pass summary for a one-line closing note in the activity feed. Only call this on a card you claimed; a card you cannot finish stays in progress until a human stops or retries it.',
+      inputSchema: {
+        card_id: z.string(),
+        summary: z
+          .string()
+          .max(500)
+          .optional()
+          .describe(
+            'One-line closing summary for the activity feed, e.g. "Pricing table redesigned, dark editorial style"',
+          ),
+        agent_name: agentName,
+      },
+    },
+    async ({ card_id, summary, agent_name }) => {
+      const canvasId = actions.taskCanvasId(card_id)
+      if (!canvasId) return err(`no card with id ${card_id}`)
+      if (!canvasFor(canvasId)) return noCanvas(canvasId)
+      arrive(canvasId, agent_name)
+      const card = actions.getTasks(canvasId).find((t) => t.id === card_id)
+      if (!card) return err(`no card with id ${card_id}`)
+      if (card.agentName !== agent_name) return err('only the agent that claimed this card can complete it')
+      if (summary?.trim()) actions.agentSummary(canvasId, actorFrom(agent_name), summary)
+      const done = actions.completeCard(canvasId, card_id)
+      if (!done || done.endedAt === undefined) return err('card not found or already closed')
+      return withFeedback(
+        text({
+          ok: true,
+          card: { id: done.id, title: done.status, completed_at: new Date(done.endedAt).toISOString() },
+          note: 'Card closed. Set your status to "" (empty) so watchers see you are between tasks.',
+        }),
+        canvasId,
+        actorFrom(agent_name),
+      )
     },
   )
 
