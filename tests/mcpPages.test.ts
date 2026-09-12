@@ -10,6 +10,14 @@ import type { Canvas, Frame, Page } from '../shared/types.ts'
    duplicate_frame) run against the real store + actions machinery — persist
    is stubbed to no-ops and broadcasts are dropped, everything else is real. */
 vi.mock('../server/db/persist.ts', () => ({
+  getUserEmail: async () => undefined,
+  getNotificationPrefs: async () => new Map(),
+  saveNotificationPref: () => {},
+  pruneRunEvents: () => {},
+  saveJournal: () => {},
+  saveRunEvent: () => {},
+  saveQuestion: () => {},
+  saveFrameProposal: () => {},
   hydrate: () => {},
   saveCanvas: () => {},
   saveCanvasCopy: () => {},
@@ -181,7 +189,10 @@ describe('pages MCP tools', () => {
   })
 
   it('rename_page renames in the store and errors on an unknown page id', async () => {
-    const { canvas, pages: [, p2] } = seedCanvas(['Page 1', 'Page 2'])
+    const {
+      canvas,
+      pages: [, p2],
+    } = seedCanvas(['Page 1', 'Page 2'])
     const { client, close } = await connect()
     try {
       const ok = await callTool(client, 'rename_page', {
@@ -202,7 +213,10 @@ describe('pages MCP tools', () => {
   })
 
   it('delete_page removes the page and its frames, and refuses the last page', async () => {
-    const { canvas, pages: [p1, p2] } = seedCanvas(['Page 1', 'Page 2'])
+    const {
+      canvas,
+      pages: [p1, p2],
+    } = seedCanvas(['Page 1', 'Page 2'])
     const doomed = [makeFrame(canvas.id, p2.id, 'Hero'), makeFrame(canvas.id, p2.id, 'Pricing')]
     const survivor = makeFrame(canvas.id, p1.id, 'About')
     addFrames(canvas, [...doomed, survivor])
@@ -228,7 +242,10 @@ describe('pages MCP tools', () => {
   })
 
   it('move_frame resolves the target page by id and by name, rejecting bogus pages', async () => {
-    const { canvas, pages: [p1, p2] } = seedCanvas(['Page 1', 'Page B'])
+    const {
+      canvas,
+      pages: [p1, p2],
+    } = seedCanvas(['Page 1', 'Page B'])
     const f = makeFrame(canvas.id, p1.id, 'Hero')
     addFrames(canvas, [f])
 
@@ -255,7 +272,10 @@ describe('pages MCP tools', () => {
   })
 
   it('duplicate_frame copies the frame 40px down-right onto the same page', async () => {
-    const { canvas, pages: [p1] } = seedCanvas(['Page 1'])
+    const {
+      canvas,
+      pages: [p1],
+    } = seedCanvas(['Page 1'])
     const source = makeFrame(canvas.id, p1.id, 'Hero', { x: 100, y: 200, html: '<h1>Hero</h1>' })
     addFrames(canvas, [source])
 
@@ -280,7 +300,10 @@ describe('pages MCP tools', () => {
   })
 
   it('create_frame targets a page by name, defaulting to the first page', async () => {
-    const { canvas, pages: [p1, p2] } = seedCanvas(['Page 1', 'Checkout'])
+    const {
+      canvas,
+      pages: [p1, p2],
+    } = seedCanvas(['Page 1', 'Checkout'])
 
     const { client, close } = await connect()
     try {

@@ -272,6 +272,15 @@ export function PlayIcon(props: SVGProps<SVGSVGElement>) {
   )
 }
 
+/** A shield — review mode: the gate agent changes wait behind. */
+export function ShieldIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg {...iconProps} {...props}>
+      <path d="M12 3 4.5 6v5.5c0 4.4 3.1 8.2 7.5 9.5 4.4-1.3 7.5-5.1 7.5-9.5V6z" />
+    </svg>
+  )
+}
+
 export function ArrowUpIcon(props: SVGProps<SVGSVGElement>) {
   return (
     <svg {...iconProps} {...props}>

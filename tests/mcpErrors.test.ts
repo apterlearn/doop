@@ -10,6 +10,14 @@ import type { Canvas } from '../shared/types.ts'
    retryable flag are part of the contract, while the human message stays
    verbatim inside the payload for everything that reads prose. */
 vi.mock('../server/db/persist.ts', () => ({
+  getUserEmail: async () => undefined,
+  getNotificationPrefs: async () => new Map(),
+  saveNotificationPref: () => {},
+  pruneRunEvents: () => {},
+  saveJournal: () => {},
+  saveRunEvent: () => {},
+  saveQuestion: () => {},
+  saveFrameProposal: () => {},
   hydrate: () => {},
   saveCanvas: () => {},
   saveFrame: () => {},
@@ -184,5 +192,4 @@ describe('structured MCP errors', () => {
       await close()
     }
   })
-
 })

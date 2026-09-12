@@ -1,11 +1,9 @@
 import type { ComponentProps } from 'react'
-import { useStore } from '../lib/store'
+import { useStore, type PanelTab } from '../lib/store'
 import { cn } from '@/lib/utils'
 import { Button } from './ui/button'
 import { Tooltip } from './ui/tooltip'
-import { BookmarkIcon, ClientsIcon, PanelExpandRightIcon, PulseIcon, SparkIcon } from './ui/icons'
-
-type PanelTab = 'tasks' | 'activity' | 'memory' | 'agents'
+import { BookmarkIcon, ClientsIcon, PanelExpandRightIcon, PulseIcon, ShieldIcon, SparkIcon } from './ui/icons'
 
 /** The collapsed side panel: a column of icon buttons pinned to the top-right
  *  of the canvas while the panel is closed. Each opens the panel on its tab;
@@ -14,6 +12,12 @@ type PanelTab = 'tasks' | 'activity' | 'memory' | 'agents'
  *  happening. */
 export function SideRail({ onOpen }: { onOpen: () => void }) {
   const setTab = useStore((s) => s.setPanelTab)
+  /* frame changes + open questions an agent is waiting on */
+  const pendingReview = useStore(
+    (s) =>
+      s.frameProposals.filter((p) => p.status === 'pending').length +
+      s.questions.filter((q) => q.status === 'open').length,
+  )
   const working = useStore(
     (s) => s.tasks.filter((t) => t.agentName && !t.endedAt && !t.failedAt && !t.cancelledAt).length,
   )
@@ -47,6 +51,18 @@ export function SideRail({ onOpen }: { onOpen: () => void }) {
       </RailControl>
       <RailControl label="Activity" onClick={() => show('activity')}>
         <PulseIcon />
+      </RailControl>
+      <RailControl
+        label={pendingReview ? `Review · ${pendingReview} waiting` : 'Review'}
+        className={cn(pendingReview > 0 && 'bg-accent-ink/6 text-accent-ink')}
+        onClick={() => show('review')}
+      >
+        <ShieldIcon className="size-4" />
+        {pendingReview > 0 && (
+          <span className="absolute -top-0.5 -right-0.5 grid h-[15px] min-w-[15px] place-items-center rounded-lg border-2 border-surface bg-accent-ink px-[3px] font-mono text-[8px] font-medium text-white">
+            {pendingReview}
+          </span>
+        )}
       </RailControl>
       <RailControl label="Connected clients" onClick={() => show('agents')}>
         <ClientsIcon />

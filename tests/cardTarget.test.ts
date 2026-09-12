@@ -4,6 +4,14 @@ import type { Frame } from '../shared/types.ts'
 /* Cards are persisted and broadcast; these cases only care about what a card
    carries, so both sides are stubbed. */
 vi.mock('../server/db/persist.ts', () => ({
+  getUserEmail: async () => undefined,
+  getNotificationPrefs: async () => new Map(),
+  saveNotificationPref: () => {},
+  pruneRunEvents: () => {},
+  saveJournal: () => {},
+  saveRunEvent: () => {},
+  saveQuestion: () => {},
+  saveFrameProposal: () => {},
   saveTask: () => {},
   saveFeedback: () => {},
   saveComment: () => {},

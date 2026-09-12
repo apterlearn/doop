@@ -17,6 +17,14 @@ import type { Canvas, Frame } from '../shared/types.ts'
    browser), and the tool end to end against real renders where Chromium exists. */
 
 vi.mock('../server/db/persist.ts', () => ({
+  getUserEmail: async () => undefined,
+  getNotificationPrefs: async () => new Map(),
+  saveNotificationPref: () => {},
+  pruneRunEvents: () => {},
+  saveJournal: () => {},
+  saveRunEvent: () => {},
+  saveQuestion: () => {},
+  saveFrameProposal: () => {},
   hydrate: () => {},
   saveCanvas: () => {},
   saveCanvasCopy: () => {},
@@ -248,7 +256,11 @@ describe.skipIf(!findBrowserPath())('diff_frame over real renders', () => {
   it('compares against a pinned Memory reference', async () => {
     const frames = seedCanvas([page('<div style="width:100px;height:100px;background:#000"></div>')])
     const source = frames[0]!
-    store.addReference(CANVAS_ID, { ...source, html: page('<div style="width:300px;height:300px;background:#000"></div>') }, 'alice')
+    store.addReference(
+      CANVAS_ID,
+      { ...source, html: page('<div style="width:300px;height:300px;background:#000"></div>') },
+      'alice',
+    )
     const ref = store.getReferences(CANVAS_ID)[0]!
     const { client, close } = await connect()
     try {

@@ -19,6 +19,14 @@ import type { Canvas, Frame } from '../shared/types.ts'
    a real render, and the manifest without a browser. */
 
 vi.mock('../server/db/persist.ts', () => ({
+  getUserEmail: async () => undefined,
+  getNotificationPrefs: async () => new Map(),
+  saveNotificationPref: () => {},
+  pruneRunEvents: () => {},
+  saveJournal: () => {},
+  saveRunEvent: () => {},
+  saveQuestion: () => {},
+  saveFrameProposal: () => {},
   hydrate: () => {},
   saveCanvas: () => {},
   saveCanvasCopy: () => {},

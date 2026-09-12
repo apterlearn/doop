@@ -23,7 +23,7 @@ describe('groupClients', () => {
         new Map(),
         now,
       ),
-    ).toEqual([{ clientId: 'a', name: 'Unnamed client', expiresAt: live.getTime(), liveTokens: 2 }])
+    ).toEqual([{ clientId: 'a', name: 'Unnamed client', expiresAt: live.getTime(), liveTokens: 2, lastUsedAt: 0 }])
   })
 
   it('names a client from its registration', () => {

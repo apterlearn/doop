@@ -1,5 +1,5 @@
 import { nanoid } from 'nanoid'
-import { eq } from 'drizzle-orm'
+import { and, count, desc, eq, inArray, or } from 'drizzle-orm'
 import { db } from './db/index.ts'
 import * as t from './db/schema.ts'
 import * as storage from './storage.ts'
@@ -186,4 +186,100 @@ export async function reconcileAssetRefs(frames: { id: string; html: string }[])
       .onConflictDoNothing()
   }
   return rows.length
+}
+
+/* ------------------------------------------------------------------ */
+/* Listing — the read side of the ledger                               */
+
+export interface AssetSummary {
+  id: string
+  /** the public path the asset is served from (`/a/<id>.<ext>`) */
+  url: string
+  mime: string
+  bytes: number
+  /** unknown: upload time does not record image dimensions */
+  width?: number
+  height?: number
+  at: number
+}
+
+const ASSET_PAGE_DEFAULT = 50
+const ASSET_PAGE_MAX = 200
+
+/** Everything the ledger says belongs to a canvas: assets uploaded for it,
+ *  plus anything a frame of its references — canvas_id is a housekeeping hint,
+ *  the refs are what keep a URL copied into another canvas alive (see the
+ *  module header). Newest first. */
+function canvasAssetScope(canvasId: string) {
+  const referenced = db
+    .selectDistinct({ assetId: t.assetRefs.assetId })
+    .from(t.assetRefs)
+    .innerJoin(t.frames, eq(t.frames.id, t.assetRefs.frameId))
+    .where(eq(t.frames.canvasId, canvasId))
+  return or(eq(t.assets.canvasId, canvasId), inArray(t.assets.id, referenced))
+}
+
+export async function listAssets(
+  canvasId: string,
+  opts: { limit?: number; offset?: number } = {},
+): Promise<{ assets: AssetSummary[]; total: number }> {
+  const limit = Math.min(Math.max(Math.trunc(opts.limit ?? ASSET_PAGE_DEFAULT), 1), ASSET_PAGE_MAX)
+  const offset = Math.max(Math.trunc(opts.offset ?? 0), 0)
+  const scope = canvasAssetScope(canvasId)
+  const rows = await db
+    .select({
+      id: t.assets.id,
+      mime: t.assets.mime,
+      ext: t.assets.ext,
+      size: t.assets.size,
+      createdAt: t.assets.createdAt,
+    })
+    .from(t.assets)
+    .where(scope)
+    .orderBy(desc(t.assets.createdAt))
+    .limit(limit)
+    .offset(offset)
+  const [counted] = await db.select({ total: count() }).from(t.assets).where(scope)
+  return {
+    assets: rows.map((row) => ({
+      id: row.id,
+      url: `/a/${row.id}.${row.ext}`,
+      mime: row.mime,
+      bytes: row.size,
+      at: row.createdAt,
+    })),
+    total: counted?.total ?? 0,
+  }
+}
+
+export interface AssetWithBytes {
+  id: string
+  url: string
+  mime: string
+  bytes: number
+  data: Buffer
+}
+
+/** One asset of a canvas, with its bytes — `get_asset` serves image mimes from
+ *  this. Named getCanvasAsset because getAsset(id) above is the storage-level
+ *  read the /a/ route serves from. */
+export async function getCanvasAsset(canvasId: string, assetId: string): Promise<AssetWithBytes | undefined> {
+  /* id first: the PK lookup is the cheap one, the ledger scope is the access
+     check on top of it */
+  const [row] = await db.select().from(t.assets).where(eq(t.assets.id, assetId))
+  if (!row) return undefined
+  const [inScope] = await db
+    .select({ id: t.assets.id })
+    .from(t.assets)
+    .where(and(eq(t.assets.id, assetId), canvasAssetScope(canvasId)))
+  if (!inScope) return undefined
+  const buf = await storage.getObject(`${row.id}.${row.ext}`)
+  if (!buf) return undefined
+  return {
+    id: row.id,
+    url: `/a/${row.id}.${row.ext}`,
+    mime: row.mime,
+    bytes: row.size,
+    data: buf,
+  }
 }

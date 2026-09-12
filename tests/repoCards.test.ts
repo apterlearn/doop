@@ -4,6 +4,14 @@ import type { RepoScreenRef } from '../shared/types.ts'
 /* Same stubs as residentQueue.test.ts: the queue mirrors into Postgres and
    broadcasts; a unit test only cares about the cards themselves. */
 vi.mock('../server/db/persist.ts', () => ({
+  getUserEmail: async () => undefined,
+  getNotificationPrefs: async () => new Map(),
+  saveNotificationPref: () => {},
+  pruneRunEvents: () => {},
+  saveJournal: () => {},
+  saveRunEvent: () => {},
+  saveQuestion: () => {},
+  saveFrameProposal: () => {},
   saveTask: () => {},
   deleteTask: () => {},
   saveFeedback: () => {},

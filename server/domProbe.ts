@@ -61,6 +61,17 @@ export interface ProbeElement {
   rect: { x: number; y: number; width: number; height: number }
   /** raw document-space top, for stable document-order-independent sorting */
   top: number
+  /** live box metrics and computed overflow, which is what the layout checks
+   *  reason over; absent only on a hand-built probe fixture */
+  scrollWidth?: number
+  scrollHeight?: number
+  clientWidth?: number
+  clientHeight?: number
+  overflowX?: string
+  overflowY?: string
+  /** index into Probe.elements of the nearest ancestor the walk kept; absent
+   *  for a top-level element (body itself is not kept) */
+  parentIndex?: number
   style: {
     color: string
     background: string
@@ -94,6 +105,9 @@ export interface ProbeElement {
     focusable: boolean
     /** a <label> wraps this control */
     wrappedInLabel: boolean
+    /** data-doop-allow-overflow: the author says this box is meant to bleed
+     *  (a marquee, a full-width band), so the layout lint leaves it alone */
+    allowOverflow?: boolean
   }
 }
 
@@ -272,6 +286,10 @@ export async function probeFrame(
                 .sort((a, b) => a.index - b.index)
                 .map((entry) => entry.el)
 
+        /* indices into the published list, so an element can name its parent */
+        const indexOf = new Map<HTMLElement, number>()
+        kept.forEach((el, index) => indexOf.set(el, index))
+
         const elements = kept.map((el) => {
           const rect = el.getBoundingClientRect()
           const style = getComputedStyle(el)
@@ -279,6 +297,17 @@ export async function probeFrame(
           const attrs = el.attributes
           const attr = (name: string) => attrs.getNamedItem(name)?.value || undefined
           const image = el instanceof HTMLImageElement
+          /* the nearest ancestor the cap kept: sibling rules compare elements
+             by this index, so a dropped wrapper degrades to a coarser group
+             rather than to a wrong one */
+          let parentIndex: number | undefined
+          for (let node = el.parentElement; node; node = node.parentElement) {
+            const found = indexOf.get(node)
+            if (found !== undefined) {
+              parentIndex = found
+              break
+            }
+          }
           const focusable =
             (tag === 'a' && !!attr('href')) ||
             tag === 'button' ||
@@ -306,6 +335,13 @@ export async function probeFrame(
               height: Math.round(rect.height),
             },
             top: rect.top,
+            scrollWidth: el.scrollWidth,
+            scrollHeight: el.scrollHeight,
+            clientWidth: el.clientWidth,
+            clientHeight: el.clientHeight,
+            overflowX: style.overflowX,
+            overflowY: style.overflowY,
+            parentIndex,
             style: {
               color: style.color,
               background: style.backgroundColor,
@@ -334,6 +370,7 @@ export async function probeFrame(
               hiddenFromAT,
               focusable,
               wrappedInLabel: !!el.closest('label'),
+              allowOverflow: el.hasAttribute('data-doop-allow-overflow'),
             },
           }
         })

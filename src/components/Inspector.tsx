@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
-import type { Frame } from '../../shared/types'
+import type { Frame, FrameVersion } from '../../shared/types'
 import { useStore } from '../lib/store'
 import { api } from '../lib/api'
 import { deleteFrameTracked, recordUpdate } from '../lib/history'
+import { timeAgo } from '../lib/time'
+import { useHtmlPreview } from '../lib/useHtmlPreview'
 import { cn } from '@/lib/utils'
 import { Panel, PanelClose, PanelDisclosure, PanelHeader } from './ui/panel'
 import { Collapsible, CollapsibleContent } from './ui/collapsible'
@@ -10,6 +12,8 @@ import { Button } from './ui/button'
 import { Input } from './ui/input'
 import { Field } from './ui/field'
 import { Textarea } from './ui/textarea'
+import { ConfirmDialog } from './ui/alert-dialog'
+import { ListItem, ListMeta, ListTitle } from './ui/list'
 
 const HTML_OPEN_KEY = 'doop:inspector-html'
 
@@ -28,8 +32,11 @@ export function Inspector({
   className?: string
 }) {
   const select = useStore((s) => s.select)
+  /* an agent editing the frame holds its lock: the human watches, or takes over */
+  const lock = useStore((s) => s.frameLocks[frame.id])
   /* the raw HTML editor is a power tool — collapsed by default so the panel
      reads as frame properties, not a code dump; the choice sticks */
+  const [historyOpen, setHistoryOpen] = useState(false)
   const [showHtml, setShowHtml] = useState(() => localStorage.getItem(HTML_OPEN_KEY) === '1')
   const [draft, setDraft] = useState(frame.html)
   const [saveState, setSaveState] = useState<'idle' | 'dirty' | 'saved' | 'error'>('idle')
@@ -138,6 +145,21 @@ export function Inspector({
           {copiedUrl ? '✓ copied' : 'Copy image URL'}
         </Button>
       </div>
+      {lock && (
+        <div className="flex items-center gap-2.5 border-b border-line-soft bg-paper px-3.5 py-2.5 text-[12px] text-ink-soft">
+          <span className="size-2 flex-none rounded-full" style={{ background: lock.color }} />
+          <span className="min-w-0 flex-1 leading-[1.4]">
+            Held by <b className="font-semibold text-ink">{lock.name}</b> — the HTML editor is paused while it works.
+          </span>
+          <Button
+            size="sm"
+            className="flex-none text-[11.5px]"
+            onClick={() => api.unlockFrame(frame.id).catch(console.error)}
+          >
+            Take over
+          </Button>
+        </div>
+      )}
       <Collapsible
         className="flex min-h-0 flex-col"
         open={showHtml}
@@ -157,8 +179,17 @@ export function Inspector({
             value={draft}
             spellCheck={false}
             placeholder="<!doctype html>…"
+            disabled={!!lock}
             onChange={(e) => onHtmlChange(e.target.value)}
           />
+        </CollapsibleContent>
+      </Collapsible>
+      <Collapsible className="flex min-h-0 flex-col" open={historyOpen} onOpenChange={setHistoryOpen}>
+        <PanelDisclosure>
+          <span>History</span>
+        </PanelDisclosure>
+        <CollapsibleContent className="flex min-h-0 flex-col">
+          <HistoryList frame={frame} />
         </CollapsibleContent>
       </Collapsible>
       <footer className="flex items-center justify-between border-t border-line-soft px-4 py-2.5">
@@ -221,5 +252,121 @@ function NumInput({ value, onCommit }: { value: number; onCommit: (v: number) =>
       }}
       onKeyDown={(e) => e.key === 'Enter' && (e.target as HTMLInputElement).blur()}
     />
+  )
+}
+
+const versionBtn = 'px-[9px] py-[4px] text-[11.5px]'
+
+function formatBytes(chars: number): string {
+  if (chars < 1024) return `${chars} B`
+  if (chars < 1024 * 1024) return `${(chars / 1024).toFixed(1)} kB`
+  return `${(chars / (1024 * 1024)).toFixed(1)} MB`
+}
+
+/** The frame's saved versions: who wrote them, when, how big, and what you
+   can do with each — peek at it, diff it against now, or go back to it.
+   Reverting is itself an update, so the revert shows up as a newer version. */
+function HistoryList({ frame }: { frame: Frame }) {
+  const versions = useStore((s) => s.frameVersions[frame.id])
+  const [previewId, setPreviewId] = useState<string | null>(null)
+  const [diff, setDiff] = useState<{ versionId: string; png: string; ratio: number } | null>(null)
+  const [revertId, setRevertId] = useState<string | null>(null)
+  const previewed = versions?.find((v) => v.id === previewId)
+  const previewUrl = useHtmlPreview(previewed?.html, previewed?.width ?? frame.width, previewed?.height ?? frame.height)
+
+  useEffect(() => {
+    void api
+      .frameVersions(frame.id)
+      .then((list) => useStore.getState().setFrameVersions(frame.id, list))
+      .catch(console.error)
+    /* refetch after an edit or a revert so a new version shows up */
+  }, [frame.id, frame.updatedAt])
+
+  function showDiff(version: FrameVersion) {
+    api
+      .frameDiff(frame.id, version.id)
+      .then((r) => setDiff({ versionId: version.id, png: r.png, ratio: r.changed_ratio }))
+      .catch(console.error)
+  }
+
+  function revert() {
+    if (!revertId) return
+    const versionId = revertId
+    setRevertId(null)
+    recordUpdate(frame.id, frame, { html: frame.html })
+    api.revertFrame(frame.id, versionId).catch(console.error)
+  }
+
+  return (
+    <div className="flex min-h-0 flex-col">
+      {versions === undefined ? (
+        <div className="px-4 py-3 text-[12px] text-ink-faint">Loading versions…</div>
+      ) : versions.length === 0 ? (
+        <div className="px-4 py-3 text-[12px] text-ink-faint">
+          No saved versions yet. Every edit an agent makes is kept here, so you can compare or go back.
+        </div>
+      ) : (
+        versions.map((v) => (
+          <ListItem key={v.id} className="gap-1.5 py-2.5">
+            <span className="flex min-w-0 items-baseline gap-2">
+              <ListTitle className="min-w-0 flex-1 truncate">{v.savedBy}</ListTitle>
+              <ListMeta className="flex-none">{timeAgo(v.savedAt)}</ListMeta>
+              <ListMeta className="flex-none font-mono">{formatBytes(v.html.length)}</ListMeta>
+            </span>
+            <span className="mt-0.5 flex flex-wrap gap-1.5">
+              <Button
+                variant="ghost"
+                size="sm"
+                className={versionBtn}
+                onClick={() => setPreviewId(previewId === v.id ? null : v.id)}
+              >
+                Preview
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                className={versionBtn}
+                onClick={() => (diff?.versionId === v.id ? setDiff(null) : showDiff(v))}
+              >
+                Diff
+              </Button>
+              <Button variant="ghost" size="sm" className={versionBtn} onClick={() => setRevertId(v.id)}>
+                Revert
+              </Button>
+            </span>
+            {previewId === v.id &&
+              (previewUrl ? (
+                <img
+                  src={previewUrl}
+                  alt={`Preview of the version from ${timeAgo(v.savedAt)}`}
+                  className="w-full rounded-[8px] border border-line bg-white"
+                />
+              ) : (
+                <ListMeta>rendering…</ListMeta>
+              ))}
+            {diff?.versionId === v.id && (
+              <span className="mt-1 block">
+                <img
+                  src={diff.png}
+                  alt={`Difference against the version from ${timeAgo(v.savedAt)}`}
+                  className="w-full rounded-[8px] border border-line bg-white"
+                />
+                <ListMeta>
+                  {(diff.ratio * 100).toFixed(diff.ratio > 0 && diff.ratio < 0.01 ? 2 : 1)}% of pixels changed (magenta)
+                </ListMeta>
+              </span>
+            )}
+          </ListItem>
+        ))
+      )}
+      <ConfirmDialog
+        open={revertId !== null}
+        onOpenChange={(open) => !open && setRevertId(null)}
+        title="Revert this frame?"
+        description="The frame goes back to the version you picked. The revert itself is saved as a newer version, so this is undoable from the same list."
+        confirmLabel="Revert"
+        onConfirm={revert}
+      />
+    </div>
   )
 }

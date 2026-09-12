@@ -1,10 +1,12 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { authClient } from '../lib/auth'
+import { api } from '../lib/api'
 import { posthog } from '../lib/posthog'
 import { Button } from './ui/button'
 import { Input } from './ui/input'
 import { Badge } from './ui/badge'
 import { Note } from './ui/note'
+import { CheckboxCard } from './ui/checkbox'
 import { Card, CardDescription, CardHeader, CardRow, CardTitle } from './ui/card'
 
 /* settings fields are a fixed column on desktop and full width on a phone */
@@ -30,8 +32,30 @@ export function AccountSettings() {
   const [current, setCurrent] = useState('')
   const [next, setNext] = useState('')
   const [savingPw, setSavingPw] = useState(false)
+
   const [pwNote, setPwNote] = useState('')
   const [pwError, setPwError] = useState('')
+
+  /* agent-event email is opt-in per account; the server keeps the preference */
+  const [agentEmail, setAgentEmail] = useState<boolean | null>(null)
+  useEffect(() => {
+    api
+      .notifications()
+      .then((prefs) => setAgentEmail(prefs.agentEmail))
+      .catch(console.error)
+  }, [])
+
+  function setAgentEmailOptIn(next: boolean) {
+    const was = agentEmail
+    setAgentEmail(next) // optimistic; a refused save rolls back below
+    api
+      .setNotifications(next)
+      .then(() => next && posthog.capture('agent_email_enabled'))
+      .catch((err) => {
+        console.error(err)
+        setAgentEmail(was)
+      })
+  }
 
   const [verifyNote, setVerifyNote] = useState('')
 
@@ -181,6 +205,24 @@ export function AccountSettings() {
             <Note>At least 8 characters</Note>
           )}
         </CardRow>
+      </Card>
+
+      <Card className={settingsCard}>
+        <CardHeader>
+          <CardTitle>Agents</CardTitle>
+          <CardDescription>
+            How you hear about the work agents do on your canvases — finishing, failing short, or stopping to ask you
+            something.
+          </CardDescription>
+        </CardHeader>
+        {agentEmail === null ? null : (
+          <CheckboxCard
+            checked={agentEmail}
+            onChange={setAgentEmailOptIn}
+            title="Email me when an agent finishes, fails or asks a question"
+            description="One message per event, sent to your sign-in address, with a link back to the canvas. In-app toasts always show these regardless."
+          />
+        )}
       </Card>
     </>
   )

@@ -3,6 +3,14 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 /* The run mirrors its claims into Postgres and calls a real model; this test
    only cares about how a stop unwinds a run, so both are stubbed. */
 vi.mock('../server/db/persist.ts', () => ({
+  getUserEmail: async () => undefined,
+  getNotificationPrefs: async () => new Map(),
+  saveNotificationPref: () => {},
+  pruneRunEvents: () => {},
+  saveJournal: () => {},
+  saveRunEvent: () => {},
+  saveQuestion: () => {},
+  saveFrameProposal: () => {},
   saveTask: () => {},
   deleteTask: () => {},
   saveFeedback: () => {},

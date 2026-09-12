@@ -11,6 +11,14 @@ import type { AgentPlan, Canvas, ServerMessage } from '../shared/types.ts'
    know where it is, and the line the Agents panel shows. */
 
 vi.mock('../server/db/persist.ts', () => ({
+  getUserEmail: async () => undefined,
+  getNotificationPrefs: async () => new Map(),
+  saveNotificationPref: () => {},
+  pruneRunEvents: () => {},
+  saveJournal: () => {},
+  saveRunEvent: () => {},
+  saveQuestion: () => {},
+  saveFrameProposal: () => {},
   hydrate: () => {},
   saveCanvas: () => {},
   saveCanvasCopy: () => {},
@@ -297,7 +305,9 @@ describe('idempotent creates', () => {
         agent_name: 'Claude',
       })
       expect(retry.parsed.idempotent_replay).toBe(true)
-      expect((retry.parsed.frame as unknown as { id: string }).id).toBe((first.parsed.frame as unknown as { id: string }).id)
+      expect((retry.parsed.frame as unknown as { id: string }).id).toBe(
+        (first.parsed.frame as unknown as { id: string }).id,
+      )
       expect(store.getCanvas(CANVAS_ID)!.frames).toHaveLength(1)
 
       /* a fresh op_id is a genuinely new create */
@@ -356,7 +366,9 @@ describe('idempotent creates', () => {
         agent_name: 'Claude',
       })
       expect(commentRetry.parsed.idempotent_replay).toBe(true)
-      expect((commentRetry.parsed as unknown as { id: string }).id).toBe((comment.parsed as unknown as { id: string }).id)
+      expect((commentRetry.parsed as unknown as { id: string }).id).toBe(
+        (comment.parsed as unknown as { id: string }).id,
+      )
       expect(actions.getComments(CANVAS_ID)).toHaveLength(1)
 
       const before = store.listCanvases(OWNER_ID).length

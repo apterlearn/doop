@@ -1,6 +1,14 @@
 import { nanoid } from 'nanoid'
 import * as persist from './db/persist.ts'
-import type { Canvas, CommunityCategory, DesignTokens, Frame, GuidelineDoc, MemoryReference, Page } from '../shared/types.ts'
+import type {
+  Canvas,
+  CommunityCategory,
+  DesignTokens,
+  Frame,
+  GuidelineDoc,
+  MemoryReference,
+  Page,
+} from '../shared/types.ts'
 
 /**
  * In-memory canvas/frame state — the hot path for reads, reveals and
@@ -97,10 +105,15 @@ class Store {
     const canvasId = nanoid(10)
     const sourceFrames = options.dropDemo ? source.frames.filter((frame) => !frame.demo) : source.frames
     const frameIds = new Map(sourceFrames.map((frame) => [frame.id, nanoid(10)]))
-    const pages = source.pages?.map((page) => ({ id: nanoid(10), canvasId, name: page.name, position: page.position, createdAt: now, updatedAt: now }))
-    const pageIdMap = new Map(
-      source.pages?.map((page, i) => [page.id, pages![i]!.id]) ?? [],
-    )
+    const pages = source.pages?.map((page) => ({
+      id: nanoid(10),
+      canvasId,
+      name: page.name,
+      position: page.position,
+      createdAt: now,
+      updatedAt: now,
+    }))
+    const pageIdMap = new Map(source.pages?.map((page, i) => [page.id, pages![i]!.id]) ?? [])
     const frames = sourceFrames.map((frame) => ({
       ...frame,
       id: frameIds.get(frame.id)!,
@@ -242,6 +255,17 @@ class Store {
     return c
   }
 
+  /** Owner-set review policy: agent frame writes become proposals. Like
+   *  setLinkAccess, this is not a design edit, so updatedAt is left alone. */
+  setReviewMode(id: string, on: boolean): Canvas | undefined {
+    const c = this.canvases.get(id)
+    if (!c) return undefined
+    if (on) c.reviewMode = true
+    else delete c.reviewMode
+    persist.saveCanvas(c)
+    return c
+  }
+
   getGuidelines(canvasId: string): GuidelineDoc[] {
     return this.canvases.get(canvasId)?.guidelines ?? []
   }
@@ -357,7 +381,6 @@ class Store {
     return ref
   }
 
-
   getPage(pageId: string): { canvas: Canvas; page: Page } | undefined {
     for (const c of this.canvases.values()) {
       const page = c.pages?.find((p) => p.id === pageId)
@@ -370,7 +393,7 @@ class Store {
     const c = this.canvases.get(canvasId)
     if (!c) return undefined
     const page = { ...newPage(canvasId, name, Date.now()), position: c.pages?.length ?? 0 }
-    this.renumber(c.pages ??= [])
+    this.renumber((c.pages ??= []))
     c.pages.push(page)
     this.renumber(c.pages)
     c.updatedAt = Date.now()

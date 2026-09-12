@@ -97,7 +97,7 @@ export function ConnectedAgents() {
             <span className="font-mono text-[13px]">
               {c.liveTokens} live token{c.liveTokens === 1 ? '' : 's'}
             </span>
-            <Note>last used {timeAgo(c.expiresAt)}</Note>
+            <Note>{c.lastUsedAt ? `last used ${timeAgo(c.lastUsedAt)}` : 'never used'}</Note>
           </CardRow>
         ))
       )}

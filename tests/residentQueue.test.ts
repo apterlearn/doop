@@ -4,6 +4,14 @@ import type { AgentTask, ElementComment, TaskFeedback } from '../shared/types.ts
 /* The queue functions mirror every claim into Postgres and broadcast it; a
    unit test only cares about which items get claimed, so both are stubbed. */
 vi.mock('../server/db/persist.ts', () => ({
+  getUserEmail: async () => undefined,
+  getNotificationPrefs: async () => new Map(),
+  saveNotificationPref: () => {},
+  pruneRunEvents: () => {},
+  saveJournal: () => {},
+  saveRunEvent: () => {},
+  saveQuestion: () => {},
+  saveFrameProposal: () => {},
   saveTask: () => {},
   saveFeedback: () => {},
   saveComment: () => {},

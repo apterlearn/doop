@@ -1,21 +1,24 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { nanoid } from 'nanoid'
-import { and, desc, eq, inArray } from 'drizzle-orm'
+import { and, desc, eq, inArray, lt } from 'drizzle-orm'
 import { db } from './index.ts'
 import * as t from './schema.ts'
+import { user as authUser } from './auth-schema.ts'
 import { extractAssetIds } from '../assets.ts'
 import { roleByAgentName } from '../../shared/agents.ts'
 import { isCommunityCategory } from '../../shared/types.ts'
 import type {
   ActivityItem,
   AgentPlan,
+  AgentQuestion,
   AgentTask,
   Canvas,
   DesignDecision,
   ElementComment,
   DesignTokens,
   Frame,
+  FrameProposal,
   FrameVersion,
   GuidelineDoc,
   MemoryProposal,
@@ -24,6 +27,8 @@ import type {
   Page,
   RepoCardKind,
   RepoCardPayload,
+  RunEvent,
+  RunJournal,
   TaskFeedback,
 } from '../../shared/types.ts'
 
@@ -48,6 +53,7 @@ function canvasColumns(c: Canvas) {
     category: c.category ?? null,
     copyCount: c.copyCount ?? 0,
     tokens: c.tokens ?? null,
+    reviewMode: c.reviewMode ?? false,
     updatedAt: c.updatedAt,
   }
 }
@@ -186,7 +192,14 @@ export function savePage(canvasId: string, page: Page) {
   swallow(
     db
       .insert(t.pages)
-      .values({ id: page.id, canvasId, name: page.name, position: page.position, createdAt: page.createdAt, updatedAt: page.updatedAt })
+      .values({
+        id: page.id,
+        canvasId,
+        name: page.name,
+        position: page.position,
+        createdAt: page.createdAt,
+        updatedAt: page.updatedAt,
+      })
       .onConflictDoUpdate({
         target: t.pages.id,
         set: { name: page.name, position: page.position, updatedAt: page.updatedAt },
@@ -308,7 +321,9 @@ export function savePlan(plan: AgentPlan) {
 }
 
 export function deletePlan(canvasId: string, agentName: string) {
-  swallow(db.delete(t.agentPlans).where(and(eq(t.agentPlans.canvasId, canvasId), eq(t.agentPlans.agentName, agentName))))
+  swallow(
+    db.delete(t.agentPlans).where(and(eq(t.agentPlans.canvasId, canvasId), eq(t.agentPlans.agentName, agentName))),
+  )
 }
 
 export function deletePlansFor(canvasId: string) {
@@ -383,6 +398,123 @@ export function saveProposal(canvasId: string, p: MemoryProposal) {
         set: { status: row.status, resolvedBy: row.resolvedBy, resolvedAt: row.resolvedAt },
       }),
   )
+}
+
+/* ---- review mode, questions, run timeline, journals, notification prefs ---- */
+
+export function saveFrameProposal(canvasId: string, p: FrameProposal) {
+  const row = {
+    id: p.id,
+    canvasId,
+    kind: p.kind,
+    frameId: p.frameId ?? null,
+    name: p.name ?? null,
+    html: p.html ?? null,
+    x: p.x ?? null,
+    y: p.y ?? null,
+    width: p.width ?? null,
+    height: p.height ?? null,
+    baseUpdatedAt: p.baseUpdatedAt,
+    summary: p.summary,
+    agentName: p.agentName,
+    owner: p.owner ?? null,
+    ownerId: p.ownerId ?? null,
+    color: p.color,
+    at: p.at,
+    status: p.status,
+    resolvedBy: p.resolvedBy ?? null,
+    resolvedAt: p.resolvedAt ?? null,
+  }
+  swallow(
+    db
+      .insert(t.frameProposals)
+      .values(row)
+      .onConflictDoUpdate({
+        target: t.frameProposals.id,
+        set: { status: row.status, resolvedBy: row.resolvedBy, resolvedAt: row.resolvedAt },
+      }),
+  )
+}
+
+export function saveQuestion(q: AgentQuestion) {
+  const row = {
+    id: q.id,
+    canvasId: q.canvasId,
+    agentName: q.agentName,
+    owner: q.owner ?? null,
+    ownerId: q.ownerId ?? null,
+    color: q.color,
+    frameId: q.frameId ?? null,
+    selector: q.selector ?? null,
+    text: q.text,
+    at: q.at,
+    status: q.status,
+    answer: q.answer ?? null,
+    answeredBy: q.answeredBy ?? null,
+    answeredAt: q.answeredAt ?? null,
+    expiresAt: q.expiresAt,
+  }
+  swallow(
+    db
+      .insert(t.agentQuestions)
+      .values(row)
+      .onConflictDoUpdate({
+        target: t.agentQuestions.id,
+        set: { status: row.status, answer: row.answer, answeredBy: row.answeredBy, answeredAt: row.answeredAt },
+      }),
+  )
+}
+
+export function saveRunEvent(e: RunEvent) {
+  swallow(
+    db.insert(t.runEvents).values({
+      id: e.id,
+      canvasId: e.canvasId,
+      runId: e.runId,
+      agentName: e.agentName,
+      at: e.at,
+      kind: e.kind,
+      name: e.name ?? null,
+      ok: e.ok ?? null,
+      ms: e.ms ?? null,
+      summary: e.summary ?? null,
+    }),
+  )
+}
+
+export function saveJournal(j: RunJournal) {
+  swallow(
+    db.insert(t.runJournals).values({
+      id: j.id,
+      canvasId: j.canvasId,
+      agentName: j.agentName,
+      cardId: j.cardId ?? null,
+      summary: j.summary,
+      decisions: j.decisions ?? null,
+      at: j.at,
+    }),
+  )
+}
+
+/** Delete run events older than a cutoff — the timeline is a recent window,
+ *  not an audit log, so the table is pruned at boot. */
+export function pruneRunEvents(before: number) {
+  swallow(db.delete(t.runEvents).where(lt(t.runEvents.at, before)))
+}
+
+export function saveNotificationPref(userId: string, agentEmail: boolean) {
+  const now = Date.now()
+  swallow(
+    db
+      .insert(t.notificationPrefs)
+      .values({ userId, agentEmail, updatedAt: now })
+      .onConflictDoUpdate({ target: t.notificationPrefs.userId, set: { agentEmail, updatedAt: now } }),
+  )
+}
+
+export async function getNotificationPrefs(): Promise<Map<string, boolean>> {
+  const rows = await db.select().from(t.notificationPrefs)
+  return new Map(rows.map((r) => [r.userId, r.agentEmail]))
 }
 
 /* Streaming appends update a frame's html on every chunk — debounce per frame
@@ -487,12 +619,30 @@ export function deleteTask(canvasId: string, taskId: string) {
   swallow(db.delete(t.tasks).where(and(eq(t.tasks.canvasId, canvasId), eq(t.tasks.id, taskId))))
 }
 
-/** A structured card's kind + payload, or nothing when the row is a prompt
- *  card or its payload no longer parses (the card then reads as a plain one). */
 function repoCardFields(kind: string | null, payload: string | null): Pick<AgentTask, 'kind' | 'payload'> {
   if (!kind || !payload) return {}
   try {
     return { kind: kind as RepoCardKind, payload: JSON.parse(payload) as RepoCardPayload }
+  } catch {
+    return {}
+  }
+}
+
+function parseHandback(raw: string | null): Pick<AgentTask, 'handback'> {
+  if (!raw) return {}
+  try {
+    const parsed = JSON.parse(raw) as AgentTask['handback']
+    return parsed ? { handback: parsed } : {}
+  } catch {
+    return {}
+  }
+}
+
+function parseUsage(raw: string | null): Pick<AgentTask, 'usage'> {
+  if (!raw) return {}
+  try {
+    const parsed = JSON.parse(raw) as AgentTask['usage']
+    return parsed ? { usage: parsed } : {}
   } catch {
     return {}
   }
@@ -523,6 +673,13 @@ export function saveTask(canvasId: string, task: AgentTask) {
     cancelledAt: task.cancelledAt ?? null,
     cancelledBy: task.cancelledBy ?? null,
     targetFrameIds: task.targetFrameIds?.join(',') ?? null,
+    pausedAt: task.pausedAt ?? null,
+    pausedBy: task.pausedBy ?? null,
+    priority: task.priority ?? null,
+    position: task.position ?? null,
+    stageSummary: task.stageSummary ?? null,
+    handback: task.handback ? JSON.stringify(task.handback) : null,
+    usage: task.usage ? JSON.stringify(task.usage) : null,
   }
   swallow(
     db
@@ -543,9 +700,22 @@ export function saveTask(canvasId: string, task: AgentTask) {
           /* a stop lands on an already-inserted row, so it must be updatable */
           cancelledAt: row.cancelledAt,
           cancelledBy: row.cancelledBy,
+          pausedAt: row.pausedAt,
+          pausedBy: row.pausedBy,
+          priority: row.priority,
+          position: row.position,
+          stageSummary: row.stageSummary,
+          handback: row.handback,
+          usage: row.usage,
         },
       }),
   )
+}
+
+/** The email behind an account id, for agent-event notifications. */
+export async function getUserEmail(userId: string): Promise<string | undefined> {
+  const [row] = await db.select({ email: authUser.email }).from(authUser).where(eq(authUser.id, userId)).limit(1)
+  return row?.email ?? undefined
 }
 
 export function saveFeedback(fb: TaskFeedback) {
@@ -668,6 +838,16 @@ export interface Hydrated {
   proposals: Map<string, MemoryProposal[]>
   /** canvasId -> agentName -> plan */
   plans: Map<string, Map<string, AgentPlan>>
+  /** canvasId -> proposals, newest first */
+  frameProposals: Map<string, FrameProposal[]>
+  /** canvasId -> questions, newest first */
+  questions: Map<string, AgentQuestion[]>
+  /** canvasId -> run events, newest first */
+  runEvents: Map<string, RunEvent[]>
+  /** canvasId -> journals, newest first */
+  journals: Map<string, RunJournal[]>
+  /** userId -> wants email on agent events */
+  notificationPrefs: Map<string, boolean>
 }
 
 const LOG_CAP = 100
@@ -687,6 +867,11 @@ export async function hydrate(): Promise<Hydrated> {
     memberRows,
     pageRows,
     planRows,
+    frameProposalRows,
+    questionRows,
+    runEventRows,
+    journalRows,
+    notificationRows,
   ] = await Promise.all([
     db.select().from(t.canvases),
     db.select().from(t.frames),
@@ -701,6 +886,11 @@ export async function hydrate(): Promise<Hydrated> {
     db.select().from(t.canvasMembers).orderBy(t.canvasMembers.addedAt),
     db.select().from(t.pages).orderBy(t.pages.position),
     db.select().from(t.agentPlans),
+    db.select().from(t.frameProposals).orderBy(desc(t.frameProposals.at)),
+    db.select().from(t.agentQuestions).orderBy(desc(t.agentQuestions.at)),
+    db.select().from(t.runEvents).orderBy(desc(t.runEvents.at)),
+    db.select().from(t.runJournals).orderBy(desc(t.runJournals.at)),
+    db.select().from(t.notificationPrefs),
   ])
 
   const canvases: Canvas[] = canvasRows.map((c) => ({
@@ -713,6 +903,7 @@ export async function hydrate(): Promise<Hydrated> {
     ...(isCommunityCategory(c.category) ? { category: c.category } : {}),
     ...(c.copyCount ? { copyCount: c.copyCount } : {}),
     ...(c.tokens ? { tokens: c.tokens as DesignTokens } : {}),
+    ...(c.reviewMode ? { reviewMode: true } : {}),
     createdAt: c.createdAt,
     updatedAt: c.updatedAt,
     frames: [],
@@ -771,7 +962,14 @@ export async function hydrate(): Promise<Hydrated> {
         updatedAt: p.updatedAt,
       }))
       if (!c.pages.length) {
-        const page: Page = { id: nanoid(10), canvasId: c.id, name: 'Page 1', position: 0, createdAt: now, updatedAt: now }
+        const page: Page = {
+          id: nanoid(10),
+          canvasId: c.id,
+          name: 'Page 1',
+          position: 0,
+          createdAt: now,
+          updatedAt: now,
+        }
         c.pages.push(page)
         swallow(db.insert(t.pages).values({ ...page }))
       }
@@ -833,6 +1031,13 @@ export async function hydrate(): Promise<Hydrated> {
       ...(row.cancelledAt != null ? { cancelledAt: row.cancelledAt } : {}),
       ...(row.cancelledBy != null ? { cancelledBy: row.cancelledBy } : {}),
       ...(row.targetFrameIds ? { targetFrameIds: row.targetFrameIds.split(',').filter(Boolean) } : {}),
+      ...(row.pausedAt != null ? { pausedAt: row.pausedAt } : {}),
+      ...(row.pausedBy != null ? { pausedBy: row.pausedBy } : {}),
+      ...(row.priority != null ? { priority: row.priority } : {}),
+      ...(row.position != null ? { position: row.position } : {}),
+      ...(row.stageSummary != null ? { stageSummary: row.stageSummary } : {}),
+      ...parseHandback(row.handback),
+      ...parseUsage(row.usage),
       ...repoCardFields(row.kind, row.payload),
     })
     tasks.set(row.canvasId, list)
@@ -972,7 +1177,110 @@ export async function hydrate(): Promise<Hydrated> {
     plans.set(row.canvasId, byAgent)
   }
 
-  return { canvases, tasks, feedback, comments, activity, decisions, proposals, plans }
+  const frameProposals = new Map<string, FrameProposal[]>()
+  for (const row of frameProposalRows) {
+    const list = frameProposals.get(row.canvasId) ?? []
+    if (list.length >= LOG_CAP) continue
+    list.push({
+      id: row.id,
+      kind: row.kind as FrameProposal['kind'],
+      ...(row.frameId != null ? { frameId: row.frameId } : {}),
+      ...(row.name != null ? { name: row.name } : {}),
+      ...(row.html != null ? { html: row.html } : {}),
+      ...(row.x != null ? { x: row.x } : {}),
+      ...(row.y != null ? { y: row.y } : {}),
+      ...(row.width != null ? { width: row.width } : {}),
+      ...(row.height != null ? { height: row.height } : {}),
+      baseUpdatedAt: row.baseUpdatedAt,
+      summary: row.summary,
+      agentName: row.agentName,
+      ...(row.owner != null ? { owner: row.owner } : {}),
+      ...(row.ownerId != null ? { ownerId: row.ownerId } : {}),
+      color: row.color,
+      at: row.at,
+      status: row.status as FrameProposal['status'],
+      ...(row.resolvedBy != null ? { resolvedBy: row.resolvedBy } : {}),
+      ...(row.resolvedAt != null ? { resolvedAt: row.resolvedAt } : {}),
+    })
+    frameProposals.set(row.canvasId, list)
+  }
+
+  const questions = new Map<string, AgentQuestion[]>()
+  for (const row of questionRows) {
+    const list = questions.get(row.canvasId) ?? []
+    if (list.length >= LOG_CAP) continue
+    list.push({
+      id: row.id,
+      canvasId: row.canvasId,
+      agentName: row.agentName,
+      ...(row.owner != null ? { owner: row.owner } : {}),
+      ...(row.ownerId != null ? { ownerId: row.ownerId } : {}),
+      color: row.color,
+      ...(row.frameId != null ? { frameId: row.frameId } : {}),
+      ...(row.selector != null ? { selector: row.selector } : {}),
+      text: row.text,
+      at: row.at,
+      status: row.status as AgentQuestion['status'],
+      ...(row.answer != null ? { answer: row.answer } : {}),
+      ...(row.answeredBy != null ? { answeredBy: row.answeredBy } : {}),
+      ...(row.answeredAt != null ? { answeredAt: row.answeredAt } : {}),
+      expiresAt: row.expiresAt,
+    })
+    questions.set(row.canvasId, list)
+  }
+
+  const runEvents = new Map<string, RunEvent[]>()
+  for (const row of runEventRows) {
+    const list = runEvents.get(row.canvasId) ?? []
+    if (list.length >= 200) continue
+    list.push({
+      id: row.id,
+      canvasId: row.canvasId,
+      runId: row.runId,
+      agentName: row.agentName,
+      at: row.at,
+      kind: row.kind as RunEvent['kind'],
+      ...(row.name != null ? { name: row.name } : {}),
+      ...(row.ok != null ? { ok: row.ok } : {}),
+      ...(row.ms != null ? { ms: row.ms } : {}),
+      ...(row.summary != null ? { summary: row.summary } : {}),
+    })
+    runEvents.set(row.canvasId, list)
+  }
+
+  const journals = new Map<string, RunJournal[]>()
+  for (const row of journalRows) {
+    const list = journals.get(row.canvasId) ?? []
+    if (list.length >= LOG_CAP) continue
+    list.push({
+      id: row.id,
+      canvasId: row.canvasId,
+      agentName: row.agentName,
+      ...(row.cardId != null ? { cardId: row.cardId } : {}),
+      summary: row.summary,
+      ...(row.decisions != null ? { decisions: row.decisions } : {}),
+      at: row.at,
+    })
+    journals.set(row.canvasId, list)
+  }
+
+  const notificationPrefs = new Map<string, boolean>(notificationRows.map((r) => [r.userId, r.agentEmail]))
+
+  return {
+    canvases,
+    tasks,
+    feedback,
+    comments,
+    activity,
+    decisions,
+    proposals,
+    plans,
+    frameProposals,
+    questions,
+    runEvents,
+    journals,
+    notificationPrefs,
+  }
 }
 
 /** One-time import of the pre-DB data/store.json so existing canvases survive. */

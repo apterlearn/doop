@@ -1,4 +1,16 @@
-import type { ActivityItem, Canvas, CanvasMeta, CommunityCategory, CommunityItem, Frame, Page } from '../../shared/types'
+import type {
+  ActivityItem,
+  AgentQuestion,
+  Canvas,
+  CanvasMeta,
+  CommunityCategory,
+  CommunityItem,
+  Frame,
+  FrameProposal,
+  FrameVersion,
+  Page,
+  RunEvent,
+} from '../../shared/types'
 
 export type HomeActivity = ActivityItem & { canvasId: string; canvasName: string }
 
@@ -153,6 +165,8 @@ export interface ConnectedAgent {
   expiresAt: number
   /** how many of its tokens for this user are still live */
   liveTokens: number
+  /** last authenticated MCP call this process saw, ms epoch — 0 = never used */
+  lastUsedAt: number
 }
 import { getIdentity } from './identity'
 
@@ -254,6 +268,50 @@ export const api = {
     req(`/api/canvases/${canvasId}/references/${refId}`, { method: 'DELETE' }),
   resolveProposal: (canvasId: string, proposalId: string, accept: boolean) =>
     req(`/api/canvases/${canvasId}/proposals/${proposalId}`, { method: 'POST', body: JSON.stringify({ accept }) }),
+  /* review mode: while it is on, agent frame writes wait for a human here */
+  setReviewMode: (canvasId: string, on: boolean) =>
+    req<{ reviewMode: boolean }>(`/api/canvases/${canvasId}/review-mode`, {
+      method: 'POST',
+      body: JSON.stringify({ on }),
+    }),
+  frameProposals: (canvasId: string, status?: 'pending') =>
+    req<FrameProposal[]>(`/api/canvases/${canvasId}/frame-proposals${status ? `?status=${status}` : ''}`),
+  resolveFrameProposal: (canvasId: string, proposalId: string, accept: boolean) =>
+    req<FrameProposal>(`/api/canvases/${canvasId}/frame-proposals/${proposalId}`, {
+      method: 'POST',
+      body: JSON.stringify({ accept }),
+    }),
+  /* the answer reaches a waiting agent inside its ask_human call */
+  answerQuestion: (canvasId: string, questionId: string, answer: string) =>
+    req<AgentQuestion>(`/api/canvases/${canvasId}/questions/${questionId}`, {
+      method: 'POST',
+      body: JSON.stringify({ answer }),
+    }),
+  /* frame history: the same versions the MCP revert_frame tool restores */
+  frameVersions: (frameId: string, limit = 20) => req<FrameVersion[]>(`/api/frames/${frameId}/versions?limit=${limit}`),
+  frameVersion: (frameId: string, versionId: string) =>
+    req<FrameVersion>(`/api/frames/${frameId}/versions/${versionId}`),
+  revertFrame: (frameId: string, versionId: string) =>
+    req<Frame>(`/api/frames/${frameId}/revert`, { method: 'POST', body: JSON.stringify({ version_id: versionId }) }),
+  /* the pixels a version differs by, marked in magenta, plus how much changed */
+  frameDiff: (frameId: string, versionId: string) =>
+    req<{ png: string; changed_ratio: number }>(`/api/frames/${frameId}/diff`, {
+      method: 'POST',
+      body: JSON.stringify({ version_id: versionId }),
+    }),
+  /* render arbitrary frame HTML and answer with raw PNG bytes, handed back
+     as an object URL — callers must revoke it (proposal previews) */
+  renderPreview: async (html: string, width: number, height: number) => {
+    const res = await fetch('/api/frames/render-preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ html, width, height }),
+    })
+    if (!res.ok) throw new ApiError(res.status, await res.text())
+    return URL.createObjectURL(await res.blob())
+  },
+  /* an agent holds the frame's edit lock; taking it over frees the frame */
+  unlockFrame: (frameId: string) => req(`/api/frames/${frameId}/unlock`, { method: 'POST' }),
   /* raw image bytes -> permanent /a/ URL (5 MB cap, type sniffed server-side) */
   uploadAsset: async (canvasId: string, blob: Blob) => {
     const res = await fetch(`/api/canvases/${canvasId}/assets`, {
@@ -274,6 +332,13 @@ export const api = {
     }
     return res.json() as Promise<{ url: string; mime: string; size: number }>
   },
+  /* agent-event email, opt-in per account */
+  notifications: () => req<{ agentEmail: boolean }>('/api/settings/notifications'),
+  setNotifications: (agentEmail: boolean) =>
+    req<{ agentEmail: boolean }>('/api/settings/notifications', {
+      method: 'POST',
+      body: JSON.stringify({ agentEmail }),
+    }),
   createFrame: (canvasId: string, input: Partial<Frame> & { name: string }) =>
     req<Frame>(`/api/canvases/${canvasId}/frames`, {
       method: 'POST',
@@ -346,6 +411,20 @@ export const api = {
     req(`/api/canvases/${canvasId}/agents/stop`, { method: 'POST', body: JSON.stringify({ agentName }) }),
   deleteCard: (canvasId: string, cardId: string) =>
     req(`/api/canvases/${canvasId}/cards/${cardId}`, { method: 'DELETE' }),
+  pauseAgentWork: (canvasId: string, agentName: string) =>
+    req(`/api/canvases/${canvasId}/agents/pause`, { method: 'POST', body: JSON.stringify({ agent_name: agentName }) }),
+  resumeCard: (canvasId: string, cardId: string) =>
+    req(`/api/canvases/${canvasId}/cards/${cardId}/resume`, { method: 'POST' }),
+  /* the queue's running order: ids in the order the cards should run */
+  reorderCards: (canvasId: string, ids: string[]) =>
+    req(`/api/canvases/${canvasId}/cards/reorder`, { method: 'POST', body: JSON.stringify({ ids }) }),
+  setCardPriority: (canvasId: string, cardId: string, priority: number) =>
+    req(`/api/canvases/${canvasId}/cards/${cardId}`, { method: 'PATCH', body: JSON.stringify({ priority }) }),
+  runEvents: (canvasId: string, runId?: string, limit = 200) => {
+    const q = new URLSearchParams({ limit: String(limit) })
+    if (runId) q.set('run_id', runId)
+    return req<RunEvent[]>(`/api/canvases/${canvasId}/run-events?${q}`)
+  },
   listMcpAgents: () => req<ConnectedAgent[]>('/api/mcp-agents'),
   revokeMcpAgent: (clientId: string) => req(`/api/mcp-agents/${encodeURIComponent(clientId)}`, { method: 'DELETE' }),
 }

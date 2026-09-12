@@ -8,13 +8,20 @@ import { toNodeHandler, fromNodeHeaders } from 'better-auth/node'
 import { oAuthDiscoveryMetadata } from 'better-auth/plugins'
 import { WebSocketServer, WebSocket } from 'ws'
 import { store } from './store.ts'
-import { getImage } from './previews.ts'
+import * as runLog from './runLog.ts'
 import * as actions from './actions.ts'
+import * as frameLocks from './frameLocks.ts'
+import * as notifications from './notifications.ts'
+import { getImage, renderHtmlPreview } from './previews.ts'
+import { diffFrames } from './visualDiff.ts'
+import type { AgentQuestion, FrameProposal } from '../shared/types.ts'
+
 import { canAccessCanvas, hasDurableCanvasAccess, isAdmin } from './access.ts'
 import { auth, initAuth, syncAdmins, getUserName, PUBLIC_ORIGIN, loginProvidersConfig } from './auth.ts'
 import { adminRouter } from './admin.ts'
 import { communityRouter, parseListing, publishableFrames } from './community.ts'
 import * as demo from './demo.ts'
+
 import { closeDb, db, initDb } from './db/index.ts'
 import * as authSchema from './db/auth-schema.ts'
 import * as persist from './db/persist.ts'
@@ -47,8 +54,12 @@ import type { ClientMessage, Presence, ServerMessage } from '../shared/types.ts'
 
 const PORT = Number(process.env.PORT || 4400)
 
+/** Human caller identity for actions: session name, user kind. */
+const resolveActorFromReq = (req: express.Request) => actions.resolveActor({ name: req.user!.name, kind: 'user' })
+/** Proposal previews are re-renders on demand: one small budget per account. */
+const renderPreviewHits = new Map<string, number[]>()
+
 /* Identifies the client bundle this process serves. Hashing dist/index.html
-   works because Vite writes hashed asset names into it — any frontend change
    changes the hash, while server-only deploys and plain restarts do not.
    Clients compare it across reconnects to know their loaded bundle is stale. */
 const BUILD_ID = (() => {
@@ -158,6 +169,9 @@ function broadcast(canvasId: string, msg: ServerMessage, excludeClientId?: strin
 /* Agents show up in presence while they are actively calling tools. */
 interface AgentPresence extends Presence {
   lastSeen: number
+  /** set by wait_for_events: the agent is parked but alive, so the 60s
+   *  status TTL applies instead of the 20s idle sweep */
+  waiting?: boolean
 }
 const agentPresences = new Map<string, Map<string, AgentPresence>>() // canvasId -> name -> presence
 
@@ -189,6 +203,7 @@ function agentTouch(
     byName.set(key, p)
   }
   p.lastSeen = Date.now()
+  if (frameId !== undefined && frameId !== null) p.waiting = false
   if (owner && !p.owner) p.owner = owner
   if (frameId !== undefined) p.activeFrameId = frameId
   let statusChanged = false
@@ -215,9 +230,9 @@ setInterval(() => {
   const now = Date.now()
   for (const [canvasId, byName] of agentPresences) {
     for (const [key, p] of byName) {
-      /* an agent with a posted status is likely thinking between tool calls —
-         keep it (and its status) on screen longer before expiring */
-      if (now - p.lastSeen > (p.status ? 60_000 : 20_000)) {
+      /* an agent with a posted status — or one parked in wait_for_events —
+         is alive between calls, not gone: keep it on screen longer */
+      if (now - p.lastSeen > (p.status || p.waiting ? 60_000 : 20_000)) {
         byName.delete(key)
         broadcast(canvasId, { type: 'presence:leave', clientId: p.clientId })
         actions.endAgentTasks(canvasId, p.name) // an agent that went silent is no longer "working on" anything
@@ -226,9 +241,22 @@ setInterval(() => {
   }
 }, 5000)
 
-actions.wire(broadcast, agentTouch, cancelCanvasRuns)
+/** Mark an agent as parked in a long wait (wait_for_events / ask_human). */
+export function markAgentWaiting(canvasId: string, agentName: string, waiting: boolean): void {
+  const byName = agentPresences.get(canvasId)
+  const key = [...(byName?.keys() ?? [])].find((k) => k.endsWith(`::${agentName}`))
+  const p = key ? byName?.get(key) : undefined
+  if (p) {
+    p.waiting = waiting
+    p.lastSeen = Date.now()
+  }
+}
 
-/* ------------------------------------------------- http api */
+actions.wire(broadcast, agentTouch, cancelCanvasRuns, markAgentWaiting)
+
+/* the Run tab sees tool calls live, and the timeline is a 7-day window */
+runLog.wireBroadcast(broadcast)
+runLog.pruneOlderThan(7 * 24 * 60 * 60 * 1000)
 
 const app = express()
 
@@ -1226,10 +1254,205 @@ app.post(
   },
 )
 
-
 /* ---- pages: ordered sub-canvases on a canvas ---- */
 
-const pageName = (raw: unknown) => String(raw ?? '').trim().slice(0, 80) || 'Untitled'
+const pageName = (raw: unknown) =>
+  String(raw ?? '')
+    .trim()
+    .slice(0, 80) || 'Untitled'
+
+/** Owner-only canvas setting: agent frame writes land as proposals. */
+app.post('/api/canvases/:id/review-mode', (req, res) => {
+  if (!requireCanvas(req, res, req.params.id)) return
+  const canvas = store.getCanvas(req.params.id)!
+  if (canvas.ownerId !== req.user!.id) return res.status(403).json({ error: 'only the owner can change review mode' })
+  const on = !!req.body?.on
+  const actor = resolveActorFromReq(req)
+  actions.setCanvasReviewMode(req.params.id, on, actor)
+  res.json({ reviewMode: on })
+})
+
+/* ---- agent review, questions, run timeline, versions, queue ---- */
+
+/** Pending agent frame-change proposals for review mode. */
+app.get('/api/canvases/:id/frame-proposals', (req, res) => {
+  if (!requireCanvas(req, res, req.params.id)) return
+  const status = typeof req.query.status === 'string' ? (req.query.status as FrameProposal['status']) : undefined
+  res.json(actions.getFrameProposals(req.params.id, status))
+})
+
+/** Accept or reject a proposal — any collaborator with canvas access may. */
+app.post('/api/canvases/:id/frame-proposals/:pid', (req, res) => {
+  if (!requireCanvas(req, res, req.params.id)) return
+  const proposal = actions.resolveFrameProposal(
+    req.params.id,
+    req.params.pid,
+    !!req.body?.accept,
+    resolveActorFromReq(req),
+  )
+  if (!proposal) return res.status(404).json({ error: 'proposal not found' })
+  res.json(proposal)
+})
+
+/** Withdraw one of your own pending proposals. */
+app.delete('/api/canvases/:id/frame-proposals/:pid', (req, res) => {
+  if (!requireCanvas(req, res, req.params.id)) return
+  const proposal = actions.withdrawFrameProposal(req.params.id, req.params.pid, resolveActorFromReq(req))
+  if (!proposal) return res.status(404).json({ error: 'proposal not found' })
+  res.json(proposal)
+})
+
+/** Agent questions (ask_human): answer or read them. */
+app.get('/api/canvases/:id/questions', (req, res) => {
+  if (!requireCanvas(req, res, req.params.id)) return
+  const status = typeof req.query.status === 'string' ? (req.query.status as AgentQuestion['status']) : undefined
+  res.json(actions.getQuestions(req.params.id, status))
+})
+
+app.post('/api/canvases/:id/questions/:qid', (req, res) => {
+  if (!requireCanvas(req, res, req.params.id)) return
+  const question = actions.answerQuestion(
+    req.params.id,
+    req.params.qid,
+    String(req.body?.answer ?? ''),
+    resolveActorFromReq(req),
+  )
+  if (!question) return res.status(404).json({ error: 'question not found' })
+  res.json(question)
+})
+
+/** A run's tool-call timeline, newest first. */
+app.get('/api/canvases/:id/run-events', (req, res) => {
+  if (!requireCanvas(req, res, req.params.id)) return
+  const runId = typeof req.query.run_id === 'string' ? req.query.run_id : undefined
+  res.json(runLog.getRunEvents(req.params.id, { runId, limit: Math.min(500, Number(req.query.limit) || 200) }))
+})
+
+/** Pause a live agent run (the card stays open, skipped by the sweep). */
+app.post('/api/canvases/:id/agents/pause', (req, res) => {
+  if (!requireCanvas(req, res, req.params.id)) return
+  const agentName = String(req.body?.agent_name ?? '')
+  if (!agentName) return res.status(400).json({ error: 'agent_name is required' })
+  res.json({ paused: actions.pauseAgentWork(req.params.id, agentName, req.user!.name) })
+})
+
+app.post('/api/canvases/:id/cards/:cardId/resume', (req, res) => {
+  if (!requireCanvas(req, res, req.params.id)) return
+  const card = actions.resumeCard(req.params.id, req.params.cardId, req.user!.name)
+  if (!card) return res.status(404).json({ error: 'card not found' })
+  res.json(card)
+})
+
+/** Queue ordering: an explicit order rewrite, or a single card's priority. */
+app.post('/api/canvases/:id/cards/reorder', (req, res) => {
+  if (!requireCanvas(req, res, req.params.id)) return
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(String) : []
+  if (!ids.length) return res.status(400).json({ error: 'ids is required' })
+  actions.reorderCards(req.params.id, ids)
+  res.json({ ok: true })
+})
+
+app.patch('/api/canvases/:id/cards/:cardId', (req, res) => {
+  if (!requireCanvas(req, res, req.params.id)) return
+  const priority = Number(req.body?.priority)
+  if (!Number.isFinite(priority)) return res.status(400).json({ error: 'priority is required' })
+  const card = actions.setCardPriority(req.params.id, req.params.cardId, priority)
+  if (!card) return res.status(404).json({ error: 'card not found' })
+  res.json(card)
+})
+
+/** Frame version history for the Inspector's History section. */
+app.get('/api/frames/:frameId/versions', async (req, res) => {
+  const frame = requireFrame(req, res, req.params.frameId)
+  if (!frame) return
+  const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 20))
+  res.json(await persist.listFrameVersions(frame.id, limit))
+})
+
+app.get('/api/frames/:frameId/versions/:versionId', async (req, res) => {
+  const frame = requireFrame(req, res, req.params.frameId)
+  if (!frame) return
+  const version = await persist.getFrameVersion(req.params.versionId)
+  if (!version || version.frameId !== frame.id) return res.status(404).json({ error: 'version not found' })
+  res.json(version)
+})
+
+/** Revert a frame to a saved version — itself a new version, so it is undoable. */
+app.post('/api/frames/:frameId/revert', async (req, res) => {
+  const frame = requireFrame(req, res, req.params.frameId)
+  if (!frame) return
+  const versionId = String(req.body?.version_id ?? '')
+  if (!versionId) return res.status(400).json({ error: 'version_id is required' })
+  const updated = await actions.revertFrame(frame.id, versionId, resolveActorFromReq(req))
+  if (!updated) return res.status(404).json({ error: 'frame not found' })
+  res.json(updated)
+})
+
+/** Visual diff of the frame's current html against a saved version. */
+app.post('/api/frames/:frameId/diff', async (req, res) => {
+  const frame = requireFrame(req, res, req.params.frameId)
+  if (!frame) return
+  const versionId = String(req.body?.version_id ?? '')
+  const version = versionId ? await persist.getFrameVersion(versionId) : undefined
+  if (!version || version.frameId !== frame.id) return res.status(404).json({ error: 'version not found' })
+  try {
+    const diff = await diffFrames(frame, { ...frame, html: version.html, width: version.width, height: version.height })
+    const asset = await createAsset(diff.diff_png, {
+      canvasId: frame.canvasId,
+      ownerId: frame.canvasId,
+      uploadedBy: req.user!.name,
+    })
+    res.json({
+      png: `${PUBLIC_ORIGIN}/a/${asset.id}.${asset.ext}`,
+      changed_ratio: Number(diff.changed_ratio.toFixed(4)),
+    })
+  } catch (err) {
+    console.error('[diff] failed', err)
+    res.status(503).json({ error: 'renderer unavailable' })
+  }
+})
+
+/** Render arbitrary html for a proposal preview — never stored, rate limited. */
+app.post('/api/frames/render-preview', async (req, res) => {
+  if (!req.user) return res.status(401).json({ error: 'unauthorized' })
+  const html = String(req.body?.html ?? '')
+  const width = Math.max(120, Math.min(2000, Number(req.body?.width) || 1280))
+  const height = Math.max(120, Math.min(6000, Number(req.body?.height) || 800))
+  if (!html || html.length > 3_000_000) return res.status(400).json({ error: 'html is required (max 3 MB)' })
+  const hits = (renderPreviewHits.get(req.user.id) ?? []).filter((t) => Date.now() - t < 60_000)
+  if (hits.length >= 12) return res.status(429).json({ error: 'too many previews, wait a minute' })
+  hits.push(Date.now())
+  renderPreviewHits.set(req.user.id, hits)
+  try {
+    const png = await renderHtmlPreview(html, { width, height })
+    res.type('png').send(png)
+  } catch (err) {
+    console.error('[render-preview] failed', err)
+    res.status(503).json({ error: 'renderer unavailable' })
+  }
+})
+
+/** Take a frame's edit lock away from a stuck agent. */
+app.post('/api/frames/:frameId/unlock', (req, res) => {
+  const frame = requireFrame(req, res, req.params.frameId)
+  if (!frame) return
+  frameLocks.release(frame.id, 'human:' + req.user!.name)
+  broadcast(frame.canvasId, { type: 'frame:lock', frameId: frame.id, holder: null })
+  res.json({ unlocked: true })
+})
+
+/** Per-user email preference for agent events. */
+app.get('/api/settings/notifications', async (req, res) => {
+  if (!req.user) return res.status(401).json({ error: 'unauthorized' })
+  res.json({ agentEmail: await notifications.getNotificationPref(req.user.id) })
+})
+
+app.post('/api/settings/notifications', async (req, res) => {
+  if (!req.user) return res.status(401).json({ error: 'unauthorized' })
+  const agentEmail = !!req.body?.agentEmail
+  notifications.setNotificationPref(req.user.id, agentEmail)
+  res.json({ agentEmail })
+})
 
 app.post('/api/canvases/:id/pages', (req, res) => {
   if (!requireCanvas(req, res, req.params.id)) return
@@ -1724,6 +1947,10 @@ wss.on('connection', (ws, upgradeReq) => {
         decisions: actions.getDecisions(msg.canvasId),
         proposals: actions.getProposals(msg.canvasId),
         plans: actions.getPlans(msg.canvasId),
+        frameProposals: actions.getFrameProposals(msg.canvasId),
+        questions: actions.getQuestions(msg.canvasId),
+        reviewMode: !!canvas.reviewMode,
+        runEvents: runLog.getRunEvents(msg.canvasId, { limit: 200 }),
         selfColor: presence.color,
         serverBuild: BUILD_ID,
       })

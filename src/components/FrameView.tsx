@@ -84,6 +84,10 @@ interface ProbeHit {
   rect: { x: number; y: number; width: number; height: number }
 }
 
+/* Where a question without an element selector pins: the frame's top-left
+   corner, so it is still findable when nothing anchors it. */
+const QUESTION_PIN_POS = { x: 22, y: 22 }
+
 type DragRect = { id: string; x: number; y: number; width: number; height: number }
 
 interface HoverHit {
@@ -294,6 +298,11 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
   const frameComments = useStore((s) => s.comments).filter((c) => c.frameId === frame.id)
   /* only thread roots get a pin; replies live inside the root's popover */
   const comments = frameComments.filter((c) => !c.parentId && !c.resolvedAt)
+
+  /* ---- agent questions on this frame ---- */
+  /* an open question is an agent parked mid-task waiting on a human */
+  const openQuestions = useStore((s) => s.questions).filter((q) => q.frameId === frame.id && q.status === 'open')
+  const lock = useStore((s) => s.frameLocks[frame.id])
   const [probe, setProbe] = useState<ProbeHit | null>(null)
   /* element selected for text editing inside the iframe (edit mode only) */
   const [activeHit, setActiveHit] = useState<ProbeHit | null>(null)
@@ -359,15 +368,20 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
     }, 250)
   }
 
-  /* keep comment pins glued to their elements: re-locate whenever the frame's
-     html or the comment set changes */
   const commentKey = comments.map((c) => c.id).join(',')
+  const questionKey = openQuestions.map((q) => q.id).join(',')
+  /* keep comment (and question) pins glued to their elements: re-locate
+     whenever the frame's html or the pinned set changes */
   useEffect(() => {
     if (!runtimeReady) return
     for (const c of comments) {
       iframeRef.current?.contentWindow?.postMessage({ type: 'doop:locate', reqId: c.id, selector: c.selector }, '*')
     }
-  }, [runtimeReady, html, commentKey]) // eslint-disable-line react-hooks/exhaustive-deps
+    for (const q of openQuestions) {
+      if (q.selector)
+        iframeRef.current?.contentWindow?.postMessage({ type: 'doop:locate', reqId: q.id, selector: q.selector }, '*')
+    }
+  }, [runtimeReady, html, commentKey, questionKey]) // eslint-disable-line react-hooks/exhaustive-deps
 
   /* the selection outline follows its element across html updates (streams,
      agent edits) the same way pins do */
@@ -620,6 +634,15 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
                     {p.kind === 'agent' ? <AgentIcon name={p.name} size={9} color="#fff" /> : '✎'} {p.name}
                   </span>
                 ))}
+              {lock && (
+                <span
+                  className={EDITOR_CHIP}
+                  style={{ background: lock.color }}
+                  title={`${lock.name} is editing this frame`}
+                >
+                  ✎ held by {lock.name}
+                </span>
+              )}
             </span>
           </div>
 
@@ -790,6 +813,49 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
                           }
                         />
                       )}
+                    </div>
+                  )
+                })}
+
+                {/* open agent questions: an agent is parked mid-task waiting
+                on a human, so its pin stays up and answers in the Review tab */}
+                {openQuestions.map((q) => {
+                  const pos = q.selector ? pinPos[q.id] : QUESTION_PIN_POS
+                  if (!pos) return null
+                  const x = Math.min(Math.max(pos.x, 10), frame.width - 10)
+                  const y = Math.min(Math.max(pos.y, 10), frame.height - 10)
+                  return (
+                    <div key={q.id}>
+                      <div
+                        className="pointer-events-auto absolute z-[5] grid h-[26px] w-[26px] cursor-pointer place-items-center rounded-[50%_50%_50%_4px] border-2 border-white bg-accent-ink text-[13px] font-extrabold text-white [transform:translate(-50%,-50%)_scale(min(calc(1/var(--zoom,1)),2.4))] shadow-card animate-[chip-in_0.25s_ease]"
+                        style={{ left: x, top: y }}
+                        onPointerDown={(e) => e.stopPropagation()}
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          useStore.getState().requestPanel('review')
+                        }}
+                        title={`${q.agentName} asks: ${q.text}`}
+                      >
+                        ?
+                      </div>
+                      <div
+                        className="pointer-events-auto absolute z-[5] [transform:translate(-12px,-50%)_scale(min(calc(1/var(--zoom,1)),2.4))]"
+                        style={{ left: x, top: y - 20 }}
+                        onPointerDown={(e) => e.stopPropagation()}
+                      >
+                        <Button
+                          variant="ghost"
+                          className="max-w-[260px] gap-1.5 whitespace-nowrap rounded-full border-line bg-surface px-2.5 py-1 text-[10.5px] font-bold shadow-card hover:bg-surface"
+                          title={`${q.agentName} asks: ${q.text}`}
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            useStore.getState().requestPanel('review')
+                          }}
+                        >
+                          <span className="truncate">{q.text}</span>
+                          <span className="flex-none text-accent-ink">Answer →</span>
+                        </Button>
+                      </div>
                     </div>
                   )
                 })}

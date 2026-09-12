@@ -2,6 +2,7 @@ import { nanoid } from 'nanoid'
 import { store } from './store.ts'
 import * as persist from './db/persist.ts'
 import * as frameLocks from './frameLocks.ts'
+import * as agentEvents from './agentEvents.ts'
 import * as thumbs from './thumbs.ts'
 import { colorFor } from '../shared/types.ts'
 import { validateTokens } from './designLint.ts'
@@ -17,6 +18,10 @@ import type {
   DesignTokens,
   ElementComment,
   Frame,
+  FrameProposal,
+  AgentQuestion,
+  TaskUsage,
+  RunJournal,
   GuidelineDoc,
   MemoryProposal,
   MemoryReference,
@@ -52,10 +57,21 @@ type Cancel = (canvasId: string) => void
 
 let cancel: Cancel = () => {}
 
-export function wire(b: Broadcast, t: AgentTouch, c?: Cancel) {
+/** Flag an agent's presence as parked in a long wait; owned by index.ts. */
+type MarkWaiting = (canvasId: string, agentName: string, waiting: boolean) => void
+
+let markWaiting: MarkWaiting = () => {}
+
+export function wire(b: Broadcast, t: AgentTouch, c?: Cancel, w?: MarkWaiting) {
   broadcast = b
   agentTouch = t
   cancel = c ?? (() => {})
+  markWaiting = w ?? (() => {})
+}
+
+/** while parked in ask_human / wait_for_events the agent is alive but idle */
+export function markAgentWaiting(canvasId: string, agentName: string, waiting: boolean): void {
+  markWaiting(canvasId, agentName, waiting)
 }
 
 const activityLog = new Map<string, ActivityItem[]>() // canvasId -> items (newest first)
@@ -144,6 +160,13 @@ function logActivity(canvasId: string, actor: Actor, message: string, frameId?: 
   broadcast(canvasId, { type: 'activity', item })
 }
 
+/** Owner flips review mode: agent frame writes now land as proposals. */
+export function setCanvasReviewMode(canvasId: string, on: boolean, actor: Actor) {
+  store.setReviewMode(canvasId, on)
+  broadcast(canvasId, { type: 'canvas:reviewMode', reviewMode: on, actor })
+  logActivity(canvasId, actor, on ? 'turned on review mode — agent changes need approval' : 'turned off review mode')
+}
+
 export function resolveActor(
   raw: { name?: string; kind?: string; clientId?: string; owner?: string; ownerId?: string } | undefined,
 ): Actor {
@@ -151,7 +174,6 @@ export function resolveActor(
   const name = raw?.name?.trim() || (kind === 'agent' ? 'AI Agent' : 'Anonymous')
   return { name, kind, color: colorFor(name), clientId: raw?.clientId, owner: raw?.owner, ownerId: raw?.ownerId }
 }
-
 
 /** Refuse a write to a frame another agent has locked. Shared by every
  *  mutation path so external agents and the resident team obey one rule. */
@@ -204,9 +226,9 @@ export function pendingWorkAgents(canvasId: string): string[] {
   const add = (name: string) => {
     if (!names.includes(name)) names.push(name)
   }
-  /* oldest first so a queue is worked in the order humans filled it */
-  for (const card of [...(taskLog.get(canvasId) ?? [])].reverse()) {
-    if (card.queuedBy && !card.agentName && !card.failedAt && !card.endedAt && !card.cancelledAt) add(stageAgent(card))
+  /* priority first, then position, then arrival (queueOrder in card utils) */
+  for (const card of queuedCards(canvasId).reverse()) {
+    add(stageAgent(card))
   }
   for (const f of [...(feedbackLog.get(canvasId) ?? [])].reverse()) {
     if (!f.deliveredAt && !f.failedAt) add(f.targetAgent ?? roleName(DEFAULT_ROLE_ID))
@@ -374,6 +396,7 @@ export function addTaskFeedback(
     feedbackLog.set(canvasId, list)
     persist.saveFeedback(fb)
     broadcast(canvasId, { type: 'feedback', feedback: fb })
+    agentEvents.push(canvasId, { kind: 'feedback', targetAgent: fb.targetAgent, data: { text: clean, from, taskId } })
     /* resident Doop agent picks feedback up instantly (no-op without an API
        key). Dynamic import: resident depends on this module. */
     import('./resident.ts').then((r) => r.onFeedback(canvasId)).catch(() => {})
@@ -390,12 +413,7 @@ export function addTaskFeedback(
 /** Open feedback this agent may take: everything addressed to it, plus
  *  untargeted feedback — that part stays a canvas-level queue where the first
  *  identified agent call wins. */
-export function takeFeedbackFor(
-  canvasId: string,
-  agentName: string,
-  payer?: string,
-  ownerId?: string,
-): TaskFeedback[] {
+export function takeFeedbackFor(canvasId: string, agentName: string, payer?: string, ownerId?: string): TaskFeedback[] {
   const pending = (feedbackLog.get(canvasId) ?? []).filter(
     (f) =>
       !f.deliveredAt &&
@@ -470,6 +488,109 @@ export function retryTaskFeedback(feedbackId: string, by: string): TaskFeedback 
 }
 
 /* ------------------------------------------------------------------ */
+/* Agent questions (ask_human): a blocking ask that lands in the room,  */
+/* plus the event-bus wake so a parked wait returns the answer.        */
+/* ------------------------------------------------------------------ */
+
+/** How long ask_human parks waiting for an answer before returning open.
+ *  The record stays answerable after expiry — the agent can re-check. */
+export const QUESTION_TTL_MS = 5 * 60 * 1000
+
+const questionLog = new Map<string, AgentQuestion[]>() // canvasId -> questions (newest first)
+
+export function getQuestions(canvasId: string, status?: AgentQuestion['status']): AgentQuestion[] {
+  const list = questionLog.get(canvasId) ?? []
+  return status ? list.filter((q) => q.status === status) : list
+}
+
+export function findQuestion(questionId: string): AgentQuestion | undefined {
+  for (const list of questionLog.values()) {
+    const q = list.find((x) => x.id === questionId)
+    if (q) return q
+  }
+  return undefined
+}
+
+/** An agent asked a human a blocking question (ask_human). It surfaces live
+ *  on the canvas and in the Review tab; the answer rides back through the
+ *  event bus into the agent's parked wait. */
+export function askQuestion(
+  canvasId: string,
+  input: { text: string; frameId?: string; selector?: string; waitSeconds?: number },
+  actor: Actor,
+): AgentQuestion | undefined {
+  const text = input.text.trim().slice(0, 2000)
+  if (!text || !store.getCanvas(canvasId)) return undefined
+  const question: AgentQuestion = {
+    id: nanoid(8),
+    canvasId,
+    agentName: actor.name,
+    ...(actor.owner ? { owner: actor.owner } : {}),
+    ...(actor.ownerId ? { ownerId: actor.ownerId } : {}),
+    color: actor.color,
+    ...(input.frameId ? { frameId: input.frameId } : {}),
+    ...(input.selector ? { selector: input.selector } : {}),
+    text,
+    at: Date.now(),
+    status: 'open',
+    expiresAt: Date.now() + Math.max(0, input.waitSeconds ?? 60) * 1000,
+  }
+  const list = questionLog.get(canvasId) ?? []
+  list.unshift(question)
+  if (list.length > 100) list.length = 100
+  questionLog.set(canvasId, list)
+  persist.saveQuestion(question)
+  broadcast(canvasId, { type: 'question', question })
+  /* announce the question itself (a card event): the question_answer event is
+     reserved for the answer, or a parked ask_human would wake immediately */
+  agentEvents.push(canvasId, { kind: 'card', targetAgent: actor.name, data: { questionId: question.id } })
+  /* email the opted-in humans (fire-and-forget; mail off = silently skipped) */
+  import('./notifications.ts')
+    .then((n) => n.notifyAgentEvent(canvasId, 'question', `${actor.name} asks: ${text}`))
+    .catch(() => {})
+  return question
+}
+
+export function answerQuestion(
+  canvasId: string,
+  questionId: string,
+  answer: string,
+  actor: Actor,
+): AgentQuestion | undefined {
+  const question = (questionLog.get(canvasId) ?? []).find((q) => q.id === questionId)
+  if (!question || question.status !== 'open') return question
+  const clean = answer.trim().slice(0, 2000)
+  if (!clean) return question
+  question.status = 'answered'
+  question.answer = clean
+  question.answeredBy = actor.name
+  question.answeredAt = Date.now()
+  persist.saveQuestion(question)
+  broadcast(canvasId, { type: 'question', question })
+  agentEvents.push(canvasId, {
+    kind: 'question_answer',
+    targetAgent: question.agentName,
+    data: { questionId: question.id, answer: clean },
+  })
+  logActivity(canvasId, actor, `answered ${question.agentName}’s question`)
+  return question
+}
+
+/** A question nobody answered before its wait expired — the agent moved on. */
+export function expireQuestion(questionId: string): AgentQuestion | undefined {
+  for (const [canvasId, list] of questionLog) {
+    const q = list.find((x) => x.id === questionId)
+    if (!q || q.status !== 'open') continue
+    q.status = 'expired'
+    persist.saveQuestion(q)
+    broadcast(canvasId, { type: 'question', question: q })
+    return q
+  }
+  return undefined
+}
+
+/* ------------------------------------------------------------------ */
+
 /* Element comments: pinned to a specific element inside a frame.      */
 /* Comments mentioning @Doop are routed to the resident agent; the     */
 /* rest are notes for the humans in the room.                          */
@@ -574,6 +695,11 @@ function postComment(
   commentLog.set(frame.canvasId, list)
   persist.saveComment(comment)
   broadcast(frame.canvasId, { type: 'comment', comment })
+  agentEvents.push(frame.canvasId, {
+    kind: 'comment',
+    targetAgent: comment.targetAgent,
+    data: { commentId: comment.id, frameId: frame.id, text: clean, from: actor.name },
+  })
   const excerpt = clean.length > 80 ? clean.slice(0, 77) + '…' : clean
   logActivity(
     frame.canvasId,
@@ -833,6 +959,7 @@ export function cancelAgentWork(canvasId: string, agentName: string, by: string,
     }
     persist.saveTask(canvasId, t)
     broadcast(canvasId, { type: 'task', task: t })
+    agentEvents.push(canvasId, { kind: 'stop', targetAgent: agentName, data: { taskId: t.id, stoppedBy: by } })
     stopped++
   }
   /* no work was stopped — do not abort whatever run happens to be live */
@@ -916,6 +1043,7 @@ export function addQueuedCard(
   taskLog.set(canvasId, trimTaskLog(list))
   persist.saveTask(canvasId, card)
   broadcast(canvasId, { type: 'task', task: card })
+  agentEvents.push(canvasId, { kind: 'card', data: { cardId: card.id, text: clean, pipeline } })
   logActivity(
     canvasId,
     resolveActor({ name: from, kind: 'user' }),
@@ -1034,15 +1162,10 @@ export function addRepoCards(canvasId: string, input: RepoImportInput, from: str
 /** Cards waiting on THIS agent's stage, claimed by it. A card at another
  *  stage is invisible here — that is what keeps a pipeline in order. */
 export function takeQueuedCardsFor(canvasId: string, agentName: string, payer?: string): AgentTask[] {
-  const pending = (taskLog.get(canvasId) ?? []).filter(
-    (t) =>
-      t.queuedBy &&
-      !t.agentName &&
-      !t.failedAt &&
-      !t.endedAt &&
-      !t.cancelledAt &&
-      stageAgent(t) === agentName &&
-      (payer === undefined || (t.queuedByUserId ?? '') === payer),
+  /* same ordering the sweep sees: priority, then position, then arrival;
+     paused cards are invisible until a human resumes them */
+  const pending = queuedCards(canvasId).filter(
+    (t) => stageAgent(t) === agentName && (payer === undefined || (t.queuedByUserId ?? '') === payer),
   )
   for (const c of pending) {
     c.agentName = agentName
@@ -1075,14 +1198,16 @@ export function claimCard(canvasId: string, cardId: string, agentName: string): 
 }
 
 /** An agent finished its stage: hand the card to the next agent in the
- *  pipeline, or complete it if that was the last one. */
-export function advanceCard(canvasId: string, cardId: string, by: Actor): AgentTask | undefined {
+ *  pipeline, or complete it if that was the last one. The finishing agent's
+ *  final message rides along as the next stage's handoff note. */
+export function advanceCard(canvasId: string, cardId: string, by: Actor, stageSummary?: string): AgentTask | undefined {
   const card = (taskLog.get(canvasId) ?? []).find((t) => t.id === cardId && t.queuedBy)
   if (!card || card.endedAt || card.cancelledAt) return card
   const pipeline = pipelineOf(card)
   const next = (card.stage ?? 0) + 1
   if (next >= pipeline.length) return completeCard(canvasId, cardId)
 
+  if (stageSummary?.trim()) card.stageSummary = stageSummary.trim().slice(0, 1000)
   card.stage = next
   card.agentName = ''
   delete card.claimedAt
@@ -1101,10 +1226,13 @@ export function completeCard(canvasId: string, cardId: string): AgentTask | unde
   card.endedAt = Date.now()
   persist.saveTask(canvasId, card)
   broadcast(canvasId, { type: 'task', task: card })
+  import('./notifications.ts')
+    .then((n) => n.notifyAgentEvent(canvasId, 'completed', `Card done: ${card.status}`))
+    .catch(() => {})
   return card
 }
 
-/** An unsuccessful card stays paused until a human explicitly retries it. */
+/** An unsuccessful card stays failed until a human explicitly retries it. */
 export function failCard(canvasId: string, cardId: string, reason: string): AgentTask | undefined {
   const card = (taskLog.get(canvasId) ?? []).find((t) => t.id === cardId && t.queuedBy)
   if (!card || card.endedAt || card.cancelledAt) return card
@@ -1112,6 +1240,9 @@ export function failCard(canvasId: string, cardId: string, reason: string): Agen
   card.failureReason = reason
   persist.saveTask(canvasId, card)
   broadcast(canvasId, { type: 'task', task: card })
+  import('./notifications.ts')
+    .then((n) => n.notifyAgentEvent(canvasId, 'failed', `Card failed: ${card.status}`))
+    .catch(() => {})
   return card
 }
 
@@ -1232,6 +1363,7 @@ setInterval(() => {
       reveals.delete(frameId)
       continue
     }
+
     const total = frame.html.length
     const remaining = total - r.shown
 
@@ -1602,7 +1734,8 @@ export function updatePlanStep(
   if (!plan) return undefined
   const step = plan.steps.find((s) => s.id === stepId)
   if (!step) return undefined
-  if (note !== undefined && note.length > MAX_STEP_NOTE) throw new Error(`note is longer than ${MAX_STEP_NOTE} characters`)
+  if (note !== undefined && note.length > MAX_STEP_NOTE)
+    throw new Error(`note is longer than ${MAX_STEP_NOTE} characters`)
   step.status = status
   if (note !== undefined) step.note = note
   step.updatedAt = Date.now()
@@ -1886,4 +2019,340 @@ export function resolveProposal(
   broadcast(canvasId, { type: 'proposal', proposal })
   if (accept) logActivity(canvasId, actor, `accepted a Memory rule into “${proposal.guideName}”`)
   return proposal
+}
+
+/* ------------------------------------------------------------------ */
+/* Frame proposals (review mode): an agent proposes; a human accepts.  */
+/* The accept path writes through the ordinary actions so the change   */
+/* versions, broadcasts and logs exactly like any human edit.          */
+/* ------------------------------------------------------------------ */
+
+const frameProposalLog = new Map<string, FrameProposal[]>() // canvasId -> newest first
+
+export function getFrameProposals(canvasId: string, status?: FrameProposal['status']): FrameProposal[] {
+  const list = frameProposalLog.get(canvasId) ?? []
+  return status ? list.filter((p) => p.status === status) : list
+}
+
+export function findFrameProposal(proposalId: string): FrameProposal | undefined {
+  for (const list of frameProposalLog.values()) {
+    const p = list.find((x) => x.id === proposalId)
+    if (p) return p
+  }
+  return undefined
+}
+
+export function addFrameProposal(
+  canvasId: string,
+  input: {
+    kind: FrameProposal['kind']
+    frameId?: string
+    name?: string
+    html?: string
+    x?: number
+    y?: number
+    width?: number
+    height?: number
+    summary: string
+  },
+  actor: Actor,
+): FrameProposal | undefined {
+  const target = input.frameId ? store.getFrame(input.frameId) : undefined
+  if (input.frameId && !target) return undefined
+  if ((input.kind === 'replace_html' || input.kind === 'delete_frame') && !target) return undefined
+  if (input.kind === 'create_frame' && !store.getCanvas(canvasId)) return undefined
+  const proposal: FrameProposal = {
+    id: nanoid(8),
+    kind: input.kind,
+    ...(input.frameId ? { frameId: input.frameId } : {}),
+    ...(input.name ? { name: input.name } : {}),
+    ...(input.html !== undefined ? { html: input.html } : {}),
+    ...(input.x !== undefined ? { x: input.x } : {}),
+    ...(input.y !== undefined ? { y: input.y } : {}),
+    ...(input.width !== undefined ? { width: input.width } : {}),
+    ...(input.height !== undefined ? { height: input.height } : {}),
+    baseUpdatedAt: target?.updatedAt ?? Date.now(),
+    summary: input.summary.trim().slice(0, 500) || input.kind.replace('_', ' '),
+    agentName: actor.name,
+    ...(actor.owner ? { owner: actor.owner } : {}),
+    ...(actor.ownerId ? { ownerId: actor.ownerId } : {}),
+    color: actor.color,
+    at: Date.now(),
+    status: 'pending',
+  }
+  const list = frameProposalLog.get(canvasId) ?? []
+  list.unshift(proposal)
+  if (list.length > 100) list.length = 100
+  frameProposalLog.set(canvasId, list)
+  persist.saveFrameProposal(canvasId, proposal)
+  broadcast(canvasId, { type: 'frameProposal', proposal })
+  agentEvents.push(canvasId, {
+    kind: 'frame_proposal',
+    targetAgent: actor.name,
+    data: { proposalId: proposal.id, kind: proposal.kind, frameId: proposal.frameId },
+  })
+  logActivity(canvasId, actor, `proposed a ${input.kind.replace('_', ' ')} — waiting for review`)
+  return proposal
+}
+
+/** A human accepted or rejected a proposal. Accepting after the frame moved
+ *  again marks it stale instead of overwriting the newer design. */
+export function resolveFrameProposal(
+  canvasId: string,
+  proposalId: string,
+  accept: boolean,
+  actor: Actor,
+): FrameProposal | undefined {
+  const proposal = (frameProposalLog.get(canvasId) ?? []).find((p) => p.id === proposalId)
+  if (!proposal || proposal.status !== 'pending') return proposal
+  if (accept) {
+    const frame = proposal.frameId ? store.getFrame(proposal.frameId) : undefined
+    if (frame && frame.updatedAt !== proposal.baseUpdatedAt) {
+      proposal.status = 'stale'
+    } else if (proposal.kind === 'replace_html' && frame) {
+      updateFrame(frame.id, { html: proposal.html ?? frame.html }, actor)
+    } else if (proposal.kind === 'delete_frame' && frame) {
+      deleteFrame(frame.id, actor)
+    } else if (proposal.kind === 'create_frame') {
+      createFrame(
+        canvasId,
+        {
+          name: proposal.name ?? 'Proposed frame',
+          html: proposal.html,
+          ...(proposal.x !== undefined ? { x: proposal.x } : {}),
+          ...(proposal.y !== undefined ? { y: proposal.y } : {}),
+          ...(proposal.width !== undefined ? { width: proposal.width } : {}),
+          ...(proposal.height !== undefined ? { height: proposal.height } : {}),
+        },
+        actor,
+      )
+    }
+    proposal.status = proposal.status === 'stale' ? 'stale' : 'accepted'
+  } else {
+    proposal.status = 'rejected'
+  }
+  proposal.resolvedBy = actor.name
+  proposal.resolvedAt = Date.now()
+  persist.saveFrameProposal(canvasId, proposal)
+  broadcast(canvasId, { type: 'frameProposal', proposal })
+  agentEvents.push(canvasId, {
+    kind: 'frame_proposal',
+    targetAgent: proposal.agentName,
+    data: { proposalId: proposal.id, status: proposal.status },
+  })
+  logActivity(canvasId, actor, `${accept ? 'accepted' : 'rejected'} ${proposal.agentName}’s proposal`)
+  return proposal
+}
+
+export function withdrawFrameProposal(canvasId: string, proposalId: string, actor: Actor): FrameProposal | undefined {
+  const proposal = (frameProposalLog.get(canvasId) ?? []).find((p) => p.id === proposalId)
+  if (!proposal || proposal.status !== 'pending') return proposal
+  proposal.status = 'withdrawn'
+  proposal.resolvedBy = actor.name
+  proposal.resolvedAt = Date.now()
+  persist.saveFrameProposal(canvasId, proposal)
+  broadcast(canvasId, { type: 'frameProposal', proposal })
+  return proposal
+}
+
+/** Gate every agent frame write through review mode. Returns the proposal
+ *  instead of writing when the canvas is in review mode and the writer is an
+ *  agent; otherwise returns undefined and the caller writes directly. */
+export function proposeInsteadOfWrite(
+  canvasId: string,
+  op: {
+    kind: FrameProposal['kind']
+    frameId?: string
+    name?: string
+    html?: string
+    x?: number
+    y?: number
+    width?: number
+    height?: number
+    summary: string
+  },
+  actor: Actor,
+): FrameProposal | undefined {
+  if (actor.kind !== 'agent' || !store.getCanvas(canvasId)?.reviewMode) return undefined
+  return addFrameProposal(canvasId, op, actor)
+}
+
+/* ------------------------------------------------------------------ */
+/* Pause / resume: an aborted run whose card is skipped by the sweep   */
+/* until a human resumes it. Not terminal — no metered retry needed.   */
+/* ------------------------------------------------------------------ */
+
+/** Pause a live run: abort the model call like a stop, but keep the card
+ *  open and paused instead of cancelling it. */
+export function pauseAgentWork(canvasId: string, agentName: string, by: string): number {
+  const now = Date.now()
+  let paused = 0
+  for (const t of taskLog.get(canvasId) ?? []) {
+    if (t.agentName !== agentName || !t.queuedBy) continue
+    if (t.endedAt || t.cancelledAt || t.pausedAt || t.failedAt) continue
+    t.pausedAt = now
+    t.pausedBy = by
+    /* the card goes back into the queue (stage kept, claim dropped) so a
+       resume is one click and the next sweep re-claims it */
+    t.agentName = ''
+    delete t.claimedAt
+    persist.saveTask(canvasId, t)
+    broadcast(canvasId, { type: 'task', task: t })
+    paused++
+  }
+  if (paused > 0) {
+    frameLocks.releaseAllFor(canvasId, agentName)
+    cancel(canvasId)
+    logActivity(canvasId, resolveActor({ name: by, kind: 'user' }), `paused ${agentName}`)
+  }
+  return paused
+}
+
+/** Resume a paused card: clears the pause and re-fires the resident sweep. */
+export function resumeCard(canvasId: string, cardId: string, by: string): AgentTask | undefined {
+  const card = (taskLog.get(canvasId) ?? []).find((t) => t.id === cardId)
+  if (!card || !card.pausedAt) return card
+  delete card.pausedAt
+  delete card.pausedBy
+  persist.saveTask(canvasId, card)
+  broadcast(canvasId, { type: 'task', task: card })
+  logActivity(canvasId, resolveActor({ name: by, kind: 'user' }), `resumed ${card.agentName || 'a paused card'}`)
+  import('./resident.ts').then((r) => r.onFeedback(canvasId)).catch(() => {})
+  return card
+}
+
+/* ------------------------------------------------------------------ */
+/* Queue ordering: higher priority first, then position, then arrival. */
+/* ------------------------------------------------------------------ */
+
+function queueOrder(a: AgentTask, b: AgentTask): number {
+  const pa = a.priority ?? 0
+  const pb = b.priority ?? 0
+  if (pa !== pb) return pb - pa
+  const sa = a.position ?? Number.MAX_SAFE_INTEGER
+  const sb = b.position ?? Number.MAX_SAFE_INTEGER
+  if (sa !== sb) return sa - sb
+  return a.startedAt - b.startedAt
+}
+
+/** Queued cards in the order work should be taken. */
+export function queuedCards(canvasId: string): AgentTask[] {
+  return (taskLog.get(canvasId) ?? [])
+    .filter((t) => t.queuedBy && !t.agentName && !t.failedAt && !t.endedAt && !t.cancelledAt && !t.pausedAt)
+    .sort(queueOrder)
+}
+
+/** Rewrite the queue order: ids in array order get position 0..n. */
+export function reorderCards(canvasId: string, ids: string[]): boolean {
+  const list = taskLog.get(canvasId) ?? []
+  const byId = new Map(list.map((t) => [t.id, t]))
+  ids.forEach((id, index) => {
+    const card = byId.get(id)
+    if (!card) return
+    card.position = index
+    persist.saveTask(canvasId, card)
+    broadcast(canvasId, { type: 'task', task: card })
+  })
+  return true
+}
+
+export function setCardPriority(canvasId: string, cardId: string, priority: number): AgentTask | undefined {
+  const card = (taskLog.get(canvasId) ?? []).find((t) => t.id === cardId)
+  if (!card) return undefined
+  card.priority = Math.max(0, Math.min(9, Math.round(priority)))
+  persist.saveTask(canvasId, card)
+  broadcast(canvasId, { type: 'task', task: card })
+  return card
+}
+
+/** A specialist handed the card back to an earlier pipeline stage. */
+export function handBackCard(
+  canvasId: string,
+  cardId: string,
+  toAgent: string,
+  reason: string,
+  actor: Actor,
+): AgentTask | undefined {
+  const card = (taskLog.get(canvasId) ?? []).find((t) => t.id === cardId)
+  if (!card || !card.queuedBy) return card
+  const pipeline = pipelineOf(card)
+  const index = pipeline.findIndex((id) => roleName(id) === toAgent || id === toAgent)
+  if (index < 0) return card
+  card.stage = index
+  card.agentName = ''
+  card.handback = { fromAgent: actor.name, reason: reason.trim().slice(0, 500), at: Date.now() }
+  delete card.claimedAt
+  persist.saveTask(canvasId, card)
+  broadcast(canvasId, { type: 'task', task: card })
+  logActivity(canvasId, actor, `handed the card back to ${toAgent}: ${card.handback.reason}`)
+  agentEvents.push(canvasId, { kind: 'card', data: { cardId: card.id, handback: true, toAgent } })
+  import('./resident.ts').then((r) => r.onFeedback(canvasId)).catch(() => {})
+  return card
+}
+
+/** Record what a card's run cost, from the provider's own report. */
+export function recordRunUsage(taskIds: string[], usage: TaskUsage): void {
+  for (const [canvasId, list] of taskLog) {
+    for (const t of list) {
+      if (!taskIds.includes(t.id)) continue
+      t.usage = usage
+      persist.saveTask(canvasId, t)
+      broadcast(canvasId, { type: 'task', task: t })
+    }
+  }
+}
+
+/** Restore a frame to a saved version. An ordinary edit: it versions, it
+ *  broadcasts, and it lands live — a revert is never a dead end. Shared by
+ *  the revert_frame MCP tool and the human History UI. */
+export async function revertFrame(frameId: string, versionId: string, actor: Actor): Promise<Frame | undefined> {
+  const version = await persist.getFrameVersion(versionId)
+  if (!version || version.frameId !== frameId) return undefined
+  frameLocks.release(frameId, actor.name)
+  return updateFrame(
+    frameId,
+    {
+      html: version.html,
+      name: version.name,
+      x: version.x,
+      y: version.y,
+      width: version.width,
+      height: version.height,
+    },
+    actor,
+  )
+}
+
+/** Cross-run memory: what an agent did on its last runs of this canvas. */
+const journalLog = new Map<string, RunJournal[]>() // canvasId -> newest first
+
+export function recordRunJournal(input: {
+  canvasId: string
+  agentName: string
+  cardId?: string
+  summary: string
+  decisions?: string
+}): void {
+  const entry: RunJournal = {
+    id: nanoid(8),
+    canvasId: input.canvasId,
+    agentName: input.agentName,
+    ...(input.cardId ? { cardId: input.cardId } : {}),
+    summary: input.summary.slice(0, 800),
+    ...(input.decisions ? { decisions: input.decisions } : {}),
+    at: Date.now(),
+  }
+  const list = journalLog.get(input.canvasId) ?? []
+  list.unshift(entry)
+  if (list.length > 100) list.length = 100
+  journalLog.set(input.canvasId, list)
+  persist.saveJournal(entry)
+}
+
+/** The role's last runs on this canvas, oldest first — kickoff context. */
+export function getRunJournals(canvasId: string, agentName: string, limit = 3): RunJournal[] {
+  return (journalLog.get(canvasId) ?? [])
+    .filter((j) => j.agentName === agentName)
+    .slice(0, limit)
+    .reverse()
 }

@@ -8,6 +8,16 @@ export interface ConnectedAgent {
   expiresAt: number
   /** how many of its tokens for this user are still live */
   liveTokens: number
+  /** last authenticated MCP call this process saw, ms epoch — 0 = never used */
+  lastUsedAt: number
+}
+
+/** lastUsedAt is per process (it answers "is this client active", not
+ *  "when did it first connect"), so an in-memory map is the right store. */
+const lastUsed = new Map<string, number>()
+
+export function touchClient(clientId: string): void {
+  lastUsed.set(clientId, Date.now())
 }
 
 /** Collapse one user's token rows into one entry per OAuth client.
@@ -31,6 +41,7 @@ export function groupClients(
       name: names.get(r.clientId) ?? 'Unnamed client',
       expiresAt: 0,
       liveTokens: 0,
+      lastUsedAt: lastUsed.get(r.clientId) ?? 0,
     }
     g.expiresAt = Math.max(g.expiresAt, at)
     if (at > now) g.liveTokens++

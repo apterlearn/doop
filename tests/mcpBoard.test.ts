@@ -10,6 +10,14 @@ import type { Canvas, Frame } from '../shared/types.ts'
    real actions machinery — persist + broadcasts are stubbed, the card queue
    state is real. The resident runner's model calls never enter the picture. */
 vi.mock('../server/db/persist.ts', () => ({
+  getUserEmail: async () => undefined,
+  getNotificationPrefs: async () => new Map(),
+  saveNotificationPref: () => {},
+  pruneRunEvents: () => {},
+  saveJournal: () => {},
+  saveRunEvent: () => {},
+  saveQuestion: () => {},
+  saveFrameProposal: () => {},
   saveTask: () => {},
   saveFeedback: () => {},
   saveComment: () => {},

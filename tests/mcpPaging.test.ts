@@ -11,6 +11,14 @@ import type { Canvas, Frame } from '../shared/types.ts'
    say so and name the tool that pages through it, instead of silently filling
    the caller's context. */
 vi.mock('../server/db/persist.ts', () => ({
+  getUserEmail: async () => undefined,
+  getNotificationPrefs: async () => new Map(),
+  saveNotificationPref: () => {},
+  pruneRunEvents: () => {},
+  saveJournal: () => {},
+  saveRunEvent: () => {},
+  saveQuestion: () => {},
+  saveFrameProposal: () => {},
   hydrate: () => {},
   saveCanvas: () => {},
   saveFrame: () => {},
@@ -138,7 +146,12 @@ describe('paged MCP reads', () => {
       expect(first.parsed.has_more).toBe(true)
       expect(first.parsed.next_offset).toBe(50)
 
-      const last = await callTool(client, 'list_frames', { canvas_id: CANVAS_ID, limit: 50, offset: 100, agent_name: 'Claude' })
+      const last = await callTool(client, 'list_frames', {
+        canvas_id: CANVAS_ID,
+        limit: 50,
+        offset: 100,
+        agent_name: 'Claude',
+      })
       expect((last.parsed.frames as unknown[]).length).toBe(21)
       expect(last.parsed.has_more).toBe(false)
       expect(last.parsed.next_offset).toBeUndefined()
@@ -151,10 +164,18 @@ describe('paged MCP reads', () => {
     seedCanvas()
     const { client, close } = await connect()
     try {
-      const byName = await callTool(client, 'list_frames', { canvas_id: CANVAS_ID, page: 'Page 1', agent_name: 'Claude' })
+      const byName = await callTool(client, 'list_frames', {
+        canvas_id: CANVAS_ID,
+        page: 'Page 1',
+        agent_name: 'Claude',
+      })
       expect(byName.parsed.total).toBe(121)
 
-      const bogus = await callTool(client, 'list_frames', { canvas_id: CANVAS_ID, page: 'Nowhere', agent_name: 'Claude' })
+      const bogus = await callTool(client, 'list_frames', {
+        canvas_id: CANVAS_ID,
+        page: 'Nowhere',
+        agent_name: 'Claude',
+      })
       expect(bogus.isError).toBe(true)
       expect(JSON.parse(bogus.raw).error.code).toBe('invalid_input')
 
@@ -174,13 +195,21 @@ describe('paged MCP reads', () => {
     seedCanvas()
     const { client, close } = await connect()
     try {
-      const { parsed } = await callTool(client, 'get_canvas', { canvas_id: CANVAS_ID, frames_limit: 5, agent_name: 'Claude' })
+      const { parsed } = await callTool(client, 'get_canvas', {
+        canvas_id: CANVAS_ID,
+        frames_limit: 5,
+        agent_name: 'Claude',
+      })
       expect((parsed.frames as unknown[]).length).toBe(5)
       expect(parsed.frame_total).toBe(121)
       expect(parsed.frames_truncated).toBe(true)
       expect(String(parsed.note)).toContain('list_frames')
 
-      const full = await callTool(client, 'get_canvas', { canvas_id: CANVAS_ID, frames_limit: 200, agent_name: 'Claude' })
+      const full = await callTool(client, 'get_canvas', {
+        canvas_id: CANVAS_ID,
+        frames_limit: 200,
+        agent_name: 'Claude',
+      })
       expect(full.parsed.frames_truncated).toBeUndefined()
       expect((full.parsed.frames as unknown[]).length).toBe(121)
     } finally {

@@ -104,3 +104,26 @@ async function consumeRenderBudget(ip: string, isAuthenticated: () => Promise<bo
    single-flight because concurrent import() of one module can serialize */
 let screenshot: Promise<typeof import('./screenshot.ts')> | undefined
 const loadScreenshot = () => (screenshot ??= import('./screenshot.ts'))
+
+/** Render arbitrary (untrusted) html to a PNG without storing a frame —
+ *  the proposal-preview surface. Same sandboxing as a frame render, same
+ *  transient lifetime: the bytes exist only for this response. */
+export async function renderHtmlPreview(html: string, viewport: { width: number; height: number }): Promise<Buffer> {
+  const frame: Frame = {
+    id: 'preview',
+    canvasId: 'preview',
+    name: 'preview',
+    html,
+    x: 0,
+    y: 0,
+    width: viewport.width,
+    height: viewport.height,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    updatedBy: 'system',
+  }
+  /* lazy: the existing module pattern keeps puppeteer-core out of dev's
+     startup; single-flight import so concurrent renders share one module */
+  const { renderFrame } = await loadScreenshot()
+  return renderFrame(frame, 1, { type: 'png', viewport })
+}

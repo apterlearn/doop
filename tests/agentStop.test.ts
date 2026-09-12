@@ -3,6 +3,14 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 /* Stops are persisted and broadcast; these cases only care about the state a
    card ends up in, so both sides are stubbed. */
 vi.mock('../server/db/persist.ts', () => ({
+  getUserEmail: async () => undefined,
+  getNotificationPrefs: async () => new Map(),
+  saveNotificationPref: () => {},
+  pruneRunEvents: () => {},
+  saveJournal: () => {},
+  saveRunEvent: () => {},
+  saveQuestion: () => {},
+  saveFrameProposal: () => {},
   saveTask: () => {},
   saveFeedback: () => {},
   saveComment: () => {},

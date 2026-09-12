@@ -13,6 +13,14 @@ import type { Canvas, Frame } from '../shared/types.ts'
    there, another agent's lock, an oversized document. */
 
 vi.mock('../server/db/persist.ts', () => ({
+  getUserEmail: async () => undefined,
+  getNotificationPrefs: async () => new Map(),
+  saveNotificationPref: () => {},
+  pruneRunEvents: () => {},
+  saveJournal: () => {},
+  saveRunEvent: () => {},
+  saveQuestion: () => {},
+  saveFrameProposal: () => {},
   hydrate: () => {},
   saveCanvas: () => {},
   saveCanvasCopy: () => {},
@@ -273,7 +281,9 @@ describe('apply_ops', () => {
     try {
       const { parsed } = await callTool(client, 'apply_ops', {
         canvas_id: CANVAS_ID,
-        ops: [{ op: 'create_frame', canvas_id: 'somewhere-else', name: 'Stray', html: '<p>x</p>', agent_name: 'Claude' }],
+        ops: [
+          { op: 'create_frame', canvas_id: 'somewhere-else', name: 'Stray', html: '<p>x</p>', agent_name: 'Claude' },
+        ],
         agent_name: 'Claude',
       })
       expect(parsed.applied).toBe(0)

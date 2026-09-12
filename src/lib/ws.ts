@@ -86,8 +86,7 @@ function handle(msg: ServerMessage) {
       s.setCanvas(msg.canvas)
       /* land on the first page tab on a fresh load, and repair a tab left
          over from a previously viewed canvas */
-      if (!msg.canvas.pages?.some((p) => p.id === s.activePageId))
-        s.setActivePage(msg.canvas.pages?.[0]?.id)
+      if (!msg.canvas.pages?.some((p) => p.id === s.activePageId)) s.setActivePage(msg.canvas.pages?.[0]?.id)
       s.setPresences(msg.presences)
       s.setActivity(msg.activity)
       s.setTasks(msg.tasks)
@@ -96,6 +95,10 @@ function handle(msg: ServerMessage) {
       s.setDecisions(msg.decisions)
       s.setProposals(msg.proposals)
       s.setPlans(msg.plans)
+      s.setFrameProposals(msg.frameProposals)
+      s.setQuestions(msg.questions)
+      s.setReviewModeLocal(msg.reviewMode)
+      s.setRunEvents(msg.runEvents)
       break
     case 'presence:join':
       if (msg.presence.clientId !== me) s.upsertPresence(msg.presence)
@@ -162,6 +165,24 @@ function handle(msg: ServerMessage) {
       break
     case 'proposal':
       s.upsertProposal(msg.proposal)
+      break
+    case 'frameProposal':
+      s.upsertFrameProposal(msg.proposal)
+      break
+    case 'frameProposal:deleted':
+      s.removeFrameProposal(msg.proposalId)
+      break
+    case 'question':
+      s.upsertQuestion(msg.question)
+      break
+    case 'run:event':
+      s.pushRunEvent(msg.event)
+      break
+    case 'canvas:reviewMode':
+      s.setReviewModeLocal(msg.reviewMode)
+      break
+    case 'frame:lock':
+      s.setFrameLock(msg.frameId, msg.holder)
       break
     case 'canvas:deleted':
       /* the room only receives this for the canvas it's viewing */

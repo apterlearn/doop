@@ -1,21 +1,36 @@
 import { create } from 'zustand'
 import type {
   ActivityItem,
+  ActorKind,
   AgentPlan,
+  AgentQuestion,
   AgentTask,
   Canvas,
   DesignDecision,
   DesignTokens,
   ElementComment,
   Frame,
+  FrameProposal,
+  FrameVersion,
   GuidelineDoc,
   MemoryProposal,
   MemoryReference,
   Page,
   Presence,
+  RunEvent,
   TaskFeedback,
 } from '../../shared/types'
 import type { SnapGuide } from './snap'
+
+/** Which tab the side panel shows. */
+export type PanelTab = 'tasks' | 'activity' | 'memory' | 'agents' | 'review' | 'run'
+
+/** Who holds a frame's edit lock, as the server broadcasts it. */
+export interface FrameLockHolder {
+  name: string
+  color: string
+  kind: ActorKind
+}
 
 export interface Viewport {
   x: number
@@ -41,9 +56,25 @@ interface State {
   /** agent plans on the open canvas, newest first — each one is an agent's
    *  published list of steps, shown alongside its live task */
   plans: AgentPlan[]
+  /** agent frame changes waiting for approval while review mode is on */
+  frameProposals: FrameProposal[]
+  /** questions agents asked; open ones surface on their frame and in Review */
+  questions: AgentQuestion[]
+  /** the resident agents' tool-call timeline, newest first */
+  runEvents: RunEvent[]
+  /** frameId -> saved versions, loaded on demand by the Inspector's History */
+  frameVersions: Record<string, FrameVersion[]>
+  /** frameId -> the actor editing it right now; agents hold these, humans
+   *  never do, and a human sees the chip so they know why a frame is busy */
+  frameLocks: Record<string, FrameLockHolder>
+  /** the canvas refuses agent frame writes until a human approves them */
+  reviewMode: boolean
   /** which tab the side panel shows — in the store so a Memory-suggestion
    *  toast anywhere in the app can jump straight to the Memory tab */
-  panelTab: 'tasks' | 'activity' | 'memory' | 'agents'
+  panelTab: PanelTab
+  /** a request for the side panel to open on a tab, raised by a question pin
+   *  or a toast and consumed by CanvasPage — the flyTo pattern for the panel */
+  panelRequest: { tab: PanelTab; at: number } | null
   /** every selected frame, in selection order — marquee and ⇧-click build
    *  this up; a plain click collapses it to one */
   selectedIds: string[]
@@ -123,7 +154,20 @@ interface State {
   pushDecision(decision: DesignDecision): void
   setProposals(proposals: MemoryProposal[]): void
   upsertProposal(proposal: MemoryProposal): void
-  setPanelTab(tab: 'tasks' | 'activity' | 'memory' | 'agents'): void
+  setPanelTab(tab: PanelTab): void
+  setFrameProposals(proposals: FrameProposal[]): void
+  upsertFrameProposal(proposal: FrameProposal): void
+  removeFrameProposal(proposalId: string): void
+  setQuestions(questions: AgentQuestion[]): void
+  upsertQuestion(question: AgentQuestion): void
+  setRunEvents(events: RunEvent[]): void
+  pushRunEvent(event: RunEvent): void
+  setFrameVersions(frameId: string, versions: FrameVersion[]): void
+  setFrameLock(frameId: string, holder: FrameLockHolder | null): void
+  setReviewModeLocal(on: boolean): void
+  /** open the side panel on a tab from anywhere (a question pin, a toast) */
+  requestPanel(tab: PanelTab): void
+  clearPanelRequest(): void
   setLimitWall(v: boolean): void
   allowanceChanged(): void
   requestFlyTo(frameId: string): void
@@ -183,6 +227,13 @@ export const useStore = create<State>((set, get) => ({
   limitWall: false,
   allowanceVersion: 0,
   flyTo: null,
+  frameProposals: [],
+  questions: [],
+  runEvents: [],
+  frameVersions: {},
+  frameLocks: {},
+  reviewMode: false,
+  panelRequest: null,
   selectedIds: [],
   selectedId: null,
   panMode: false,
@@ -198,7 +249,9 @@ export const useStore = create<State>((set, get) => ({
   flashes: {},
   streams: {},
 
-  setCanvas: (canvas) => set({ canvas }),
+  /* leaving a canvas drops its per-frame state: locks and loaded version
+     lists belong to frames that no longer exist on screen */
+  setCanvas: (canvas) => set(canvas ? { canvas } : { canvas: null, frameLocks: {}, frameVersions: {} }),
   setActivePage: (activePageId) => set({ activePageId }),
   setPagesLocal: (pages) =>
     set((s) => {
@@ -285,6 +338,8 @@ export const useStore = create<State>((set, get) => ({
     set((s) => {
       if (!s.canvas) return {}
       const selectedIds = s.selectedIds.filter((id) => id !== frameId)
+      const frameLocks = { ...s.frameLocks }
+      delete frameLocks[frameId]
       return {
         canvas: { ...s.canvas, frames: s.canvas.frames.filter((f) => f.id !== frameId) },
         selectedIds,
@@ -294,8 +349,43 @@ export const useStore = create<State>((set, get) => ({
         /* an open Inspector must not silently retarget onto the promoted frame */
         inspectorOpen: s.selectedId === frameId ? false : s.inspectorOpen,
         ctxMenu: s.ctxMenu?.frameId === frameId ? null : s.ctxMenu,
+        frameLocks,
       }
     }),
+  setFrameProposals: (frameProposals) => set({ frameProposals: (frameProposals ?? []).slice(0, 100) }),
+  upsertFrameProposal: (proposal) =>
+    set((s) => {
+      const frameProposals = s.frameProposals.some((p) => p.id === proposal.id)
+        ? s.frameProposals.map((p) => (p.id === proposal.id ? proposal : p))
+        : [proposal, ...s.frameProposals].slice(0, 100)
+      return { frameProposals }
+    }),
+  removeFrameProposal: (proposalId) =>
+    set((s) => ({ frameProposals: s.frameProposals.filter((p) => p.id !== proposalId) })),
+  setQuestions: (questions) => set({ questions: (questions ?? []).slice(0, 100) }),
+  upsertQuestion: (question) =>
+    set((s) => {
+      const questions = s.questions.some((q) => q.id === question.id)
+        ? s.questions.map((q) => (q.id === question.id ? question : q))
+        : [question, ...s.questions].slice(0, 100)
+      return { questions }
+    }),
+  setRunEvents: (runEvents) => set({ runEvents: (runEvents ?? []).slice(0, 500) }),
+  pushRunEvent: (event) =>
+    set((s) =>
+      s.runEvents.some((e) => e.id === event.id) ? {} : { runEvents: [event, ...s.runEvents].slice(0, 500) },
+    ),
+  setFrameVersions: (frameId, versions) => set((s) => ({ frameVersions: { ...s.frameVersions, [frameId]: versions } })),
+  setFrameLock: (frameId, holder) =>
+    set((s) => {
+      const frameLocks = { ...s.frameLocks }
+      if (holder) frameLocks[frameId] = holder
+      else delete frameLocks[frameId]
+      return { frameLocks }
+    }),
+  setReviewModeLocal: (reviewMode) => set({ reviewMode }),
+  requestPanel: (tab) => set({ panelRequest: { tab, at: Date.now() } }),
+  clearPanelRequest: () => set({ panelRequest: null }),
   renameCanvasLocal: (name) => set((s) => (s.canvas ? { canvas: { ...s.canvas, name } } : {})),
   setGuidelineLocal: (name, doc) =>
     set((s) => {
@@ -307,8 +397,7 @@ export const useStore = create<State>((set, get) => ({
       }
       return { canvas: { ...s.canvas, guidelines: docs } }
     }),
-  setTokensLocal: (tokens) =>
-    set((s) => (s.canvas ? { canvas: { ...s.canvas, tokens: tokens ?? undefined } } : {})),
+  setTokensLocal: (tokens) => set((s) => (s.canvas ? { canvas: { ...s.canvas, tokens: tokens ?? undefined } } : {})),
   setPlans: (plans) => set({ plans }),
   setPlanLocal: (plan) =>
     set((s) => {

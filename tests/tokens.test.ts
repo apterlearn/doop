@@ -14,6 +14,14 @@ import type { Canvas, DesignTokens, Frame } from '../shared/types.ts'
    for the lint where one is installed. */
 
 vi.mock('../server/db/persist.ts', () => ({
+  getUserEmail: async () => undefined,
+  getNotificationPrefs: async () => new Map(),
+  saveNotificationPref: () => {},
+  pruneRunEvents: () => {},
+  saveJournal: () => {},
+  saveRunEvent: () => {},
+  saveQuestion: () => {},
+  saveFrameProposal: () => {},
   hydrate: () => {},
   saveCanvas: () => {},
   saveCanvasCopy: () => {},
@@ -167,7 +175,9 @@ describe('token validation and rendering', () => {
     expect(() => validateTokens(tokens({ spacing: [4, -8] }))).toThrow(/invalid spacing value -8/)
     expect(() => validateTokens(tokens({ radii: [8, Number.NaN] }))).toThrow(/invalid radii value NaN/)
     expect(() => validateTokens(tokens({ shadows: ['soft and dreamy'] }))).toThrow(/invalid shadow/)
-    expect(() => validateTokens(tokens({ spacing: Array.from({ length: 13 }, (_, i) => i + 1) }))).toThrow(/the limit is 12/)
+    expect(() => validateTokens(tokens({ spacing: Array.from({ length: 13 }, (_, i) => i + 1) }))).toThrow(
+      /the limit is 12/,
+    )
   })
 
   it('renders the tokens as a :root block', () => {
@@ -382,7 +392,11 @@ describe.skipIf(!findBrowserPath())('lint_frame over a real render', () => {
         agent_name: 'Claude',
       })
 
-      actions.updateFrame(frame.id, { html: page('<h1 style="color:#ff0000">Wrong</h1>') }, actions.resolveActor({ name: 'alice', kind: 'user' }))
+      actions.updateFrame(
+        frame.id,
+        { html: page('<h1 style="color:#ff0000">Wrong</h1>') },
+        actions.resolveActor({ name: 'alice', kind: 'user' }),
+      )
       const dirty = await callTool(client, 'lint_frame', { frame_id: frame.id, agent_name: 'Claude' })
       const colorViolations = (dirty.parsed.violations as unknown as { rule: string; expected: string }[]).filter(
         (v) => v.rule === 'off_token_color',
@@ -390,7 +404,11 @@ describe.skipIf(!findBrowserPath())('lint_frame over a real render', () => {
       expect(colorViolations.length).toBeGreaterThan(0)
       expect(colorViolations[0]!.expected).toBe('ink')
 
-      actions.updateFrame(frame.id, { html: page('<h1 style="color:#111110">Right</h1>') }, actions.resolveActor({ name: 'alice', kind: 'user' }))
+      actions.updateFrame(
+        frame.id,
+        { html: page('<h1 style="color:#111110">Right</h1>') },
+        actions.resolveActor({ name: 'alice', kind: 'user' }),
+      )
       const clean = await callTool(client, 'lint_frame', { frame_id: frame.id, agent_name: 'Claude' })
       expect(clean.parsed.tokens_present).toBe(true)
       expect((clean.parsed.violations as unknown as unknown[]).length).toBe(0)

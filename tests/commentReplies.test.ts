@@ -4,6 +4,14 @@ import type { Frame } from '../shared/types.ts'
 /* Replies are persisted and broadcast like any comment; the unit tests only
    care about how a thread is shaped, so both sides are stubbed. */
 vi.mock('../server/db/persist.ts', () => ({
+  getUserEmail: async () => undefined,
+  getNotificationPrefs: async () => new Map(),
+  saveNotificationPref: () => {},
+  pruneRunEvents: () => {},
+  saveJournal: () => {},
+  saveRunEvent: () => {},
+  saveQuestion: () => {},
+  saveFrameProposal: () => {},
   saveTask: () => {},
   saveFeedback: () => {},
   saveComment: () => {},

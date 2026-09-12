@@ -6,6 +6,8 @@ import { timeAgo } from '../lib/time'
 import { cn } from '@/lib/utils'
 import { AgentIcon } from './AgentIcon'
 import { MemoryPanel } from './MemoryPanel'
+import { ReviewPanel } from './ReviewPanel'
+import { RunPanel } from './RunPanel'
 import { Panel, PanelBody, PanelHeader, PanelTab, PanelTabPanel, PanelTabs, PanelTabsRoot } from './ui/panel'
 import { Button } from './ui/button'
 import { Tooltip } from './ui/tooltip'
@@ -63,6 +65,12 @@ export function ActivityPanel({
             >
               Memory
             </PanelTab>
+            <PanelTab value="review" title="Agent changes waiting for your approval, and their questions">
+              Review
+            </PanelTab>
+            <PanelTab value="run" title="What the agent did, tool call by tool call">
+              Run
+            </PanelTab>
             <PanelTab value="agents" title="MCP clients connected to your account — revoke one to cut it off">
               Clients
             </PanelTab>
@@ -84,6 +92,12 @@ export function ActivityPanel({
         </PanelTabPanel>
         <PanelTabPanel value="activity">
           <ActivityList />
+        </PanelTabPanel>
+        <PanelTabPanel value="review">
+          <ReviewPanel />
+        </PanelTabPanel>
+        <PanelTabPanel value="run">
+          <RunPanel />
         </PanelTabPanel>
         <PanelTabPanel value="memory">
           <MemoryPanel />
@@ -456,7 +470,8 @@ function ClientsList() {
           <div className="min-w-0">
             <div className="truncate font-bold">{c.name}</div>
             <div className="mt-0.5 text-[11px] text-ink-faint">
-              {c.liveTokens} live token{c.liveTokens === 1 ? '' : 's'} · last used {timeAgo(c.expiresAt)}
+              {c.liveTokens} live token{c.liveTokens === 1 ? '' : 's'} ·{' '}
+              {c.lastUsedAt ? `last used ${timeAgo(c.lastUsedAt)}` : 'never used'}
             </div>
           </div>
           <Button

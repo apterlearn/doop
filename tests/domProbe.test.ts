@@ -15,6 +15,14 @@ import type { Canvas, Frame } from '../shared/types.ts'
    the audits need (which is more than inspect_frame shows). */
 
 vi.mock('../server/db/persist.ts', () => ({
+  getUserEmail: async () => undefined,
+  getNotificationPrefs: async () => new Map(),
+  saveNotificationPref: () => {},
+  pruneRunEvents: () => {},
+  saveJournal: () => {},
+  saveRunEvent: () => {},
+  saveQuestion: () => {},
+  saveFrameProposal: () => {},
   hydrate: () => {},
   saveCanvas: () => {},
   saveCanvasCopy: () => {},
@@ -196,10 +204,9 @@ const page = (body: string) =>
 
 describe.skipIf(!findBrowserPath())('probeFrame over a real render', () => {
   it('keeps the interactive elements the audits need, beyond inspect_frame’s sample', async () => {
-    const buttons = Array.from(
-      { length: 90 },
-      (_, i) => `<button style="width:120px;height:40px">B${i}</button>`,
-    ).join('')
+    const buttons = Array.from({ length: 90 }, (_, i) => `<button style="width:120px;height:40px">B${i}</button>`).join(
+      '',
+    )
     const frame = seedFrame(page(`<main>${buttons}</main>`))
 
     const probe = await probeFrame(frame)

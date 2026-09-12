@@ -28,6 +28,8 @@ export const canvases = pgTable('canvases', {
   tokens: jsonb('tokens'),
   createdAt: bigint('created_at', { mode: 'number' }).notNull(),
   updatedAt: bigint('updated_at', { mode: 'number' }).notNull(),
+  /** when on, agent frame writes become frame_proposals instead of landing */
+  reviewMode: boolean('review_mode').notNull().default(false),
 })
 
 /** Users invited to collaborate on a canvas (the owner is not listed).
@@ -199,6 +201,18 @@ export const tasks = pgTable(
     /** comma-joined frame ids the card is about (the human's selection at queue
      *  time) — the agent edits these in place instead of delivering elsewhere */
     targetFrameIds: text('target_frame_ids'),
+    /** a human paused this card's run — skipped until explicitly resumed */
+    pausedAt: bigint('paused_at', { mode: 'number' }),
+    pausedBy: text('paused_by'),
+    /** queue ordering: higher priority first, then position, then arrival */
+    priority: integer('priority'),
+    position: integer('position'),
+    /** the finishing agent's one-line handoff note for the next pipeline stage */
+    stageSummary: text('stage_summary'),
+    /** JSON {fromAgent, reason, at} — a specialist sent the card back a stage */
+    handback: text('handback'),
+    /** JSON {input, output, cacheRead, cacheWrite, model} for the card's run */
+    usage: text('usage'),
   },
   (t) => [index('tasks_canvas_idx').on(t.canvasId)],
 )
@@ -484,4 +498,97 @@ export const backgrounds = pgTable('backgrounds', {
   /** off = kept but hidden from search; new uploads without tags start off */
   enabled: boolean('enabled').notNull().default(true),
   createdAt: bigint('created_at', { mode: 'number' }).notNull(),
+})
+
+/** A frame change an agent proposed while the canvas is in review mode.
+ *  Accepting applies it through the ordinary actions; nothing touches the
+ *  canvas until then. `base_updated_at` is the stale guard. */
+export const frameProposals = pgTable(
+  'frame_proposals',
+  {
+    id: text('id').primaryKey(),
+    canvasId: text('canvas_id').notNull(),
+    kind: text('kind').notNull(),
+    frameId: text('frame_id'),
+    name: text('name'),
+    html: text('html'),
+    x: doublePrecision('x'),
+    y: doublePrecision('y'),
+    width: doublePrecision('width'),
+    height: doublePrecision('height'),
+    baseUpdatedAt: bigint('base_updated_at', { mode: 'number' }).notNull(),
+    summary: text('summary').notNull(),
+    agentName: text('agent_name').notNull(),
+    owner: text('owner'),
+    ownerId: text('owner_id'),
+    color: text('color').notNull(),
+    at: bigint('at', { mode: 'number' }).notNull(),
+    status: text('status').notNull(),
+    resolvedBy: text('resolved_by'),
+    resolvedAt: bigint('resolved_at', { mode: 'number' }),
+  },
+  (t) => [index('frame_proposals_canvas_idx').on(t.canvasId)],
+)
+
+/** A blocking question an agent asked a human via ask_human. */
+export const agentQuestions = pgTable(
+  'agent_questions',
+  {
+    id: text('id').primaryKey(),
+    canvasId: text('canvas_id').notNull(),
+    agentName: text('agent_name').notNull(),
+    owner: text('owner'),
+    ownerId: text('owner_id'),
+    color: text('color').notNull(),
+    frameId: text('frame_id'),
+    selector: text('selector'),
+    text: text('text').notNull(),
+    at: bigint('at', { mode: 'number' }).notNull(),
+    status: text('status').notNull(),
+    answer: text('answer'),
+    answeredBy: text('answered_by'),
+    answeredAt: bigint('answered_at', { mode: 'number' }),
+    expiresAt: bigint('expires_at', { mode: 'number' }).notNull(),
+  },
+  (t) => [index('agent_questions_canvas_idx').on(t.canvasId)],
+)
+
+/** One step of a resident agent run — the Run tab's timeline. */
+export const runEvents = pgTable(
+  'run_events',
+  {
+    id: text('id').primaryKey(),
+    canvasId: text('canvas_id').notNull(),
+    runId: text('run_id').notNull(),
+    agentName: text('agent_name').notNull(),
+    at: bigint('at', { mode: 'number' }).notNull(),
+    kind: text('kind').notNull(),
+    name: text('name'),
+    ok: boolean('ok'),
+    ms: integer('ms'),
+    summary: text('summary'),
+  },
+  (t) => [index('run_events_canvas_idx').on(t.canvasId)],
+)
+
+/** What an agent did on its last runs — the resident's cross-run memory. */
+export const runJournals = pgTable(
+  'run_journals',
+  {
+    id: text('id').primaryKey(),
+    canvasId: text('canvas_id').notNull(),
+    agentName: text('agent_name').notNull(),
+    cardId: text('card_id'),
+    summary: text('summary').notNull(),
+    decisions: text('decisions'),
+    at: bigint('at', { mode: 'number' }).notNull(),
+  },
+  (t) => [index('run_journals_canvas_idx').on(t.canvasId)],
+)
+
+/** Per-user email notification preference for agent events. */
+export const notificationPrefs = pgTable('notification_prefs', {
+  userId: text('user_id').primaryKey(),
+  agentEmail: boolean('agent_email').notNull().default(false),
+  updatedAt: bigint('updated_at', { mode: 'number' }).notNull(),
 })

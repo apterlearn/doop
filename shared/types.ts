@@ -235,6 +235,9 @@ export interface Canvas {
   pages?: Page[]
   /** the canvas's design tokens — the palette, type and scale every frame should use */
   tokens?: DesignTokens
+  /** when on, agent frame writes land as pending proposals a human must
+   *  accept; unset/false means agent edits land canonically (the default) */
+  reviewMode?: boolean
 }
 
 /* ---- design memory ---- */
@@ -296,6 +299,104 @@ export interface MemoryProposal {
   status: 'pending' | 'accepted' | 'dismissed'
   resolvedBy?: string
   resolvedAt?: number
+}
+
+/** A frame change an agent proposed while the canvas is in review mode.
+ *  Nothing touches the canvas until a human accepts. `baseUpdatedAt` is the
+ *  optimistic-concurrency guard: accepting after the frame changed again
+ *  marks the proposal stale instead of overwriting the newer design. */
+export interface FrameProposal {
+  id: string
+  kind: 'replace_html' | 'create_frame' | 'delete_frame'
+  /** target frame for replace_html / delete_frame */
+  frameId?: string
+  /** proposed frame name (create_frame; or a rename alongside the design) */
+  name?: string
+  /** proposed document for replace_html / create_frame */
+  html?: string
+  /** proposed placement/size for create_frame */
+  x?: number
+  y?: number
+  width?: number
+  height?: number
+  /** frame.updatedAt the agent read before proposing; the stale guard */
+  baseUpdatedAt: number
+  /** one-line what-and-why, shown in the review list */
+  summary: string
+  agentName: string
+  owner?: string
+  ownerId?: string
+  color: string
+  at: number
+  status: 'pending' | 'accepted' | 'rejected' | 'withdrawn' | 'stale'
+  resolvedBy?: string
+  resolvedAt?: number
+}
+
+/** A blocking question an agent asked via ask_human. Open questions surface
+ *  on the canvas and in the Review tab; the agent receives the answer inside
+ *  its wait (or on its next tool result when it timed out and moved on). */
+export interface AgentQuestion {
+  id: string
+  canvasId: string
+  agentName: string
+  owner?: string
+  ownerId?: string
+  color: string
+  frameId?: string
+  /** element selector the question is about, from inspect_frame */
+  selector?: string
+  text: string
+  at: number
+  status: 'open' | 'answered' | 'expired'
+  answer?: string
+  answeredBy?: string
+  answeredAt?: number
+  /** after this the wait returns open; the record stays answerable */
+  expiresAt: number
+}
+
+/** One step of a resident agent's run: a model turn, a tool call, a status
+ *  line, an error, or a stop. The Run tab replays these so a human can see
+ *  what the agent actually did. */
+export interface RunEvent {
+  id: string
+  canvasId: string
+  runId: string
+  agentName: string
+  at: number
+  kind: 'turn' | 'tool' | 'status' | 'error' | 'stop'
+  /** tool name for kind 'tool' */
+  name?: string
+  ok?: boolean
+  ms?: number
+  /** one-line result/turn summary (≤200 chars) */
+  summary?: string
+}
+
+/** What an agent did on one past run — the resident's cross-run memory. */
+export interface RunJournal {
+  id: string
+  canvasId: string
+  agentName: string
+  cardId?: string
+  summary: string
+  /** JSON string of what the run touched (frames, guides read) */
+  decisions?: string
+  at: number
+}
+
+/** What wakes an agent parked in wait_for_events / ask_human. */
+export type AgentEventKind = 'feedback' | 'comment' | 'stop' | 'question_answer' | 'frame_proposal' | 'card'
+
+/** A buffered event an agent receives from a long-poll call. `targetAgent`
+ *  scopes it to one agent; unset means every agent on the canvas may see it. */
+export interface AgentEvent {
+  seq: number
+  at: number
+  kind: AgentEventKind
+  targetAgent?: string
+  data?: unknown
 }
 
 /** A named design markdown attached to a canvas — palettes, fonts, layout
@@ -388,6 +489,29 @@ export interface AgentTask {
    *  material the agent must leave alone), these are the card's subject and the
    *  agent edits them in place. */
   targetFrameIds?: string[]
+  /** a human paused this card's run: the run was aborted and the card is
+   *  skipped by the sweep until explicitly resumed. Not terminal like
+   *  cancelledAt — a resume is one click, not a metered retry. */
+  pausedAt?: number
+  pausedBy?: string
+  /** queue ordering: higher first; then position; then arrival */
+  priority?: number
+  position?: number
+  /** the finishing agent's one-line note handed to the next pipeline stage */
+  stageSummary?: string
+  /** a specialist sent the card back to an earlier stage, with its reason */
+  handback?: { fromAgent: string; reason: string; at: number }
+  /** what the card's run cost, as the provider reported it */
+  usage?: TaskUsage
+}
+
+/** Provider-reported token usage for one card's run. */
+export interface TaskUsage {
+  input: number
+  output: number
+  cacheRead: number
+  cacheWrite: number
+  model?: string
 }
 
 export type RepoCardKind = 'sketch' | 'design-system'
@@ -511,7 +635,14 @@ export type ServerMessage =
       /** every agent plan published on this canvas, newest first */
       plans: AgentPlan[]
       selfColor: string
-      /** id of the client bundle the server is serving; 'dev' outside production */
+      /** pending agent frame-change proposals awaiting review */
+      frameProposals: FrameProposal[]
+      /** open agent questions awaiting a human answer */
+      questions: AgentQuestion[]
+      /** whether agent frame writes must be approved before they land */
+      reviewMode: boolean
+      /** per-agent tool-call timeline, newest first (a bounded recent window) */
+      runEvents: RunEvent[]
       serverBuild: string
     }
   | { type: 'presence:join'; presence: Presence }
@@ -544,6 +675,17 @@ export type ServerMessage =
    *  carries the full list so clients can replace canvas.pages wholesale */
   | { type: 'pages'; pages: Page[]; actor: Actor }
   | { type: 'activity'; item: ActivityItem }
+  /** an agent proposed a frame change (review mode), or it was resolved */
+  | { type: 'frameProposal'; proposal: FrameProposal }
+  | { type: 'frameProposal:deleted'; proposalId: string }
+  /** an agent asked a question, or a human answered it */
+  | { type: 'question'; question: AgentQuestion }
+  /** a resident agent emitted a run-timeline event (tool call, turn, stop) */
+  | { type: 'run:event'; event: RunEvent }
+  /** review mode was toggled */
+  | { type: 'canvas:reviewMode'; reviewMode: boolean; actor: Actor }
+  /** a frame edit lock was taken, released or expired (holder null = free) */
+  | { type: 'frame:lock'; frameId: string; holder: { name: string; color: string; kind: ActorKind } | null }
 
 export const CURSOR_PALETTE = [
   '#2743EE', // cursor blue — the brand accent leads

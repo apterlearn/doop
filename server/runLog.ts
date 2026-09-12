@@ -1,0 +1,102 @@
+import { nanoid } from 'nanoid'
+import { eq, lte } from 'drizzle-orm'
+import { db } from './db/index.ts'
+import { runEvents } from './db/schema.ts'
+import type { RunEvent, ServerMessage } from '../shared/types.ts'
+
+/**
+ * The resident agent's run timeline: one record per model turn, tool call,
+ * status line, error or stop, so a human can see what an agent actually did
+ * instead of only where it ended up.
+ *
+ * The per-canvas ring is the hot path and the source of truth for reads, the
+ * same shape as actions.ts's activityLog. Each event is mirrored to the
+ * database fire-and-forget so a restart does not erase the recent history; a
+ * write that fails, or cannot happen yet, never reaches the run.
+ */
+
+/** Ring size per canvas: the Run tab reads a bounded recent window. */
+const CAP = 500
+
+/** How many events a read returns unless the caller asks for fewer. */
+const DEFAULT_LIMIT = 200
+
+const runLog = new Map<string, RunEvent[]>() // canvasId -> events (newest first)
+
+/** Where a recorded event is announced to the canvas's ws room. Wired by the
+ *  server at boot; the no-op default keeps recording usable with no room
+ *  (module tests, a worker process). */
+type Broadcast = (canvasId: string, msg: ServerMessage) => void
+
+let broadcast: Broadcast = () => {}
+
+export function wireBroadcast(b: Broadcast): void {
+  broadcast = b
+}
+
+/** Fire-and-forget DB statement. `db` is unset until the server boots (and in
+ *  module-level tests), and a failed write is logged rather than thrown: the
+ *  ring above already holds the event, and losing durability must not fail
+ *  the run that is reporting it. */
+function writeBehind(statement: () => Promise<unknown>): void {
+  if (!db) return
+  try {
+    statement().catch((err) => console.error('[db] write failed', err))
+  } catch (err) {
+    console.error('[db] write failed', err)
+  }
+}
+
+/** Append one event to a canvas's timeline and return it as stored. */
+export function record(event: Omit<RunEvent, 'id' | 'at'> & { at?: number }): RunEvent {
+  const full: RunEvent = { ...event, id: nanoid(8), at: event.at ?? Date.now() }
+  const list = runLog.get(full.canvasId) ?? []
+  list.unshift(full)
+  if (list.length > CAP) list.length = CAP
+  runLog.set(full.canvasId, list)
+  writeBehind(() =>
+    db.insert(runEvents).values({
+      id: full.id,
+      canvasId: full.canvasId,
+      runId: full.runId,
+      agentName: full.agentName,
+      at: full.at,
+      kind: full.kind,
+      name: full.name ?? null,
+      ok: full.ok ?? null,
+      ms: full.ms ?? null,
+      summary: full.summary ?? null,
+    }),
+  )
+  broadcast(full.canvasId, { type: 'run:event', event: full })
+  return full
+}
+
+/** A canvas's timeline, newest first — optionally one run's, and never more
+ *  than the ring holds. */
+export function getRunEvents(canvasId: string, opts: { limit?: number; runId?: string } = {}): RunEvent[] {
+  const list = runLog.get(canvasId) ?? []
+  const wanted = opts.runId ? list.filter((event) => event.runId === opts.runId) : list
+  const limit = Math.min(Math.max(opts.limit ?? DEFAULT_LIMIT, 0), CAP)
+  return wanted.slice(0, limit)
+}
+
+/** Drop a canvas's timeline: its rows in the database and its ring in memory. */
+export function forgetCanvas(canvasId: string): void {
+  runLog.delete(canvasId)
+  writeBehind(() => db.delete(runEvents).where(eq(runEvents.canvasId, canvasId)))
+}
+
+/** Retention pass: forget everything at least `ms` old — what the boot path
+ *  calls to keep seven days of history. An event exactly on the cutoff counts
+ *  as pruned, so `pruneOlderThan(0)` empties the log. */
+export function pruneOlderThan(ms: number): void {
+  const cutoff = Date.now() - ms
+  for (const [canvasId, list] of runLog) {
+    const kept = list.filter((event) => event.at > cutoff)
+    if (kept.length === list.length) continue
+    if (kept.length === 0) runLog.delete(canvasId)
+    else runLog.set(canvasId, kept)
+  }
+  writeBehind(() => db.delete(runEvents).where(lte(runEvents.at, cutoff)))
+}

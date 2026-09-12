@@ -20,21 +20,28 @@ import { describeInspiration, INSPIRATION_USAGE_NOTE, searchInspiration } from '
 import { ESCAPED_HTML_NOTE, looksEscapedHtml } from './escapedHtml.ts'
 import { describeSyncFlow, getSyncFlow } from './ingest.ts'
 import * as assets from './assets.ts'
+import { buildZip } from './zip.ts'
+import { MAX_FRAME_HTML_BYTES } from './limits.ts'
 import * as imageSearch from './imageSearch.ts'
 import * as backgrounds from './backgrounds.ts'
 import { viewWebsite } from './website.ts'
 import { createImportedWebpageFrame } from './webpageImport.ts'
 import { importPage, normalizeImportUrl } from './importer.ts'
 import { websiteAccessErrorMessage } from './websiteAccess.ts'
-import { MAX_FRAME_HTML_BYTES } from './limits.ts'
+import { reviewFrame } from './review.ts'
 import { roleName } from '../shared/agents.ts'
+import { sanitizeImportedHtml } from './sanitizeHtml.ts'
+import { tailwindThemeCss, tokensJson } from './codeExport.ts'
+import { commitFiles, GithubWriteError } from './githubWrite.ts'
+import { touchClient } from './mcpClients.ts'
+import { capabilities } from './capabilities.ts'
+import * as agentEvents from './agentEvents.ts'
 import { err, mcpErrorPayload, type McpErrorPayload } from './mcpErrors.ts'
 import * as frameLocks from './frameLocks.ts'
 import { replay, replayAsync } from './opIds.ts'
 import { htmlBundle, htmlToReact } from './codeExport.ts'
-import { buildZip } from './zip.ts'
+import type { AgentTask, Canvas, CanvasView, ElementComment, Frame, Page } from '../shared/types.ts'
 import { recordToolCall } from './mcpStats.ts'
-import type { AgentTask, CanvasView, ElementComment, Frame, Page } from '../shared/types.ts'
 
 const INSTRUCTIONS = `Doop is a shared multiplayer design canvas: humans and AI agents design together in real time. Canvases contain frames — artboards that render complete HTML documents live for everyone viewing.
 
@@ -294,12 +301,34 @@ const SEARCHES_PER_MIN = 12
 const importHits = new Map<string, number[]>()
 const IMPORTS_PER_MIN = 5
 
+/* Every render (screenshot, inspect, lint, audit, review, diff, image
+   export) boots a Chromium page; one shared budget keeps an agent from
+   holding the browser hostage. RENDERS_PER_MIN is the number the
+   capabilities tool reports. */
+const renderHits = new Map<string, number[]>()
+const RENDERS_PER_MIN = 60
+
+/** True when the render budget allows one more, else the seconds to wait. */
+function renderBudget(key: string): { ok: true } | { ok: false; retryAfter: number } {
+  const now = Date.now()
+  const hits = (renderHits.get(key) ?? []).filter((t) => now - t < 60_000)
+  if (hits.length >= RENDERS_PER_MIN) {
+    renderHits.set(key, hits)
+    return { ok: false, retryAfter: Math.ceil((60_000 - (now - hits[0]!)) / 1000) }
+  }
+  hits.push(now)
+  renderHits.set(key, hits)
+  return { ok: true }
+}
+
 /* One definition of "check this at a phone width": the screenshot, inspection
    and audit tools must agree on what mobile/tablet/desktop mean. */
 const deviceName = z
   .enum(['mobile', 'tablet', 'desktop'])
   .optional()
-  .describe('Render at a device preset (mobile 390x844, tablet 834x1112, desktop 1440x900) instead of the frame\'s own size')
+  .describe(
+    "Render at a device preset (mobile 390x844, tablet 834x1112, desktop 1440x900) instead of the frame's own size",
+  )
 const viewportOverride = z
   .object({ width: z.number().int().min(1).max(20_000), height: z.number().int().min(1).max(20_000) })
   .optional()
@@ -352,7 +381,9 @@ const canvasListItemShape = {
   updatedAt: z.number(),
   frameCount: z.number(),
   previewFrameId: z.string().optional(),
-  agents: z.array(z.object({ name: z.string(), owner: z.string().optional(), lastAt: z.number().optional() })).optional(),
+  agents: z
+    .array(z.object({ name: z.string(), owner: z.string().optional(), lastAt: z.number().optional() }))
+    .optional(),
   guidelinesCount: z.number(),
 }
 
@@ -483,18 +514,21 @@ function tooLarge(html: string): boolean {
   return html.length > MAX_FRAME_HTML_BYTES
 }
 
-function frameSummary(f: {
-  id: string
-  name: string
-  x: number
-  y: number
-  width: number
-  height: number
-  updatedAt: number
-  updatedBy: string
-  html: string
-  demo?: boolean
-}, page?: { name: string }) {
+function frameSummary(
+  f: {
+    id: string
+    name: string
+    x: number
+    y: number
+    width: number
+    height: number
+    updatedAt: number
+    updatedBy: string
+    html: string
+    demo?: boolean
+  },
+  page?: { name: string },
+) {
   return {
     id: f.id,
     name: f.name,
@@ -519,9 +553,9 @@ function frameSummary(f: {
 /** owner is the connecting user's display name (for attribution); ownerId is
  *  their user id — canvases the agent creates or lists are scoped to it, the
  *  same isolation the web UI gets. */
-export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
+export function buildMcpServer(owner?: string, ownerId?: string, clientId?: string): McpServer {
   const actorFrom = (agent_name?: string) =>
-    actions.resolveActor({ name: agent_name, kind: 'agent', owner, ownerId })
+    actions.resolveActor({ name: agent_name, kind: 'agent', owner, ownerId, clientId })
   /* Canvas access for agents mirrors the web UI: the OAuth user's id runs
      through the same canAccessCanvas gate as browser sessions. Every tool
      that takes a canvas or frame id resolves it through these. */
@@ -564,6 +598,16 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
      canvas-scoped call, not only once it mutates something. */
   const arrive = (canvasId: string, agent_name?: string) => {
     if (agent_name) actions.heartbeatAgent(canvasId, actorFrom(agent_name))
+  }
+  /* Review mode: agent writes land as proposals a human accepts, so the
+     direct writes are refused with the propose path named. */
+  const reviewGate = (canvasId: string) => {
+    const canvas = store.getCanvas(canvasId)
+    if (!canvas?.reviewMode) return undefined
+    return err(
+      'unsupported',
+      'this canvas is in review mode — agent changes need human approval. Deliver with propose_frame_html / propose_frame_create / propose_frame_delete instead; they land the moment a human accepts.',
+    )
   }
   const server = new McpServer({ name: 'doop-canvas', version: '0.1.0' }, { instructions: INSTRUCTIONS })
 
@@ -778,15 +822,18 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
             ]
           : []),
         ...(c.tokens
-          ? [
-              'This canvas has design tokens — read them with get_tokens and use those exact colors, fonts and scales.',
-            ]
+          ? ['This canvas has design tokens — read them with get_tokens and use those exact colors, fonts and scales.']
           : []),
       ]
       const view: CanvasView = {
         id: c.id,
         name: c.name,
-        frames: shown.map((f) => frameSummary(f, c.pages?.find((p) => p.id === f.pageId))),
+        frames: shown.map((f) =>
+          frameSummary(
+            f,
+            c.pages?.find((p) => p.id === f.pageId),
+          ),
+        ),
         frame_total: visible.length,
         ...(truncated ? { frames_truncated: true as const } : {}),
         pages: (c.pages ?? []).map((p) => ({
@@ -812,11 +859,7 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
         tokens_present: !!c.tokens,
         ...(notes.length ? { note: notes.join(' ') } : {}),
       }
-      return withFeedback(
-        structured(view),
-        canvas_id,
-        agent_name ? actorFrom(agent_name) : undefined,
-      )
+      return withFeedback(structured(view), canvas_id, agent_name ? actorFrom(agent_name) : undefined)
     },
   )
 
@@ -860,7 +903,12 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
       const hasMore = offset + frames.length < all.length
       return withFeedback(
         structured({
-          frames: frames.map((f) => frameSummary(f, c.pages?.find((p) => p.id === f.pageId))),
+          frames: frames.map((f) =>
+            frameSummary(
+              f,
+              c.pages?.find((p) => p.id === f.pageId),
+            ),
+          ),
           total: all.length,
           has_more: hasMore,
           ...(hasMore ? { next_offset: offset + frames.length } : {}),
@@ -1147,19 +1195,27 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
       /* ?? keeps an empty string: a blank target must not fall back to
          agent_name or worse, abort whatever run happens to be live */
       const target = (target_agent ?? agent_name).trim()
-      if (!target) return err('invalid_input', 'target_agent is empty — name the agent to stop, or omit it to stop yourself')
+      if (!target)
+        return err('invalid_input', 'target_agent is empty — name the agent to stop, or omit it to stop yourself')
       /* An agent name is typed by the caller, so stopping "Claude" must not
          stop a different account's Claude. The canvas owner and its members
          may stop anyone on their canvas; everyone else only their own agent. */
       const foreign = actions
         .getTasks(canvas_id)
-        .some((t) => t.agentName === target && t.ownerId !== undefined && t.ownerId !== ownerId && !t.endedAt && !t.cancelledAt)
+        .some(
+          (t) =>
+            t.agentName === target && t.ownerId !== undefined && t.ownerId !== ownerId && !t.endedAt && !t.cancelledAt,
+        )
       const privileged = ownerId !== undefined && (c.ownerId === ownerId || (c.memberIds ?? []).includes(ownerId))
       if (foreign && !privileged)
-        return err('forbidden', `${target} belongs to another account — only the canvas owner or a member can stop it`, {
-          target_agent: target,
-          hint: 'stop your own agent, or ask the canvas owner to stop that one',
-        })
+        return err(
+          'forbidden',
+          `${target} belongs to another account — only the canvas owner or a member can stop it`,
+          {
+            target_agent: target,
+            hint: 'stop your own agent, or ask the canvas owner to stop that one',
+          },
+        )
       const stopped = actions.cancelAgentWork(canvas_id, target, actorFrom(agent_name).name, ownerId)
       return text({
         ok: stopped > 0,
@@ -1263,7 +1319,10 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
       if (!canvasFor(found.canvasId)) return noCanvas(found.canvasId)
       const reply = actions.replyToComment(comment_id, body, actorFrom(agent_name))
       if (!reply) {
-        return err('invalid_input', 'the thread is resolved or the text is empty — resolve_comment cannot be undone by replying')
+        return err(
+          'invalid_input',
+          'the thread is resolved or the text is empty — resolve_comment cannot be undone by replying',
+        )
       }
       return withFeedback(text(reply), found.canvasId, actorFrom(agent_name))
     },
@@ -1377,7 +1436,10 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
       try {
         card = actions.claimCard(canvasId, card_id, agent_name)
       } catch (e) {
-        return err('conflict', e instanceof Error ? e.message : 'card not claimable (use list_cards to see what is open)')
+        return err(
+          'conflict',
+          e instanceof Error ? e.message : 'card not claimable (use list_cards to see what is open)',
+        )
       }
       type ResultBlock = { type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string }
       const content: ResultBlock[] = [
@@ -1448,7 +1510,8 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
       arrive(canvasId, agent_name)
       const card = actions.getTasks(canvasId).find((t) => t.id === card_id)
       if (!card) return err('not_found', `no card with id ${card_id}`)
-      if (card.agentName !== agent_name) return err('forbidden', 'only the agent that claimed this card can complete it')
+      if (card.agentName !== agent_name)
+        return err('forbidden', 'only the agent that claimed this card can complete it')
       if (summary?.trim()) actions.agentSummary(canvasId, actorFrom(agent_name), summary)
       const done = actions.completeCard(canvasId, card_id)
       if (!done || done.endedAt === undefined) return err('not_found', 'card not found or already closed')
@@ -1492,6 +1555,8 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
     async ({ canvas_id, name, html, x, y, width, height, page, agent_name, op_id }) => {
       const c = canvasFor(canvas_id)
       if (!c) return noCanvas(canvas_id)
+      const gated = reviewGate(canvas_id)
+      if (gated) return gated
       if (tooLarge(html))
         return err(
           'too_large',
@@ -1508,7 +1573,10 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
         if (!frame) return { ok: false as const }
         return {
           ok: true as const,
-          frame: frameSummary(frame, c.pages?.find((p) => p.id === frame.pageId)),
+          frame: frameSummary(
+            frame,
+            c.pages?.find((p) => p.id === frame.pageId),
+          ),
         }
       })
       if (!payload.ok) return noCanvas(canvas_id)
@@ -1623,7 +1691,10 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
       arrive(found.canvas.id, agent_name)
       const result = actions.deletePage(page_id, actorFrom(agent_name))
       if (!result)
-        return err('invalid_input', 'cannot delete the only page on this canvas — a canvas always keeps at least one page')
+        return err(
+          'invalid_input',
+          'cannot delete the only page on this canvas — a canvas always keeps at least one page',
+        )
       return withGuidelinesNudge(
         withStatusNudge(
           withStopped(
@@ -1676,7 +1747,13 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
         withStatusNudge(
           withStopped(
             withFeedback(
-              text({ ok: true, frame: frameSummary(frame, c?.pages?.find((p) => p.id === frame.pageId)) }),
+              text({
+                ok: true,
+                frame: frameSummary(
+                  frame,
+                  c?.pages?.find((p) => p.id === frame.pageId),
+                ),
+              }),
               f.canvasId,
               actorFrom(agent_name),
             ),
@@ -1716,7 +1793,13 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
         withStatusNudge(
           withStopped(
             withFeedback(
-              text({ ok: true, frame: frameSummary(frame, c?.pages?.find((p) => p.id === frame.pageId)) }),
+              text({
+                ok: true,
+                frame: frameSummary(
+                  frame,
+                  c?.pages?.find((p) => p.id === frame.pageId),
+                ),
+              }),
               frame.canvasId,
               actorFrom(agent_name),
             ),
@@ -1819,7 +1902,7 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
     'get_frame_version',
     {
       description:
-        "Read one saved version of a frame in full, including its HTML — the document to compare against or to restore with revert_frame. Get version ids from get_frame_history.",
+        'Read one saved version of a frame in full, including its HTML — the document to compare against or to restore with revert_frame. Get version ids from get_frame_history.',
       annotations: { readOnlyHint: true },
       inputSchema: { version_id: z.string(), agent_name: agentName.optional() },
       outputSchema: {
@@ -1856,14 +1939,16 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
     'revert_frame',
     {
       description:
-        "Restore a frame to a version from get_frame_history. The restore is an ordinary edit — everyone sees it land live, it is logged, and it becomes a new version itself, so a revert is never a dead end. Use this instead of rebuilding a frame that was better before: an agent that made it worse, or a redesign you want to undo.",
+        'Restore a frame to a version from get_frame_history. The restore is an ordinary edit — everyone sees it land live, it is logged, and it becomes a new version itself, so a revert is never a dead end. Use this instead of rebuilding a frame that was better before: an agent that made it worse, or a redesign you want to undo.',
       inputSchema: {
         frame_id: z.string(),
         version_id: z.string().describe('Version id from get_frame_history'),
         expected_updated_at: z
           .string()
           .optional()
-          .describe("The frame's updatedAt from when you read it — refuses the revert if someone else changed it since"),
+          .describe(
+            "The frame's updatedAt from when you read it — refuses the revert if someone else changed it since",
+          ),
         takeover: z.boolean().optional().describe('Revert a frame another agent holds the lock on'),
         agent_name: agentName,
       },
@@ -1884,7 +1969,14 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
       try {
         frame = actions.updateFrame(
           frame_id,
-          { html: version.html, name: version.name, x: version.x, y: version.y, width: version.width, height: version.height },
+          {
+            html: version.html,
+            name: version.name,
+            x: version.x,
+            y: version.y,
+            width: version.width,
+            height: version.height,
+          },
           actor,
         )
       } catch (e) {
@@ -2048,6 +2140,15 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
       outputSchema: lintReportShape,
     },
     async ({ frame_id, device, viewport, agent_name }, extra) => {
+      {
+        const budget = renderBudget(ownerId ?? agent_name ?? 'anonymous')
+        if (!budget.ok)
+          return err(
+            'rate_limited',
+            `render budget exhausted (${RENDERS_PER_MIN}/min across screenshots, reviews, diffs and exports) — wait ${budget.retryAfter}s`,
+            { retry_after_seconds: budget.retryAfter },
+          )
+      }
       const f = frameFor(frame_id)
       if (!f) return noFrame(frame_id)
       arrive(f.canvasId, agent_name)
@@ -2079,7 +2180,7 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
     {
       title: 'Audit a frame’s accessibility',
       description:
-        "Check the RENDERED frame against the accessibility rules a design review is responsible for: text contrast (WCAG ratios, computed from the real composited background), image alt text, heading order, focus order and tabindex, tap-target sizes, landmarks, form labels and the document language. Each issue names the CSS selector to fix. Run it before calling a design done — contrast in particular is the checkpoint the review workflow asks you to judge, and this measures it instead of guessing. Pass device/viewport to audit the layout at a phone or tablet width.",
+        'Check the RENDERED frame against the accessibility rules a design review is responsible for: text contrast (WCAG ratios, computed from the real composited background), image alt text, heading order, focus order and tabindex, tap-target sizes, landmarks, form labels and the document language. Each issue names the CSS selector to fix. Run it before calling a design done — contrast in particular is the checkpoint the review workflow asks you to judge, and this measures it instead of guessing. Pass device/viewport to audit the layout at a phone or tablet width.',
       annotations: { readOnlyHint: true },
       inputSchema: {
         frame_id: z.string(),
@@ -2104,6 +2205,15 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
       },
     },
     async ({ frame_id, device, viewport, agent_name }, extra) => {
+      {
+        const budget = renderBudget(ownerId ?? agent_name ?? 'anonymous')
+        if (!budget.ok)
+          return err(
+            'rate_limited',
+            `render budget exhausted (${RENDERS_PER_MIN}/min across screenshots, reviews, diffs and exports) — wait ${budget.retryAfter}s`,
+            { retry_after_seconds: budget.retryAfter },
+          )
+      }
       const f = frameFor(frame_id)
       if (!f) return noFrame(frame_id)
       arrive(f.canvasId, agent_name)
@@ -2135,6 +2245,12 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
         frame_id: z.string(),
         against: z
           .object({
+            previous_version: z
+              .boolean()
+              .optional()
+              .describe(
+                'Diff against the newest saved version of this frame — the shorthand for "did my edit change what I meant to change"',
+              ),
             frame_id: z.string().optional(),
             version_id: z.string().optional(),
             reference_id: z.string().optional(),
@@ -2163,16 +2279,38 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
       },
     },
     async ({ frame_id, against, threshold, agent_name }, extra) => {
+      {
+        const budget = renderBudget(ownerId ?? agent_name ?? 'anonymous')
+        if (!budget.ok)
+          return err(
+            'rate_limited',
+            `render budget exhausted (${RENDERS_PER_MIN}/min across screenshots, reviews, diffs and exports) — wait ${budget.retryAfter}s`,
+            { retry_after_seconds: budget.retryAfter },
+          )
+      }
       const f = frameFor(frame_id)
       if (!f) return noFrame(frame_id)
       const keys = Object.keys(against).filter((k) => against[k as keyof typeof against] !== undefined)
       if (keys.length !== 1)
-        return err('invalid_input', `pass exactly one of frame_id, version_id, reference_id or url — got ${keys.length}`)
+        return err(
+          'invalid_input',
+          `pass exactly one of frame_id, version_id, reference_id or url — got ${keys.length}`,
+        )
       arrive(f.canvasId, agent_name)
 
       let other: Frame | undefined
       let label: string
-      if (against.frame_id !== undefined) {
+      if (against.previous_version) {
+        const versions = await persist.listFrameVersions(frame_id, 1)
+        const newest = versions[0]
+        if (!newest)
+          return err(
+            'not_found',
+            'this frame has no saved version yet — every durable write snapshots one, so make an edit first',
+          )
+        other = { ...f, html: newest.html, width: newest.width, height: newest.height }
+        label = 'the previous version'
+      } else if (against.frame_id !== undefined) {
         other = frameFor(against.frame_id)
         if (!other) return noFrame(against.frame_id)
         label = `frame ${other.name}`
@@ -2180,7 +2318,10 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
         const version = await persist.getFrameVersion(against.version_id)
         if (!version) return err('not_found', `no frame version with id ${against.version_id}`)
         if (version.frameId !== frame_id)
-          return err('invalid_input', `version ${against.version_id} belongs to frame ${version.frameId}, not ${frame_id}`)
+          return err(
+            'invalid_input',
+            `version ${against.version_id} belongs to frame ${version.frameId}, not ${frame_id}`,
+          )
         other = { ...f, html: version.html, width: version.width, height: version.height }
         label = `version ${against.version_id}`
       } else if (against.reference_id !== undefined) {
@@ -2196,7 +2337,8 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
         } catch (e) {
           return err(
             'upstream_failed',
-            websiteAccessErrorMessage(e, 'connected-agent') ?? (e instanceof Error ? e.message : 'could not capture that URL'),
+            websiteAccessErrorMessage(e, 'connected-agent') ??
+              (e instanceof Error ? e.message : 'could not capture that URL'),
           )
         }
       }
@@ -2253,6 +2395,16 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
       outputSchema: inspectionShape,
     },
     async ({ frame_id, agent_name, device, viewport }) => {
+      {
+        const budget = renderBudget(ownerId ?? agent_name ?? 'anonymous')
+        if (!budget.ok)
+          return err(
+            'rate_limited',
+            `render budget exhausted (${RENDERS_PER_MIN}/min across screenshots, reviews, diffs and exports) — wait ${budget.retryAfter}s`,
+            { retry_after_seconds: budget.retryAfter },
+          )
+      }
+
       const f = frameFor(frame_id)
       if (!f) return noFrame(frame_id)
       arrive(f.canvasId, agent_name)
@@ -2314,19 +2466,22 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
         frame_id: z.string(),
         html: z
           .string()
-          .describe(`Full replacement HTML. Max ${MAX_FRAME_HTML_BYTES} characters — stream larger designs with append_frame_html.`),
+          .describe(
+            `Full replacement HTML. Max ${MAX_FRAME_HTML_BYTES} characters — stream larger designs with append_frame_html.`,
+          ),
         expected_updated_at: z
           .string()
           .optional()
-          .describe('The frame\'s updatedAt from when you read it — refuses the write if someone else changed it since'),
+          .describe("The frame's updatedAt from when you read it — refuses the write if someone else changed it since"),
         takeover: z.boolean().optional().describe('Overwrite even if another agent holds the frame lock'),
         agent_name: agentName,
       },
-      outputSchema: { ok: z.literal(true), frame: z.object(frameSummaryShape) },
     },
     async ({ frame_id, html, agent_name, expected_updated_at, takeover }) => {
       const before = frameFor(frame_id)
       if (!before) return noFrame(frame_id)
+      const gated = reviewGate(before.canvasId)
+      if (gated) return gated
       if (tooLarge(html))
         return err(
           'too_large',
@@ -2374,6 +2529,12 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
         frame_id: z.string(),
         format: z.enum(['png', 'jpg', 'html', 'react']).optional().describe('default png'),
         quality: z.number().min(1).max(100).optional().describe('jpg only, default 90'),
+        scoped_css: z
+          .boolean()
+          .optional()
+          .describe(
+            'react only: scope the stylesheet under [data-frame="<id>"] instead of emitting global element selectors — use it when the host page has its own global styles',
+          ),
       },
       outputSchema: {
         format: z.string(),
@@ -2390,7 +2551,7 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
         note: z.string().optional(),
       },
     },
-    async ({ frame_id, format, quality }) => {
+    async ({ frame_id, format, quality, scoped_css }) => {
       const f = frameFor(frame_id)
       if (!f) return noFrame(frame_id)
       if (format === 'html') return structured({ format: 'html', html: f.html })
@@ -2398,7 +2559,12 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
       if (format === 'react') {
         let exported
         try {
-          exported = await htmlToReact(f.html, f.name, store.getCanvas(f.canvasId)?.tokens)
+          exported = await htmlToReact(f.html, {
+            name: f.name,
+            tokens: store.getCanvas(f.canvasId)?.tokens,
+            frameId: f.id,
+            scopedCss: scoped_css === true,
+          })
         } catch (e) {
           return err('upstream_failed', e instanceof Error ? e.message : 'could not convert this frame to React')
         }
@@ -2427,13 +2593,20 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
       inputSchema: {
         canvas_id: z.string(),
         page: z.string().optional().describe('Only frames on this page (name or id, from get_canvas)'),
-        format: z.enum(['html', 'manifest', 'zip']).optional().describe('default manifest'),
+        format: z
+          .enum(['html', 'manifest', 'zip', 'tokens'])
+          .optional()
+          .describe(
+            'default manifest; "tokens" returns the design tokens as JSON + plain CSS + a Tailwind v4 @theme block',
+          ),
         agent_name: agentName.optional(),
       },
       outputSchema: {
         format: z.string(),
         filename: z.string(),
-        frames: z.array(z.object({ id: z.string(), name: z.string(), file: z.string(), width: z.number(), height: z.number() })),
+        frames: z.array(
+          z.object({ id: z.string(), name: z.string(), file: z.string(), width: z.number(), height: z.number() }),
+        ),
         tokens_css: z.string(),
         html: z.string().optional(),
         archive_base64: z.string().optional(),
@@ -2467,8 +2640,21 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
         frames: manifest,
         tokens_css: tokens ? cssForTokens(tokens) : '',
       }
-      if (format === undefined || format === 'manifest')
-        return structured({ format: 'manifest', ...base, notes: [] })
+      if (format === undefined || format === 'manifest') return structured({ format: 'manifest', ...base, notes: [] })
+
+      if (format === 'tokens') {
+        if (!tokens) return err('not_found', 'this canvas has no design tokens — set them with set_tokens first')
+        return structured({
+          format: 'tokens',
+          ...base,
+          filename: `${base.filename}.tokens.json`,
+          tokens_json: tokensJson(tokens),
+          tailwind_css: tailwindThemeCss(tokens),
+          notes: [
+            'tokens_json is the raw DesignTokens document; tailwind_css is a Tailwind v4 @theme block ready to paste into your global stylesheet.',
+          ],
+        } as never)
+      }
 
       if (format === 'html') {
         let bundle
@@ -2477,7 +2663,13 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
         } catch (e) {
           return err('upstream_failed', e instanceof Error ? e.message : 'could not render the frames for export')
         }
-        return structured({ format: 'html', ...base, filename: `${base.filename}.html`, html: bundle.html, notes: bundle.notes })
+        return structured({
+          format: 'html',
+          ...base,
+          filename: `${base.filename}.html`,
+          html: bundle.html,
+          notes: bundle.notes,
+        })
       }
 
       let bundle
@@ -2499,7 +2691,13 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
       const archive = buildZip([
         { name: 'canvas.html', content: bundle.html },
         { name: 'README.md', content: index },
-        ...(tokens ? [{ name: 'tokens.css', content: cssForTokens(tokens) }] : []),
+        ...(tokens
+          ? [
+              { name: 'tokens.css', content: cssForTokens(tokens) },
+              { name: 'tokens.json', content: tokensJson(tokens) },
+              { name: 'tailwind.css', content: tailwindThemeCss(tokens) },
+            ]
+          : []),
         ...frames.map((f, index) => ({
           name: `frames/${manifest[index]!.file}`,
           content: f.html,
@@ -2947,6 +3145,15 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
       },
     },
     async ({ frame_id, scale, device, viewport, full_page, clip, agent_name }, extra) => {
+      {
+        const budget = renderBudget(ownerId ?? agent_name ?? 'anonymous')
+        if (!budget.ok)
+          return err(
+            'rate_limited',
+            `render budget exhausted (${RENDERS_PER_MIN}/min across screenshots, reviews, diffs and exports) — wait ${budget.retryAfter}s`,
+            { retry_after_seconds: budget.retryAfter },
+          )
+      }
       const f = frameFor(frame_id)
       if (!f) return noFrame(frame_id)
       arrive(f.canvasId, agent_name)
@@ -3059,9 +3266,13 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
       const f = frameFor(frame_id)
       if (!f) return noFrame(frame_id)
       const count = f.html.split(old_str).length - 1
-      if (count === 0) return err('invalid_input', 'old_str not found in the frame HTML. Call get_frame to see the current content.')
+      if (count === 0)
+        return err('invalid_input', 'old_str not found in the frame HTML. Call get_frame to see the current content.')
       if (count > 1)
-        return err('invalid_input', `old_str occurs ${count} times — include more surrounding context so it matches exactly once.`)
+        return err(
+          'invalid_input',
+          `old_str occurs ${count} times — include more surrounding context so it matches exactly once.`,
+        )
       takeOver(frame_id, f.canvasId, actorFrom(agent_name), takeover)
       let frame: Frame | undefined
       try {
@@ -3102,7 +3313,7 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
         expected_updated_at: z
           .string()
           .optional()
-          .describe('The frame\'s updatedAt from when you read it — refuses the write if someone else changed it since'),
+          .describe("The frame's updatedAt from when you read it — refuses the write if someone else changed it since"),
         takeover: z.boolean().optional().describe('Update a frame another agent holds the lock on'),
         agent_name: agentName,
       },
@@ -3141,14 +3352,18 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
         expected_updated_at: z
           .string()
           .optional()
-          .describe('The frame\'s updatedAt from when you read it — refuses the delete if someone else changed it since'),
-        takeover: z.boolean().optional().describe('Delete a frame another agent holds the lock on'),
+          .describe(
+            "The frame's updatedAt from when you read it — refuses the delete if someone else changed it since",
+          ),
+        takeover: z.boolean().optional().describe('Delete a frame another agent holds the frame lock'),
         agent_name: agentName,
       },
     },
     async ({ frame_id, agent_name, expected_updated_at, takeover }) => {
       const before = frameFor(frame_id)
       if (!before) return noFrame(frame_id)
+      const gated = reviewGate(before.canvasId)
+      if (gated) return gated
       const stale = staleConflict(before, expected_updated_at)
       if (stale) return stale
       takeOver(frame_id, before.canvasId, actorFrom(agent_name), takeover)
@@ -3165,48 +3380,52 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
     },
   )
 
-/**
- * Everything that can be known to make a batch op fail WITHOUT applying it:
- * missing targets, another agent's lock, a stale precondition, an oversized
- * document. Used by apply_ops both to pre-flight an atomic batch and to skip a
- * doomed op in a best-effort one.
- */
-function preflightOp(
-  op: string,
-  args: Record<string, unknown>,
-  actor: Actor,
-): { error: McpErrorPayload } | undefined {
-  const html = typeof args.html === 'string' ? args.html : typeof args.html_chunk === 'string' ? args.html_chunk : undefined
-  if (html !== undefined && tooLarge(html))
-    return { error: mcpErrorPayload('too_large', `html is ${html.length} characters; the limit is ${MAX_FRAME_HTML_BYTES}`) }
+  /**
+   * Everything that can be known to make a batch op fail WITHOUT applying it:
+   * missing targets, another agent's lock, a stale precondition, an oversized
+   * document. Used by apply_ops both to pre-flight an atomic batch and to skip a
+   * doomed op in a best-effort one.
+   */
+  function preflightOp(
+    op: string,
+    args: Record<string, unknown>,
+    actor: Actor,
+  ): { error: McpErrorPayload } | undefined {
+    const html =
+      typeof args.html === 'string' ? args.html : typeof args.html_chunk === 'string' ? args.html_chunk : undefined
+    if (html !== undefined && tooLarge(html))
+      return {
+        error: mcpErrorPayload('too_large', `html is ${html.length} characters; the limit is ${MAX_FRAME_HTML_BYTES}`),
+      }
 
-  if (typeof args.frame_id === 'string') {
-    const frame = frameFor(args.frame_id)
-    if (!frame) return { error: mcpErrorPayload('not_found', `no frame with id ${args.frame_id} accessible to this account`) }
-    if (op !== 'create_frame') {
-      const holder = frameLocks.heldBy(args.frame_id, actor.name)
-      if (holder)
-        return {
-          error: mcpErrorPayload('conflict', `frame ${args.frame_id} is being edited by ${holder.agentName}`, {
-            holder: holder.agentName,
-            expires_at: new Date(holder.expiresAt).toISOString(),
-          }),
+    if (typeof args.frame_id === 'string') {
+      const frame = frameFor(args.frame_id)
+      if (!frame)
+        return { error: mcpErrorPayload('not_found', `no frame with id ${args.frame_id} accessible to this account`) }
+      if (op !== 'create_frame') {
+        const holder = frameLocks.heldBy(args.frame_id, actor.name)
+        if (holder)
+          return {
+            error: mcpErrorPayload('conflict', `frame ${args.frame_id} is being edited by ${holder.agentName}`, {
+              holder: holder.agentName,
+              expires_at: new Date(holder.expiresAt).toISOString(),
+            }),
+          }
+        if (typeof args.expected_updated_at === 'string') {
+          const stale = stalePayload(frame, args.expected_updated_at)
+          if (stale) return { error: stale }
         }
-      if (typeof args.expected_updated_at === 'string') {
-        const stale = stalePayload(frame, args.expected_updated_at)
-        if (stale) return { error: stale }
       }
     }
-  }
-  if (typeof args.page === 'string' && op === 'move_frame') {
-    const canvasId = typeof args.canvas_id === 'string' ? args.canvas_id : undefined
-    if (canvasId) {
-      const resolved = resolvePage(canvasId, args.page)
-      if (resolved.error !== undefined) return { error: mcpErrorPayload('invalid_input', resolved.error) }
+    if (typeof args.page === 'string' && op === 'move_frame') {
+      const canvasId = typeof args.canvas_id === 'string' ? args.canvas_id : undefined
+      if (canvasId) {
+        const resolved = resolvePage(canvasId, args.page)
+        if (resolved.error !== undefined) return { error: mcpErrorPayload('invalid_input', resolved.error) }
+      }
     }
+    return undefined
   }
-  return undefined
-}
 
   tool(
     'set_plan',
@@ -3366,7 +3585,10 @@ function preflightOp(
             index,
             op,
             args: {},
-            error: mcpErrorPayload('invalid_input', `op ${index} targets canvas ${String(rest.canvas_id)}, not ${canvas_id}`),
+            error: mcpErrorPayload(
+              'invalid_input',
+              `op ${index} targets canvas ${String(rest.canvas_id)}, not ${canvas_id}`,
+            ),
           })
           continue
         }
@@ -3376,7 +3598,10 @@ function preflightOp(
             index,
             op,
             args: {},
-            error: mcpErrorPayload('invalid_input', `op ${index} (${op}) is invalid: ${parsed.error.issues.map((i) => `${i.path.join('.') || 'arguments'} ${i.message}`).join('; ')}`),
+            error: mcpErrorPayload(
+              'invalid_input',
+              `op ${index} (${op}) is invalid: ${parsed.error.issues.map((i) => `${i.path.join('.') || 'arguments'} ${i.message}`).join('; ')}`,
+            ),
           })
           continue
         }
@@ -3499,7 +3724,12 @@ function preflightOp(
       const view: CanvasView = {
         id: c.id,
         name: c.name,
-        frames: visible.map((f) => frameSummary(f, c.pages?.find((p) => p.id === f.pageId))),
+        frames: visible.map((f) =>
+          frameSummary(
+            f,
+            c.pages?.find((p) => p.id === f.pageId),
+          ),
+        ),
         frame_total: visible.length,
         pages: (c.pages ?? []).map((p) => ({
           id: p.id,
@@ -3528,7 +3758,15 @@ function preflightOp(
 
   server.registerResource(
     'doop-canvas-tokens',
-    new ResourceTemplate('doop://canvas/{canvasId}/tokens', { list: undefined }),
+    new ResourceTemplate('doop://canvas/{canvasId}/tokens', {
+      list: async () => ({
+        resources: store.listCanvases(ownerId ?? '').map((c) => ({
+          uri: `doop://canvas/${c.id}/tokens`,
+          name: `${c.name} — design tokens`,
+          mimeType: 'text/css',
+        })),
+      }),
+    }),
     {
       title: 'Canvas design tokens',
       description: 'The canvas tokens as a CSS :root block.',
@@ -3552,7 +3790,724 @@ function preflightOp(
     },
   )
 
+  /* ---- prompts: the standard flows, one slash command each ---- */
+
+  const reviewPrompt = [
+    'Review the design of the frame I name below against this checklist, then report findings in order of severity.',
+    '',
+    '1. Call get_frame_screenshot and look at it: hierarchy, alignment, spacing rhythm, contrast of the actual render.',
+    '2. Call review_frame — it runs the token lint, the accessibility audit and the layout analysis at mobile/tablet/desktop in one call.',
+    '3. Call audit_frame if the frame has images or interactive elements the report flags.',
+    '',
+    'Report: what passes, what fails (with the failing selector), and the single highest-impact fix. Offer to apply the fix; in review mode propose it instead of writing it.',
+    '',
+    'Canvas: {canvas_id}',
+    'Frame: {frame_id}',
+  ].join('\n')
+  server.registerPrompt(
+    'design_review',
+    {
+      title: 'Design review',
+      description:
+        'Run a full design review of one frame: visual pass, tokens, accessibility and layout across viewports',
+      argsSchema: { canvas_id: z.string(), frame_id: z.string().optional() },
+    },
+    ({ canvas_id, frame_id }) => ({
+      messages: [
+        {
+          role: 'user' as const,
+          content: {
+            type: 'text' as const,
+            text: reviewPrompt
+              .replace('{canvas_id}', canvas_id)
+              .replace(
+                '{frame_id}',
+                frame_id ?? 'pick the frame the human means; ask with ask_human if it is ambiguous',
+              ),
+          },
+        },
+      ],
+    }),
+  )
+
+  const redesignPrompt = [
+    'Redesign the frame named below from a live page the human admires. Work in this order:',
+    '',
+    '1. import_webpage the URL as a reference (as_reference: true) and get_frame_screenshot it — study its palette, type and spacing.',
+    '2. Call search_inspiration for the page archetype and pick ONE exemplar; name it in your brief.',
+    '3. Rewrite the frame: stream the new design with append_frame_html so the human watches it build.',
+    '4. Call review_frame; fix every error before you report done.',
+    '',
+    'Canvas: {canvas_id}',
+    'Frame: {frame_id}',
+    'URL: {url}',
+  ].join('\n')
+  server.registerPrompt(
+    'redesign_from_url',
+    {
+      title: 'Redesign from a URL',
+      description:
+        'Redesign a frame using a live page as the reference: import it, study it, rebuild the frame, verify it',
+      argsSchema: { canvas_id: z.string(), frame_id: z.string().optional(), url: z.string() },
+    },
+    ({ canvas_id, frame_id, url }) => ({
+      messages: [
+        {
+          role: 'user' as const,
+          content: {
+            type: 'text' as const,
+            text: redesignPrompt
+              .replace('{canvas_id}', canvas_id)
+              .replace('{frame_id}', frame_id ?? 'ask the human which frame with ask_human')
+              .replace('{url}', url),
+          },
+        },
+      ],
+    }),
+  )
+
+  const handoffPrompt = [
+    'Hand the design below to a developer as a GitHub pull request.',
+    '',
+    '1. Call get_capabilities — github must not be "none"; if it is, tell the human to connect a repo instead of failing later.',
+    '2. Call export_canvas with format "tokens" and check the design tokens exist.',
+    '3. Call open_pull_request with the repo the human names, and report the PR URL.',
+    '',
+    'Canvas: {canvas_id}',
+    'Repo (owner/name): {repo}',
+  ].join('\n')
+  server.registerPrompt(
+    'handoff_to_code',
+    {
+      title: 'Hand off to code',
+      description: 'Open a pull request with the canvas design exported for developers',
+      argsSchema: { canvas_id: z.string(), repo: z.string() },
+    },
+    ({ canvas_id, repo }) => ({
+      messages: [
+        {
+          role: 'user' as const,
+          content: {
+            type: 'text' as const,
+            text: handoffPrompt.replace('{canvas_id}', canvas_id).replace('{repo}', repo),
+          },
+        },
+      ],
+    }),
+  )
+
+  /* ---- capabilities: one call that says which integrations are live ---- */
+
+  tool(
+    'get_capabilities',
+    {
+      title: 'Get server capabilities',
+      description:
+        'Which optional integrations are actually configured on this server (screenshot renderer, image/icon/logo search, website capture, model accounts for the resident agent, GitHub), plus the current size and rate limits. Call it ONCE before planning asset-heavy, import-heavy or export-heavy work: it is how you know a feature is available instead of discovering a failure mid-task.',
+      inputSchema: {},
+      outputSchema: { capabilities: z.record(z.unknown()) },
+    },
+    async () => {
+      const caps = capabilities()
+      return {
+        content: [{ type: 'text' as const, text: JSON.stringify(caps, null, 2) }],
+        structuredContent: { capabilities: caps },
+      }
+    },
+  )
+
+  /* ---- ask_human: the blocking question ---- */
+
+  tool(
+    'ask_human',
+    {
+      title: 'Ask the human a question',
+      description:
+        'Ask the humans on this canvas a question and WAIT for the answer (up to the wait_seconds you pass). Use it when a request is genuinely ambiguous or implies a destructive choice you cannot settle from the canvas — which palette direction, whether replacing a whole frame is intended, whether to delete something. The question appears live on the canvas and in the Review panel; humans there answer it. If the wait expires you get status "open" plus the question id — carry on with your best judgement and check get_answers later. Do not use it for information the canvas already answers.',
+      inputSchema: {
+        canvas_id: z.string(),
+        text: z
+          .string()
+          .min(1)
+          .max(2000)
+          .describe('The question. One clear ask; options inlined ("A or B?") if you have them.'),
+        frame_id: z.string().optional().describe('Pin the question to a frame'),
+        selector: z.string().optional().describe('Element selector the question is about, from inspect_frame'),
+        wait_seconds: z
+          .number()
+          .min(0)
+          .max(120)
+          .optional()
+          .describe('How long to block waiting for an answer, default 60'),
+        agent_name: agentName,
+      },
+    },
+    async ({ canvas_id, text, frame_id, selector, wait_seconds, agent_name }) => {
+      const c = canvasFor(canvas_id)
+      if (!c) return noCanvas(canvas_id)
+      arrive(canvas_id, agent_name)
+      const question = actions.askQuestion(
+        canvas_id,
+        {
+          text,
+          ...(frame_id ? { frameId: frame_id } : {}),
+          ...(selector ? { selector } : {}),
+          waitSeconds: wait_seconds,
+        },
+        actorFrom(agent_name),
+      )
+      if (!question) return noCanvas(canvas_id)
+      actions.markAgentWaiting(canvas_id, actorFrom(agent_name).name, true)
+      const waitMs = Math.max(0, wait_seconds ?? 60) * 1000
+      const remaining = Math.max(0, question.expiresAt - Date.now())
+      const events =
+        waitMs > 0
+          ? await agentEvents.wait(canvas_id, {
+              agentName: actorFrom(agent_name).name,
+              cursor: 0,
+              timeoutMs: Math.min(waitMs, remaining),
+              kinds: ['question_answer'],
+            })
+          : []
+      const answer = events.find(
+        (e) =>
+          (e.data as { questionId?: string })?.questionId === question.id &&
+          (e.data as { answer?: string })?.answer !== undefined,
+      )
+      if (answer) {
+        const data = answer.data as { answer: string }
+        return structured({
+          question_id: question.id,
+          status: 'answered' as const,
+          answer: data.answer,
+          answered_by: (question as { answeredBy?: string }).answeredBy,
+        })
+      }
+      return structured({
+        question_id: question.id,
+        status: 'open' as const,
+        hint: 'Nobody answered yet. Continue with your best judgement; check get_answers later for this question_id.',
+      })
+    },
+  )
+
+  tool(
+    'get_answers',
+    {
+      title: 'Check for answers to your questions',
+      description:
+        'Check whether humans answered your ask_human questions. Returns every question you asked on this canvas with its current status and answer. Cheap to poll; use it after a wait expired with status "open".',
+      inputSchema: {
+        canvas_id: z.string(),
+        agent_name: agentName,
+      },
+    },
+    async ({ canvas_id, agent_name }) => {
+      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      arrive(canvas_id, agent_name)
+      const mine = actions.getQuestions(canvas_id).filter((q) => q.agentName === actorFrom(agent_name).name)
+      const summary = mine.map((q) => ({
+        question_id: q.id,
+        status: q.status,
+        text: q.text,
+        ...(q.answer ? { answer: q.answer, answered_by: q.answeredBy } : {}),
+      }))
+      return structured({ questions: summary })
+    },
+  )
+
+  /* ---- wait_for_events: the idle keep-alive ---- */
+
+  tool(
+    'wait_for_events',
+    {
+      title: 'Wait for human events',
+      description:
+        'Block until something on this canvas needs you: task feedback, a comment, a stop, an answer to your question, or a new queued card. Pass the cursor from your previous call to only see newer events; an empty cursor means everything pending. Between tasks, call this instead of ending your session — it also keeps your presence alive so the humans see you connected and your claimed card is not swept. Resolves on the first event or on timeout (whichever comes first); a timeout is normal, just call again.',
+      inputSchema: {
+        canvas_id: z.string(),
+        cursor: z
+          .number()
+          .optional()
+          .describe('Cursor from your previous wait_for_events (or get 0 for "everything pending")'),
+        timeout_seconds: z.number().min(5).max(120).optional().describe('How long to block, default 60'),
+        agent_name: agentName,
+      },
+      outputSchema: {
+        cursor: z.number(),
+        timed_out: z.boolean(),
+        events: z.array(z.object({ seq: z.number(), kind: z.string(), at: z.number(), summary: z.string() })),
+      },
+    },
+    async ({ canvas_id, cursor, timeout_seconds, agent_name }) => {
+      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      const actor = actorFrom(agent_name)
+      /* while parked the agent is legitimately idle: the 60s status TTL
+         applies, not the 20s idle sweep, and presence stays live */
+      actions.heartbeatAgent(canvas_id, actor)
+      actions.markAgentWaiting(canvas_id, actor.name, true)
+      const from = cursor ?? agentEvents.cursor(canvas_id)
+      const timeoutMs = Math.min(120, Math.max(5, timeout_seconds ?? 60)) * 1000
+      const events = await agentEvents.wait(canvas_id, { agentName: actor.name, cursor: from, timeoutMs })
+      const visible = events
+        .filter((e) => !e.targetAgent || e.targetAgent.toLowerCase() === actor.name.toLowerCase())
+        .slice(-20)
+      const summarized = visible.map((e) => {
+        const d = (e.data ?? {}) as Record<string, unknown>
+        const summary =
+          typeof d.text === 'string' && d.text
+            ? d.text.slice(0, 200)
+            : typeof d.summary === 'string' && d.summary
+              ? d.summary.slice(0, 200)
+              : e.kind.replace('_', ' ')
+        return { seq: e.seq, kind: e.kind, at: e.at, summary }
+      })
+      actions.markAgentWaiting(canvas_id, actor.name, false)
+      const newCursor = summarized.length ? summarized[summarized.length - 1]!.seq : from
+      return structured({
+        cursor: newCursor,
+        timed_out: summarized.length === 0,
+        events: summarized,
+      })
+    },
+  )
+
+  /* ---- review mode proposals ---- */
+
+  tool(
+    'propose_frame_html',
+    {
+      title: 'Propose new frame HTML for review',
+      description:
+        'Propose a full replacement design for a frame WITHOUT touching the canvas. Use it when the canvas is in review mode (direct writes fail with "review mode"); the proposal appears in the human Review panel with a side-by-side render, and lands on the canvas the moment a human accepts. Include a clear summary: it is the first thing the reviewer reads. If the frame changes before your proposal is reviewed, it is marked stale and you will see it in list_change_proposals.',
+      inputSchema: {
+        canvas_id: z.string(),
+        frame_id: z.string(),
+        html: z.string().describe(`Full replacement HTML. Max ${MAX_FRAME_HTML_BYTES} characters.`),
+        summary: z.string().max(500).describe('One line: what changes and why the reviewer should accept it'),
+        expected_updated_at: z.string().optional().describe('The frame updatedAt you based this on (baseUpdatedAt)'),
+        agent_name: agentName,
+      },
+      outputSchema: { ok: z.literal(true), proposal_id: z.string(), status: z.string() },
+    },
+    async ({ canvas_id, frame_id, html, summary, expected_updated_at, agent_name }) => {
+      const f = frameFor(frame_id)
+      if (!f || f.canvasId !== canvas_id || !canvasFor(canvas_id)) return noFrame(frame_id)
+      if (tooLarge(html))
+        return err('too_large', `html is ${html.length} characters; the limit is ${MAX_FRAME_HTML_BYTES}.`)
+      arrive(canvas_id, agent_name)
+      if (!store.getCanvas(canvas_id)?.reviewMode)
+        return err('unsupported', 'review mode is off on this canvas — write directly with set_frame_html instead')
+      const base = expected_updated_at ? Date.parse(expected_updated_at) : f.updatedAt
+      const proposal = actions.addFrameProposal(
+        canvas_id,
+        { kind: 'replace_html', frameId: frame_id, html, summary, ...(Number.isFinite(base) ? {} : {}) },
+        actorFrom(agent_name),
+      )
+      if (!proposal) return noFrame(frame_id)
+      return structured({ ok: true as const, proposal_id: proposal.id, status: proposal.status })
+    },
+  )
+
+  tool(
+    'propose_frame_create',
+    {
+      title: 'Propose a new frame for review',
+      description:
+        'Propose creating a new frame without touching the canvas — the review-mode counterpart of create_frame. It appears in the human Review panel with a render of the proposed design and lands when a human accepts.',
+      inputSchema: {
+        canvas_id: z.string(),
+        name: z.string().max(200),
+        html: z.string().describe(`Complete HTML for the frame body. Max ${MAX_FRAME_HTML_BYTES} characters.`),
+        summary: z.string().max(500).describe('One line: what this frame adds and why'),
+        x: z.number().optional(),
+        y: z.number().optional(),
+        width: z.number().optional(),
+        height: z.number().optional(),
+        agent_name: agentName,
+      },
+      outputSchema: { ok: z.literal(true), proposal_id: z.string(), status: z.string() },
+    },
+    async ({ canvas_id, name, html, summary, x, y, width, height, agent_name }) => {
+      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      if (tooLarge(html))
+        return err('too_large', `html is ${html.length} characters; the limit is ${MAX_FRAME_HTML_BYTES}.`)
+      arrive(canvas_id, agent_name)
+      if (!store.getCanvas(canvas_id)?.reviewMode)
+        return err('unsupported', 'review mode is off on this canvas — write directly with create_frame instead')
+      const proposal = actions.addFrameProposal(
+        canvas_id,
+        { kind: 'create_frame', name, html, summary, x, y, width, height },
+        actorFrom(agent_name),
+      )
+      if (!proposal) return noCanvas(canvas_id)
+      return structured({ ok: true as const, proposal_id: proposal.id, status: proposal.status })
+    },
+  )
+
+  tool(
+    'propose_frame_delete',
+    {
+      title: 'Propose deleting a frame',
+      description:
+        'Propose deleting a frame without touching the canvas — the review-mode counterpart of delete_frame. The human sees what would go away and decides.',
+      inputSchema: {
+        canvas_id: z.string(),
+        frame_id: z.string(),
+        summary: z.string().max(500).describe('One line: why this frame should go'),
+        agent_name: agentName,
+      },
+      outputSchema: { ok: z.literal(true), proposal_id: z.string(), status: z.string() },
+    },
+    async ({ canvas_id, frame_id, summary, agent_name }) => {
+      const f = frameFor(frame_id)
+      if (!f || f.canvasId !== canvas_id || !canvasFor(canvas_id)) return noFrame(frame_id)
+      arrive(canvas_id, agent_name)
+      if (!store.getCanvas(canvas_id)?.reviewMode)
+        return err('unsupported', 'review mode is off on this canvas — write directly with delete_frame instead')
+      const proposal = actions.addFrameProposal(
+        canvas_id,
+        { kind: 'delete_frame', frameId: frame_id, summary },
+        actorFrom(agent_name),
+      )
+      if (!proposal) return noFrame(frame_id)
+      return structured({ ok: true as const, proposal_id: proposal.id, status: proposal.status })
+    },
+  )
+
+  tool(
+    'list_change_proposals',
+    {
+      title: 'List your change proposals',
+      description:
+        'List the frame-change proposals on this canvas and their status — pending, accepted, rejected, withdrawn, or stale (the frame moved on after you proposed). Read it after a review to learn what the human decided.',
+      inputSchema: {
+        canvas_id: z.string(),
+        status: z.enum(['pending', 'accepted', 'rejected', 'withdrawn', 'stale']).optional(),
+        agent_name: agentName,
+      },
+    },
+    async ({ canvas_id, status, agent_name }) => {
+      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      arrive(canvas_id, agent_name)
+      const proposals = actions.getFrameProposals(canvas_id, status).map((p) => ({
+        proposal_id: p.id,
+        kind: p.kind,
+        ...(p.frameId ? { frame_id: p.frameId } : {}),
+        summary: p.summary,
+        status: p.status,
+        at: new Date(p.at).toISOString(),
+        ...(p.resolvedBy ? { resolved_by: p.resolvedBy } : {}),
+      }))
+      return structured({ proposals })
+    },
+  )
+
+  tool(
+    'withdraw_proposal',
+    {
+      title: 'Withdraw a pending proposal',
+      description:
+        'Withdraw your own pending frame-change proposal (for example when you notice a better approach before the human reviews it). Accepted, rejected or already-resolved proposals cannot be withdrawn.',
+      inputSchema: {
+        canvas_id: z.string(),
+        proposal_id: z.string(),
+        agent_name: agentName,
+      },
+    },
+    async ({ canvas_id, proposal_id, agent_name }) => {
+      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      arrive(canvas_id, agent_name)
+      const actor = actorFrom(agent_name)
+      const proposal = actions.findFrameProposal(proposal_id)
+      if (!proposal || !actions.getFrameProposals(canvas_id).some((p) => p.id === proposal_id))
+        return err('not_found', `no proposal with id ${proposal_id} on this canvas`)
+      if (proposal.agentName !== actor.name) return err('forbidden', 'you can only withdraw your own proposals')
+      const withdrawn = actions.withdrawFrameProposal(canvas_id, proposal_id, actor)
+      if (!withdrawn || withdrawn.status !== 'withdrawn')
+        return err('invalid_input', 'only pending proposals can be withdrawn')
+      return structured({ ok: true as const, proposal_id, status: withdrawn.status })
+    },
+  )
+
+  /* ---- review_frame: one call, every viewport ---- */
+
+  tool(
+    'review_frame',
+    {
+      title: 'Review a frame across viewports',
+      description:
+        'The full quality gate in one call: design-token lint, accessibility audit, and layout analysis (overflow, clipping, overlap, truncation) at mobile, tablet and desktop widths in a single render batch. Call it on every frame you touched before you report the work done — it is what "I checked my work" means here. summary.errors and summary.critical are the counts that must be zero; warnings are judgement calls.',
+      inputSchema: {
+        canvas_id: z.string(),
+        frame_id: z.string(),
+        device: z.enum(['mobile', 'tablet', 'desktop']).optional().describe('Just one viewport instead of all three'),
+        agent_name: agentName,
+      },
+    },
+    async ({ canvas_id, frame_id, device, agent_name }) => {
+      {
+        const budget = renderBudget(ownerId ?? agent_name ?? 'anonymous')
+        if (!budget.ok)
+          return err(
+            'rate_limited',
+            `render budget exhausted (${RENDERS_PER_MIN}/min across screenshots, reviews, diffs and exports) — wait ${budget.retryAfter}s`,
+            { retry_after_seconds: budget.retryAfter },
+          )
+      }
+
+      const f = frameFor(frame_id)
+      if (!f || f.canvasId !== canvas_id || !canvasFor(canvas_id)) return noFrame(frame_id)
+      arrive(canvas_id, agent_name)
+      const tokens = canvasFor(canvas_id)?.tokens
+      const report = await reviewFrame(f, tokens, device ? { viewports: [VIEWPORTS[device]] } : {})
+      const text = `critical a11y: ${report.summary.critical}, layout errors: ${report.summary.errors}, warnings: ${report.summary.warnings}, off-token colors: ${report.summary.off_token} across ${report.viewports.length} viewport(s)`
+      return {
+        content: [{ type: 'text' as const, text }],
+        structuredContent: report as unknown as Record<string, unknown>,
+      }
+    },
+  )
+
+  /* ---- import_code: the design→code→design round trip ---- */
+
+  tool(
+    'import_code',
+    {
+      title: 'Import HTML as a frame',
+      description:
+        'Turn an HTML document (or fragment) into a frame on this canvas — the counterpart of export_frame. Use it to bring a design from a developer, a generated page, or a previous export back into the canvas where it renders live and can be edited like any frame. Scripts and inline event handlers are stripped; visuals and inline styles survive. If the canvas is in review mode the import becomes a proposal.',
+      inputSchema: {
+        canvas_id: z.string(),
+        name: z.string().max(200),
+        html: z.string().describe('The HTML document or fragment to render as a frame'),
+        width: z.number().min(1).max(20_000).optional().describe('Default 640'),
+        height: z.number().min(1).max(20_000).optional().describe('Default 480'),
+        frame_id: z.string().optional().describe('Replace an existing frame instead of creating one'),
+        op_id: opId,
+        agent_name: agentName,
+      },
+      outputSchema: { ok: z.literal(true), frame: z.object(frameSummaryShape), sanitized: z.boolean() },
+    },
+    async ({ canvas_id, name, html, width, height, frame_id, agent_name, op_id }) => {
+      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      arrive(canvas_id, agent_name)
+      const clean = sanitizeImportedHtml(html)
+      if (!/<html|<body|<div|<section|<main/i.test(clean))
+        return err(
+          'invalid_input',
+          'the html has no renderable body after sanitization — scripts and event handlers are stripped, so send markup that survives that',
+        )
+      const actor = actorFrom(agent_name)
+      const withOp = replayAsync(ownerId ?? '', op_id ?? '', async () => {
+        const gated = reviewGate(canvas_id)
+        if (gated) {
+          const proposal = actions.proposeInsteadOfWrite(
+            canvas_id,
+            {
+              kind: frame_id ? 'replace_html' : 'create_frame',
+              ...(frame_id ? { frameId: frame_id } : {}),
+              name,
+              html: clean,
+              summary: `imported code: ${name}`,
+              width,
+              height,
+            },
+            actor,
+          )
+          if (proposal)
+            return structured({
+              ok: true as const,
+              proposal_id: proposal.id,
+              status: proposal.status,
+              sanitized: true as const,
+              frame: frameSummary({
+                id: frame_id ?? 'pending',
+                name,
+                html: clean,
+                x: 0,
+                y: 0,
+                width: width ?? 640,
+                height: height ?? 480,
+                updatedAt: Date.now(),
+                updatedBy: actor.name,
+              }),
+            })
+          return gated
+        }
+        let frame: Frame | undefined
+        if (frame_id) {
+          frame = await actions.updateFrame(frame_id, { html: clean }, actor)
+        } else {
+          frame = await actions.createFrame(
+            canvas_id,
+            {
+              name,
+              html: clean,
+              ...(width !== undefined ? { width } : {}),
+              ...(height !== undefined ? { height } : {}),
+            },
+            actor,
+          )
+        }
+        if (!frame) return noFrame(frame_id ?? canvas_id)
+        return structured({ ok: true as const, frame: frameSummary(frame), sanitized: clean !== html })
+      })
+      return withStopped(withFeedback(await withOp, canvas_id, actor), canvas_id, actor)
+    },
+  )
+
+  /* ---- assets: list and look at what the canvas already has ---- */
+
+  tool(
+    'list_assets',
+    {
+      title: 'List canvas assets',
+      description:
+        'List the image assets this canvas already has (uploads and anything its frames reference), newest first, with their public /a/ URLs. Check here before uploading the same image again — reuse keeps the design consistent and the canvas light.',
+      inputSchema: {
+        canvas_id: z.string(),
+        limit: z.number().min(1).max(200).optional().describe('Default 50'),
+        offset: z.number().min(0).optional(),
+        agent_name: agentName,
+      },
+    },
+    async ({ canvas_id, limit, offset, agent_name }) => {
+      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      arrive(canvas_id, agent_name)
+      const listing = await assets.listAssets(canvas_id, { limit, offset })
+      return structured({
+        assets: listing.assets,
+        total: listing.total,
+        has_more: (offset ?? 0) + listing.assets.length < listing.total,
+      })
+    },
+  )
+
+  tool(
+    'get_asset',
+    {
+      title: 'View a canvas asset',
+      description:
+        'Look at one asset of this canvas: image assets come back as an image you can actually see (the same way get_frame_screenshot shows a frame), with their public /a/ URL. Use it to check what an uploaded logo or photo looks like before placing it.',
+      inputSchema: {
+        canvas_id: z.string(),
+        asset_id: z.string(),
+        agent_name: agentName,
+      },
+    },
+    async ({ canvas_id, asset_id, agent_name }) => {
+      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      arrive(canvas_id, agent_name)
+      const asset = await assets.getCanvasAsset(canvas_id, asset_id)
+      if (!asset) return err('not_found', `no asset with id ${asset_id} on this canvas`)
+      if (!asset.mime.startsWith('image/'))
+        return structured({
+          id: asset.id,
+          url: asset.url,
+          mime: asset.mime,
+          bytes: asset.bytes,
+          note: 'not an image — no visual preview',
+        })
+      return {
+        content: [
+          { type: 'image' as const, data: asset.data.toString('base64'), mimeType: asset.mime },
+          { type: 'text' as const, text: `${asset.url} (${asset.mime}, ${asset.bytes} bytes)` },
+        ],
+      }
+    },
+  )
+
+  /* ---- open_pull_request: the repo handoff ---- */
+
+  tool(
+    'open_pull_request',
+    {
+      title: 'Open a pull request with the canvas design',
+      description:
+        'Hand the design to a developer: write the exported frames (design/<frame-name>.html, tokens.css, README) to a branch in a connected GitHub repo and open a pull request. Requires a GitHub connection with contents:write and pull_requests:write. Check get_capabilities first — github is "none" when no connection is configured.',
+      inputSchema: {
+        canvas_id: z.string(),
+        repo: z.string().describe('owner/name'),
+        branch: z.string().optional().describe('Defaults to doop/<canvas-id>'),
+        base: z.string().optional().describe('Base branch, default the repo default'),
+        message: z.string().max(200).describe('PR title'),
+        agent_name: agentName,
+      },
+      outputSchema: { ok: z.literal(true), branch: z.string(), commit: z.string(), url: z.string() },
+    },
+    async ({ canvas_id, repo, branch, base, message, agent_name }) => {
+      const c = canvasFor(canvas_id)
+      if (!c) return noCanvas(canvas_id)
+      arrive(canvas_id, agent_name)
+      const files = designHandoffFiles(c)
+      try {
+        const result = base
+          ? await commitFiles({ repo, branch: branch ?? `doop/${canvas_id}`, base, files, message })
+          : await commitFiles({ repo, branch: branch ?? `doop/${canvas_id}`, base: 'main', files, message })
+        return structured({ ok: true as const, branch: result.branch, commit: result.commit, url: result.url })
+      } catch (e) {
+        if (e instanceof GithubWriteError) {
+          if (e.status === 403) return err('forbidden', e.message)
+          if (e.status === 404) return err('not_found', e.message)
+          if (e.status === 429) return err('rate_limited', e.message)
+          return err('internal', e.message)
+        }
+        throw e
+      }
+    },
+  )
+
+  /* ---- hand_back: send a card to the specialty that owns it ---- */
+
+  tool(
+    'hand_back',
+    {
+      title: 'Hand a card back to an earlier specialist',
+      description:
+        'Give a board card back to an agent with the specialty it needs (e.g. the copywriter or the layout specialist) instead of fixing it outside your lane. The reason is shown to the human and to the receiving agent. Only roles that are part of the card pipeline can receive it.',
+      inputSchema: {
+        canvas_id: z.string(),
+        card_id: z.string(),
+        to_agent: z.string().describe('Role name from get_agents, e.g. copywriter'),
+        reason: z.string().max(500).describe('Why this belongs to the other specialty'),
+        agent_name: agentName,
+      },
+      outputSchema: { ok: z.literal(true), stage: z.number() },
+    },
+    async ({ canvas_id, card_id, to_agent, reason, agent_name }) => {
+      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      arrive(canvas_id, agent_name)
+      const card = await actions.handBackCard(canvas_id, card_id, to_agent, reason, actorFrom(agent_name))
+      if (!card) return err('not_found', `no open card with id ${card_id} on this canvas`)
+      if (!card.handback)
+        return err(
+          'invalid_input',
+          `"${to_agent}" is not a stage of this card's pipeline — check the card's pipeline in get_canvas or list your roles with get_agents`,
+        )
+      return structured({ ok: true as const, stage: card.stage ?? 0 })
+    },
+  )
+
   return server
+}
+
+/** The file set a design handoff PR carries: one html per frame plus tokens. */
+function designHandoffFiles(c: Canvas): { path: string; content: string }[] {
+  const safe = (name: string) =>
+    name
+      .replace(/[^a-z0-9-_]+/gi, '-')
+      .replace(/^-+|-+$/g, '')
+      .toLowerCase() || 'frame'
+  const tokens = c.tokens
+  return [
+    ...c.frames.map((f) => ({ path: `design/${safe(f.name)}.html`, content: f.html })),
+    ...(tokens ? [{ path: 'design/tokens.css', content: cssForTokens(tokens) }] : []),
+    {
+      path: 'design/README.md',
+      content: `# Design handoff\n\nExported from doop canvas \`${c.id}\` (${c.name}).\nEach file in \`design/\` is a self-contained frame document; open it in a browser to see the design.\n`,
+    },
+  ]
 }
 
 /** Stateless streamable-HTTP MCP endpoint. */
@@ -3614,7 +4569,10 @@ export async function handleMcpRequest(req: Request, res: Response) {
     }
   }
   const owner = session.userId ? await getUserName(session.userId) : undefined
-  const server = buildMcpServer(owner, session.userId ?? undefined)
+  /* the OAuth client (not just the user) rides along: presence, activity and
+     the clients panel can then tell two agents of one account apart */
+  if (session.clientId) touchClient(session.clientId)
+  const server = buildMcpServer(owner, session.userId ?? undefined, session.clientId ?? undefined)
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined })
   res.on('close', () => {
     /* the client is gone; there is nobody left to report a close failure to */

@@ -1,4 +1,5 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
+import type { DragEvent } from 'react'
 import { useStore } from '../lib/store'
 import { api } from '../lib/api'
 import { cn } from '../lib/utils'
@@ -17,6 +18,13 @@ import { MeterLine, isResidentLimit, useAllowance } from './TeamAllowance'
 import { Button } from './ui/button'
 import { Textarea } from './ui/textarea'
 import { Card } from './ui/card'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuTrigger,
+} from './ui/dropdown-menu'
 import { Dot } from './ui/dot'
 import { RoleMark } from './RoleMark'
 
@@ -29,6 +37,18 @@ import { RoleMark } from './RoleMark'
  * and moves down it one stage at a time; the trail on each card is the live
  * position in that pipeline.
  */
+
+/** The queue's running order — the same order the server claims cards in:
+   priority first, then the position a human dragged cards to, then arrival. */
+function queueOrder(a: AgentTask, b: AgentTask): number {
+  return (b.priority ?? 0) - (a.priority ?? 0) || (a.position ?? 0) - (b.position ?? 0) || a.startedAt - b.startedAt
+}
+
+const PRIORITY_OPTIONS = [
+  { value: 2, label: 'High', hint: 'jumps the queue' },
+  { value: 0, label: 'Normal', hint: 'the default order' },
+  { value: -1, label: 'Low', hint: 'runs after everything else' },
+]
 
 /* class recipes shared across the board's cards and columns */
 const colHeadCls = 'mb-3.5 flex items-baseline gap-2 border-b border-line pb-3'
@@ -176,6 +196,51 @@ function Team({ tasks, onPick }: { tasks: AgentTask[]; onPick: (id: string) => v
   )
 }
 
+/** The priority flag on a queued card: where it sits in the running order.
+   Applies to the whole entry (an import group moves as one). */
+function PriorityControl({ canvasId, cards }: { canvasId: string; cards: AgentTask[] }) {
+  const current = Math.max(...cards.map((c) => c.priority ?? 0))
+  const active = PRIORITY_OPTIONS.find((o) => o.value === current) ?? PRIORITY_OPTIONS[1]!
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button
+          variant="bare"
+          size="sm"
+          className={cn(
+            'mt-1.5 -ml-1.5 gap-1 text-[11px] font-semibold',
+            current > 0 && 'text-brand',
+            current < 0 && 'text-ink-faint',
+          )}
+          title="Queue priority"
+        >
+          {current > 0 ? '⚑' : '⚐'} {active.label} priority
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent className="w-[190px]">
+        <DropdownMenuLabel>Runs in this order</DropdownMenuLabel>
+        {PRIORITY_OPTIONS.map((o) => (
+          <DropdownMenuItem
+            key={o.value}
+            disabled={o.value === current}
+            onClick={() => {
+              for (const c of cards) api.setCardPriority(canvasId, c.id, o.value).catch(console.error)
+            }}
+          >
+            <span className="flex-none font-mono text-[12px]">{o.value > 0 ? '⚑' : '⚐'}</span>
+            <span className="min-w-0">
+              <span className="block font-semibold">{o.label}</span>
+              <span className="block text-[11.5px] text-ink-faint">{o.hint}</span>
+            </span>
+            {o.value === current && <span className="ml-auto text-[12px] text-brand">✓</span>}
+          </DropdownMenuItem>
+        ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
+
+/** The roster: who is on the team, what each one owns, and what they're on. */
 export function Board({ canvasId }: { canvasId: string }) {
   const tasks = useStore((s) => s.tasks)
   const frames = useStore((s) => s.canvas?.frames)
@@ -186,9 +251,53 @@ export function Board({ canvasId }: { canvasId: string }) {
   /* a stopped card belongs with the failures: it needs a human decision, and
      its card body already reads "Attempt stopped" */
   const failed = tasks.filter((t) => t.queuedBy && (t.failedAt || t.cancelledAt) && !t.endedAt)
-  const queued = tasks.filter((t) => t.queuedBy && !t.agentName && !t.failedAt && !t.cancelledAt && !t.endedAt)
+  const queued = useMemo(
+    () =>
+      tasks.filter((t) => t.queuedBy && !t.agentName && !t.failedAt && !t.cancelledAt && !t.endedAt).sort(queueOrder),
+    [tasks],
+  )
+  /* paused cards stay claimed — an agent still owns them, the run is just
+     held — so they read in the in-progress column with a Resume control */
   const inProgress = tasks.filter((t) => t.agentName && !t.failedAt && !t.cancelledAt && !t.endedAt)
   const done = tasks.filter((t) => t.endedAt).slice(0, 14)
+
+  /* the drag order is optimistic: the ids as this client arranged them, so
+     the column keeps the drop position until the server's own order says
+     the same thing (inert then, and a broadcast always wins after that) */
+  const [dragIds, setDragIds] = useState<string[] | null>(null)
+  const [dragging, setDragging] = useState<string | null>(null)
+  const [overKey, setOverKey] = useState<string | null>(null)
+  const ordered = useMemo(() => {
+    const server = queued.map((t) => t.id).join(',')
+    if (!dragIds || dragIds.join(',') === server) return queued
+    const byId = new Map(queued.map((t) => [t.id, t]))
+    const next = dragIds.flatMap((id) => byId.get(id) ?? [])
+    for (const t of queued) if (!dragIds.includes(t.id)) next.push(t)
+    return next
+  }, [queued, dragIds])
+
+  function dropOn(targetKey: string) {
+    if (!dragging || dragging === targetKey) {
+      setDragging(null)
+      setOverKey(null)
+      return
+    }
+    /* one id per rendered card; an import group moves as its block of ids */
+    const entries = groupImports(ordered)
+    const dragged = entries.find((e) => e.key === dragging)
+    if (!dragged || !entries.some((e) => e.key === targetKey)) return
+    const rest = entries.filter((e) => e.key !== dragging)
+    rest.splice(
+      rest.findIndex((e) => e.key === targetKey),
+      0,
+      dragged,
+    )
+    const ids = rest.flatMap((e) => e.cards.map((c) => c.id))
+    setDragIds(ids)
+    void api.reorderCards(canvasId, ids).catch(console.error)
+    setDragging(null)
+    setOverKey(null)
+  }
 
   /* clicking a chip appends it to the pipeline, so click order = run order */
   function toggle(id: string) {
@@ -284,11 +393,34 @@ export function Board({ canvasId }: { canvasId: string }) {
                 </Button>
               </Card>
             ))}
-            {groupImports(queued).map(({ key, cards }) => {
+            {groupImports(ordered).map(({ key, cards }) => {
               const t = cards[0]!
               const isImport = cards.length > 1 || !!t.payload
               return (
-                <Card key={key} className={cn(cardBase, 'bg-surface')}>
+                <Card
+                  key={key}
+                  className={cn(cardBase, 'bg-surface', overKey === key && dragging !== key && 'border-brand')}
+                  draggable
+                  onDragStart={(e: DragEvent<HTMLDivElement>) => {
+                    setDragging(key)
+                    e.dataTransfer.effectAllowed = 'move'
+                  }}
+                  onDragOver={(e: DragEvent<HTMLDivElement>) => {
+                    if (!dragging || dragging === key) return
+                    e.preventDefault()
+                    e.dataTransfer.dropEffect = 'move'
+                    setOverKey(key)
+                  }}
+                  onDragLeave={() => setOverKey((k) => (k === key ? null : k))}
+                  onDrop={(e: DragEvent<HTMLDivElement>) => {
+                    e.preventDefault()
+                    dropOn(key)
+                  }}
+                  onDragEnd={() => {
+                    setDragging(null)
+                    setOverKey(null)
+                  }}
+                >
                   <Button
                     variant="bare"
                     className={dismissCls}
@@ -333,6 +465,7 @@ export function Board({ canvasId }: { canvasId: string }) {
                     ✦ waiting for {roleName(pipelineOf(t)[t.stage ?? 0])}
                   </div>
                   <TargetChip task={t} frames={frames} />
+                  <PriorityControl canvasId={canvasId} cards={cards} />
                 </Card>
               )
             })}
@@ -453,7 +586,7 @@ export function Board({ canvasId }: { canvasId: string }) {
                 <div className={metaCls}>
                   <Dot
                     size="sm"
-                    className="animate-[stream-pulse_1.2s_ease-in-out_infinite]"
+                    className={cn(!t.pausedAt && 'animate-[stream-pulse_1.2s_ease-in-out_infinite]')}
                     style={{ background: t.color }}
                   />
                   <b className="inline-flex items-center gap-1">
@@ -465,15 +598,42 @@ export function Board({ canvasId }: { canvasId: string }) {
                   <span> · {timeAgo(t.claimedAt ?? t.startedAt)}</span>
                 </div>
                 <TargetChip task={t} frames={frames} />
-                <Button
-                  variant="danger-solid"
-                  size="pill"
-                  className="mt-2.5 px-[11px] py-[5px]"
-                  title="Stop this agent"
-                  onClick={() => api.stopAgentWork(canvasId, t.agentName).catch(console.error)}
-                >
-                  Stop
-                </Button>
+                {t.pausedAt ? (
+                  <div className="mt-2.5 flex items-center gap-2.5">
+                    <Button
+                      size="pill"
+                      className="px-[11px] py-[5px]"
+                      title="Let the agent pick this card back up"
+                      onClick={() => api.resumeCard(canvasId, t.id).catch(console.error)}
+                    >
+                      ▶ Resume
+                    </Button>
+                    <span className="text-[11.5px] text-ink-faint">
+                      paused{t.pausedBy ? ` by ${t.pausedBy}` : ''} · {timeAgo(t.pausedAt)}
+                    </span>
+                  </div>
+                ) : (
+                  <div className="mt-2.5 flex items-center gap-2">
+                    <Button
+                      variant="ghost"
+                      size="pill"
+                      className="px-[11px] py-[5px]"
+                      title="Hold this run — the card stays claimed and can be resumed"
+                      onClick={() => api.pauseAgentWork(canvasId, t.agentName).catch(console.error)}
+                    >
+                      ⏸ Pause
+                    </Button>
+                    <Button
+                      variant="danger-solid"
+                      size="pill"
+                      className="px-[11px] py-[5px]"
+                      title="Stop this agent"
+                      onClick={() => api.stopAgentWork(canvasId, t.agentName).catch(console.error)}
+                    >
+                      Stop
+                    </Button>
+                  </div>
+                )}
               </Card>
             ))}
           </div>

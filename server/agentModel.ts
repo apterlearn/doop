@@ -35,10 +35,26 @@ export interface AgentTurnRequest {
   signal?: AbortSignal
 }
 
+/** What one model turn cost its payer, in provider-reported tokens. */
+export interface TurnUsage {
+  input: number
+  output: number
+  cacheRead: number
+  cacheWrite: number
+}
+
 export interface AgentTurnResult {
   content: TurnBlock[]
   stop_reason: StopReason
+  /** Provider usage for this turn. All-zero when the provider does not
+   *  report it — see the [OI]-shaped transports below. */
+  usage: TurnUsage
 }
+
+/** Usage the [OI]-shaped transports do not report: openaiAgent.ts's TurnResult
+ *  carries only content and stop_reason, so a turn there accounts as zero
+ *  rather than as an invented number. Shared, treated as immutable. */
+const NO_USAGE: TurnUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
 
 export interface AgentModel {
   provider: Provider
@@ -117,7 +133,15 @@ export async function runAnthropicTurn(
         : res.stop_reason === 'tool_use'
           ? 'tool_use'
           : 'end_turn'
-  return { content: res.content as TurnBlock[], stop_reason: stop }
+  /* cache_* are nullable in the SDK: a turn that used no cache reports null,
+     which is zero tokens spent on it, not a missing number */
+  const usage: TurnUsage = {
+    input: res.usage.input_tokens ?? 0,
+    output: res.usage.output_tokens ?? 0,
+    cacheRead: res.usage.cache_read_input_tokens ?? 0,
+    cacheWrite: res.usage.cache_creation_input_tokens ?? 0,
+  }
+  return { content: res.content as TurnBlock[], stop_reason: stop, usage }
 }
 
 function azureTier(): AgentModel | null {
@@ -136,13 +160,14 @@ function azureTier(): AgentModel | null {
     label: `Doop (${deployment})`,
     async run(req) {
       try {
-        return await runAzureTurn(config, {
+        const result = await runAzureTurn(config, {
           system: joinSystem(req),
           tools: req.tools,
           messages: req.messages,
           maxTokens: req.maxTokens,
           signal: req.signal,
         })
+        return { ...result, usage: NO_USAGE }
       } catch (err) {
         /* these are the SERVER's credentials — "reconnect your account" would
            send users chasing a connection they don't have */
@@ -210,13 +235,14 @@ function byoModel(account: ModelAccount): AgentModel {
       /* refreshed per turn, not per run: a long design run outlives an
          hour-long access token */
       const live = await withFreshToken(account)
-      return runOpenAiTurn(live, {
+      const result = await runOpenAiTurn(live, {
         system: joinSystem(req),
         tools: req.tools,
         messages: req.messages,
         maxTokens: req.maxTokens,
         signal: req.signal,
       })
+      return { ...result, usage: NO_USAGE }
     },
   }
 }

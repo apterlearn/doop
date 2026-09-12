@@ -47,7 +47,15 @@ import { useIsMobile } from '../hooks/use-mobile'
 import { cn } from '@/lib/utils'
 import { Button } from '../components/ui/button'
 import { Sheet, SheetContent, SheetDescription, SheetTitle } from '../components/ui/sheet'
-import { GithubIcon, ImportIcon, MoreHorizontalIcon, PlayIcon, PulseIcon, SparkIcon } from '../components/ui/icons'
+import {
+  GithubIcon,
+  ImportIcon,
+  MoreHorizontalIcon,
+  PlayIcon,
+  PulseIcon,
+  ShieldIcon,
+  SparkIcon,
+} from '../components/ui/icons'
 import { Badge } from '../components/ui/badge'
 import { Input } from '../components/ui/input'
 import { Field } from '../components/ui/field'
@@ -89,6 +97,9 @@ const errorNoteCls = 'mt-2.5 text-[13px] text-accent-ink'
 
 export function CanvasPage({ canvasId }: { canvasId: string }) {
   const canvas = useStore((s) => s.canvas)
+  const reviewMode = useStore((s) => s.reviewMode)
+  const { data: session } = authClient.useSession()
+  const isOwner = !!canvas?.ownerId && canvas.ownerId === session?.user?.id
   const connected = useStore((s) => s.connected)
   const presences = useStore((s) => s.presences)
   const selectedId = useStore((s) => s.selectedId)
@@ -137,7 +148,6 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
       clearHistory()
     }
   }, [canvasId, select])
-
   /* broadcast which frame I'm focused on */
   useEffect(() => {
     sendWs({ type: 'editing', frameId: selectedId })
@@ -263,6 +273,40 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
     if (taskToastTimer.current) window.clearTimeout(taskToastTimer.current)
     taskToastTimer.current = window.setTimeout(() => setTaskToast(null), 6000)
   }, [tasks])
+
+  /* a question arriving in the same channel is likewise invisible: surface it
+     as its own toast in the same stack, ✕ mutes it for this session, and the
+     jump action opens the Review tab — that is where the answer box lives */
+  const questions = useStore((s) => s.questions)
+  const [questionToastId, setQuestionToastId] = useState<string | null>(null)
+  const [mutedQuestion, setMutedQuestion] = useState<string | null>(null)
+  const questionToastTimer = useRef<number | null>(null)
+  const announcedQuestions = useRef<Set<string> | null>(null)
+  useEffect(() => {
+    if (!loadedAt.current) loadedAt.current = Date.now()
+    const announced = announcedQuestions.current ?? new Set<string>()
+    announcedQuestions.current = announced
+    const fresh = questions
+      .filter((q) => q.status === 'open' && q.at > loadedAt.current && !announced.has(q.id))
+      .sort((a, b) => b.at - a.at)
+    for (const q of fresh) announced.add(q.id)
+    const question = fresh[0]
+    if (!question) return
+    setQuestionToastId(question.id)
+    if (questionToastTimer.current) window.clearTimeout(questionToastTimer.current)
+    questionToastTimer.current = window.setTimeout(() => setQuestionToastId(null), 8000)
+  }, [questions])
+  const questionToast = questions.find((q) => q.id === questionToastId)
+
+  /* a question pin (or this toast) asked for the panel: open it on that tab */
+  const panelRequest = useStore((s) => s.panelRequest)
+  useEffect(() => {
+    if (!panelRequest) return
+    useStore.getState().setPanelTab(panelRequest.tab)
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- an external request moves the panel, the same case FrameView documents
+    setShowActivity(true)
+    useStore.getState().clearPanelRequest()
+  }, [panelRequest])
 
   /* a decision landing in Memory is invisible work — surface it as its own
      memory toast in the same top-right stack. Only decisions captured after
@@ -424,6 +468,36 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
               <PlayIcon className="size-3.5" />
             </Button>
           </Tooltip>
+          <Tooltip
+            label={
+              isOwner
+                ? reviewMode
+                  ? 'Review mode is on — agent changes need your approval. Click to turn it off'
+                  : 'Review mode — agent changes wait for your approval'
+                : `Review mode is ${reviewMode ? 'on' : 'off'} — only the canvas owner can change it`
+            }
+            side="bottom"
+          >
+            <Button
+              variant="ghost"
+              size="icon"
+              className={cn(
+                'size-[34px] rounded-[7px] bg-surface hover:border-ink-faint hover:bg-paper-deep',
+                reviewMode && 'border-brand text-brand hover:border-brand hover:text-brand',
+              )}
+              aria-label="Review mode"
+              aria-pressed={reviewMode}
+              disabled={!isOwner}
+              onClick={() =>
+                api
+                  .setReviewMode(canvasId, !reviewMode)
+                  .then((next) => useStore.getState().setReviewModeLocal(next.reviewMode))
+                  .catch(console.error)
+              }
+            >
+              <ShieldIcon className="size-3.5" />
+            </Button>
+          </Tooltip>
           <Button
             variant="ghost"
             className="h-[34px] rounded-[7px] bg-surface px-[17px] text-[12.5px] font-semibold hover:border-ink-faint hover:bg-paper-deep"
@@ -518,6 +592,29 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
                     className="py-[9px] pl-1.5 pr-2.5 text-[11px] hover:bg-transparent"
                     title="Hide for now"
                     onClick={() => setMutedProposal(pendingProposal.id)}
+                  >
+                    ✕
+                  </Button>
+                </div>
+              )}
+              {questionToast && mutedQuestion !== questionToast.id && !(showActivity && panelTab === 'review') && (
+                <div className="flex items-center rounded-[10px] border border-accent-ink bg-white shadow-card">
+                  <Button
+                    variant="bare"
+                    className="max-w-[300px] gap-1.5 py-[9px] pl-3.5 pr-1 text-[12.5px] font-bold text-accent-ink hover:bg-transparent hover:text-accent-ink"
+                    title={questionToast.text}
+                    onClick={() => useStore.getState().requestPanel('review')}
+                  >
+                    <ShieldIcon className="size-3 flex-none" />
+                    <span className="truncate">
+                      {questionToast.agentName} asks — {questionToast.text}
+                    </span>
+                  </Button>
+                  <Button
+                    variant="bare"
+                    className="py-[9px] pl-1.5 pr-2.5 text-[11px] hover:bg-transparent"
+                    title="Hide for now"
+                    onClick={() => setMutedQuestion(questionToast.id)}
                   >
                     ✕
                   </Button>

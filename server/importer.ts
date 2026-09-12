@@ -15,6 +15,7 @@ import {
 } from './publicUrl.ts'
 import { navigateWebsitePage, WebsiteCaptureUnavailableError } from './websiteAccess.ts'
 import { pruneUnusedCss } from './cssPrune.ts'
+import { IMPORT_SANITIZE_RULES, sanitizeImportedHtml, type SanitizeOptions } from './sanitizeHtml.ts'
 import {
   MAX_DISCOVERY_BYTES,
   MAX_FRAME_HTML_BYTES,
@@ -569,47 +570,38 @@ export async function importPage(rawUrl: string, options: { includePreview?: boo
       await new Promise((r) => setTimeout(r, 600)) // late layout/lazy paint
     }
 
-    const snap = await page.evaluate((maxHeight: number) => {
-      for (const el of document.querySelectorAll(
-        'script, noscript, iframe, frame, frameset, object, embed, applet, portal, fencedframe',
-      ))
-        el.remove()
-      for (const meta of document.querySelectorAll<HTMLMetaElement>('meta[http-equiv]')) meta.remove()
-
-      /* A snapshot is passive HTML. Inline handlers and executable URL
-         schemes would otherwise run again inside the canvas iframe. */
-      const executableUrlAttributes = new Set(['action', 'formaction', 'href', 'poster', 'src', 'xlink:href'])
-      for (const el of document.querySelectorAll('*')) {
-        for (const attr of Array.from(el.attributes)) {
-          const name = attr.name.toLowerCase()
-          if (name.startsWith('on') || name === 'srcdoc' || name === 'ping') el.removeAttribute(attr.name)
-          else if (executableUrlAttributes.has(name) && /^\s*javascript:/i.test(attr.value)) {
-            el.removeAttribute(attr.name)
+    /* Element removal happens in the live page because what follows measures
+       layout and collects stylesheets from it. The attribute and meta rules
+       are applied to the serialized document below, by the shared sanitizer —
+       one copy of the rules lives in sanitizeHtml.ts. */
+    const snap = await page.evaluate(
+      (maxHeight: number, rules: typeof IMPORT_SANITIZE_RULES) => {
+        for (const el of document.querySelectorAll(rules.stripSelector)) el.remove()
+        const sheets: string[] = []
+        for (const l of document.querySelectorAll<HTMLLinkElement>('link')) {
+          if (
+            l.relList.contains('stylesheet') &&
+            l.href &&
+            !l.disabled &&
+            (!l.media || window.matchMedia(l.media).matches)
+          ) {
+            sheets.push(l.href)
           }
+          l.remove()
         }
-      }
-      const sheets: string[] = []
-      for (const l of document.querySelectorAll<HTMLLinkElement>('link')) {
-        if (
-          l.relList.contains('stylesheet') &&
-          l.href &&
-          !l.disabled &&
-          (!l.media || window.matchMedia(l.media).matches)
-        ) {
-          sheets.push(l.href)
+        const baseUrl = document.baseURI
+        for (const base of document.querySelectorAll('base')) base.remove()
+        return {
+          baseUrl,
+          sheets,
+          title: document.title,
+          height: Math.min(Math.max(document.documentElement.scrollHeight, 400), maxHeight),
+          html: document.documentElement.outerHTML,
         }
-        l.remove()
-      }
-      const baseUrl = document.baseURI
-      for (const base of document.querySelectorAll('base')) base.remove()
-      return {
-        baseUrl,
-        sheets,
-        title: document.title,
-        height: Math.min(Math.max(document.documentElement.scrollHeight, 400), maxHeight),
-        html: document.documentElement.outerHTML,
-      }
-    }, MAX_HEIGHT)
+      },
+      MAX_HEIGHT,
+      IMPORT_SANITIZE_RULES,
+    )
 
     let css = ''
     for (const sheet of snap.sheets) {
@@ -638,6 +630,13 @@ export async function importPage(rawUrl: string, options: { includePreview?: boo
     } catch {
       /* Unsafe or malformed bases fall back to the already validated page URL. */
     }
+    /* The canonical output filter: the same rules as the in-page removal,
+       applied to the serialized document (which the CSS pruner re-serialized),
+       plus url() references resolved against the page's own base so the frame
+       does not depend on relative resolution. Runs before the injection so the
+       CSP meta we add below is not stripped by the http-equiv rule. */
+    const sanitizeOptions: SanitizeOptions = { baseUrl: documentBase }
+    html = sanitizeImportedHtml(html, sanitizeOptions)
 
     /* self-contained document: a base tag so in-document relative URLs
        (images, srcset) keep resolving, plus every stylesheet inlined */

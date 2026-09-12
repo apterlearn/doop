@@ -36,6 +36,30 @@ export function componentName(name: string): string {
   return /^[0-9]/.test(cleaned) ? `Frame${cleaned}` : cleaned
 }
 
+/* ------------------------------------------------------------------ */
+/* Tokens as portable code                                             */
+
+/** The tokens as a Tailwind v4 `@theme` block. Same naming as
+ *  `cssForTokens` (designLint.ts), the one other place a token becomes a
+ *  custom property, except spacing, which Tailwind namespaces `--spacing-*`
+ *  where the paste-into-a-frame block uses `--space-*`. */
+export function tailwindThemeCss(tokens: DesignTokens): string {
+  const lines: string[] = []
+  for (const [name, value] of Object.entries(tokens.colors ?? {})) lines.push(`  --color-${name}: ${value.trim()};`)
+  for (const [key, value] of Object.entries(tokens.fonts ?? {}))
+    if (value) lines.push(`  --font-${key}: ${value.trim()};`)
+  for (const value of tokens.spacing ?? []) lines.push(`  --spacing-${value}: ${value}px;`)
+  for (const value of tokens.radii ?? []) lines.push(`  --radius-${value}: ${value}px;`)
+  for (const [index, value] of (tokens.shadows ?? []).entries()) lines.push(`  --shadow-${index + 1}: ${value.trim()};`)
+  return `@theme {\n${lines.join('\n')}\n}`
+}
+
+/** The tokens verbatim, pretty-printed — the machine-readable form the CSS
+ *  exports are derived from. */
+export function tokensJson(tokens: DesignTokens): string {
+  return JSON.stringify(tokens, null, 2)
+}
+
 interface Extracted {
   css: string
   jsx: string
@@ -51,7 +75,21 @@ async function extract(frame: Frame): Promise<Extracted> {
        serializes the callback without that runtime helper. */
     await page.evaluate('globalThis.__name = (target) => target')
     return (await page.evaluate(() => {
-      const VOID_TAGS = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'source', 'track', 'wbr'])
+      const VOID_TAGS = new Set([
+        'area',
+        'base',
+        'br',
+        'col',
+        'embed',
+        'hr',
+        'img',
+        'input',
+        'link',
+        'meta',
+        'source',
+        'track',
+        'wbr',
+      ])
       const CAMEL: Record<string, string> = {
         class: 'className',
         for: 'htmlFor',
@@ -128,7 +166,8 @@ async function extract(frame: Frame): Promise<Extracted> {
             else notes.push('an inline style attribute could not be parsed and was dropped')
             continue
           }
-          const jsxName = CAMEL[name] ?? (SVG_KEEP.has(name) ? name : name.replace(/-([a-z])/g, (_, c: string) => c.toUpperCase()))
+          const jsxName =
+            CAMEL[name] ?? (SVG_KEEP.has(name) ? name : name.replace(/-([a-z])/g, (_, c: string) => c.toUpperCase()))
           if (jsxName === 'value' || jsxName === 'checked' || jsxName === 'selected' || jsxName === 'disabled') {
             /* boolean/controlled attributes are left as strings so the export
                renders identically without a React state model */
@@ -176,10 +215,33 @@ async function extract(frame: Frame): Promise<Extracted> {
   }
 }
 
-/** A frame's HTML as a self-contained React component plus its stylesheet. */
-export async function htmlToReact(html: string, name: string, tokens?: DesignTokens): Promise<ReactExport> {
+export interface HtmlToReactOptions {
+  /** component name; defaults to the frame name or "Frame" */
+  name?: string
+  /** the frame id the scoped stylesheet keys off (`[data-frame="<id>"]`) */
+  frameId?: string
+  tokens?: DesignTokens
+  /** Emit the frame's CSS scoped under `[data-frame="<id>"]` (the same mapping
+   *  `htmlBundle` uses) instead of global rules, and wrap the markup in an
+   *  element carrying that attribute so the selectors match. Default false:
+   *  the frame's own `<style>` blocks ship unmodified. */
+  scopedCss?: boolean
+}
+
+/** A frame's HTML as a self-contained React component plus its stylesheet.
+ *  `htmlToReact(html, name, tokens)` and `htmlToReact(html, options)` are the
+ *  same call. */
+export async function htmlToReact(html: string, name: string, tokens?: DesignTokens): Promise<ReactExport>
+export async function htmlToReact(html: string, options: HtmlToReactOptions): Promise<ReactExport>
+export async function htmlToReact(
+  html: string,
+  nameOrOptions: string | HtmlToReactOptions,
+  tokens?: DesignTokens,
+): Promise<ReactExport> {
+  const options = typeof nameOrOptions === 'string' ? { name: nameOrOptions, tokens } : nameOrOptions
+  const name = options.name ?? 'Frame'
   const frame: Frame = {
-    id: 'export',
+    id: options.frameId ?? 'export',
     canvasId: 'export',
     name,
     x: 0,
@@ -191,18 +253,33 @@ export async function htmlToReact(html: string, name: string, tokens?: DesignTok
     updatedAt: 0,
     updatedBy: 'export',
   }
-  const { css, jsx, notes } = await extract(frame)
+  const { css: unscopedCss, jsx, notes } = await extract(frame)
+  const scoped = options.scopedCss === true
+  const scope = `[data-frame="${frame.id}"]`
+  const css = scoped ? (await scopedCss(frame, scope)).css : unscopedCss
   const component = componentName(name)
+  /* the scoped selectors only match inside an element with the attribute, so
+     the markup carries it; children shift one level deeper */
+  const body = jsx.trimEnd()
+  const markup = scoped
+    ? body
+        .split('\n')
+        .map((line) => `  ${line}`)
+        .join('\n')
+    : body
+  const styleNote = scoped
+    ? `styles are scoped to ${scope}; keep the wrapper element's data-frame attribute when reusing the markup`
+    : undefined
   return {
     component_name: component,
     jsx: [
       `/* ${component} — exported from Doop. Styles are in ${component}.css. */`,
       `export function ${component}() {`,
       '  return (',
-      '    <>',
-      jsx.trimEnd(),
+      scoped ? `    <div data-frame="${frame.id}">` : '    <>',
+      ...(markup ? markup.split('\n') : []),
       '      <style>{css}</style>',
-      '    </>',
+      scoped ? '    </div>' : '    </>',
       '  )',
       '}',
       '',
@@ -210,8 +287,8 @@ export async function htmlToReact(html: string, name: string, tokens?: DesignTok
       '',
     ].join('\n'),
     css,
-    tokens_css: tokens ? cssForTokens(tokens) : '',
-    notes,
+    tokens_css: options.tokens ? cssForTokens(options.tokens) : '',
+    notes: styleNote ? [...notes, styleNote] : notes,
   }
 }
 
@@ -248,7 +325,8 @@ async function scopedCss(frame: Frame, scope: string): Promise<FrameCss> {
         for (const rule of Array.from(rules)) {
           if (rule instanceof CSSStyleRule) out += `${rule.selectorText} {${rule.style.cssText}}\n`
           else if (rule instanceof CSSMediaRule) out += `@media ${rule.conditionText} {\n${walkRaw(rule.cssRules)}}\n`
-          else if (rule instanceof CSSSupportsRule) out += `@supports ${rule.conditionText} {\n${walkRaw(rule.cssRules)}}\n`
+          else if (rule instanceof CSSSupportsRule)
+            out += `@supports ${rule.conditionText} {\n${walkRaw(rule.cssRules)}}\n`
         }
         return out
       }

@@ -3,6 +3,14 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 /* The queue mirrors into Postgres and broadcasts; this test only cares about
    the text a card carries. */
 vi.mock('../server/db/persist.ts', () => ({
+  getUserEmail: async () => undefined,
+  getNotificationPrefs: async () => new Map(),
+  saveNotificationPref: () => {},
+  pruneRunEvents: () => {},
+  saveJournal: () => {},
+  saveRunEvent: () => {},
+  saveQuestion: () => {},
+  saveFrameProposal: () => {},
   saveTask: () => {},
   deleteTask: () => {},
   saveFeedback: () => {},

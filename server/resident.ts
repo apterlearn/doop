@@ -1,6 +1,11 @@
 import type Anthropic from '@anthropic-ai/sdk'
+import { nanoid } from 'nanoid'
 import { store } from './store.ts'
 import { ModelAuthError, pickModel } from './agentModel.ts'
+import * as runLog from './runLog.ts'
+import { reviewFrame, type ReviewReport } from './review.ts'
+import * as plans from './plans.ts'
+import * as agentEvents from './agentEvents.ts'
 import { RESIDENT_TASK_LIMIT } from './allowance.ts'
 import * as actions from './actions.ts'
 import * as frameLocks from './frameLocks.ts'
@@ -157,10 +162,28 @@ interface RunState {
   verifiedFrames: Set<string>
   rewriteDrafts: Map<string, string>
   blockedWebsiteAccess?: string
+  /** review_frame output per deliverable frame — the automated quality gate */
+  reviewedFrames: Map<string, ReviewReport>
 }
 
 function deliverableFrameIds(runState: RunState): string[] {
   return [...runState.mutatedFrames].filter((id) => !runState.sourceFrames.has(id))
+}
+
+/** The first deliverable frame whose automated review still fails, with a
+ *  human-readable reason. Absent review means it has not been checked yet. */
+function failedReview(runState: RunState): { frameId: string; detail: string } | undefined {
+  for (const id of deliverableFrameIds(runState)) {
+    const report = runState.reviewedFrames.get(id)
+    if (!report) return { frameId: id, detail: 'no review_frame report yet' }
+    const s = report.summary
+    if (s.critical > 0 || s.errors > 0 || s.off_token > 0)
+      return {
+        frameId: id,
+        detail: `${s.critical} critical a11y, ${s.errors} layout errors, ${s.off_token} off-token colors`,
+      }
+  }
+  return undefined
 }
 
 function verificationFrameIds(runState: RunState): string[] {
@@ -416,8 +439,14 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
             .join('\n') +
           `\nBefore designing or restyling anything, call get_reference on the most relevant one and match its palette, typography and spacing.`
         : ''
+    const journals = actions.getRunJournals(canvasId, role.name, 3)
+    const journalBlock = journals.length
+      ? `\n\n# What you did before on this canvas\n` +
+        journals.map((j) => `- ${new Date(j.at).toISOString().slice(0, 16)}: ${j.summary}`).join('\n')
+      : ''
     const kickoff =
       sections.join('\n\n') +
+      journalBlock +
       `\n\nFrames currently on the canvas:\n${frameList}` +
       referenceList +
       `\n\nExecution strategy selected by the harness:\n${strategyFor(workText, visibleFrames)}` +
@@ -429,9 +458,11 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
         ? ` For element comments, use the selector and HTML excerpt to find the exact element in the frame's HTML — the live document may have drifted since the comment was left, so match on content, not position.`
         : '')
 
+    const runId = nanoid(8)
     console.log(
       `[resident] run start canvas=${canvasId} agent=${role.name} model=${model.label}${model.userId ? ` on=${model.userId}` : ''} feedback=${claimed.length} comments=${comments.length} cards=${cards.length}`,
     )
+    let usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
     /* a review pass legitimately ends without touching a frame; an
        originating pass that changed nothing has not delivered its card */
     const requireMutation = cards.length > 0 && !role.reviewer
@@ -441,6 +472,7 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
       sourceFrames: new Set(),
       verificationFrames: new Set(),
       verifiedFrames: new Set(),
+      reviewedFrames: new Map(),
       rewriteDrafts: new Map(),
     }
     let refused = false
@@ -451,6 +483,7 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
     let mutationNudgeSent = false
     let verificationNudgeSent = false
     let outputLimitNudgeSent = false
+    let reviewNudgeSent = false
     let turnsUsed = 0
 
     try {
@@ -498,6 +531,19 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
 
         messages.push({ role: 'assistant', content: res.content })
         turnsUsed = turn + 1
+        usage = {
+          input: usage.input + res.usage.input,
+          output: usage.output + res.usage.output,
+          cacheRead: usage.cacheRead + res.usage.cacheRead,
+          cacheWrite: usage.cacheWrite + res.usage.cacheWrite,
+        }
+        runLog.record({
+          canvasId,
+          runId,
+          agentName: actor.name,
+          kind: 'turn',
+          summary: `turn ${turnsUsed}: ${res.usage.output} output tokens`,
+        })
         const toolBlocks = res.content.filter(
           (block): block is Anthropic.ToolUseBlockParam => block.type === 'tool_use',
         )
@@ -538,7 +584,28 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
                 console.log(
                   `[resident] tool canvas=${canvasId} name=${block.name}${typeof target === 'string' ? ` frame=${target}` : ''}`,
                 )
+                const startedAt = Date.now()
                 const result = await execTool(block, canvasId, actor, runState)
+                /* the Run tab's tool timeline: name, duration, outcome and a
+                   one-line summary the human can expand */
+                const resultText = Array.isArray(result.content)
+                  ? result.content
+                      .map((c) => (typeof c === 'string' ? c : c.type === 'text' ? c.text : ''))
+                      .join(' ')
+                      .replace(/\s+/g, ' ')
+                      .trim()
+                      .slice(0, 200)
+                  : ''
+                runLog.record({
+                  canvasId,
+                  runId,
+                  agentName: actor.name,
+                  kind: 'tool',
+                  name: block.name,
+                  ok: !result.is_error,
+                  ms: Date.now() - startedAt,
+                  summary: resultText,
+                })
                 if (block.name === 'import_webpage' && result.is_error && !runState.blockedWebsiteAccess) {
                   importFailureInBatch =
                     'The website import failed. Correct the tool error and retry the import before making design changes.'
@@ -589,6 +656,18 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
           })
           continue
         }
+        /* the automated design gate: a deliverable must pass review_frame —
+           zero critical a11y issues, zero layout errors, zero off-token
+           colors. Screenshotting alone trusts the agent's own eye. */
+        const failing = failedReview(runState)
+        if (cards.length > 0 && failing && !reviewNudgeSent) {
+          reviewNudgeSent = true
+          messages.push({
+            role: 'user',
+            content: `Your design failed the automated checks (${failing.detail}). Call review_frame for ${failing.frameId}, fix the failing selectors, and re-run it until the report is clean.`,
+          })
+          continue
+        }
         finished = true
         break
       }
@@ -626,6 +705,7 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
       !blockedWebsiteAccess &&
       cards.length > 0 &&
       verificationFrameIds(runState).some((id) => !runState.verifiedFrames.has(id))
+    const failedGate = finished && !blockedWebsiteAccess && cards.length > 0 && !!failedReview(runState)
     const exhausted = !finished && !refused && !crashed && !cancelled
     if (exhausted) actions.setAgentStatus(canvasId, actor, 'Ran out of turns — waiting for a retry')
     if (blockedWebsiteAccess && !staleAccount) {
@@ -633,6 +713,7 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
     }
     if (noMutation) actions.setAgentStatus(canvasId, actor, 'No frame changed — waiting for a retry')
     if (unverifiedMutation) actions.setAgentStatus(canvasId, actor, 'Change not verified — waiting for a retry')
+    if (failedGate) actions.setAgentStatus(canvasId, actor, 'Design checks failed — waiting for a retry')
     console.log(
       `[resident] run end canvas=${canvasId} agent=${role.name} turns=${turnsUsed} finished=${finished} refused=${refused} crashed=${crashed} mutations=${runState.mutatedFrames.size} sources=${runState.sourceFrames.size} deliverables=${deliverableFrames.length} verified=${runState.verifiedFrames.size}`,
     )
@@ -649,11 +730,56 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
         actions.agentSummary(canvasId, actor, text)
       }
     }
-    if (finished && !blockedWebsiteAccess && !noMutation && !unverifiedMutation) {
+    /* what the run cost, on every card it served */
+    if (usage.input > 0 || usage.output > 0) {
+      actions.recordRunUsage(
+        cards.map((c) => c.id),
+        { ...usage, model: model.label },
+      )
+    }
+    /* cross-run memory: the next run of this role starts knowing what this
+       one did — the summary plus which frames it touched */
+    const runSummaryText = (() => {
+      const last = messages[messages.length - 1]
+      if (last?.role === 'assistant' && Array.isArray(last.content)) {
+        return last.content
+          .filter((b): b is Anthropic.TextBlock => b.type === 'text')
+          .map((b) => b.text)
+          .join(' ')
+          .replace(/\s+/g, ' ')
+          .trim()
+          .slice(0, 800)
+      }
+      return ''
+    })()
+    actions.recordRunJournal({
+      canvasId,
+      agentName: actor.name,
+      cardId: cards[0]?.id,
+      summary: runSummaryText || `${role.name} run ended without a summary`,
+      decisions: JSON.stringify({
+        frames: [...runState.mutatedFrames],
+        guidelines: store.getGuidelines(canvasId).map((d) => d.name),
+      }),
+    })
+    if (finished && !blockedWebsiteAccess && !noMutation && !unverifiedMutation && !failedGate) {
       for (const f of claimed) actions.completeTaskFeedback(f.id)
       for (const c of comments) actions.resolveComment(c.id, actor)
       /* a card moves to the next agent in its pipeline, or finishes here */
-      for (const c of cards) actions.advanceCard(canvasId, c.id, actor)
+      for (const c of cards) {
+        const last = messages[messages.length - 1]
+        const summary =
+          last?.role === 'assistant' && Array.isArray(last.content)
+            ? last.content
+                .filter((b): b is Anthropic.TextBlock => b.type === 'text')
+                .map((b) => b.text)
+                .join(' ')
+                .replace(/\s+/g, ' ')
+                .trim()
+                .slice(0, 1000)
+            : undefined
+        actions.advanceCard(canvasId, c.id, actor, summary)
+      }
     } else {
       let reason: string
       if (cancelled) {
@@ -670,6 +796,9 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
         reason = `${role.name} ran out of turns before finishing. Retry when you are ready.`
       } else if (noMutation) {
         reason = `${role.name} finished without changing a frame. Retry when you are ready.`
+      } else if (failedGate) {
+        const failing = failedReview(runState)
+        reason = `Design checks failed: ${failing?.detail ?? 'review incomplete'}. Retry when you are ready.`
       } else {
         reason = `${role.name} changed a frame but could not verify it. Retry when you are ready.`
       }
@@ -986,6 +1115,78 @@ const TOOLS: Anthropic.Tool[] = [
       type: 'object',
       properties: { frame_id: { type: 'string' } },
       required: ['frame_id'],
+    },
+  },
+  {
+    name: 'review_frame',
+    description:
+      'Run the automated design quality gate on a frame: token lint, accessibility audit and layout analysis (overflow, clipping, overlap, truncation) at mobile/tablet/desktop in one call. REQUIRED after finishing a frame: the run cannot complete while a deliverable frame has critical a11y issues, layout errors or off-token colors.',
+    input_schema: {
+      type: 'object',
+      properties: { frame_id: { type: 'string' } },
+      required: ['frame_id'],
+    },
+  },
+  {
+    name: 'set_plan',
+    description:
+      'Publish your working plan for the current task so the humans (and the rest of the team) can see it. Required for any task with more than two steps. Re-publishing the same steps keeps their progress.',
+    input_schema: {
+      type: 'object',
+      properties: { steps: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 12 } },
+      required: ['steps'],
+    },
+  },
+  {
+    name: 'update_plan_step',
+    description:
+      'Move a step of your published plan: set its status to active, done or blocked, optionally with a one-line note.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        step_id: { type: 'string' },
+        status: { type: 'string', enum: ['pending', 'active', 'done', 'blocked'] },
+        note: { type: 'string' },
+      },
+      required: ['step_id', 'status'],
+    },
+  },
+  {
+    name: 'get_plan',
+    description: 'Read your currently published plan for this canvas, with each step and its status.',
+    input_schema: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'ask_human',
+    description:
+      'Ask the humans on this canvas a blocking question and WAIT for the answer. Use it when a request is genuinely ambiguous or implies a destructive choice; never for information the canvas already answers. On timeout the question stays open — continue with best judgement and check get_answers later.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        text: { type: 'string', maxLength: 2000 },
+        frame_id: { type: 'string' },
+        wait_seconds: { type: 'number', minimum: 0, maximum: 120 },
+      },
+      required: ['text'],
+    },
+  },
+  {
+    name: 'get_answers',
+    description: 'Check whether humans answered your ask_human questions.',
+    input_schema: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'hand_back',
+    description:
+      'Give the current card back to an agent with the specialty it needs (only roles that are part of the card pipeline can receive it), with a reason. Use it when the work belongs to an earlier or different specialty instead of fixing it outside your lane.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        card_id: { type: 'string' },
+        to_agent: { type: 'string' },
+        reason: { type: 'string', maxLength: 500 },
+      },
+      required: ['card_id', 'to_agent', 'reason'],
     },
   },
 ]
@@ -1448,6 +1649,88 @@ async function execTool(
         }
         return ok(blocks)
       }
+      case 'review_frame': {
+        const f = store.getFrame(input.frame_id)
+        if (!f || f.canvasId !== canvasId) return fail('frame not found on this canvas')
+        const report = await reviewFrame(f, store.getCanvas(canvasId)?.tokens)
+        runState.reviewedFrames.set(f.id, report)
+        const s = report.summary
+        return ok(
+          s.critical === 0 && s.errors === 0 && s.off_token === 0
+            ? `review passed: 0 critical a11y, 0 layout errors, 0 off-token colors across ${report.viewports.length} viewport(s)`
+            : `review FAILED — critical a11y: ${s.critical}, layout errors: ${s.errors}, warnings: ${s.warnings}, off-token colors: ${s.off_token}. Fix the failing selectors and re-run review_frame: ${JSON.stringify(report.viewports.map((v) => ({ viewport: v.viewport, lint: v.lint.violations.slice(0, 5), a11y: v.a11y.issues.slice(0, 5), layout: v.layout.issues.slice(0, 5) })))}`,
+        )
+      }
+      case 'set_plan': {
+        const raw = block.input as { steps?: unknown }
+        const steps = Array.isArray(raw.steps)
+          ? raw.steps
+              .map(String)
+              .filter((s) => s.trim())
+              .slice(0, 12)
+          : []
+        if (!steps.length) return fail('set_plan requires a non-empty steps array')
+        plans.publishPlan(canvasId, actor.name, steps, actor)
+        return ok('plan published — update the steps as you go with update_plan_step')
+      }
+      case 'update_plan_step': {
+        const raw = block.input as { step_id?: string; status?: string; note?: string }
+        if (!raw.step_id || !raw.status) return fail('update_plan_step requires step_id and status')
+        const updated = plans.advancePlanStep(
+          canvasId,
+          actor.name,
+          { stepId: raw.step_id, status: raw.status, ...(raw.note ? { note: raw.note } : {}) },
+          actor,
+        )
+        return updated
+          ? ok(`step ${raw.step_id} is now ${raw.status}`)
+          : fail(`no plan or no step ${raw.step_id} — check get_plan`)
+      }
+      case 'get_plan': {
+        const plan = plans.readPlan(canvasId, actor.name)
+        return plan
+          ? ok(plan.steps.map((s) => `${s.id} [${s.status}] ${s.text}`).join('\n'))
+          : ok('no plan published yet — call set_plan for multi-step work')
+      }
+      case 'ask_human': {
+        const raw = block.input as { text?: string; frame_id?: string; wait_seconds?: number }
+        const text = String(raw.text ?? '').trim()
+        if (!text) return fail('ask_human requires text')
+        const question = actions.askQuestion(
+          canvasId,
+          { text, ...(raw.frame_id ? { frameId: raw.frame_id } : {}), waitSeconds: raw.wait_seconds },
+          actor,
+        )
+        if (!question) return fail('could not post the question')
+        actions.markAgentWaiting(canvasId, actor.name, true)
+        try {
+          const answer = await agentEventsWaitForAnswer(canvasId, actor.name, question.id, question.expiresAt)
+          if (answer !== undefined) return ok(`answered: ${answer}`)
+          return ok(
+            `nobody answered yet (status open, question_id ${question.id}). Continue with your best judgement; call get_answers later.`,
+          )
+        } finally {
+          actions.markAgentWaiting(canvasId, actor.name, false)
+        }
+      }
+      case 'get_answers': {
+        const mine = actions.getQuestions(canvasId).filter((q) => q.agentName === actor.name)
+        if (!mine.length) return ok('you have not asked any questions')
+        return ok(
+          mine
+            .map((q) => `[${q.status}] ${q.text}${q.answer ? ` — answered by ${q.answeredBy}: ${q.answer}` : ''}`)
+            .join('\n'),
+        )
+      }
+      case 'hand_back': {
+        const raw = block.input as { card_id?: string; to_agent?: string; reason?: string }
+        if (!raw.card_id || !raw.to_agent || !raw.reason?.trim())
+          return fail('hand_back requires card_id, to_agent and reason')
+        const card = await actions.handBackCard(canvasId, raw.card_id, raw.to_agent, raw.reason, actor)
+        if (!card) return fail(`no open card with id ${raw.card_id}`)
+        if (!card.handback) return fail(`"${raw.to_agent}" is not a stage of this card's pipeline`)
+        return ok(`handed back to ${raw.to_agent}`)
+      }
       default:
         return fail(`unknown tool ${block.name}`)
     }
@@ -1459,4 +1742,22 @@ async function execTool(
     if (blocked) runState.blockedWebsiteAccess = blocked
     return fail(blocked ?? (e instanceof Error ? e.message : 'tool failed'))
   }
+}
+
+/** Park until the answer to one question arrives, or its wait expires.
+ *  Returns the answer text, or undefined on timeout. */
+async function agentEventsWaitForAnswer(
+  canvasId: string,
+  agentName: string,
+  questionId: string,
+  expiresAt: number,
+): Promise<string | undefined> {
+  const events = await agentEvents.wait(canvasId, {
+    agentName,
+    cursor: 0,
+    timeoutMs: Math.max(0, expiresAt - Date.now()),
+    kinds: ['question_answer'],
+  })
+  const match = events.find((e) => (e.data as { questionId?: string; answer?: string })?.questionId === questionId)
+  return (match?.data as { answer?: string } | undefined)?.answer
 }
