@@ -427,14 +427,26 @@ Steering happens at three layers (the same architecture paper.design uses, plus 
 | `add_comment`          | Pin a note to one element in a frame — for recording a change, or asking a human about that element                 |
 | `reply_to_comment`     | Reply inside an element-comment thread, inheriting the thread's anchor                                              |
 | `resolve_comment`      | Close an element-comment thread once the note it carries has been addressed                                         |
-| `list_canvases`        | List all canvases                                                                                                   |
+| `whoami`               | The account and agent name your calls run as                                                                        |
+| `list_canvases`        | List canvases, paged                                                                                                |
 | `create_canvas`        | Create a canvas, returns its shareable id                                                                           |
-| `get_canvas`           | Canvas layout: every frame's position/size/meta                                                                     |
+| `get_canvas`           | Canvas layout: every frame's position/size/meta (bounded frame list)                                                |
+| `list_frames`          | Page a canvas's frames without pulling their HTML — filter by page or `updated_since`                                |
+| `get_tokens` / `set_tokens` | The canvas's design tokens (colors, fonts, spacing, radii) and their `:root` block                             |
+| `set_plan` / `update_plan_step` / `get_plan` | Publish the run's plan and move its steps — the panel shows the active step                 |
+| `apply_ops`            | Run several edits in one round trip, reported per op (`atomic: true` validates first)                               |
 | `view_website`         | Inspect one public page read-only; returns a desktop screenshot and visible text without changing the canvas        |
 | `import_webpage`       | Import one public URL onto a canvas as an editable HTML snapshot/frame                                              |
 | `create_frame`         | Add a frame with HTML (auto-placed if no x/y)                                                                       |
-| `get_frame`            | Read a frame including its HTML                                                                                     |
+| `get_frame`            | Read a frame including its HTML (clamped, with `html_truncated` when it is big)                                     |
 | `inspect_frame`        | Inspect the RENDERED page: semantic outline, element selectors, computed colors/type/radii/shadows                  |
+| `audit_frame`          | Accessibility audit of the render: contrast ratios, alt text, heading order, focus order, tap targets, landmarks    |
+| `lint_frame`           | Check the render against the canvas design tokens, naming the selector and the token it should have used            |
+| `diff_frame`           | Compare the render against a saved version, a pinned reference, another frame or a live URL — returns a marked image |
+| `get_frame_history`    | The frame's saved versions, newest first (metadata only)                                                            |
+| `get_frame_version`    | Read one saved version in full                                                                                      |
+| `revert_frame`         | Restore a saved version — an ordinary edit, versioned itself                                                        |
+| `begin_frame_edit` / `end_frame_edit` | Claim a frame so another agent's writes to it come back as a conflict                                  |
 | `get_frame_html`       | Read a bounded slice of a frame's source (`query` for snippets, or `offset`/`limit` to page)                        |
 | `get_frame_screenshot` | Render the frame headlessly and return a PNG — lets agents _see_ and iterate on their design                        |
 | `set_frame_html`       | Replace a frame's design in one shot — renders live for everyone                                                    |
@@ -442,6 +454,8 @@ Steering happens at three layers (the same architecture paper.design uses, plus 
 | `edit_frame_html`      | Targeted exact find/replace in a frame's HTML — morphs into the render in place                                     |
 | `update_frame`         | Rename / move / resize a frame                                                                                      |
 | `delete_frame`         | Remove a frame                                                                                                      |
+| `export_frame`         | Image URLs, the stored HTML, or a React component converted from the render                                          |
+| `export_canvas`        | The whole canvas as one document, a manifest, or a ZIP of every frame's source                                       |
 | `stop_work`            | Stop an agent's run on a canvas (`target_agent` for another agent, or omit to stop yourself)                        |
 
 Mutating tools accept `agent_name`; the agent then appears in the presence stack (pulsing square avatar),
@@ -450,7 +464,36 @@ expire from presence after ~20s of inactivity (~60s while they have a posted sta
 usually means the agent is thinking between tool calls).
 
 Agent-to-human ownership comes from the OAuth token: the bearer token identifies who approved
-the connection, and that user shows up as the agent's owner in tasks and presence.
+the connection, and that user shows up as the agent's owner in tasks and presence. An agent's
+identity is that account **plus** the name it posts under, so two accounts running the same
+`agent_name` are two agents: neither inherits the other's feedback, comment claims, stop records or
+presence. `whoami` reports which identity a session is running as.
+
+### What the MCP surface guarantees
+
+- **Errors are structured.** A failing tool returns `{ error: { code, message, retryable, details } }`
+  instead of a bare string, so an agent can branch on `conflict` / `rate_limited` / `too_large` /
+  `forbidden` rather than parsing prose.
+- **Reads are bounded.** `get_canvas`, `list_canvases`, `get_comments` and `list_frames` page
+  (`limit`/`offset`, `has_more`), and `get_frame` clamps a big document to 30 000 characters with
+  `html_truncated` set. HTML writes are capped at 3 MB; `append_frame_html` streams past it.
+- **Writes are recoverable and race-safe.** Every durable frame write is snapshotted
+  (`get_frame_history` / `get_frame_version` / `revert_frame`); `expected_updated_at` turns a write
+  built on a stale read into a `conflict` instead of a silent overwrite; `begin_frame_edit` /
+  `end_frame_edit` claim a frame so a concurrent writer gets a conflict naming the holder, with
+  `takeover: true` as the deliberate override.
+- **Design intent is shared.** `get_tokens` / `set_tokens` hold the canvas's palette, type and scale,
+  and `lint_frame` reports values that drift off them.
+- **The loop can be judged.** `audit_frame` measures contrast, alt text, heading order, focus order
+  and tap targets; `diff_frame` compares a render against a saved version, a reference, another frame
+  or a live URL and returns a marked-up image.
+- **Handoff is code, not only pixels.** `export_frame` converts a render to a React component;
+  `export_canvas` produces one document, a manifest, or a ZIP of every frame's source.
+- **Context can be attached, not just called.** Three MCP resources: `doop://guide`,
+  `doop://canvas/{canvasId}`, `doop://canvas/{canvasId}/tokens` — all gated by the same canvas access
+  check as the tools.
+- **Long calls report progress.** Tools that render, import or search emit
+  `notifications/progress` when the client sends a `progressToken`.
 
 ### Live task narration
 
@@ -520,9 +563,11 @@ CSS selector, HTML snippet, and any claim, failure, or resolution metadata. Repl
 
 Pass `frame_id` to read only comments on a frame belonging to that canvas, or
 `include_resolved: false` to exclude resolved entries. Resolved entries are included by default
-so conversation context remains available. An empty result is `[]`. The tool enforces the same
-canvas access permissions as other MCP reads; optional `agent_name` announces presence.
-It does not claim task feedback or comments, or mark anything resolved.
+so conversation context remains available. The result is `{ comments, total, has_more }` and pages
+via `limit`/`offset` (50 at a time by default) — follow `has_more` rather than assuming one page is
+everything. The tool enforces the same canvas access permissions as other MCP reads; optional
+`agent_name` announces presence. It does not claim task feedback or comments, or mark anything
+resolved.
 
 Writing is a separate path: `add_comment` pins a new note to one element (`selector` from
 `inspect_frame`'s `elements[].selector`, or from an existing comment), `reply_to_comment` answers

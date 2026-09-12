@@ -244,7 +244,10 @@ describe('pages MCP tools', () => {
 
       const bogus = await callTool(client, 'move_frame', { frame_id: f.id, page: 'Nowhere', agent_name: 'alice' })
       expect(bogus.isError).toBe(true)
-      expect(bogus.raw).toContain('no page "Nowhere"')
+      expect((bogus.parsed as { error: { code: string; message: string } }).error).toMatchObject({
+        code: 'invalid_input',
+        message: 'no page "Nowhere" on this canvas — try a page id from get_canvas',
+      })
       expect(store.getFrame(f.id)!.pageId).toBe(p1.id)
     } finally {
       await close()

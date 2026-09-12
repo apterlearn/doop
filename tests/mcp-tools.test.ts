@@ -98,4 +98,44 @@ describe('MCP website tool contract', () => {
       await server.close()
     }
   })
+
+  it('publishes output schemas and returns structured content alongside the text block', async () => {
+    const server = buildMcpServer('Test Owner', 'test-owner-id')
+    const client = new Client({ name: 'doop-tool-contract-test', version: '1.0.0' })
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
+
+    await server.connect(serverTransport)
+    await client.connect(clientTransport)
+
+    try {
+      const { tools } = await client.listTools()
+      const byName = new Map(tools.map((tool) => [tool.name, tool]))
+      for (const name of [
+        'get_guide',
+        'get_canvas',
+        'get_frame',
+        'get_frame_html',
+        'inspect_frame',
+        'get_comments',
+        'list_cards',
+        'list_canvases',
+        'list_guidelines',
+        'get_guidelines',
+        'export_frame',
+      ]) {
+        expect(byName.get(name)?.outputSchema, `${name} should publish an outputSchema`).toBeDefined()
+      }
+
+      const result = (await client.callTool({ name: 'get_guide', arguments: { topic: 'review' } })) as unknown as {
+        content: Array<{ type: string; text?: string }>
+        structuredContent?: Record<string, unknown>
+      }
+      expect(result.structuredContent).toBeDefined()
+      expect(result.structuredContent!.guide).toBe(result.content[0]!.text)
+      expect(result.structuredContent!.topic).toBe('review')
+    } finally {
+      await client.close()
+      await server.close()
+    }
+  })
 })

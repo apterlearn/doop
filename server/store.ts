@@ -1,6 +1,6 @@
 import { nanoid } from 'nanoid'
 import * as persist from './db/persist.ts'
-import type { Canvas, CommunityCategory, Frame, GuidelineDoc, MemoryReference, Page } from '../shared/types.ts'
+import type { Canvas, CommunityCategory, DesignTokens, Frame, GuidelineDoc, MemoryReference, Page } from '../shared/types.ts'
 
 /**
  * In-memory canvas/frame state — the hot path for reads, reveals and
@@ -312,6 +312,17 @@ class Store {
     persist.deleteGuideline(canvasId, name)
     persist.saveCanvas(c)
     return true
+  }
+
+  /** Replace (or clear, with undefined) the canvas's design tokens. */
+  setTokens(canvasId: string, tokens: DesignTokens | undefined, by: string): Canvas | undefined {
+    const c = this.canvases.get(canvasId)
+    if (!c) return undefined
+    const now = Date.now()
+    c.tokens = tokens ? { ...tokens, updatedAt: now, updatedBy: by } : undefined
+    c.updatedAt = now
+    persist.saveCanvas(c)
+    return c
   }
 
   getReferences(canvasId: string): MemoryReference[] {

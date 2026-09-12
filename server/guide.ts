@@ -13,7 +13,7 @@ export type GuideTopic = (typeof GUIDE_TOPICS)[number]
 const TOPIC_SECTIONS: Record<GuideTopic, string[]> = {
   'doop-instructions': [],
   streaming: ['Streaming — how to write designs', 'Frames and HTML'],
-  review: ['Review checkpoints — MANDATORY'],
+  review: ['Review checkpoints — MANDATORY', 'Design tokens — the values every frame shares'],
   images: ['Images — search first, then upload'],
   redesign: ['Redesigns — audit first, then two drafts'],
 }
@@ -106,8 +106,10 @@ Use get_comments({ canvas_id }) to read element-pinned comments and replies, inc
 their frame, selector, snippet, author, thread links, and claim/failure/resolution state.
 Add frame_id to focus on one frame. Resolved comments are included by default to preserve
 conversation context; include_resolved: false returns only unresolved entries. The result
-is newest first and covers the retained history (up to 100 entries per canvas). Reading
-comments does not claim work or resolve it; task feedback is separate (get_feedback).
+is newest first and paged — 50 at a time by default, so follow has_more / next_offset
+instead of assuming you saw every comment. It covers the retained history (up to 100
+entries per canvas). Reading comments does not claim work or resolve it; task feedback
+is separate (get_feedback).
 
 ## Narrate your work — set_status
 
@@ -161,6 +163,22 @@ explicitly:
 A card you cannot finish stays in progress; tell humans why via set_status or a comment
 and let them stop or retry it.
 
+## Plan your run — set_plan
+
+For anything bigger than a single frame — a multi-screen flow, a redesign pass, a review
+sweep — publish the steps before you start:
+
+  set_plan({ canvas_id, steps: [{ id: "tokens", text: "Define the canvas tokens" },
+                                 { id: "hero",   text: "Build the hero" },
+                                 { id: "flow",   text: "Add pricing and checkout" },
+                                 { id: "review", text: "Screenshot, audit and fix" }] })
+
+Then keep it current with update_plan_step as you go (pending → active → done, or blocked
+with a note when you cannot continue). The human watching sees your active step next to
+your task, so they can tell the difference between "still working" and "stuck". If your
+context is compacted mid-run, or you join a canvas another agent is already working on,
+call get_plan to read back what has been done and what is next instead of guessing.
+
 ## Review checkpoints — MANDATORY
 
 After creating a frame or finishing a significant edit, you MUST call get_frame_screenshot
@@ -172,15 +190,29 @@ and fix real issues before moving on:
 - **Spacing**: uneven gaps, cramped clusters, hero content with no room to breathe.
 - **Hierarchy**: can you tell heading from body from caption at a glance?
 - **Contrast**: text you would squint at; elements dissolving into their background.
+  audit_frame measures this instead of leaving it to your eye — run it and fix every
+  critical issue it names before you call the design done.
 - **Alignment**: edges that should share a line but drift; repeated rows whose icons or
   trailing actions do not form clean vertical lanes.
 - **Realism**: lorem ipsum or "Item 1 / Item 2" content — replace with plausible, specific
   copy (invented product names, believable numbers, human sentences).
 - **Logos**: any placeholder brand mark (gray tile, "LOGO", initials, an invented company
   wordmark) still in the frame — replace it with a real logo from search_logos.
+- **Responsive**: a design that must hold up on a phone — check it with
+  get_frame_screenshot({ frame_id, device: "mobile" }) and audit_frame at the same device
+  rather than assuming the desktop layout reflows.
+
+audit_frame also reports alt text, heading order, focus order, tap-target sizes,
+landmarks, form labels and the document language. Those are not optional polish: fix what
+it names, and re-run it until the critical count is zero.
+
+When you need to know whether a change actually landed, or how far a redesign drifted from
+the design it came from, call diff_frame — it compares the current render against a saved
+version, a pinned reference, another frame or a live URL, and shows you the changed pixels.
 
 Prefer targeted fixes over rewrites. Never delete and restart a mostly-good frame — the
-humans watching lose work they may have been reacting to.
+humans watching lose work they may have been reacting to. If you have already made a frame
+worse, revert_frame restores a saved version instead of rebuilding it by hand.
 
 ## Design brief — before your first frame
 
@@ -205,6 +237,13 @@ Viewers watch designs assemble live. Stream with append_frame_html:
 - For small tweaks (copy, a color, one element's spacing) use edit_frame_html — an exact
   find/replace that morphs into the rendered frame in place, with no re-render. Resending
   a whole document via set_frame_html is for genuine redesigns.
+- Building several frames, or applying the same fix across a flow? Use apply_ops: one call
+  carrying a list of ops (\`{ op: "create_frame", ...that tool's arguments }\`) run in order, each
+  reported at its index. Ops run best-effort by default; pass atomic: true to validate them all
+  first and apply nothing if any would fail.
+- Long runs: pass an op_id to create_frame / create_page / create_canvas / add_comment /
+  upload_asset. If the connection drops and you retry, the same op_id returns the original
+  result (marked idempotent_replay) instead of creating a duplicate.
 
 ## Frames and HTML
 
@@ -299,6 +338,19 @@ any public image URL. Source images in this order:
 
 Never inline images as data: URIs in frame HTML; they bloat every get_frame and
 edit round-trip.
+
+## Design tokens — the values every frame shares
+
+A canvas can carry design tokens: named colors, a display/body/mono font set, a px spacing
+scale and radii. get_canvas reports tokens_present; get_tokens returns the tokens and a
+ready-to-paste :root block.
+
+- Before designing on a canvas that has tokens, read them and use those exact values.
+  That is what makes a new frame look like it belongs next to the others.
+- On a NEW canvas, define them early with set_tokens — pick one aesthetic direction and
+  name it (see Design quality below), then every frame you add inherits it.
+- After building or restyling a frame, run lint_frame. It names every color, font, radius
+  and spacing value that drifted off the tokens, with the selector to fix. Aim for zero.
 
 ## Style guides — read before designing
 
@@ -400,6 +452,16 @@ The URL re-renders on change, so an embedded link stays current as the frame ite
   and close it with resolve_comment. Use add_comment to ask a human a question about
   one specific element instead of burying it in a chat message.
 - Keep the SAME agent_name for your whole session. It is your identity in the room.
+- Every durable frame write is snapshotted: get_frame_history lists the saved versions of
+  a frame (newest first, metadata only), get_frame_version reads one in full, and
+  revert_frame restores it. Reach for revert instead of rebuilding a frame that was
+  better before — a revert is an ordinary edit, visible live and versioned itself.
+- Frame writes are conflict-checked. Pass expected_updated_at (the updatedAt you read)
+  and a write that would clobber someone else's change comes back as a conflict instead
+  of silently winning; re-read and retry. If two agents are working the same frame,
+  claim it with begin_frame_edit and release it with end_frame_edit — another agent's
+  write to a frame you hold fails with a conflict naming you, and takeover: true is the
+  deliberate way to override someone else's claim.
 `
 
 /** The guide, or one topic's sections sliced out of it by heading. Slicing at

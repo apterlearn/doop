@@ -1,9 +1,11 @@
 import { create } from 'zustand'
 import type {
   ActivityItem,
+  AgentPlan,
   AgentTask,
   Canvas,
   DesignDecision,
+  DesignTokens,
   ElementComment,
   Frame,
   GuidelineDoc,
@@ -36,6 +38,9 @@ interface State {
   decisions: DesignDecision[]
   /** distiller rule proposals (newest first) */
   proposals: MemoryProposal[]
+  /** agent plans on the open canvas, newest first — each one is an agent's
+   *  published list of steps, shown alongside its live task */
+  plans: AgentPlan[]
   /** which tab the side panel shows — in the store so a Memory-suggestion
    *  toast anywhere in the app can jump straight to the Memory tab */
   panelTab: 'tasks' | 'activity' | 'memory' | 'agents'
@@ -109,6 +114,9 @@ interface State {
   renameCanvasLocal(name: string): void
   /** upsert (doc set) or remove (doc null) a style guide on the open canvas */
   setGuidelineLocal(name: string, doc: GuidelineDoc | null): void
+  setTokensLocal(tokens: DesignTokens | null): void
+  setPlanLocal(plan: AgentPlan): void
+  setPlans(plans: AgentPlan[]): void
   /** pin (reference set) or unpin (null) a Memory reference on the open canvas */
   setReferenceLocal(id: string, reference: MemoryReference | null): void
   setDecisions(decisions: DesignDecision[]): void
@@ -170,6 +178,7 @@ export const useStore = create<State>((set, get) => ({
   comments: [],
   decisions: [],
   proposals: [],
+  plans: [],
   panelTab: 'tasks',
   limitWall: false,
   allowanceVersion: 0,
@@ -297,6 +306,14 @@ export const useStore = create<State>((set, get) => ({
         docs.sort((a, b) => a.name.localeCompare(b.name))
       }
       return { canvas: { ...s.canvas, guidelines: docs } }
+    }),
+  setTokensLocal: (tokens) =>
+    set((s) => (s.canvas ? { canvas: { ...s.canvas, tokens: tokens ?? undefined } } : {})),
+  setPlans: (plans) => set({ plans }),
+  setPlanLocal: (plan) =>
+    set((s) => {
+      const others = s.plans.filter((p) => !(p.canvasId === plan.canvasId && p.agentName === plan.agentName))
+      return { plans: [plan, ...others] }
     }),
   setReferenceLocal: (id, reference) =>
     set((s) => {

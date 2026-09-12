@@ -23,6 +23,9 @@ export const canvases = pgTable('canvases', {
   category: text('category'),
   /** how many times the gallery has copied this canvas — the "trending" signal */
   copyCount: integer('copy_count').notNull().default(0),
+  /** design tokens (DesignTokens): the palette/type/scale every frame should
+   *  use; null until an agent or human defines them */
+  tokens: jsonb('tokens'),
   createdAt: bigint('created_at', { mode: 'number' }).notNull(),
   updatedAt: bigint('updated_at', { mode: 'number' }).notNull(),
 })
@@ -168,6 +171,7 @@ export const tasks = pgTable(
     canvasId: text('canvas_id').notNull(),
     agentName: text('agent_name').notNull(),
     owner: text('owner'),
+    ownerId: text('owner_id'),
     color: text('color').notNull(),
     status: text('status').notNull(),
     startedAt: bigint('started_at', { mode: 'number' }).notNull(),
@@ -213,6 +217,7 @@ export const feedback = pgTable(
     at: bigint('at', { mode: 'number' }).notNull(),
     deliveredAt: bigint('delivered_at', { mode: 'number' }),
     claimedBy: text('claimed_by'),
+    claimedByOwner: text('claimed_by_owner'),
     completedAt: bigint('completed_at', { mode: 'number' }),
     failedAt: bigint('failed_at', { mode: 'number' }),
     failureReason: text('failure_reason'),
@@ -235,6 +240,7 @@ export const comments = pgTable(
     forAgent: boolean('for_agent').notNull().default(false),
     targetAgent: text('target_agent'),
     claimedBy: text('claimed_by'),
+    claimedByOwner: text('claimed_by_owner'),
     claimedAt: bigint('claimed_at', { mode: 'number' }),
     failedAt: bigint('failed_at', { mode: 'number' }),
     failureReason: text('failure_reason'),
@@ -313,6 +319,45 @@ export const guidelineVersions = pgTable(
     savedBy: text('saved_by').notNull(),
   },
   (t) => [index('guideline_versions_doc_idx').on(t.canvasId, t.name)],
+)
+
+/** Append-only history of frame designs: one snapshot per durable write,
+ *  capped per frame at write time. Frames are the thing agents destroy and
+ *  rebuild, so this is what makes a bad edit recoverable — cold path, no
+ *  in-memory mirror, read on demand. */
+export const frameVersions = pgTable(
+  'frame_versions',
+  {
+    id: text('id').primaryKey(),
+    frameId: text('frame_id').notNull(),
+    canvasId: text('canvas_id').notNull(),
+    name: text('name').notNull(),
+    html: text('html').notNull(),
+    x: doublePrecision('x').notNull(),
+    y: doublePrecision('y').notNull(),
+    width: doublePrecision('width').notNull(),
+    height: doublePrecision('height').notNull(),
+    savedAt: bigint('saved_at', { mode: 'number' }).notNull(),
+    savedBy: text('saved_by').notNull(),
+  },
+  (t) => [index('frame_versions_frame_idx').on(t.frameId, t.savedAt)],
+)
+
+/** An agent's plan for one canvas: the ordered steps it is working through,
+ *  so a long or compacted run can be read back and resumed. One plan per
+ *  (canvas, agent) — the latest write wins. */
+export const agentPlans = pgTable(
+  'agent_plans',
+  {
+    canvasId: text('canvas_id').notNull(),
+    agentName: text('agent_name').notNull(),
+    owner: text('owner'),
+    ownerId: text('owner_id'),
+    /** JSON array of PlanStep */
+    steps: jsonb('steps').notNull(),
+    updatedAt: bigint('updated_at', { mode: 'number' }).notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.canvasId, t.agentName] })],
 )
 
 /** Frames pinned to Memory as style exemplars: the HTML is a snapshot taken

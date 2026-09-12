@@ -206,6 +206,12 @@ function TaskRow({ task }: { task: AgentTask }) {
   const state = task.endedAt ? 'done' : task.failedAt || task.cancelledAt ? 'failed' : 'active'
   const live = !task.endedAt && !task.failedAt && !task.cancelledAt
 
+  /* the plan this agent published, so the row says what it is doing right now
+     rather than only what it announced at the start */
+  const plan = useStore((s) => s.plans.find((p) => p.agentName === task.agentName))
+  const step = plan?.steps.find((s) => s.status === 'active') ?? plan?.steps.find((s) => s.status !== 'done')
+  const stepNumber = plan && step ? plan.steps.indexOf(step) + 1 : 0
+
   return (
     <div className="group">
       <div className="flex animate-[chip-in_0.25s_ease] items-baseline gap-2 py-[5px] pr-4 pl-5 text-[12.5px] leading-[1.4]">
@@ -233,6 +239,12 @@ function TaskRow({ task }: { task: AgentTask }) {
           )}
         >
           {task.status}
+          {live && plan && step ? (
+            <span className="font-normal text-ink-faint">
+              {' '}
+              · step {stepNumber}/{plan.steps.length}: {step.text}
+            </span>
+          ) : null}
         </span>
         <span className="flex-none font-mono text-[10.5px] text-ink-faint">
           {task.failedAt || task.cancelledAt

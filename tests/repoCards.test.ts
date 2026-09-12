@@ -5,12 +5,31 @@ import type { RepoScreenRef } from '../shared/types.ts'
    broadcasts; a unit test only cares about the cards themselves. */
 vi.mock('../server/db/persist.ts', () => ({
   saveTask: () => {},
+  deleteTask: () => {},
   saveFeedback: () => {},
   saveComment: () => {},
   saveActivity: () => {},
   saveDecision: () => {},
   saveProposal: () => {},
   saveCanvas: () => {},
+  saveCanvasCopy: () => {},
+  saveFrame: () => {},
+  deleteFrame: () => {},
+  savePage: () => {},
+  deletePage: () => {},
+  setFramePage: () => {},
+  saveGuideline: () => {},
+  saveGuidelineVersion: () => {},
+  deleteGuideline: () => {},
+  saveMember: () => {},
+  deleteMember: () => {},
+  saveReference: () => {},
+  deleteReference: () => {},
+  deleteCanvas: () => {},
+  savePlan: () => {},
+  deletePlan: () => {},
+  deletePlansFor: () => {},
+  flush: async () => {},
 }))
 
 const actions = await import('../server/actions.ts')

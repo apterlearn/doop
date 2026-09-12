@@ -167,10 +167,14 @@ function agentTouch(
   frameId?: string | null,
   status?: string | null,
   owner?: string,
+  ownerId?: string,
 ) {
+  /* presence is keyed by account + name: an agent name is free text, so two
+     accounts both running the same name are two agents, not one flickering one */
+  const key = `${ownerId ?? ''}::${agentName}`
   let byName = agentPresences.get(canvasId)
   if (!byName) agentPresences.set(canvasId, (byName = new Map()))
-  let p = byName.get(agentName)
+  let p = byName.get(key)
   const isNew = !p
   if (!p) {
     p = {
@@ -182,7 +186,7 @@ function agentTouch(
       lastSeen: Date.now(),
       activeFrameId: frameId ?? null,
     }
-    byName.set(agentName, p)
+    byName.set(key, p)
   }
   p.lastSeen = Date.now()
   if (owner && !p.owner) p.owner = owner
@@ -210,11 +214,11 @@ function agentTouch(
 setInterval(() => {
   const now = Date.now()
   for (const [canvasId, byName] of agentPresences) {
-    for (const [name, p] of byName) {
+    for (const [key, p] of byName) {
       /* an agent with a posted status is likely thinking between tool calls —
          keep it (and its status) on screen longer before expiring */
       if (now - p.lastSeen > (p.status ? 60_000 : 20_000)) {
-        byName.delete(name)
+        byName.delete(key)
         broadcast(canvasId, { type: 'presence:leave', clientId: p.clientId })
         actions.endAgentTasks(canvasId, p.name) // an agent that went silent is no longer "working on" anything
       }
@@ -1719,6 +1723,7 @@ wss.on('connection', (ws, upgradeReq) => {
         comments: actions.getComments(msg.canvasId),
         decisions: actions.getDecisions(msg.canvasId),
         proposals: actions.getProposals(msg.canvasId),
+        plans: actions.getPlans(msg.canvasId),
         selfColor: presence.color,
         serverBuild: BUILD_ID,
       })

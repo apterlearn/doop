@@ -28,6 +28,127 @@ export interface Page {
   createdAt: number
   updatedAt: number
 }
+/* ---- MCP tool payloads ---- */
+
+/** A canvas's design tokens: the named values every frame should use, so an
+ *  agent has one palette/type/scale to conform to instead of inventing one per
+ *  frame. Deliberately small — a design system for a canvas, not a theme
+ *  editor. `cssForTokens` renders it as a :root block to paste into a frame. */
+export interface DesignTokens {
+  /** token name -> CSS color, e.g. { ink: '#111110' } */
+  colors: Record<string, string>
+  fonts?: { display?: string; body?: string; mono?: string }
+  /** px spacing scale, ascending */
+  spacing?: number[]
+  radii?: number[]
+  shadows?: string[]
+  updatedAt: number
+  updatedBy: string
+}
+
+/** One saved state of a frame, restorable with revert_frame. */
+export interface FrameVersion {
+  id: string
+  frameId: string
+  canvasId: string
+  name: string
+  html: string
+  x: number
+  y: number
+  width: number
+  height: number
+  savedAt: number
+  savedBy: string
+}
+
+/** A step of an agent's published plan. */
+export interface PlanStep {
+  id: string
+  text: string
+  status: 'pending' | 'active' | 'done' | 'blocked'
+  note?: string
+  updatedAt?: number
+}
+
+/** An agent's plan for one canvas — the record a resumed or compacted run
+ *  reads back to know where it left off. */
+export interface AgentPlan {
+  canvasId: string
+  agentName: string
+  /** display name of the account whose token authorized the agent */
+  owner?: string
+  /** the account id behind `owner` — the half of an agent's identity that
+   *  cannot be typed by the caller, so work routing keys on it */
+  ownerId?: string
+  steps: PlanStep[]
+  updatedAt: number
+}
+
+/** What every frame-listing MCP tool returns per frame: enough to decide
+ *  whether and how to read the frame, never the HTML itself. */
+export interface FrameSummary {
+  id: string
+  name: string
+  /** page display name, when the frame sits on one */
+  page?: string
+  /** product-made content, hidden from agents in practice */
+  demo?: true
+  x: number
+  y: number
+  width: number
+  height: number
+  /** ISO 8601 — also the value to pass back as expected_updated_at */
+  updatedAt: string
+  updatedBy: string
+  htmlBytes: number
+  /** the document is big enough that pulling it whole risks the context window */
+  large?: true
+  image_url: string
+}
+
+/** A canvas row on the dashboard list, as MCP reports it. */
+export type CanvasListItem = CanvasMeta & { guidelinesCount: number }
+
+/** The `get_canvas` payload — the canvas picture an agent plans from. */
+export interface CanvasView {
+  id: string
+  name: string
+  frames: FrameSummary[]
+  /** total frames on the canvas, which may exceed `frames` when truncated */
+  frame_total: number
+  frames_truncated?: true
+  pages: { id: string; name: string; position: number; frameCount: number }[]
+  guidelines: GuidelineSummary[]
+  references: { id: string; title: string; size: string; htmlBytes: number; pinnedBy: string }[]
+  /** how real users navigate between synced screens */
+  flow?: string[]
+  /** whether the canvas has design tokens to conform to (read them with get_tokens) */
+  tokens_present: boolean
+  note?: string
+}
+
+/** A style guide as listed — metadata only; the markdown comes from get_guidelines. */
+export interface GuidelineSummary {
+  name: string
+  title: string
+  summary: string
+  bytes: number
+  updatedAt?: string
+  updatedBy?: string
+}
+
+/** An open board card, as `list_cards` reports it. */
+export interface BoardCardSummary {
+  id: string
+  title: string
+  queued_by: string
+  queued_at: string
+  stage: number
+  waiting_for: string
+  attachments: string[]
+  target_frames: string[]
+}
+
 export interface CanvasMeta {
   id: string
   name: string
@@ -112,6 +233,8 @@ export interface Canvas {
   references?: MemoryReference[]
   /** ordered sub-canvases; the server guarantees ≥1 page after boot backfill */
   pages?: Page[]
+  /** the canvas's design tokens — the palette, type and scale every frame should use */
+  tokens?: DesignTokens
 }
 
 /* ---- design memory ---- */
@@ -200,6 +323,9 @@ export interface Actor {
   clientId?: string
   /** for agents: display name of the user whose OAuth token authorized it */
   owner?: string
+  /** the account id behind `owner` — the half of an agent's identity that a
+   *  caller cannot type, so work routing keys on it */
+  ownerId?: string
 }
 
 export interface Presence {
@@ -224,6 +350,9 @@ export interface AgentTask {
   agentName: string
   /** whose token the agent connected with */
   owner?: string
+  /** that owner's account id — what makes two agents with the same name on
+   *  different accounts different agents */
+  ownerId?: string
   color: string
   status: string
   startedAt: number
@@ -303,6 +432,9 @@ export interface TaskFeedback {
   deliveredAt?: number
   /** the agent that picked it up */
   claimedBy?: string
+  /** the account that agent's token belonged to — what stops an agent on
+   *  another account from inheriting a claim by typing the same name */
+  claimedByOwner?: string
   /** resident Doop finished handling this feedback */
   completedAt?: number
   /** unsuccessful resident-agent attempt; never retried automatically */
@@ -331,6 +463,8 @@ export interface ElementComment {
   /** which resident agent was mentioned; defaults to Doop */
   targetAgent?: string
   claimedBy?: string
+  /** the account that agent's token belonged to — see TaskFeedback.claimedByOwner */
+  claimedByOwner?: string
   claimedAt?: number
   /** unsuccessful agent attempt; the comment remains paused until retried */
   failedAt?: number
@@ -374,6 +508,8 @@ export type ServerMessage =
       comments: ElementComment[]
       decisions: DesignDecision[]
       proposals: MemoryProposal[]
+      /** every agent plan published on this canvas, newest first */
+      plans: AgentPlan[]
       selfColor: string
       /** id of the client bundle the server is serving; 'dev' outside production */
       serverBuild: string
@@ -395,6 +531,8 @@ export type ServerMessage =
   | { type: 'canvas:renamed'; name: string; actor: Actor }
   /** a style-guide doc was written, moved (doc set) or deleted (doc null) */
   | { type: 'guidelines'; name: string; doc: GuidelineDoc | null; actor: Actor }
+  | { type: 'tokens'; tokens: DesignTokens | null; actor: Actor }
+  | { type: 'plan'; plan: AgentPlan }
   /** a frame was pinned to (reference set) or unpinned from (null) Memory */
   | { type: 'reference'; id: string; reference: MemoryReference | null; actor: Actor }
   /** a design decision was captured into Memory */

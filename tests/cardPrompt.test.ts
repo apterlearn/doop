@@ -4,12 +4,31 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
    the text a card carries. */
 vi.mock('../server/db/persist.ts', () => ({
   saveTask: () => {},
+  deleteTask: () => {},
   saveFeedback: () => {},
   saveComment: () => {},
   saveActivity: () => {},
   saveDecision: () => {},
   saveProposal: () => {},
   saveCanvas: () => {},
+  saveCanvasCopy: () => {},
+  saveFrame: () => {},
+  deleteFrame: () => {},
+  savePage: () => {},
+  deletePage: () => {},
+  setFramePage: () => {},
+  saveGuideline: () => {},
+  saveGuidelineVersion: () => {},
+  deleteGuideline: () => {},
+  saveMember: () => {},
+  deleteMember: () => {},
+  saveReference: () => {},
+  deleteReference: () => {},
+  deleteCanvas: () => {},
+  savePlan: () => {},
+  deletePlan: () => {},
+  deletePlansFor: () => {},
+  flush: async () => {},
 }))
 
 const actions = await import('../server/actions.ts')

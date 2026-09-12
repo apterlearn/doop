@@ -1,20 +1,26 @@
 import { nanoid } from 'nanoid'
 import { store } from './store.ts'
 import * as persist from './db/persist.ts'
+import * as frameLocks from './frameLocks.ts'
 import * as thumbs from './thumbs.ts'
 import { colorFor } from '../shared/types.ts'
+import { validateTokens } from './designLint.ts'
 import { DEFAULT_ROLE_ID, mentionedRole, normalizePipeline, roleByAgentName, roleName } from '../shared/agents.ts'
 import { decodeEscapedHtml, looksEscapedHtml, repairEscapedHtml } from './escapedHtml.ts'
 import type {
   Actor,
   ActivityItem,
+  AgentPlan,
   AgentTask,
+  Canvas,
   DesignDecision,
+  DesignTokens,
   ElementComment,
   Frame,
   GuidelineDoc,
   MemoryProposal,
   MemoryReference,
+  PlanStep,
   RepoCardKind,
   RepoCardPayload,
   RepoScreenRef,
@@ -34,6 +40,7 @@ type AgentTouch = (
   frameId?: string | null,
   status?: string | null,
   owner?: string,
+  ownerId?: string,
 ) => void
 
 let broadcast: Broadcast = () => {}
@@ -61,6 +68,8 @@ export function hydrateLogs(data: {
   activity: Map<string, ActivityItem[]>
   decisions: Map<string, DesignDecision[]>
   proposals: Map<string, MemoryProposal[]>
+  /** canvasId -> agentName -> plan */
+  plans?: Map<string, Map<string, AgentPlan>>
 }) {
   for (const [canvasId, list] of data.tasks) taskLog.set(canvasId, list)
   for (const [canvasId, list] of data.feedback) feedbackLog.set(canvasId, list)
@@ -68,6 +77,7 @@ export function hydrateLogs(data: {
   for (const [canvasId, list] of data.activity) activityLog.set(canvasId, list)
   for (const [canvasId, list] of data.decisions) decisionLog.set(canvasId, list)
   for (const [canvasId, list] of data.proposals) proposalLog.set(canvasId, list)
+  for (const [canvasId, byAgent] of data.plans ?? []) planLog.set(canvasId, byAgent)
   failInterruptedWork()
 }
 
@@ -135,15 +145,23 @@ function logActivity(canvasId: string, actor: Actor, message: string, frameId?: 
 }
 
 export function resolveActor(
-  raw: { name?: string; kind?: string; clientId?: string; owner?: string } | undefined,
+  raw: { name?: string; kind?: string; clientId?: string; owner?: string; ownerId?: string } | undefined,
 ): Actor {
   const kind = raw?.kind === 'agent' ? 'agent' : raw?.kind === 'user' ? 'user' : 'agent'
   const name = raw?.name?.trim() || (kind === 'agent' ? 'AI Agent' : 'Anonymous')
-  return { name, kind, color: colorFor(name), clientId: raw?.clientId, owner: raw?.owner }
+  return { name, kind, color: colorFor(name), clientId: raw?.clientId, owner: raw?.owner, ownerId: raw?.ownerId }
+}
+
+
+/** Refuse a write to a frame another agent has locked. Shared by every
+ *  mutation path so external agents and the resident team obey one rule. */
+function assertUnlocked(frameId: string, actor: Actor) {
+  const holder = frameLocks.heldBy(frameId, actor.name)
+  if (holder) throw new frameLocks.FrameLockedError(holder)
 }
 
 function touch(canvasId: string, actor: Actor, frameId?: string | null) {
-  if (actor.kind === 'agent') agentTouch(canvasId, actor.name, frameId, undefined, actor.owner)
+  if (actor.kind === 'agent') agentTouch(canvasId, actor.name, frameId, undefined, actor.owner, actor.ownerId)
 }
 
 /** Refresh an agent's presence without changing its frame or status. A model
@@ -154,9 +172,12 @@ export function heartbeatAgent(canvasId: string, actor: Actor) {
   touch(canvasId, actor)
 }
 
-/** Same agent identity = same name. (Owner-scoping deferred until MCP auth.) */
-function sameAgent(t: { agentName: string }, actor: Actor): boolean {
-  return t.agentName === actor.name
+/** Same agent identity = same name on the same account. A task with no recorded
+ *  owner is legacy work, and matches on the name alone. */
+function sameAgent(t: { agentName: string; ownerId?: string }, actor: Actor): boolean {
+  if (t.agentName !== actor.name) return false
+  if (t.ownerId === undefined) return true
+  return t.ownerId === actor.ownerId
 }
 
 /* ------------------------------------------------------------------ */
@@ -253,6 +274,9 @@ export function nextWorkPayer(canvasId: string, agentName: string, skip?: Readon
 
 const taskLog = new Map<string, AgentTask[]>() // canvasId -> tasks (newest first)
 
+/** canvasId -> agentName -> the plan that agent published for this canvas */
+const planLog = new Map<string, Map<string, AgentPlan>>()
+
 export function getTasks(canvasId: string): AgentTask[] {
   return taskLog.get(canvasId) ?? []
 }
@@ -267,7 +291,7 @@ export function taskCanvasId(taskId: string): string | undefined {
 /** Agent announces what it is working on right now (empty string clears it). */
 export function setAgentStatus(canvasId: string, actor: Actor, status: string) {
   const clean = status.trim()
-  agentTouch(canvasId, actor.name, undefined, clean || null, actor.owner)
+  agentTouch(canvasId, actor.name, undefined, clean || null, actor.owner, actor.ownerId)
 
   const list = taskLog.get(canvasId) ?? []
   /* board cards stay open until explicitly completed — a status change
@@ -284,6 +308,7 @@ export function setAgentStatus(canvasId: string, actor: Actor, status: string) {
       id: nanoid(8),
       agentName: actor.name,
       owner: actor.owner,
+      ownerId: actor.ownerId,
       color: actor.color,
       status: clean,
       startedAt: Date.now(),
@@ -365,17 +390,26 @@ export function addTaskFeedback(
 /** Open feedback this agent may take: everything addressed to it, plus
  *  untargeted feedback — that part stays a canvas-level queue where the first
  *  identified agent call wins. */
-export function takeFeedbackFor(canvasId: string, agentName: string, payer?: string): TaskFeedback[] {
+export function takeFeedbackFor(
+  canvasId: string,
+  agentName: string,
+  payer?: string,
+  ownerId?: string,
+): TaskFeedback[] {
   const pending = (feedbackLog.get(canvasId) ?? []).filter(
     (f) =>
       !f.deliveredAt &&
       !f.failedAt &&
       (!f.targetAgent || f.targetAgent === agentName) &&
-      (payer === undefined || (f.fromUserId ?? '') === payer),
+      (payer === undefined || (f.fromUserId ?? '') === payer) &&
+      /* an undelivered item already claimed by another account's same-named
+         agent is not ours to take */
+      (f.claimedBy === undefined || f.claimedByOwner === undefined || f.claimedByOwner === ownerId),
   )
   for (const f of pending) {
     f.deliveredAt = Date.now()
     f.claimedBy = agentName
+    f.claimedByOwner = ownerId
     persist.saveFeedback(f)
     broadcast(canvasId, { type: 'feedback', feedback: f }) // clients flip the entry to "picked up"
   }
@@ -569,7 +603,12 @@ export function commentThread(comment: ElementComment): ElementComment[] {
 }
 
 /** Open comments @mentioning this agent, claimed by it. */
-export function takeAgentCommentsFor(canvasId: string, agentName: string, payer?: string): ElementComment[] {
+export function takeAgentCommentsFor(
+  canvasId: string,
+  agentName: string,
+  payer?: string,
+  ownerId?: string,
+): ElementComment[] {
   const pending = (commentLog.get(canvasId) ?? []).filter(
     (c) =>
       c.forAgent &&
@@ -581,6 +620,7 @@ export function takeAgentCommentsFor(canvasId: string, agentName: string, payer?
   )
   for (const c of pending) {
     c.claimedBy = agentName
+    c.claimedByOwner = ownerId
     c.claimedAt = Date.now()
     persist.saveComment(c)
     broadcast(canvasId, { type: 'comment', comment: c }) // pins flip to "Doop is on it"
@@ -692,10 +732,15 @@ function endAutoTask(canvasId: string, actor: Actor) {
 }
 
 /** Close an agent's open tasks, e.g. when its presence expires. */
-export function endAgentTasks(canvasId: string, agentName: string) {
+export function endAgentTasks(canvasId: string, agentName: string, ownerId?: string) {
+  frameLocks.releaseAllFor(canvasId, agentName)
+  /* a finished plan is history the panel does not need; the activity log keeps
+     the record of what happened */
+  if (planLog.get(canvasId)?.delete(agentName)) persist.deletePlan(canvasId, agentName)
   const now = Date.now()
   for (const t of taskLog.get(canvasId) ?? []) {
     if (t.agentName !== agentName || t.endedAt || t.cancelledAt) continue
+    if (ownerId !== undefined && t.ownerId !== undefined && t.ownerId !== ownerId) continue
     if (t.queuedBy) {
       /* A card the run already failed keeps its failure: the crash is the
          actionable story, and overwriting it with "the agent went away" would
@@ -716,10 +761,16 @@ export function endAgentTasks(canvasId: string, agentName: string) {
 /* object — queuedBy set, agentName empty until claimed.               */
 /* ------------------------------------------------------------------ */
 
-/* canvasId -> agentName -> when a stop was requested. Kept so the MCP
-   result-nudge layer can tell a stopped agent to stop, and so nothing
-   re-claims the work before the run has actually unwound. */
-const cancellations = new Map<string, Map<string, number>>()
+/* canvasId -> agent name -> the stop record. Kept so the MCP result-nudge
+   layer can tell a stopped agent to stop, and so nothing re-claims the work
+   before the run has actually unwound. The record carries the account the
+   stop was aimed at; a stop recorded without one (the resident team) is read
+   by any agent of that name, which is exactly the old behaviour. */
+interface StopRecord {
+  at: number
+  ownerId?: string
+}
+const cancellations = new Map<string, Map<string, StopRecord>>()
 
 /** How long a stop keeps being reported to the agent it was aimed at.
  *
@@ -729,21 +780,30 @@ const cancellations = new Map<string, Map<string, number>>()
 const STOP_TTL_MS = 10 * 60_000
 
 /** True while a stop request is outstanding for this agent on this canvas. */
-export function wasStopped(canvasId: string, agentName: string): boolean {
-  const at = cancellations.get(canvasId)?.get(agentName)
-  if (at === undefined) return false
-  if (Date.now() - at > STOP_TTL_MS) {
+export function wasStopped(canvasId: string, agentName: string, ownerId?: string): boolean {
+  const record = cancellations.get(canvasId)?.get(agentName)
+  if (!record) return false
+  if (Date.now() - record.at > STOP_TTL_MS) {
     cancellations.get(canvasId)?.delete(agentName)
     return false
   }
-  return true
+  /* a stop with no account behind it (the resident team) reaches everyone
+     running that name; an account-scoped stop reaches only its own agent */
+  if (record.ownerId === undefined || ownerId === undefined) return true
+  return record.ownerId === ownerId
 }
 
 /** Clear the record when a fresh run claims work, so a stop cannot leak into a
  *  later, unrelated session under the same agent name. Called by the resident
  *  runner right after it claims (server/resident.ts). */
-export function clearStop(canvasId: string, agentName: string) {
-  cancellations.get(canvasId)?.delete(agentName)
+export function clearStop(canvasId: string, agentName: string, ownerId?: string) {
+  const byName = cancellations.get(canvasId)
+  const record = byName?.get(agentName)
+  if (!record) return
+  /* the resident team clears unconditionally: it owns the bare name. An
+     account-scoped agent only clears its own record. */
+  if (ownerId !== undefined && record.ownerId !== undefined && record.ownerId !== ownerId) return
+  byName!.delete(agentName)
 }
 
 /** Stop every run this agent has in flight on a canvas.
@@ -752,14 +812,16 @@ export function clearStop(canvasId: string, agentName: string) {
  *  stopped this, so it needs an explicit Retry, not a failure. Open status
  *  tasks simply end. The model call is aborted if it is still streaming.
  *  Returns how many open tasks were stopped. */
-export function cancelAgentWork(canvasId: string, agentName: string, by: string): number {
-  const byName = cancellations.get(canvasId) ?? new Map<string, number>()
+export function cancelAgentWork(canvasId: string, agentName: string, by: string, ownerId?: string): number {
+  const byName = cancellations.get(canvasId) ?? new Map<string, StopRecord>()
   cancellations.set(canvasId, byName)
-  byName.set(agentName, Date.now())
+  byName.set(agentName, { at: Date.now(), ownerId })
   const now = Date.now()
   let stopped = 0
   for (const t of taskLog.get(canvasId) ?? []) {
     if (t.agentName !== agentName || t.endedAt || t.cancelledAt) continue
+    /* a stop aimed at one account's agent must not stop another's */
+    if (t.ownerId !== undefined && t.ownerId !== ownerId) continue
     if (t.queuedBy) {
       /* a card the run already failed keeps its failure: that is the actionable
          story, and rewriting it as a stop would hide why it died */
@@ -775,6 +837,8 @@ export function cancelAgentWork(canvasId: string, agentName: string, by: string)
   }
   /* no work was stopped — do not abort whatever run happens to be live */
   if (stopped > 0) {
+    /* a stopped run holds nothing: its frames are free for the human to edit */
+    frameLocks.releaseAllFor(canvasId, agentName)
     cancel(canvasId)
     logActivity(canvasId, resolveActor({ name: by, kind: 'user' }), `stopped ${agentName}`)
   }
@@ -1197,6 +1261,10 @@ export function appendFrameHtml(
 ): Frame | undefined {
   const before = store.getFrame(frameId)
   if (!before) return undefined
+  /* A streaming agent keeps its own lock alive chunk by chunk; a writer who
+     holds no lock (the common case) is unaffected. */
+  assertUnlocked(frameId, actor)
+  frameLocks.refresh(frameId, actor.name)
 
   const starting = opts.start || !streams.has(frameId)
   /* an agent that escapes its opening chunk escapes the whole stream, so latch
@@ -1269,6 +1337,8 @@ export function updateFrame(
 ): Frame | undefined {
   const before = store.getFrame(frameId)
   if (!before) return undefined
+  assertUnlocked(frameId, actor)
+  frameLocks.refresh(frameId, actor.name)
   if (patch.html !== undefined) patch = { ...patch, html: repairEscapedHtml(patch.html) }
   const prevName = before.name
   const prevHtml = before.html
@@ -1315,6 +1385,7 @@ export function updateFrame(
 }
 
 export function deleteFrame(frameId: string, actor: Actor): Frame | undefined {
+  if (store.getFrame(frameId)) assertUnlocked(frameId, actor)
   /* close any live stream or playback while the frame still exists,
      so their auto “Designing…” tasks end with it */
   finishStream(frameId, false)
@@ -1468,6 +1539,99 @@ export function guidelineSummary(doc: GuidelineDoc): string {
     if (line) return line.length > 120 ? line.slice(0, 117) + '…' : line
   }
   return ''
+}
+
+/* ---- agent plans ---- */
+
+const MAX_PLAN_STEPS = 20
+const MAX_STEP_TEXT = 200
+const MAX_STEP_NOTE = 500
+
+export interface PlanStepInput {
+  id: string
+  text: string
+}
+
+/** Publish (or replace) an agent's plan for a canvas. Throws on invalid input
+ *  with a message meant for the caller's error channel. */
+export function setPlan(canvasId: string, agentName: string, steps: PlanStepInput[], actor: Actor): AgentPlan {
+  if (steps.length === 0) throw new Error('a plan needs at least one step')
+  if (steps.length > MAX_PLAN_STEPS) throw new Error(`${steps.length} steps — the limit is ${MAX_PLAN_STEPS}`)
+  const ids = new Set<string>()
+  const previous = planLog.get(canvasId)?.get(agentName)
+  const now = Date.now()
+  const clean = steps.map((step) => {
+    const id = step.id.trim()
+    if (!id) throw new Error('every step needs an id')
+    if (ids.has(id)) throw new Error(`duplicate step id “${id}”`)
+    ids.add(id)
+    const text = step.text.trim()
+    if (!text) throw new Error(`step “${id}” has no text`)
+    if (text.length > MAX_STEP_TEXT) throw new Error(`step “${id}” is longer than ${MAX_STEP_TEXT} characters`)
+    /* a re-published plan keeps each step's progress rather than resetting it */
+    const prior = previous?.steps.find((s) => s.id === id)
+    return prior && prior.text === text ? prior : { id, text, status: 'pending' as const, updatedAt: now }
+  })
+  const plan: AgentPlan = {
+    canvasId,
+    agentName,
+    ...(actor.owner ? { owner: actor.owner } : {}),
+    ...(actor.ownerId ? { ownerId: actor.ownerId } : {}),
+    steps: clean,
+    updatedAt: now,
+  }
+  const byAgent = planLog.get(canvasId) ?? new Map<string, AgentPlan>()
+  byAgent.set(agentName, plan)
+  planLog.set(canvasId, byAgent)
+  persist.savePlan(plan)
+  broadcast(canvasId, { type: 'plan', plan })
+  touch(canvasId, actor)
+  return plan
+}
+
+/** Move one step of a plan; the note is free text the agent leaves for itself. */
+export function updatePlanStep(
+  canvasId: string,
+  agentName: string,
+  stepId: string,
+  status: PlanStep['status'],
+  note: string | undefined,
+  actor: Actor,
+): AgentPlan | undefined {
+  const plan = planLog.get(canvasId)?.get(agentName)
+  if (!plan) return undefined
+  const step = plan.steps.find((s) => s.id === stepId)
+  if (!step) return undefined
+  if (note !== undefined && note.length > MAX_STEP_NOTE) throw new Error(`note is longer than ${MAX_STEP_NOTE} characters`)
+  step.status = status
+  if (note !== undefined) step.note = note
+  step.updatedAt = Date.now()
+  plan.updatedAt = step.updatedAt
+  persist.savePlan(plan)
+  broadcast(canvasId, { type: 'plan', plan })
+  touch(canvasId, actor)
+  return plan
+}
+
+/** Every plan on the canvas, newest first. */
+export function getPlans(canvasId: string): AgentPlan[] {
+  return [...(planLog.get(canvasId)?.values() ?? [])].sort((a, b) => b.updatedAt - a.updatedAt)
+}
+
+export function getPlan(canvasId: string, agentName: string): AgentPlan | undefined {
+  return planLog.get(canvasId)?.get(agentName)
+}
+
+/** Replace the canvas's design tokens (or clear them with undefined).
+ *  Validates first, so an invalid token never reaches the store. */
+export function setTokens(canvasId: string, tokens: DesignTokens | undefined, actor: Actor): Canvas | undefined {
+  if (tokens) validateTokens(tokens)
+  const canvas = store.setTokens(canvasId, tokens, actor.name)
+  if (!canvas) return undefined
+  broadcast(canvasId, { type: 'tokens', tokens: canvas.tokens ?? null, actor })
+  logActivity(canvasId, actor, tokens ? 'updated the design tokens' : 'cleared the design tokens')
+  touch(canvasId, actor)
+  return canvas
 }
 
 /** Upsert (or, with empty markdown, delete) a design doc. Returns the doc,

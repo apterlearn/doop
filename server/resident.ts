@@ -3,7 +3,9 @@ import { store } from './store.ts'
 import { ModelAuthError, pickModel } from './agentModel.ts'
 import { RESIDENT_TASK_LIMIT } from './allowance.ts'
 import * as actions from './actions.ts'
-import { inspectFrame, MAX_HTML_READ_CHARS, readFrameHtml, renderFrame } from './screenshot.ts'
+import * as frameLocks from './frameLocks.ts'
+import { MAX_HTML_READ_CHARS, readFrameHtml, renderFrame } from './screenshot.ts'
+import { inspectFrame } from './domProbe.ts'
 import { AGENT_ROLES, DEFAULT_ROLE_ID, roleById, roleByAgentName, roleName } from '../shared/agents.ts'
 import type { AgentRole } from '../shared/agents.ts'
 import * as imageSearch from './imageSearch.ts'
@@ -677,6 +679,8 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
     }
   } finally {
     clearInterval(heartbeat)
+    /* a finished run holds nothing: its frames are free for the next agent */
+    frameLocks.releaseAllFor(canvasId, actor.name)
     /* clear the status — this completes the agent's task in the panel */
     actions.setAgentStatus(canvasId, actor, '')
   }
@@ -1448,6 +1452,9 @@ async function execTool(
         return fail(`unknown tool ${block.name}`)
     }
   } catch (e) {
+    /* another agent holds the frame: report it like any tool error so the
+       model can move to another frame instead of dying on the run */
+    if (e instanceof frameLocks.FrameLockedError) return fail(e.message)
     const blocked = websiteAccessErrorMessage(e, 'resident')
     if (blocked) runState.blockedWebsiteAccess = blocked
     return fail(blocked ?? (e instanceof Error ? e.message : 'tool failed'))

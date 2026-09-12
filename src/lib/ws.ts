@@ -95,6 +95,7 @@ function handle(msg: ServerMessage) {
       s.setComments(msg.comments)
       s.setDecisions(msg.decisions)
       s.setProposals(msg.proposals)
+      s.setPlans(msg.plans)
       break
     case 'presence:join':
       if (msg.presence.clientId !== me) s.upsertPresence(msg.presence)
@@ -146,6 +147,12 @@ function handle(msg: ServerMessage) {
       break
     case 'guidelines':
       s.setGuidelineLocal(msg.name, msg.doc)
+      break
+    case 'tokens':
+      s.setTokensLocal(msg.tokens)
+      break
+    case 'plan':
+      s.setPlanLocal(msg.plan)
       break
     case 'reference':
       s.setReferenceLocal(msg.id, msg.reference)

@@ -104,7 +104,7 @@ beforeEach(() => {
 })
 
 describe('get_comments MCP tool', () => {
-  it('is read-only with canvas_id required and frame/include_resolved/agent_name optional', async () => {
+  it('is read-only with canvas_id required and frame/include_resolved/limit/offset/agent_name optional', async () => {
     const { client, close } = await connect()
     try {
       const { tools } = await client.listTools()
@@ -116,10 +116,11 @@ describe('get_comments MCP tool', () => {
         required?: string[]
       }
       expect(Object.keys(schema.properties ?? {})).toEqual(
-        expect.arrayContaining(['canvas_id', 'frame_id', 'include_resolved', 'agent_name']),
+        expect.arrayContaining(['canvas_id', 'frame_id', 'include_resolved', 'limit', 'offset', 'agent_name']),
       )
       expect(schema.required).toEqual(['canvas_id'])
       expect(schema.properties?.include_resolved?.default).toBe(true)
+      expect(schema.properties?.limit?.default).toBe(50)
     } finally {
       await close()
     }
@@ -143,8 +144,8 @@ describe('get_comments MCP tool', () => {
       const { parsed, isError } = await callComments(client, { canvas_id: CANVAS.id })
       expect(isError).toBeFalsy()
       expect(spy).toHaveBeenCalledWith(CANVAS.id)
-      expect(parsed).toEqual(stored)
-      expect(parsed).toEqual([reply, root])
+      expect(parsed).toEqual({ comments: stored, total: 2, has_more: false })
+      expect((parsed as { comments: unknown[] }).comments).toEqual([reply, root])
     } finally {
       await close()
     }
@@ -159,7 +160,7 @@ describe('get_comments MCP tool', () => {
     const { client, close } = await connect()
     try {
       const { parsed } = await callComments(client, { canvas_id: CANVAS.id, frame_id: FRAME_B.id })
-      expect(parsed).toEqual([stored[0]])
+      expect(parsed).toEqual({ comments: [stored[0]], total: 1, has_more: false })
     } finally {
       await close()
     }
@@ -172,9 +173,9 @@ describe('get_comments MCP tool', () => {
     const { client, close } = await connect()
     try {
       const withDefault = await callComments(client, { canvas_id: CANVAS.id })
-      expect(withDefault.parsed).toHaveLength(2)
+      expect((withDefault.parsed as { comments: unknown[] }).comments).toHaveLength(2)
       const unresolvedOnly = await callComments(client, { canvas_id: CANVAS.id, include_resolved: false })
-      expect(unresolvedOnly.parsed).toEqual([open])
+      expect(unresolvedOnly.parsed).toEqual({ comments: [open], total: 1, has_more: false })
     } finally {
       await close()
     }
@@ -186,7 +187,7 @@ describe('get_comments MCP tool', () => {
     try {
       const { parsed, isError } = await callComments(client, { canvas_id: CANVAS.id })
       expect(isError).toBeFalsy()
-      expect(parsed).toEqual([])
+      expect(parsed).toEqual({ comments: [], total: 0, has_more: false })
     } finally {
       await close()
     }
@@ -222,7 +223,7 @@ describe('get_comments MCP tool', () => {
       try {
         const { parsed, isError } = await callComments(client, { canvas_id: CANVAS.id })
         expect(isError).toBeFalsy()
-        expect(parsed).toEqual(stored)
+        expect(parsed).toEqual({ comments: stored, total: 1, has_more: false })
       } finally {
         await close()
       }

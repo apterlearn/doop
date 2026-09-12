@@ -153,7 +153,7 @@ export async function pruneUnusedCss(page: Page, css: string): Promise<PrunedPag
   try {
     /* tsx/esbuild annotates nested functions with __name; page.evaluate
        serialises the function source, so the helper must exist in the page.
-       Same shim as inspectFrame in screenshot.ts. */
+       Same shim as inspectFrame in domProbe.ts. */
     await page.evaluate('globalThis.__name = (target) => target')
     const pruned = await Promise.race([
       page.evaluate(pruneCssInDocument, css, PRUNE_DEADLINE_MS),

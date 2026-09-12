@@ -9,14 +9,18 @@ import { roleByAgentName } from '../../shared/agents.ts'
 import { isCommunityCategory } from '../../shared/types.ts'
 import type {
   ActivityItem,
+  AgentPlan,
   AgentTask,
   Canvas,
   DesignDecision,
   ElementComment,
+  DesignTokens,
   Frame,
+  FrameVersion,
   GuidelineDoc,
   MemoryProposal,
   MemoryReference,
+  PlanStep,
   Page,
   RepoCardKind,
   RepoCardPayload,
@@ -43,6 +47,7 @@ function canvasColumns(c: Canvas) {
     description: c.description ?? null,
     category: c.category ?? null,
     copyCount: c.copyCount ?? 0,
+    tokens: c.tokens ?? null,
     updatedAt: c.updatedAt,
   }
 }
@@ -231,6 +236,85 @@ export function listGuidelineVersions(canvasId: string, name: string) {
     .orderBy(desc(t.guidelineVersions.savedAt))
 }
 
+/* Append-only frame history: one snapshot per durable write, capped per frame.
+   Written from writeFrame, which is already debounced per frame, so a
+   streaming burst lands as one version rather than one per chunk. */
+const MAX_FRAME_VERSIONS = 50
+
+export function listFrameVersions(frameId: string, limit = 20): Promise<FrameVersion[]> {
+  return db
+    .select()
+    .from(t.frameVersions)
+    .where(eq(t.frameVersions.frameId, frameId))
+    .orderBy(desc(t.frameVersions.savedAt))
+    .limit(limit)
+}
+
+export async function getFrameVersion(versionId: string): Promise<FrameVersion | undefined> {
+  const [row] = await db.select().from(t.frameVersions).where(eq(t.frameVersions.id, versionId)).limit(1)
+  return row
+}
+
+async function appendFrameVersion(f: Frame) {
+  const [newest] = await db
+    .select({ html: t.frameVersions.html })
+    .from(t.frameVersions)
+    .where(eq(t.frameVersions.frameId, f.id))
+    .orderBy(desc(t.frameVersions.savedAt))
+    .limit(1)
+  /* an unchanged re-save (a rename, a drag) is not a design version */
+  if (newest?.html === f.html) return
+  await db.insert(t.frameVersions).values({
+    id: nanoid(10),
+    frameId: f.id,
+    canvasId: f.canvasId,
+    name: f.name,
+    html: f.html,
+    x: f.x,
+    y: f.y,
+    width: f.width,
+    height: f.height,
+    savedAt: f.updatedAt,
+    savedBy: f.updatedBy,
+  })
+  const excess = await db
+    .select({ id: t.frameVersions.id })
+    .from(t.frameVersions)
+    .where(eq(t.frameVersions.frameId, f.id))
+    .orderBy(desc(t.frameVersions.savedAt))
+    .offset(MAX_FRAME_VERSIONS)
+  if (excess.length) {
+    await db.delete(t.frameVersions).where(
+      inArray(
+        t.frameVersions.id,
+        excess.map((e) => e.id),
+      ),
+    )
+  }
+}
+
+/* Agent plans: one row per (canvas, agent), the latest write wins. */
+export function savePlan(plan: AgentPlan) {
+  const row = { ...plan, owner: plan.owner ?? null, ownerId: plan.ownerId ?? null }
+  swallow(
+    db
+      .insert(t.agentPlans)
+      .values(row)
+      .onConflictDoUpdate({
+        target: [t.agentPlans.canvasId, t.agentPlans.agentName],
+        set: { owner: row.owner, ownerId: row.ownerId, steps: row.steps, updatedAt: row.updatedAt },
+      }),
+  )
+}
+
+export function deletePlan(canvasId: string, agentName: string) {
+  swallow(db.delete(t.agentPlans).where(and(eq(t.agentPlans.canvasId, canvasId), eq(t.agentPlans.agentName, agentName))))
+}
+
+export function deletePlansFor(canvasId: string) {
+  swallow(db.delete(t.agentPlans).where(eq(t.agentPlans.canvasId, canvasId)))
+}
+
 /* Design memory: single-shot writes, like guidelines. */
 export function saveReference(canvasId: string, ref: MemoryReference) {
   swallow(
@@ -341,6 +425,7 @@ async function writeFrame(f: Frame) {
   }
   const { id, createdAt, ...set } = row
   await db.insert(t.frames).values(row).onConflictDoUpdate({ target: t.frames.id, set })
+  await appendFrameVersion(f)
   await syncAssetRefs(f.id, f.html)
 }
 
@@ -377,6 +462,7 @@ export function deleteCanvas(canvasId: string) {
   swallow(db.delete(t.activity).where(eq(t.activity.canvasId, canvasId)))
   swallow(db.delete(t.guidelines).where(eq(t.guidelines.canvasId, canvasId)))
   swallow(db.delete(t.guidelineVersions).where(eq(t.guidelineVersions.canvasId, canvasId)))
+  swallow(db.delete(t.frameVersions).where(eq(t.frameVersions.canvasId, canvasId)))
   swallow(db.delete(t.memoryReferences).where(eq(t.memoryReferences.canvasId, canvasId)))
   swallow(db.delete(t.decisions).where(eq(t.decisions.canvasId, canvasId)))
   swallow(db.delete(t.memoryProposals).where(eq(t.memoryProposals.canvasId, canvasId)))
@@ -393,6 +479,7 @@ export function deleteFrame(frameId: string) {
   }
   swallow(db.delete(t.frames).where(eq(t.frames.id, frameId)))
   swallow(db.delete(t.assetRefs).where(eq(t.assetRefs.frameId, frameId)))
+  swallow(db.delete(t.frameVersions).where(eq(t.frameVersions.frameId, frameId)))
 }
 
 /** Drop one card row. Used when a human removes a card from the board. */
@@ -417,6 +504,7 @@ export function saveTask(canvasId: string, task: AgentTask) {
     canvasId,
     agentName: task.agentName,
     owner: task.owner ?? null,
+    ownerId: task.ownerId ?? null,
     color: task.color,
     status: task.status,
     startedAt: task.startedAt,
@@ -473,6 +561,7 @@ export function saveFeedback(fb: TaskFeedback) {
     at: fb.at,
     deliveredAt: fb.deliveredAt ?? null,
     claimedBy: fb.claimedBy ?? null,
+    claimedByOwner: fb.claimedByOwner ?? null,
     completedAt: fb.completedAt ?? null,
     failedAt: fb.failedAt ?? null,
     failureReason: fb.failureReason ?? null,
@@ -486,6 +575,7 @@ export function saveFeedback(fb: TaskFeedback) {
         set: {
           deliveredAt: row.deliveredAt,
           claimedBy: row.claimedBy,
+          claimedByOwner: row.claimedByOwner,
           completedAt: row.completedAt,
           failedAt: row.failedAt,
           failureReason: row.failureReason,
@@ -508,6 +598,7 @@ export function saveComment(c: ElementComment) {
     forAgent: c.forAgent ?? false,
     targetAgent: c.targetAgent ?? null,
     claimedBy: c.claimedBy ?? null,
+    claimedByOwner: c.claimedByOwner ?? null,
     claimedAt: c.claimedAt ?? null,
     failedAt: c.failedAt ?? null,
     failureReason: c.failureReason ?? null,
@@ -524,6 +615,7 @@ export function saveComment(c: ElementComment) {
         target: t.comments.id,
         set: {
           claimedBy: row.claimedBy,
+          claimedByOwner: row.claimedByOwner,
           claimedAt: row.claimedAt,
           failedAt: row.failedAt,
           failureReason: row.failureReason,
@@ -574,6 +666,8 @@ export interface Hydrated {
   activity: Map<string, ActivityItem[]>
   decisions: Map<string, DesignDecision[]>
   proposals: Map<string, MemoryProposal[]>
+  /** canvasId -> agentName -> plan */
+  plans: Map<string, Map<string, AgentPlan>>
 }
 
 const LOG_CAP = 100
@@ -592,6 +686,7 @@ export async function hydrate(): Promise<Hydrated> {
     proposalRows,
     memberRows,
     pageRows,
+    planRows,
   ] = await Promise.all([
     db.select().from(t.canvases),
     db.select().from(t.frames),
@@ -605,6 +700,7 @@ export async function hydrate(): Promise<Hydrated> {
     db.select().from(t.memoryProposals).orderBy(desc(t.memoryProposals.at)),
     db.select().from(t.canvasMembers).orderBy(t.canvasMembers.addedAt),
     db.select().from(t.pages).orderBy(t.pages.position),
+    db.select().from(t.agentPlans),
   ])
 
   const canvases: Canvas[] = canvasRows.map((c) => ({
@@ -616,6 +712,7 @@ export async function hydrate(): Promise<Hydrated> {
     ...(c.description ? { description: c.description } : {}),
     ...(isCommunityCategory(c.category) ? { category: c.category } : {}),
     ...(c.copyCount ? { copyCount: c.copyCount } : {}),
+    ...(c.tokens ? { tokens: c.tokens as DesignTokens } : {}),
     createdAt: c.createdAt,
     updatedAt: c.updatedAt,
     frames: [],
@@ -719,6 +816,7 @@ export async function hydrate(): Promise<Hydrated> {
       id: row.id,
       agentName: row.agentName,
       ...(row.owner != null ? { owner: row.owner } : {}),
+      ...(row.ownerId != null ? { ownerId: row.ownerId } : {}),
       color: row.color,
       status: row.status,
       startedAt: row.startedAt,
@@ -766,6 +864,7 @@ export async function hydrate(): Promise<Hydrated> {
       at: row.at,
       ...(row.deliveredAt != null ? { deliveredAt: row.deliveredAt } : {}),
       ...(row.claimedBy != null ? { claimedBy: row.claimedBy } : {}),
+      ...(row.claimedByOwner != null ? { claimedByOwner: row.claimedByOwner } : {}),
       ...(row.completedAt != null ? { completedAt: row.completedAt } : {}),
       ...(failedAt !== undefined ? { failedAt } : {}),
       ...(failureReason !== undefined ? { failureReason } : {}),
@@ -794,6 +893,7 @@ export async function hydrate(): Promise<Hydrated> {
       ...(row.forAgent ? { forAgent: true } : {}),
       ...(row.targetAgent != null ? { targetAgent: row.targetAgent } : {}),
       ...(row.claimedBy != null ? { claimedBy: row.claimedBy } : {}),
+      ...(row.claimedByOwner != null ? { claimedByOwner: row.claimedByOwner } : {}),
       ...(row.claimedAt != null ? { claimedAt: row.claimedAt } : {}),
       ...(failedAt !== undefined ? { failedAt } : {}),
       ...(failureReason !== undefined ? { failureReason } : {}),
@@ -858,7 +958,21 @@ export async function hydrate(): Promise<Hydrated> {
     proposals.set(row.canvasId, list)
   }
 
-  return { canvases, tasks, feedback, comments, activity, decisions, proposals }
+  const plans = new Map<string, Map<string, AgentPlan>>()
+  for (const row of planRows) {
+    const byAgent = plans.get(row.canvasId) ?? new Map<string, AgentPlan>()
+    byAgent.set(row.agentName, {
+      canvasId: row.canvasId,
+      agentName: row.agentName,
+      ...(row.owner ? { owner: row.owner } : {}),
+      ...(row.ownerId ? { ownerId: row.ownerId } : {}),
+      steps: row.steps as PlanStep[],
+      updatedAt: row.updatedAt,
+    })
+    plans.set(row.canvasId, byAgent)
+  }
+
+  return { canvases, tasks, feedback, comments, activity, decisions, proposals, plans }
 }
 
 /** One-time import of the pre-DB data/store.json so existing canvases survive. */

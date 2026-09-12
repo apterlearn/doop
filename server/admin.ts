@@ -4,6 +4,7 @@ import { store } from './store.ts'
 import { isAdmin } from './access.ts'
 import { db } from './db/index.ts'
 import * as authSchema from './db/auth-schema.ts'
+import { getStats } from './mcpStats.ts'
 
 /**
  * Instance-admin surface, mounted at /api/admin (so already behind the
@@ -47,6 +48,13 @@ adminRouter.get('/stats', async (req, res) => {
     canvases: canvases.length,
     frames: canvases.reduce((n, c) => n + c.frames.length, 0),
   })
+})
+
+/** Which MCP tools agents actually call, and which ones fail. In-process, so
+ *  it covers this instance since it booted — enough to answer "is anyone using
+ *  this surface, and what is breaking" without a metrics pipeline. */
+adminRouter.get('/mcp-stats', (req, res) => {
+  res.json(getStats())
 })
 
 /** Accounts, for the "view as" picker and (later) ban/role management. */
