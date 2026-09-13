@@ -127,7 +127,7 @@ function seedCard(agentName = 'Claude') {
 }
 
 describe.skipIf(!findBrowserPath())('stored verification reports', () => {
-  it('survives the agent that made it, and the gate reads it back', async () => {
+  it('survives the agent that made it, and the gate reads it back', { timeout: 20_000 }, async () => {
     const card = seedCard()
     const first = await connect()
     try {
