@@ -280,6 +280,10 @@ export const api = {
   /** the frame's stored verification reports, newest first */
   frameReviews: (frameId: string, limit = 5) =>
     req<(FrameReview & { current: boolean })[]>(`/api/frames/${frameId}/reviews?limit=${limit}`),
+  /** run the checks now and store the report — the human's side of
+   *  ready_for_review, for when a reviewer does not want to wait for an agent */
+  runFrameReviews: (frameId: string) =>
+    req<FrameReview & { current: boolean }>(`/api/frames/${frameId}/reviews`, { method: 'POST' }),
   frameProposals: (canvasId: string, status?: 'pending') =>
     req<FrameProposal[]>(`/api/canvases/${canvasId}/frame-proposals${status ? `?status=${status}` : ''}`),
   /* the canvas design tokens, as the Tokens panel edits them */
@@ -403,10 +407,26 @@ export const api = {
   disconnectModelAccount: () => req<ModelAccountStatus>('/api/model-account', { method: 'DELETE' }),
   setAgentModel: (model: string) =>
     req<ModelAccountStatus>('/api/model-account', { method: 'PATCH', body: JSON.stringify({ model }) }),
-  addCard: (canvasId: string, title: string, agents: string[], attachments?: string[], targetFrameIds?: string[]) =>
+  /** `target` is the element/page the card is about — the human's selection at
+   *  queue time, so "fix this element" reaches the agent as a selector. */
+  addCard: (
+    canvasId: string,
+    title: string,
+    agents: string[],
+    attachments?: string[],
+    targetFrameIds?: string[],
+    target?: { selector?: string; pageId?: string },
+  ) =>
     req(`/api/canvases/${canvasId}/cards`, {
       method: 'POST',
-      body: JSON.stringify({ title, agents, attachments, targetFrameIds }),
+      body: JSON.stringify({
+        title,
+        agents,
+        attachments,
+        targetFrameIds,
+        targetSelector: target?.selector,
+        targetPageId: target?.pageId,
+      }),
     }),
   completeCard: (canvasId: string, cardId: string) =>
     req(`/api/canvases/${canvasId}/cards/${cardId}/done`, { method: 'POST' }),

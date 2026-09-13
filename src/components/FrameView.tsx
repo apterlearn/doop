@@ -15,7 +15,14 @@ import { gesture } from '../lib/gesture'
 import { FrameContextMenu } from './FrameContextMenu'
 import { CodePanel } from './CodePanel'
 import { ContextMenu, ContextMenuTrigger } from './ui/context-menu'
-import { AGENT_ROLES, DEFAULT_ROLE_ID, mentionedRole, roleName } from '../../shared/agents'
+import {
+  AGENT_ROLES,
+  DEFAULT_ROLE_ID,
+  mentionedAgent,
+  mentionedRole,
+  roleByAgentName,
+  roleName,
+} from '../../shared/agents'
 import { posthog } from '../lib/posthog'
 import { isResidentLimit } from './TeamAllowance'
 import { cn } from '@/lib/utils'
@@ -1082,8 +1089,15 @@ function CommentComposer({
   useEffect(() => taRef.current?.focus(), [])
   const send = () => text.trim() && onSubmit(text)
   /* @mention a resident agent to route the comment to it; without one the
-     comment is a note for the humans in the room */
+     comment is a note for the humans in the room. Outside agents connected
+     over MCP are addressable by name too, so the pills list them beside the
+     roles — derived from the stable presences map, as everywhere else here. */
   const mentioned = mentionedRole(text)
+  const presences = useStore((s) => s.presences)
+  const outside = Object.values(presences)
+    .filter((p) => p.kind === 'agent' && !roleByAgentName(p.name))
+    .map((p) => p.name)
+  const mentionedOutside = mentioned ? undefined : mentionedAgent(text, outside)
   return (
     <div className="w-[240px] rounded-[10px] border border-line bg-surface p-2 shadow-pop animate-[chip-in_0.18s_ease]">
       <Textarea
@@ -1098,7 +1112,7 @@ function CommentComposer({
           if (e.key === 'Escape') onCancel()
         }}
       />
-      {!mentioned && (
+      {!mentioned && !mentionedOutside && (
         <div className="mb-2 flex flex-wrap gap-1">
           {AGENT_ROLES.map((role) => (
             <Button
@@ -1112,15 +1126,31 @@ function CommentComposer({
               <RoleMark role={role} size={13} /> @{role.id}
             </Button>
           ))}
+          {outside.map((name) => (
+            <Button
+              key={name}
+              variant="ghost"
+              size="pill"
+              className="border-dashed px-2 text-[11px] font-semibold text-ink-soft hover:border-brand hover:bg-transparent hover:text-brand"
+              title={`${name} — connected over MCP`}
+              onClick={() => setText((t) => (t ? t.replace(/\s*$/, ' ') : '') + `@${name} `)}
+            >
+              @{name}
+            </Button>
+          ))}
         </div>
       )}
       <div className="flex items-center justify-end gap-2">
-        {mentioned && (
+        {mentioned ? (
           <span className="mr-auto inline-flex items-center gap-1 text-[11px] font-semibold text-brand">
             <RoleMark role={mentioned} size={13} />
             {mentioned.name} will pick this up
           </span>
-        )}
+        ) : mentionedOutside ? (
+          <span className="mr-auto inline-flex items-center gap-1 text-[11px] font-semibold text-brand">
+            {mentionedOutside} will pick this up
+          </span>
+        ) : null}
         <Button variant="solid" size="pill" className="px-3.5 py-[5px] text-xs" disabled={!text.trim()} onClick={send}>
           Post
         </Button>
@@ -1170,7 +1200,18 @@ function CommentThread({
       .catch(() => setFailed(true))
       .finally(() => setSending(false))
   }
+  /* the same resolution the server does on submit: a resident role, or a
+     connected agent's own name — a reply to either is a request to it */
   const mentioned = mentionedRole(reply)
+  const presences = useStore((s) => s.presences)
+  const mentionedOutside = mentioned
+    ? undefined
+    : mentionedAgent(
+        reply,
+        Object.values(presences)
+          .filter((p) => p.kind === 'agent' && !roleByAgentName(p.name))
+          .map((p) => p.name),
+      )
   return (
     <div
       className="absolute top-[calc(100%_+_8px)] left-1/2 w-[250px] -translate-x-1/2 cursor-default rounded-[10px] border border-line bg-surface p-2.5 text-left shadow-pop animate-[chip-in_0.18s_ease]"
@@ -1239,6 +1280,14 @@ function CommentThread({
           >
             <RoleMark role={mentioned} size={13} />
             <span className="truncate">{mentioned.name}</span>
+          </span>
+        )}
+        {mentionedOutside && (
+          <span
+            className="ml-auto inline-flex min-w-0 items-center gap-1 truncate text-[11px] font-semibold text-brand"
+            title={`${mentionedOutside} will pick this up`}
+          >
+            <span className="truncate">{mentionedOutside}</span>
           </span>
         )}
         <Button

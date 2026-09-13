@@ -483,6 +483,20 @@ export interface Presence {
   owner?: string
 }
 
+/** What a connected client is looking at: the frame, the element inside it and
+ *  the page. Nulls mean nothing is selected. This is how a human points an
+ *  agent at "this" — the server keeps one per client and the MCP surface reads
+ *  them back. */
+export interface CanvasFocus {
+  clientId: string
+  /** the client's display name, as the room knows it */
+  name: string
+  frameId: string | null
+  selector: string | null
+  pageId: string | null
+  at: number
+}
+
 /** A unit of work an agent announced via set_status. A new status completes the previous task.
  *  Board cards are the same object: a human queues one (queuedBy set, agentName empty)
  *  and an agent claims it — cards stay open until explicitly completed. */

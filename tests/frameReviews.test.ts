@@ -10,6 +10,7 @@ import { store } from '../server/store.ts'
 import { closeDb, initDb } from '../server/db/index.ts'
 import * as persist from '../server/db/persist.ts'
 import { findBrowserPath } from '../server/screenshot.ts'
+import { Client as ApiClient, startServer, type Server } from './harness.ts'
 import type { Canvas, Frame } from '../shared/types.ts'
 
 /* Verification reports are persisted, so this file drives the real database:
@@ -212,5 +213,70 @@ describe.skipIf(!findBrowserPath())('stored verification reports', () => {
     } finally {
       await close()
     }
+  })
+})
+
+/* The same gate, on a human's word. A reviewer reading the checks panel should
+   not have to wait for an agent to re-run the checks, and the report the button
+   produces has to be the same stored kind the panel and the delivery gate read
+   — not a second, parallel notion of "checked". */
+
+const REST_PORT = 4988
+
+describe.skipIf(!findBrowserPath())('checks a human can trigger', () => {
+  let server: Server
+  let client: ApiClient
+  let canvasId: string
+  let frameId: string
+
+  beforeAll(async () => {
+    server = await startServer(REST_PORT)
+    client = new ApiClient(server)
+    await client.signUp('checks@test.dev', 'Checker')
+    canvasId = (await (await client.post('/api/canvases', { name: 'Checks' })).json()).id
+    frameId = (await (await client.post(`/api/canvases/${canvasId}/frames`, { name: 'Home' })).json()).id
+    await client.patch(`/api/frames/${frameId}`, { html: CLEAN })
+  }, 90_000)
+
+  afterAll(() => server?.stop())
+
+  it('stores a report the panel can read, current for the html it checked', async () => {
+    const res = await client.post(`/api/frames/${frameId}/reviews`)
+    expect(res.status).toBe(200)
+    const report = (await res.json()) as { id: string; verdict: string; htmlSha: string; current: boolean }
+    expect(report.verdict).toBe('pass')
+    expect(report.current).toBe(true)
+
+    /* stored, not merely returned: the GET the panel reads reports it back */
+    const listed = (await (await client.get(`/api/frames/${frameId}/reviews`)).json()) as {
+      id: string
+      htmlSha: string
+      current: boolean
+    }[]
+    expect(listed[0]!.id).toBe(report.id)
+    expect(listed[0]!.htmlSha).toBe(report.htmlSha)
+    expect(listed[0]!.current).toBe(true)
+  })
+
+  it('marks the earlier report stale after the frame changes', async () => {
+    await client.patch(`/api/frames/${frameId}`, { html: CLEAN.replace('reliably', 'quickly') })
+    const listed = (await (await client.get(`/api/frames/${frameId}/reviews`)).json()) as {
+      id: string
+      current: boolean
+    }[]
+    expect(listed[0]!.current).toBe(false)
+
+    const fresh = (await (await client.post(`/api/frames/${frameId}/reviews`)).json()) as {
+      htmlSha: string
+      current: boolean
+    }
+    expect(fresh.current).toBe(true)
+    const after = (await (await client.get(`/api/frames/${frameId}/reviews`)).json()) as {
+      id: string
+      htmlSha: string
+      current: boolean
+    }[]
+    expect(after[0]!.htmlSha).toBe(fresh.htmlSha)
+    expect(after[0]!.current).toBe(true)
   })
 })

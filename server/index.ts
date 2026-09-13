@@ -27,7 +27,7 @@ import * as authSchema from './db/auth-schema.ts'
 import * as persist from './db/persist.ts'
 import { htmlBundle } from './codeExport.ts'
 import { SNAPSHOT_CSP } from './snapshotCsp.ts'
-import { frameSha } from './review.ts'
+import { frameSha, reviewFrame, reviewToRecord } from './review.ts'
 import { handleMcpRequest } from './mcp.ts'
 import { groupClients } from './mcpClients.ts'
 /* static, not dynamic: nothing imports this entrypoint, so there is no cycle,
@@ -54,7 +54,7 @@ import { AGENT_MODELS } from './openaiAgent.ts'
 import { mentionedRole } from '../shared/agents.ts'
 import { colorFor } from '../shared/types.ts'
 import type { FrameLockHolder } from '../shared/types.ts'
-import type { ClientMessage, Presence, ServerMessage } from '../shared/types.ts'
+import type { CanvasFocus, ClientMessage, Presence, ServerMessage } from '../shared/types.ts'
 
 const PORT = Number(process.env.PORT || 4400)
 
@@ -184,6 +184,12 @@ interface AgentPresence extends Presence {
 }
 const agentPresences = new Map<string, Map<string, AgentPresence>>() // canvasId -> name -> presence
 
+/** What each connected client is looking at: frame, element and page. Kept
+ *  per canvas and swept with presence — a client that left is not still
+ *  pointing at anything. `at` is what the MCP focus nudge compares against. */
+type Focus = Omit<CanvasFocus, 'clientId' | 'name'>
+const focusByCanvas = new Map<string, Map<string, Focus>>() // canvasId -> clientId -> focus
+
 function agentTouch(
   canvasId: string,
   agentName: string,
@@ -254,6 +260,14 @@ setInterval(() => {
       }
     }
   }
+  /* focus follows presence: a socket that died without a close event must not
+     leave the room — or an agent reading the canvas — pointing at a selection
+     nobody is holding any more */
+  for (const [canvasId, byClient] of focusByCanvas) {
+    const here = new Set(room(canvasId).map((c) => c.presence.clientId))
+    for (const clientId of byClient.keys()) if (!here.has(clientId)) byClient.delete(clientId)
+    if (byClient.size === 0) focusByCanvas.delete(canvasId)
+  }
 }, 5000)
 
 /** Mark an agent as parked in a long wait (wait_for_events / ask_human). */
@@ -268,6 +282,33 @@ export function markAgentWaiting(canvasId: string, agentName: string, waiting: b
 }
 
 actions.wire(broadcast, agentTouch, cancelCanvasRuns, markAgentWaiting)
+
+/* Presence lives here (agentPresences), the MCP surface lives in mcp.ts, and
+   neither may import the other: the reader is handed over at boot so
+   get_agents can list an agent that has only posted a status. */
+actions.wirePresence((canvasId) =>
+  [...(agentPresences.get(canvasId)?.values() ?? [])].map((p) => ({
+    name: p.name,
+    ...(p.owner ? { owner: p.owner } : {}),
+    status: p.status ?? null,
+    frameId: p.activeFrameId ?? null,
+    ...(p.waiting ? { waiting: true } : {}),
+    lastSeen: p.lastSeen,
+  })),
+)
+
+/* What humans are looking at lives here too, and the MCP surface reads it the
+   same way: the frame/element/page a person selected is the only way they can
+   point an agent at "this". Names come from the room, so a reader never has to
+   trust an id. */
+actions.wireFocus((canvasId) => {
+  const byClient = focusByCanvas.get(canvasId)
+  if (!byClient) return []
+  const names = new Map(room(canvasId).map((c) => [c.presence.clientId, c.presence.name]))
+  return [...byClient]
+    .filter(([clientId]) => names.has(clientId))
+    .map(([clientId, f]) => ({ clientId, name: names.get(clientId)!, ...f }))
+})
 
 /* the Run tab sees tool calls live, and the timeline is a 7-day window */
 runLog.wireBroadcast(broadcast)
@@ -1444,6 +1485,35 @@ app.get('/api/frames/:frameId/reviews', async (req, res) => {
   res.json(reviews.map((review) => ({ ...review, current: review.htmlSha === current })))
 })
 
+/* Checks are three renders each, so this budget is the preview route's shape
+   at a smaller allowance — enough for a reviewer working through a canvas,
+   not enough to hold the shared browser hostage. */
+const frameReviewHits = new Map<string, number[]>()
+
+/** Run the quality gate on a frame now, on a human's word. The same checks and
+ *  the same stored report ready_for_review produces, so a reviewer can ask for
+ *  a fresh verdict without waiting for an agent to re-run it. */
+app.post('/api/frames/:frameId/reviews', async (req, res) => {
+  const frame = requireFrame(req, res, req.params.frameId)
+  if (!frame) return
+  const hits = (frameReviewHits.get(req.user!.id) ?? []).filter((t) => Date.now() - t < 60_000)
+  if (hits.length >= 6) return res.status(429).json({ error: 'too many checks, wait a minute' })
+  hits.push(Date.now())
+  frameReviewHits.set(req.user!.id, hits)
+  const actor = resolveActorFromReq(req)
+  const canvas = store.getCanvas(frame.canvasId)
+  try {
+    const report = await reviewFrame(frame, canvas?.tokens)
+    const record = reviewToRecord(report, frame.canvasId, actor.name)
+    await persist.saveFrameReview(record)
+    actions.logActivity(frame.canvasId, actor, `ran checks on "${frame.name}" — ${report.verdict}`, frame.id)
+    res.json({ ...record, current: record.htmlSha === frameSha(frame, canvas?.tokens) })
+  } catch (err) {
+    console.error('[frame-reviews] failed', err)
+    res.status(503).json({ error: 'renderer unavailable' })
+  }
+})
+
 app.get('/api/frames/:frameId/versions/:versionId', async (req, res) => {
   const frame = requireFrame(req, res, req.params.frameId)
   if (!frame) return
@@ -1857,6 +1927,8 @@ app.post('/api/canvases/:id/cards', async (req, res) => {
     req.body?.attachments,
     req.user!.id,
     req.body?.targetFrameIds,
+    req.body?.targetSelector,
+    req.body?.targetPageId,
   )
   if (!card) return res.status(404).json({ error: 'canvas not found or empty title' })
   res.json(card)
@@ -2097,6 +2169,32 @@ wss.on('connection', (ws, upgradeReq) => {
           presence.clientId,
         )
         break
+      case 'focus': {
+        const next: Focus = { frameId: msg.frameId, selector: msg.selector, pageId: msg.pageId, at: Date.now() }
+        let byClient = focusByCanvas.get(canvasId)
+        if (!byClient) focusByCanvas.set(canvasId, (byClient = new Map()))
+        const prev = byClient.get(presence.clientId)
+        /* only a real change is worth a message: the client re-announces its
+           selection on every page/zoom settle, and panning is not part of the
+           tuple, so a human scrolling produces no traffic at all */
+        if (prev && prev.frameId === next.frameId && prev.selector === next.selector && prev.pageId === next.pageId) {
+          prev.at = next.at
+          break
+        }
+        byClient.set(presence.clientId, next)
+        broadcast(
+          canvasId,
+          {
+            type: 'focus',
+            clientId: presence.clientId,
+            frameId: next.frameId,
+            selector: next.selector,
+            pageId: next.pageId,
+          },
+          presence.clientId,
+        )
+        break
+      }
     }
   })
 
@@ -2106,6 +2204,10 @@ wss.on('connection', (ws, upgradeReq) => {
     conns.delete(ws)
     if (conn.silent) return // never announced a join, so nothing to leave
     broadcast(conn.canvasId, { type: 'presence:leave', clientId: conn.presence.clientId })
+    /* a departed client is not still looking at anything */
+    const byClient = focusByCanvas.get(conn.canvasId)
+    byClient?.delete(conn.presence.clientId)
+    if (byClient?.size === 0) focusByCanvas.delete(conn.canvasId)
   })
 })
 

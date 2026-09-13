@@ -7,7 +7,14 @@ import * as thumbs from './thumbs.ts'
 import { colorFor } from '../shared/types.ts'
 import { validateTokens } from './tokenCss.ts'
 import { stripTokenStyle } from '../shared/tokens.ts'
-import { DEFAULT_ROLE_ID, mentionedRole, normalizePipeline, roleByAgentName, roleName } from '../shared/agents.ts'
+import {
+  DEFAULT_ROLE_ID,
+  mentionedAgent,
+  mentionedRole,
+  normalizePipeline,
+  roleByAgentName,
+  roleName,
+} from '../shared/agents.ts'
 import { decodeEscapedHtml, looksEscapedHtml, repairEscapedHtml } from './escapedHtml.ts'
 import type {
   Actor,
@@ -15,6 +22,7 @@ import type {
   AgentPlan,
   AgentTask,
   Canvas,
+  CanvasFocus,
   DesignDecision,
   DesignTokens,
   ElementComment,
@@ -68,6 +76,58 @@ export function wire(b: Broadcast, t: AgentTouch, c?: Cancel, w?: MarkWaiting) {
   agentTouch = t
   cancel = c ?? (() => {})
   markWaiting = w ?? (() => {})
+}
+
+/** An agent currently present on a canvas, as index.ts's presence map holds
+ *  it. The map lives in index.ts, which actions.ts must not import, so the
+ *  reader is wired in at boot like the broadcaster. */
+export interface AgentPresenceEntry {
+  name: string
+  owner?: string
+  status?: string | null
+  frameId?: string | null
+  waiting?: boolean
+  lastSeen: number
+}
+type PresenceReader = (canvasId: string) => AgentPresenceEntry[]
+
+let presenceReader: PresenceReader = () => []
+
+/** Wired once from index.ts. Absent (tests, tools-only boot) = nobody present. */
+export function wirePresence(r: PresenceReader) {
+  presenceReader = r
+}
+
+/** Live agents on a canvas — including one that has only called set_status
+ *  once and so has no open task row to be read from. */
+export function listAgentPresence(canvasId: string): AgentPresenceEntry[] {
+  return presenceReader(canvasId)
+}
+
+type FocusReader = (canvasId: string) => CanvasFocus[]
+
+let focusReader: FocusReader = () => []
+
+/** Wired once from index.ts, like the presence reader — the map lives there. */
+export function wireFocus(r: FocusReader) {
+  focusReader = r
+}
+
+/** What every connected client on this canvas is looking at, newest first —
+ *  the selection a human points an agent with. */
+export function listCanvasFocus(canvasId: string): CanvasFocus[] {
+  return [...focusReader(canvasId)].sort((a, b) => b.at - a.at)
+}
+
+/** The agent names an @mention on this canvas can address right now: the ones
+ *  present (even with nothing claimed) plus the ones an open card belongs to.
+ *  Matched against what is actually here, never against a name invented from
+ *  the text — a typo must stay a note for the humans, not vanish into a
+ *  delivery to nobody. */
+function liveAgentNames(canvasId: string): string[] {
+  const names = new Set(presenceReader(canvasId).map((p) => p.name))
+  for (const t of taskLog.get(canvasId) ?? []) if (t.agentName) names.add(t.agentName)
+  return [...names]
 }
 
 /** while parked in ask_human / wait_for_events the agent is alive but idle */
@@ -815,7 +875,12 @@ function postComment(
   const clean = text.trim()
   if (!clean) return undefined
   /* @Doop, @brand, @a11y… — whichever resident agent is mentioned picks it up */
-  const mentioned = mentionedRole(clean)
+  const role = mentionedRole(clean)
+  /* a role is not the only addressable agent: an outside agent connected over
+     MCP has a name of its own, and @-mentioning it routes the comment to that
+     agent. Only names that are actually here count, so a typo stays a note for
+     the humans in the room instead of being delivered to nobody. */
+  const target = role?.name ?? mentionedAgent(clean, liveAgentNames(frame.canvasId))
   const list = commentLog.get(frame.canvasId) ?? []
   /* strictly increasing per canvas: thread order is reconstructed from `at`
      after a restart, so two messages must never share a timestamp */
@@ -831,7 +896,7 @@ function postComment(
     ...(fromUserId ? { fromUserId } : {}),
     text: clean,
     at,
-    ...(mentioned ? { forAgent: true, targetAgent: mentioned.name } : {}),
+    ...(target ? { forAgent: true, targetAgent: target } : {}),
     ...(anchor.parentId ? { parentId: anchor.parentId } : {}),
     ...(actor.kind === 'agent' ? { fromKind: 'agent' as const } : {}),
   }
@@ -1149,6 +1214,8 @@ export function addQueuedCard(
   attachments?: unknown,
   fromUserId?: string,
   targetFrameIds?: unknown,
+  targetSelector?: unknown,
+  targetPageId?: unknown,
 ): AgentTask | undefined {
   const clean = title.trim().slice(0, MAX_CARD_CHARS)
   if (!clean || !store.getCanvas(canvasId)) return undefined
@@ -1165,6 +1232,14 @@ export function addQueuedCard(
     .filter((a): a is string => typeof a === 'string')
     .filter((id, i, arr) => arr.indexOf(id) === i && store.getFrame(id)?.canvasId === canvasId)
     .slice(0, 4)
+  /* "fix THIS element": the selector only means something alongside a target
+     frame, and the page is validated like every other id — a page id from
+     another canvas would send the agent looking in the wrong place */
+  const selector = targets.length > 0 && typeof targetSelector === 'string' ? targetSelector.trim().slice(0, 300) : ''
+  const page =
+    targets.length > 0 && typeof targetPageId === 'string' && store.getPage(targetPageId)?.canvas.id === canvasId
+      ? targetPageId
+      : ''
   const list = taskLog.get(canvasId) ?? []
   const duplicate = list.find(
     (t) =>
@@ -1173,7 +1248,9 @@ export function addQueuedCard(
       t.status === clean &&
       pipelineOf(t).join(',') === pipeline.join(',') &&
       (t.attachments ?? []).join(',') === refs.join(',') &&
-      (t.targetFrameIds ?? []).join(',') === targets.join(','),
+      (t.targetFrameIds ?? []).join(',') === targets.join(',') &&
+      (t.targetSelector ?? '') === selector &&
+      (t.targetPageId ?? '') === page,
   )
   if (duplicate) return duplicate
   const card: AgentTask = {
@@ -1188,12 +1265,22 @@ export function addQueuedCard(
     stage: 0,
     ...(refs.length > 0 ? { attachments: refs } : {}),
     ...(targets.length > 0 ? { targetFrameIds: targets } : {}),
+    ...(selector ? { targetSelector: selector } : {}),
+    ...(page ? { targetPageId: page } : {}),
   }
   list.unshift(card)
   taskLog.set(canvasId, trimTaskLog(list))
   persist.saveTask(canvasId, card)
   broadcast(canvasId, { type: 'task', task: card })
-  agentEvents.push(canvasId, { kind: 'card', data: { cardId: card.id, text: clean, pipeline } })
+  /* a card that @mentions a connected agent is addressed to that agent: the
+     event wakes it specifically instead of every parked agent on the canvas.
+     Roles are left untargeted — the pipeline decides who picks the card up. */
+  const outside = mentionedRole(clean) ? undefined : mentionedAgent(clean, liveAgentNames(canvasId))
+  agentEvents.push(canvasId, {
+    kind: 'card',
+    ...(outside ? { targetAgent: outside } : {}),
+    data: { cardId: card.id, text: clean, pipeline },
+  })
   logActivity(
     canvasId,
     resolveActor({ name: from, kind: 'user' }),

@@ -206,6 +206,10 @@ export const tasks = pgTable(
     /** comma-joined frame ids the card is about (the human's selection at queue
      *  time) — the agent edits these in place instead of delivering elsewhere */
     targetFrameIds: text('target_frame_ids'),
+    /** element selector on that frame the human pointed at — "fix THIS element" */
+    targetSelector: text('target_selector'),
+    /** page the target frame lives on, so the agent needs no lookup to reach it */
+    targetPageId: text('target_page_id'),
     /** a human paused this card's run — skipped until explicitly resumed */
     pausedAt: bigint('paused_at', { mode: 'number' }),
     pausedBy: text('paused_by'),

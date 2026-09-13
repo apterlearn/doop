@@ -6,6 +6,25 @@ import { buildMcpServer } from '../server/mcp.ts'
 import { store } from '../server/store.ts'
 import type { Actor, Canvas, ElementComment, Frame } from '../shared/types.ts'
 
+/* Comments are persisted and broadcast; the routing cases below run the real
+   action, so the two sides it touches are stubbed instead of reaching a db. */
+vi.mock('../server/db/persist.ts', () => ({
+  getUserEmail: async () => undefined,
+  getNotificationPrefs: async () => new Map(),
+  saveNotificationPref: () => {},
+  pruneRunEvents: () => {},
+  saveJournal: () => {},
+  saveRunEvent: () => {},
+  saveQuestion: () => {},
+  saveFrameProposal: () => {},
+  saveTask: () => {},
+  saveFeedback: () => {},
+  saveComment: () => {},
+  saveActivity: () => {},
+  saveDecision: () => {},
+  saveProposal: () => {},
+}))
+
 const OWNER_ID = 'owner-1'
 
 const CANVAS: Canvas = {
@@ -212,6 +231,55 @@ describe('resolve_comment', () => {
       expect(result.isError).toBe(true)
       expect(raw).toContain('no comment with id nope')
       expect(resolve).not.toHaveBeenCalled()
+    } finally {
+      await close()
+    }
+  })
+})
+
+describe('@mentions of connected agents', () => {
+  /* These run the real action: routing a comment to an agent is exactly what
+     is under test, so addElementComment must not be stubbed. Presence is
+     injected the way index.ts wires it. */
+  function withPresentAgent(name: string) {
+    actions.wirePresence((canvasId) => (canvasId === CANVAS.id ? [{ name, lastSeen: Date.now() }] : []))
+  }
+
+  it('routes the comment to a connected agent that is not a resident role', async () => {
+    withPresentAgent('OutsideAgent')
+    const { client, close } = await connect()
+    try {
+      const { result, raw } = await call(client, 'add_comment', {
+        frame_id: FRAME.id,
+        selector: '.hero h1',
+        snippet: '<h1>Hi</h1>',
+        text: '@OutsideAgent hi',
+        agent_name: 'Claude',
+      })
+
+      expect(result.isError).toBeFalsy()
+      expect(JSON.parse(raw)).toMatchObject({ forAgent: true, targetAgent: 'OutsideAgent', text: '@OutsideAgent hi' })
+    } finally {
+      await close()
+    }
+  })
+
+  it('leaves a comment addressed to a name nobody answers to untargeted', async () => {
+    withPresentAgent('OutsideAgent')
+    const { client, close } = await connect()
+    try {
+      const { result, raw } = await call(client, 'add_comment', {
+        frame_id: FRAME.id,
+        selector: '.hero h1',
+        snippet: '<h1>Hi</h1>',
+        text: '@Nobody hi',
+        agent_name: 'Claude',
+      })
+
+      expect(result.isError).toBeFalsy()
+      const comment = JSON.parse(raw) as ElementComment
+      expect(comment.forAgent).toBeUndefined()
+      expect(comment.targetAgent).toBeUndefined()
     } finally {
       await close()
     }

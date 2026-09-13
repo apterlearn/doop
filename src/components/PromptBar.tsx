@@ -143,13 +143,21 @@ export function PromptBar({ canvasId }: { canvasId: string }) {
         'Attached image',
       )
       /* the target frame stays OUT of the attachments: attachments are
-         described to the agent as source material it must not edit */
+         described to the agent as source material it must not edit. The
+         element selector and page ride along so "fix this element" arrives as
+         an address, not a guess. */
       await api.addCard(
         canvasId,
         clean,
         ['doop'],
         refFrames.map((f) => f.id),
         target ? [target.id] : undefined,
+        target
+          ? {
+              ...(selectedElement?.frameId === target.id ? { selector: selectedElement.selector } : {}),
+              ...(target.pageId ? { pageId: target.pageId } : {}),
+            }
+          : undefined,
       )
       posthog.capture('prompt_bar_submitted', { attachments: refFrames.length })
       awaiting.current = openFlyWindow(refFrames.map((f) => f.id))

@@ -24,6 +24,8 @@ import { VIEWPORTS } from './screenshot.ts'
 
 export interface ReviewViewport {
   viewport: { width: number; height: number }
+  /** the width's name — the device preset, the canvas breakpoint, or "<n>px" */
+  label?: string
   lint: LintReport
   a11y: A11yReport
   layout: LayoutReport
@@ -74,12 +76,27 @@ const DEFAULT_VIEWPORTS: { width: number; height: number }[] = Object.values(VIE
   height: viewport.height,
 }))
 
-/** The viewport a preset means for THIS frame. A frame taller than the preset
- *  is rendered at its own height (up to the same 4000px cap the renderer uses),
- *  so `clipped_by_frame` reports content that is really cut off rather than
- *  content that simply sits below a phone's fold. */
-function viewportFor(preset: { width: number; height: number }, frame: Frame): { width: number; height: number } {
-  return { width: preset.width, height: Math.min(4000, Math.max(preset.height, Math.round(frame.height))) }
+/** One width to review at: a device preset, or a canvas breakpoint named by the
+ *  canvas. */
+interface ReviewViewportSpec {
+  width: number
+  height: number
+  /** the name to report this width by; defaults to the preset it matches */
+  name?: string
+}
+
+/** The viewport a preset means for THIS frame, and the name to report it by. A
+ *  frame taller than the preset is rendered at its own height (up to the same
+ *  4000px cap the renderer uses), so `clipped_by_frame` reports content that is
+ *  really cut off rather than content that simply sits below a phone's fold. */
+function viewportFor(preset: ReviewViewportSpec, frame: Frame): { width: number; height: number; label: string } {
+  return {
+    width: preset.width,
+    height: Math.min(4000, Math.max(preset.height, Math.round(frame.height))),
+    /* a name the caller chose — a canvas breakpoint — is what the render is
+       for, so it wins over whatever preset the width happens to match */
+    label: preset.name ?? presetName(preset),
+  }
 }
 
 /** The name a preset is known by, for reporting which widths failed. */
@@ -161,21 +178,33 @@ function findingsFrom(
 export async function reviewFrame(
   frame: Frame,
   tokens: DesignTokens | undefined,
-  opts: { viewports?: { width: number; height: number }[] } = {},
+  opts: { viewports?: ReviewViewportSpec[]; breakpoints?: { name: string; min_width: number }[] } = {},
 ): Promise<ReviewReport> {
   /* one document for the whole run: the frame object is mutated in place by
      writes, so rendering it per viewport could measure two different designs
      and hash a third */
   const target: Frame = { ...frame }
   const presets = opts.viewports?.length ? opts.viewports : DEFAULT_VIEWPORTS
-  const viewports = opts.viewports?.length ? presets : presets.map((preset) => viewportFor(preset, target))
+  const viewports = presets.map((preset) => viewportFor(preset, target))
+  /* the canvas's own breakpoints are reviewed on top of the presets: a design
+     that declares where it reflows has to survive exactly those widths, and a
+     finding there is reported by the breakpoint's name so it is attributable
+     to the one width the agent chose rather than to a device preset */
+  for (const breakpoint of opts.breakpoints ?? []) {
+    viewports.push({
+      width: breakpoint.min_width,
+      height: Math.min(4000, Math.max(VIEWPORTS.mobile.height, Math.round(target.height))),
+      label: breakpoint.name,
+    })
+  }
   const reviewed: ReviewViewport[] = []
   /* a family mismatch is drift only when the declared family was available at
      all: a webfont that never loaded computes as its fallback */
   let fontsLoaded = true
   /* sequential on purpose: the checks share one headless browser, and a
      parallel fan-out would only contend for it */
-  for (const viewport of viewports) {
+  for (const spec of viewports) {
+    const viewport = { width: spec.width, height: spec.height }
     const probe: Probe = await probeFrame(target, { viewport })
     if (probe.document.fontsFailed.length) fontsLoaded = false
     const lint = lintProbe(probe, tokens)
@@ -189,7 +218,7 @@ export async function reviewFrame(
       lint.violations.some(
         (issue) => BLOCKING_TOKEN_RULES.has(issue.rule) || (issue.rule === 'off_token_font' && fontsLoaded),
       )
-    reviewed.push({ viewport, lint, a11y, layout, content, verdict: failing ? 'fail' : 'pass' })
+    reviewed.push({ viewport, label: spec.label, lint, a11y, layout, content, verdict: failing ? 'fail' : 'pass' })
   }
 
   const summary = {
@@ -224,7 +253,9 @@ export async function reviewFrame(
     summary,
     blocking,
     advisory,
-    failing_viewports: reviewed.filter((entry) => entry.verdict === 'fail').map((entry) => presetName(entry.viewport)),
+    failing_viewports: reviewed
+      .filter((entry) => entry.verdict === 'fail')
+      .map((entry) => entry.label ?? presetName(entry.viewport)),
     verdict: reviewed.every((entry) => entry.verdict === 'pass') ? 'pass' : 'fail',
   }
 }

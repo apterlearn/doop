@@ -26,7 +26,9 @@ import {
   deleteElement,
   ElementEditError,
   getElement,
+  getFrameCss,
   insertElement,
+  setFrameCss,
   updateElements,
   type UpdateElementsResult,
 } from './elementEdit.ts'
@@ -45,7 +47,7 @@ import { discoverSitePages, importPage, normalizeImportUrl, type DiscoveredSite 
 import { getJob, recordUnit, startJob } from './jobs.ts'
 import { websiteAccessErrorMessage } from './websiteAccess.ts'
 import { frameSha, htmlSha, reviewFrame, reviewToRecord } from './review.ts'
-import { roleName } from '../shared/agents.ts'
+import { AGENT_ROLES, PIPELINE_PRESETS, roleName } from '../shared/agents.ts'
 import { feedbackAbout, feedbackBlock } from './feedbackText.ts'
 import { parseListing, publishCanvas, unpublishCanvas } from './community.ts'
 import { COMMUNITY_CATEGORIES } from '../shared/types.ts'
@@ -60,7 +62,16 @@ import { codeFor, err, mcpErrorPayload, ResourceError, type McpErrorPayload } fr
 import * as frameLocks from './frameLocks.ts'
 import { replay, replayAsync } from './opIds.ts'
 import { htmlBundle, htmlToReact } from './codeExport.ts'
-import type { AgentTask, Canvas, CanvasView, DesignTokens, ElementComment, Frame, Page } from '../shared/types.ts'
+import type {
+  AgentTask,
+  Canvas,
+  CanvasView,
+  DesignTokens,
+  ElementComment,
+  Frame,
+  MemoryReference,
+  Page,
+} from '../shared/types.ts'
 import { recordToolCall } from './mcpStats.ts'
 
 const INSTRUCTIONS = `Doop is a shared multiplayer design canvas: humans and AI agents design together in real time. Canvases contain frames — artboards that render complete HTML documents live for everyone viewing.
@@ -354,6 +365,56 @@ function withFeedback<T extends { content: { type: 'text' | 'image'; [k: string]
   return result
 }
 
+/** A human's selection is how "fix THIS element" points at something, and MCP
+ *  is pull-based: the agent can only be told on a call it makes. One line, and
+ *  only when the newest selection changed since this session's last call — a
+ *  human moving around the canvas must not cost a line per tool call. */
+function withFocusNudge<T extends CallToolResult>(result: T, canvasId: string, session: McpSession): T {
+  if (!result || result.isError) return result
+  const [newest] = actions.listCanvasFocus(canvasId)
+  const tuple = newest
+    ? `${newest.clientId}|${newest.frameId ?? ''}|${newest.selector ?? ''}|${newest.pageId ?? ''}`
+    : ''
+  if (tuple === (session.lastFocus ?? '')) return result
+  session.lastFocus = tuple
+  /* a cleared selection is a change, but not something to interrupt a call for */
+  if (!newest || (!newest.frameId && !newest.selector)) return result
+  const frame = newest.frameId ? store.getFrame(newest.frameId) : undefined
+  const where = frame ? `frame “${frame.name}”` : `frame ${newest.frameId}`
+  result.content.push({
+    type: 'text' as const,
+    text: newest.selector
+      ? `A human is looking at ${where} — element ${newest.selector}.`
+      : `A human is looking at ${where}.`,
+  })
+  return result
+}
+
+/** What the session filled in for a call that omitted it. Defaulting silently
+ *  is the failure this exists to prevent, so the substitution is reported in
+ *  the payload and in prose. */
+interface UsedContext {
+  canvasId?: string
+  agentName?: boolean
+}
+
+/** Say what the session supplied. Merged into `structuredContent` when the
+ *  result has one, and always as a text line for the client that reads prose. */
+function withSessionContext<T extends CallToolResult>(result: T, used: UsedContext): T {
+  if (!result || result.isError) return result
+  if (result.structuredContent) {
+    if (used.canvasId) result.structuredContent.used_active_context = { canvas_id: used.canvasId, from: 'session' }
+    if (used.agentName) result.structuredContent.used_agent_name = true
+  }
+  if (used.canvasId) {
+    result.content.push({
+      type: 'text' as const,
+      text: `using canvas ${used.canvasId} from this session; pass canvas_id explicitly to target another`,
+    })
+  }
+  return result
+}
+
 /** The per-call `extra` the SDK hands a tool handler, taken from the SDK so it
  *  stays the same type the registration site checks against. This server uses
  *  one part of it: `sendRequest`, which is how it asks the human at the agent's
@@ -483,6 +544,10 @@ const guidelineSummaryShape = {
   updatedBy: z.string().optional(),
 }
 
+/** `breakpoints` is reported by get_canvas and the canvas resource; the local
+ *  extension keeps the shared CanvasView type untouched. */
+type CanvasViewWithBreakpoints = CanvasView & { breakpoints?: { name: string; min_width: number }[] }
+
 const canvasViewShape = {
   id: z.string(),
   name: z.string(),
@@ -495,6 +560,7 @@ const canvasViewShape = {
     z.object({ id: z.string(), title: z.string(), size: z.string(), htmlBytes: z.number(), pinnedBy: z.string() }),
   ),
   flow: z.array(z.string()).optional(),
+  breakpoints: z.array(z.object({ name: z.string(), min_width: z.number() })).optional(),
   tokens_present: z.boolean(),
   note: z.string().optional(),
 }
@@ -621,6 +687,11 @@ const boardCardShape = {
   waiting_for: z.string(),
   attachments: z.array(z.string()),
   target_frames: z.array(z.string()),
+  /** the element the human had selected when they queued the card — "fix THIS
+   *  element", not "fix this frame" */
+  target_selector: z.string().optional(),
+  /** the page the target frame lives on, so no lookup is needed to reach it */
+  target_page_id: z.string().optional(),
 }
 
 /* The three agent HTML write paths share one ceiling: a frame is stored whole,
@@ -666,21 +737,52 @@ function frameSummary(
   }
 }
 
-/** One run id per connecting account, and the canvas it last named. The
- *  streamable-HTTP endpoint is stateless — a fresh server per POST — so a
- *  closure would give every call its own run and the Run tab would group
- *  nothing; the last canvas a session named is what a later call that fails
- *  before its frame resolves (a mistyped id) still lands on. */
+/** What one connected account's session remembers between calls. The
+ *  streamable-HTTP endpoint builds a fresh server per POST, so anything a
+ *  later call should inherit has to live here, keyed by the account. */
+interface McpSession {
+  /** one id per connection: every call this agent makes lands on the Run tab
+   *  under the same run, so its session reads as one timeline */
+  runId: string
+  /** the canvas this session last named, kept even for a call that failed
+   *  before its own frame resolved (a mistyped id) */
+  lastCanvasId?: string
+  /** the canvas this session is working on. A call that omits canvas_id is
+   *  filled in with this — which is what lets an agent stop repeating it. */
+  canvasId?: string
+  /** the agent name this session works as, so identity survives a call that
+   *  forgot it and the human feedback channel never goes quiet */
+  agentName?: string
+  /** the newest human focus tuple this session has already been told about,
+   *  so a selection is reported once per change and not once per call */
+  lastFocus?: string
+}
+
 const MCP_SESSIONS = 2000
-const mcpSessions = new Map<string, { runId: string; lastCanvasId?: string }>()
+const mcpSessions = new Map<string, McpSession>()
 function sessionFor(key: string) {
   const existing = mcpSessions.get(key)
   if (existing) return existing
-  const fresh: { runId: string; lastCanvasId?: string } = { runId: randomUUID() }
+  const fresh: McpSession = { runId: randomUUID() }
   if (mcpSessions.size >= MCP_SESSIONS) mcpSessions.delete(mcpSessions.keys().next().value!)
   mcpSessions.set(key, fresh)
   return fresh
 }
+
+/** Tools where the agent name is the whole point of the call rather than a
+ *  detail of it: claiming a card, answering a human, reading the feedback
+ *  addressed to you, or stopping work. These keep `agent_name` required in
+ *  their published schema — a session default here would mean acting as
+ *  whichever agent last used this account. */
+const IDENTITY_TOOLS = new Set([
+  'set_status',
+  'get_feedback',
+  'take_card',
+  'complete_card',
+  'ask_human',
+  'wait_for_events',
+  'stop_work',
+])
 
 /** owner is the connecting user's display name (for attribution); ownerId is
  *  their user id — canvases the agent creates or lists are scoped to it, the
@@ -854,6 +956,92 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
     if (typeof args.page_id === 'string') return store.getPage(args.page_id)?.canvas.id
     return undefined
   }
+
+  /**
+   * The session's context, applied to a call that omitted it.
+   *
+   * `canvas_id` and `agent_name` are the two arguments an agent has to repeat
+   * on nearly every call, and forgetting `agent_name` is not a visible mistake:
+   * `withFeedback` returns early without an actor, so the human feedback channel
+   * goes quiet with no error at all. Both are therefore inherited from the
+   * session, and — because a silent default is its own hazard — the
+   * substitution is reported back in the result.
+   *
+   * An explicit argument always wins, and nothing is inherited by the tools
+   * that have no canvas scope (create_canvas, list_canvases, whoami), which do
+   * not declare `canvas_id` in the first place.
+   */
+  const applySessionContext = (args: unknown, declared: z.ZodRawShape): UsedContext => {
+    const used: UsedContext = {}
+    if (!args || typeof args !== 'object') return used
+    const record = args as Record<string, unknown>
+    /* Only arguments the tool actually declares. A tool that never asked for a
+       canvas or an agent name was not written to carry one, and handing it a
+       field it does not know about would change what it means — a run-timeline
+       event attributed to a call that never claimed to be that agent. */
+    const declaresCanvas = 'canvas_id' in declared
+    const declaresAgent = 'agent_name' in declared
+    if (declaresCanvas && typeof record.canvas_id !== 'string' && session.canvasId) {
+      record.canvas_id = session.canvasId
+      used.canvasId = session.canvasId
+    }
+    if (declaresAgent && typeof record.agent_name !== 'string' && session.agentName) {
+      record.agent_name = session.agentName
+      used.agentName = true
+    }
+    /* record what this call named, so the next one can inherit it */
+    if (declaresCanvas && typeof record.canvas_id === 'string') session.canvasId = record.canvas_id
+    if (declaresAgent && typeof record.agent_name === 'string') session.agentName = record.agent_name
+    return used
+  }
+
+  /** A call that omitted a canvas the session could not supply. The published
+   *  schema no longer enforces `canvas_id` (the session may fill it), so this is
+   *  where the refusal happens — naming what to do, instead of letting
+   *  `undefined` travel into a handler that would report it as "no canvas with
+   *  id undefined".
+   *
+   *  Only the canvas: an unresolved `agent_name` is nudged, never refused, or
+   *  every client that has never passed one would break. */
+  const missingCanvas = (args: unknown, declared: z.ZodRawShape): CallToolResult | undefined => {
+    if (!args || typeof args !== 'object') return undefined
+    const field = declared.canvas_id
+    if (!(field instanceof z.ZodString) || field.isOptional()) return undefined
+    const record = args as Record<string, unknown>
+    if (typeof record.canvas_id === 'string') return undefined
+    return err(
+      'invalid_input',
+      'canvas_id is required: this session has not worked on a canvas yet, so there is nothing to default to. Call list_canvases to pick one, or pass canvas_id explicitly.',
+    )
+  }
+
+  /** The focus nudge and the session report, in that order: steering first,
+   *  the bookkeeping about which canvas this was last. */
+  const contextNotices = (
+    args: unknown,
+    result: CallToolResult,
+    used: UsedContext,
+    declared: z.ZodRawShape,
+  ): CallToolResult => {
+    if (!result || result.isError) return result
+    if (!args || typeof args !== 'object') return result
+    const record = args as Record<string, unknown>
+    let out = result
+    if (typeof record.agent_name === 'string') {
+      const canvasId = canvasArgOf(record)
+      if (canvasId) out = withFocusNudge(out, canvasId, session)
+    }
+    /* A canvas-scoped call is exactly where feedback would have been delivered,
+       so an unresolved name is worth naming here — never as a hard error, which
+       would break every client that has never passed one. Only for a tool that
+       accepts the argument at all. */
+    const unresolved = 'agent_name' in declared && used.agentName === undefined && typeof record.agent_name !== 'string'
+    if (unresolved && canvasArgOf(record) !== undefined) {
+      out.content.push({ type: 'text' as const, text: 'call with agent_name to receive human feedback' })
+    }
+    return withSessionContext(out, used)
+  }
+
   const stoppedResult = (args: unknown): CallToolResult | undefined => {
     if (!args || typeof args !== 'object') return undefined
     const record = args as Record<string, unknown>
@@ -918,41 +1106,64 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   }
   const tool = ((name: string, config: never, cb: never) => {
     const cfg = config as unknown as { inputSchema?: z.ZodRawShape }
-    registry.set(name, {
-      inputSchema: cfg.inputSchema ?? {},
-      run: cb as unknown as ToolHandler,
-    })
-    return server.registerTool(name as never, config, (async (args: never, extra: never) => {
-      const started = Date.now()
-      const stopped = stoppedResult(args)
-      if (stopped) {
-        recordToolCall(name, false, Date.now() - started, 'stopped')
-        recordRunEvent(name, args, false, Date.now() - started, 'refused: the work was stopped')
-        return stopped
-      }
-      try {
-        const result = await (cb as unknown as ToolHandler)(args, extra)
-        recordToolCall(name, !result?.isError, Date.now() - started)
-        recordRunEvent(name, args, !result?.isError, Date.now() - started, resultSummary(result))
-        return interruptedResult(args, result)
-      } catch (e) {
-        /* Review mode is enforced in the mutation layer, so it catches every
-           write path — including ones reached indirectly (duplicate_frame,
-           revert_frame, import_webpage). Report it the way the agent can act
-           on: a typed refusal naming the proposal tools. */
-        if (e instanceof actions.ReviewModeError) {
-          recordToolCall(name, false, Date.now() - started, 'unsupported')
-          recordRunEvent(name, args, false, Date.now() - started, 'refused: review mode needs human approval')
-          return err(
-            'unsupported',
-            'this canvas is in review mode — agent changes need human approval. Deliver with propose_frame_html / propose_frame_create / propose_frame_delete instead; they land the moment a human accepts.',
-          )
+    /* The registry keeps the tool's OWN schema, so apply_ops validates a batch
+       against exactly what the tool publishes. The schema registered with the
+       SDK is loosened instead: `canvas_id` and `agent_name` are declared
+       required on most tools, and the SDK validates arguments before this
+       wrapper runs — so a call that omits them would be refused as invalid
+       before the session could fill them in. Nothing is lost by loosening:
+       applySessionContext supplies both, and a call that names neither a canvas
+       nor a session canvas still fails in the handler with `not_found`. */
+    const declared = cfg.inputSchema ?? {}
+    const registered: z.ZodRawShape = { ...declared }
+    /* `agent_name` stays required where the identity IS the call */
+    for (const key of IDENTITY_TOOLS.has(name) ? (['canvas_id'] as const) : (['canvas_id', 'agent_name'] as const)) {
+      const field = registered[key]
+      if (field instanceof z.ZodString) registered[key] = field.optional()
+    }
+    registry.set(name, { inputSchema: declared, run: cb as unknown as ToolHandler })
+    return server.registerTool(
+      name as never,
+      { ...(config as object), inputSchema: registered } as never,
+      (async (args: never, extra: never) => {
+        const started = Date.now()
+        const used = applySessionContext(args, declared)
+        const stopped = stoppedResult(args)
+        if (stopped) {
+          recordToolCall(name, false, Date.now() - started, 'stopped')
+          recordRunEvent(name, args, false, Date.now() - started, 'refused: the work was stopped')
+          return stopped
         }
-        recordToolCall(name, false, Date.now() - started, 'internal')
-        recordRunEvent(name, args, false, Date.now() - started, e instanceof Error ? e.message : 'failed')
-        throw e
-      }
-    }) as never)
+        const missing = missingCanvas(args, declared)
+        if (missing) {
+          recordToolCall(name, false, Date.now() - started, 'invalid_input')
+          recordRunEvent(name, args, false, Date.now() - started, 'refused: a required argument was missing')
+          return missing
+        }
+        try {
+          const result = await (cb as unknown as ToolHandler)(args, extra)
+          recordToolCall(name, !result?.isError, Date.now() - started)
+          recordRunEvent(name, args, !result?.isError, Date.now() - started, resultSummary(result))
+          return contextNotices(args, interruptedResult(args, result), used, declared)
+        } catch (e) {
+          /* Review mode is enforced in the mutation layer, so it catches every
+             write path — including ones reached indirectly (duplicate_frame,
+             revert_frame, import_webpage). Report it the way the agent can act
+             on: a typed refusal naming the proposal tools. */
+          if (e instanceof actions.ReviewModeError) {
+            recordToolCall(name, false, Date.now() - started, 'unsupported')
+            recordRunEvent(name, args, false, Date.now() - started, 'refused: review mode needs human approval')
+            return err(
+              'unsupported',
+              'this canvas is in review mode — agent changes need human approval. Deliver with propose_frame_html / propose_frame_create / propose_frame_delete instead; they land the moment a human accepts.',
+            )
+          }
+          recordToolCall(name, false, Date.now() - started, 'internal')
+          recordRunEvent(name, args, false, Date.now() - started, e instanceof Error ? e.message : 'failed')
+          throw e
+        }
+      }) as never,
+    )
   }) as unknown as RegisterTool
 
   tool(
@@ -1139,7 +1350,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
           ? ['This canvas has design tokens — read them with get_tokens and use those exact colors, fonts and scales.']
           : []),
       ]
-      const view: CanvasView = {
+      const view: CanvasViewWithBreakpoints = {
         id: c.id,
         name: c.name,
         frames: shown.map((f) =>
@@ -1170,6 +1381,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
           pinnedBy: r.pinnedBy,
         })),
         ...(flow.length ? { flow } : {}),
+        ...(c.breakpoints?.length ? { breakpoints: c.breakpoints } : {}),
         tokens_present: !!c.tokens,
         ...(notes.length ? { note: notes.join(' ') } : {}),
       }
@@ -1456,6 +1668,54 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   )
 
   tool(
+    'get_agents',
+    {
+      title: 'List agents and pipelines',
+      description:
+        'The resident design team this canvas can be worked by, and who is live on it right now: the roles with what each one is for, the ready-made pipelines (an ordered list of role ids), and every agent currently present on the canvas. Use it to address work to a specific agent, or to see whether the agent you expected is actually connected before you hand something back.',
+      annotations: { readOnlyHint: true },
+      inputSchema: { canvas_id: z.string(), agent_name: agentName.optional() },
+      outputSchema: {
+        roles: z.array(z.object({ id: z.string(), name: z.string(), blurb: z.string() })),
+        pipelines: z.array(z.object({ id: z.string(), label: z.string(), roles: z.array(z.string()) })),
+        connected: z.array(
+          z.object({ agent: z.string(), owner: z.string().optional(), working_on: z.string().optional() }),
+        ),
+      },
+    },
+    async ({ canvas_id, agent_name }) => {
+      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      /* Two sources, because an agent shows up in one of them depending on how
+         it works: a card/status row it claimed, or presence alone (an external
+         agent that has only called set_status once). Tasks are read first —
+         they are the authoritative record of what an agent is doing — and
+         presence only fills what a task row lacks. Deduped by name: the canvas
+         shows one worker per name. */
+      const connected = new Map<string, { agent: string; owner?: string; working_on?: string }>()
+      const record = (name: string, owner?: string, status?: string | null) => {
+        const entry = connected.get(name) ?? { agent: name }
+        if (!entry.owner && owner) entry.owner = owner
+        if (!entry.working_on && status) entry.working_on = status
+        connected.set(name, entry)
+      }
+      for (const t of actions
+        .getTasks(canvas_id)
+        .filter((t) => t.agentName && !t.endedAt && !t.failedAt && !t.cancelledAt))
+        record(t.agentName, t.owner, t.status)
+      for (const p of actions.listAgentPresence(canvas_id)) record(p.name, p.owner, p.status)
+      return withFeedback(
+        structured({
+          roles: AGENT_ROLES.map((r) => ({ id: r.id, name: r.name, blurb: r.blurb })),
+          pipelines: PIPELINE_PRESETS.map((p) => ({ id: p.id, label: p.label, roles: p.roles })),
+          connected: [...connected.values()],
+        }),
+        canvas_id,
+        agent_name ? actorFrom(agent_name) : undefined,
+      )
+    },
+  )
+
+  tool(
     'set_status',
     {
       description:
@@ -1710,6 +1970,56 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   )
 
   tool(
+    'get_focus',
+    {
+      title: 'See what the humans are looking at',
+      description:
+        'What every connected human on this canvas is looking at right now: the frame, the element selector and the page, with how recently each moved. Use it when a human says "fix this" or "this one" — it is how you find out which element they mean. An empty humans array means nobody is connected, not an error.',
+      annotations: { readOnlyHint: true },
+      inputSchema: { canvas_id: z.string(), agent_name: agentName.optional() },
+      outputSchema: {
+        humans: z.array(
+          z.object({
+            name: z.string(),
+            frame_id: z.string().optional(),
+            selector: z.string().optional(),
+            page_id: z.string().optional(),
+            at: z.number(),
+          }),
+        ),
+        latest: z
+          .object({
+            name: z.string(),
+            frame_id: z.string().optional(),
+            selector: z.string().optional(),
+            page_id: z.string().optional(),
+            at: z.number(),
+          })
+          .nullable(),
+      },
+    },
+    async ({ canvas_id, agent_name }) => {
+      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      arrive(canvas_id, agent_name)
+      /* nulls are dropped rather than sent: "looking at the canvas, no element
+         in particular" is the absence of a field, not a null the caller has to
+         branch on */
+      const humans = actions.listCanvasFocus(canvas_id).map((f) => ({
+        name: f.name,
+        ...(f.frameId ? { frame_id: f.frameId } : {}),
+        ...(f.selector ? { selector: f.selector } : {}),
+        ...(f.pageId ? { page_id: f.pageId } : {}),
+        at: f.at,
+      }))
+      return withFeedback(
+        structured({ humans, latest: humans[0] ?? null }),
+        canvas_id,
+        agent_name ? actorFrom(agent_name) : undefined,
+      )
+    },
+  )
+
+  tool(
     'list_cards',
     {
       title: 'List board cards',
@@ -1737,6 +2047,8 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
           waiting_for: roleName(actions.pipelineOf(t)[Math.min(t.stage ?? 0, actions.pipelineOf(t).length - 1)]),
           attachments: t.attachments ?? [],
           target_frames: t.targetFrameIds ?? [],
+          ...(t.targetSelector ? { target_selector: t.targetSelector } : {}),
+          ...(t.targetPageId ? { target_page_id: t.targetPageId } : {}),
         }))
       if (cards.length === 0) return structured({ cards: [], note: 'No open board cards right now.' })
       return structured({
@@ -1784,6 +2096,8 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
                 title: card.status,
                 queued_by: card.queuedBy,
                 target_frames: card.targetFrameIds ?? [],
+                ...(card.targetSelector ? { target_selector: card.targetSelector } : {}),
+                ...(card.targetPageId ? { target_page_id: card.targetPageId } : {}),
               },
             },
             null,
@@ -2596,6 +2910,63 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   )
 
   tool(
+    'set_breakpoints',
+    {
+      title: 'Declare the canvas responsive breakpoints',
+      description:
+        "Declare the widths this canvas designs for, by name (e.g. [{ name: 'mobile', min_width: 390 }, { name: 'desktop', min_width: 1280 }]). review_frame then renders every frame at each one in addition to the device presets and labels its findings with the breakpoint name, so verification matches the widths the design targets. Order is normalised ascending by min_width; an empty list clears them.",
+      inputSchema: {
+        canvas_id: z.string(),
+        breakpoints: z
+          .array(
+            z.object({
+              name: z.string().min(1).max(40).describe('Short label, e.g. "mobile" or "desktop"'),
+              min_width: z.number().int().min(0).max(20_000).describe('Viewport width in px this breakpoint starts at'),
+            }),
+          )
+          .max(8)
+          .describe('Up to 8 breakpoints; unique names, ordered ascending by min_width'),
+        agent_name: agentName,
+      },
+      outputSchema: {
+        ok: z.literal(true),
+        breakpoints: z.array(z.object({ name: z.string(), min_width: z.number() })),
+      },
+    },
+    async ({ canvas_id, breakpoints, agent_name }) => {
+      const c = canvasFor(canvas_id)
+      if (!c) return noCanvas(canvas_id)
+      const gated = reviewGate(canvas_id)
+      if (gated) return gated
+      const actor = actorFrom(agent_name)
+      const names = breakpoints.map((b) => b.name.trim().toLowerCase())
+      const clash = names.find((n, i) => n && names.indexOf(n) !== i)
+      if (clash) return err('invalid_input', `two breakpoints are both named “${clash}” — names must be unique`)
+      if (names.some((n) => !n)) return err('invalid_input', 'a breakpoint name is empty')
+      /* ascending is the order review_frame renders in and the order the panel
+         shows, so the caller's ordering never decides what "mobile first" means */
+      const next = breakpoints.length
+        ? breakpoints
+            .map((b) => ({ name: b.name.trim(), min_width: b.min_width }))
+            .sort((a, b) => a.min_width - b.min_width)
+        : undefined
+      try {
+        store.setBreakpoints(canvas_id, next, actor.name)
+      } catch (e) {
+        if (e instanceof actions.ReviewModeError) throw e
+        return err('invalid_input', e instanceof Error ? e.message : 'invalid breakpoints')
+      }
+      const stored = store.getCanvas(canvas_id)?.breakpoints ?? []
+      try {
+        await server.server.sendResourceUpdated({ uri: `doop://canvas/${canvas_id}` })
+      } catch {
+        /* no stream on this transport, or the client is gone — the write stands */
+      }
+      return withFeedback(structured({ ok: true as const, breakpoints: stored }), canvas_id, actor)
+    },
+  )
+
+  tool(
     'lint_frame',
     {
       title: 'Lint a frame against the design tokens',
@@ -2650,6 +3021,15 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
         frame_id: z.string(),
         device: deviceName,
         viewport: viewportOverride,
+        width: z
+          .number()
+          .int()
+          .min(1)
+          .max(20_000)
+          .optional()
+          .describe(
+            'Audit at this width instead of the frame’s own — a breakpoint that is not a named device. Ignored when device or viewport is set.',
+          ),
         agent_name: agentName,
       },
       outputSchema: {
@@ -2668,13 +3048,13 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
         viewport: z.object({ width: z.number(), height: z.number() }),
       },
     },
-    async ({ frame_id, device, viewport, agent_name }, extra) => {
+    async ({ frame_id, device, viewport, width, agent_name }, extra) => {
       const budget = takeRender(agent_name)
       if (budget) return budget
       const f = frameFor(frame_id)
       if (!f) return noFrame(frame_id)
       arrive(f.canvasId, agent_name)
-      const resolved = resolveViewport(device, viewport)
+      const resolved = resolveViewport(device, viewport) ?? (width ? { width, height: f.height } : undefined)
       let report: A11yReport
       try {
         await progress(extra, 0, `Rendering “${f.name}” for the audit…`)
@@ -2959,6 +3339,159 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   )
 
   tool(
+    'set_frame_css',
+    {
+      title: 'Write the frame stylesheet',
+      description:
+        "Write the frame's own stylesheet (a <style data-doop-css> block in its head): the only place responsive rules (@media), interaction states (:hover/:focus/:active) and motion (transition/@keyframes) can live. Inline styles cannot express any of those, so a frame that needs them needs this. Replaces the whole block each call — read it first with get_frame_css if you are adding to it. @import is refused: a frame must not fetch anything external.",
+      inputSchema: {
+        frame_id: z.string(),
+        css: z
+          .string()
+          .max(100_000)
+          .describe(
+            'The full stylesheet for this frame. Media queries, states and transitions belong here, not in inline styles.',
+          ),
+        expected_updated_at: z
+          .string()
+          .optional()
+          .describe("The frame's updatedAt from when you read it — refuses the write if someone else changed it since"),
+        takeover: z.boolean().optional().describe('Overwrite even if another agent holds the frame lock'),
+        agent_name: agentName,
+      },
+      outputSchema: { ok: z.literal(true), frame: z.unknown(), css_bytes: z.number() },
+    },
+    async ({ frame_id, css, agent_name, expected_updated_at, takeover }) => {
+      const before = frameFor(frame_id)
+      if (!before) return noFrame(frame_id)
+      const gated = reviewGate(before.canvasId)
+      if (gated) return gated
+      const stale = staleConflict(before, expected_updated_at)
+      if (stale) return stale
+      const budget = takeRender(agent_name)
+      if (budget) return budget
+      takeOver(frame_id, before.canvasId, actorFrom(agent_name), takeover)
+      let outcome: { html: string }
+      try {
+        outcome = await setFrameCss(before, css)
+      } catch (e) {
+        if (e instanceof ElementEditError) return err(e.code, e.message)
+        throw e
+      }
+      let frame: Frame | undefined
+      try {
+        frame = actions.updateFrame(frame_id, { html: outcome.html }, actorFrom(agent_name))
+      } catch (e) {
+        const conflict = lockConflict(e)
+        if (conflict) return conflict
+        throw e
+      }
+      if (!frame) return noFrame(frame_id)
+      return withStatusNudge(
+        withFeedback(
+          structured({ ok: true as const, frame: frameSummary(frame), css_bytes: css.length }),
+          frame.canvasId,
+          actorFrom(agent_name),
+        ),
+        frame.canvasId,
+        actorFrom(agent_name),
+      )
+    },
+  )
+
+  tool(
+    'get_frame_css',
+    {
+      title: 'Read the frame stylesheet',
+      description:
+        "Read back the frame's own stylesheet (the <style data-doop-css> block), or an empty string when it has none. Read it before set_frame_css if you are adding to what is already there — set_frame_css replaces the whole block.",
+      annotations: { readOnlyHint: true },
+      inputSchema: { frame_id: z.string(), agent_name: agentName.optional() },
+      outputSchema: { css: z.string() },
+    },
+    async ({ frame_id, agent_name }) => {
+      const f = frameFor(frame_id)
+      if (!f) return noFrame(frame_id)
+      arrive(f.canvasId, agent_name)
+      const budget = takeRender(agent_name)
+      if (budget) return budget
+      try {
+        return withFeedback(
+          structured(await getFrameCss(f)),
+          f.canvasId,
+          agent_name ? actorFrom(agent_name) : undefined,
+        )
+      } catch (e) {
+        if (e instanceof ElementEditError) return err(e.code, e.message)
+        throw e
+      }
+    },
+  )
+
+  tool(
+    'search_frames',
+    {
+      title: 'Search across the canvas frames',
+      description:
+        'Find which frames on a canvas mention something: a literal, case-insensitive substring matched against every frame name and its HTML, newest-updated first, with a few short snippets around each hit. Use it on a big canvas to answer "where is the pricing table" or "which frames use the old brand name" without reading frames one at a time.',
+      annotations: { readOnlyHint: true },
+      inputSchema: {
+        canvas_id: z.string(),
+        query: z.string().min(1).max(500).describe('Literal text to find (case-insensitive)'),
+        limit: z.number().int().min(1).max(20).optional().describe('Frames to return, default 10, max 20'),
+        agent_name: agentName.optional(),
+      },
+      outputSchema: {
+        results: z.array(
+          z.object({
+            frame_id: z.string(),
+            name: z.string(),
+            matches: z.number(),
+            snippets: z.array(z.object({ before: z.string(), match: z.string(), after: z.string() })),
+          }),
+        ),
+      },
+    },
+    async ({ canvas_id, query, limit, agent_name }) => {
+      const c = canvasFor(canvas_id)
+      if (!c) return noCanvas(canvas_id)
+      arrive(canvas_id, agent_name)
+      const needle = query.toLowerCase()
+      /* the same bound readFrameHtml applies to one frame's source: a search
+         must not become the way a whole document enters the context */
+      const CONTEXT = 40
+      const MAX_SNIPPETS = 3
+      const results: Array<{
+        frame_id: string
+        name: string
+        matches: number
+        snippets: { before: string; match: string; after: string }[]
+      }> = []
+      for (const f of [...c.frames].filter((frame) => !frame.demo).sort((a, b) => b.updatedAt - a.updatedAt)) {
+        const haystack = f.html.slice(0, MAX_HTML_READ_CHARS)
+        const nameHit = f.name.toLowerCase().includes(needle)
+        const matches = haystack.toLowerCase().split(needle).length - 1
+        if (!nameHit && matches === 0) continue
+        const snippets: { before: string; match: string; after: string }[] = []
+        let cursor = 0
+        while (snippets.length < MAX_SNIPPETS) {
+          const at = haystack.toLowerCase().indexOf(needle, cursor)
+          if (at < 0) break
+          snippets.push({
+            before: haystack.slice(Math.max(0, at - CONTEXT), at),
+            match: haystack.slice(at, at + query.length),
+            after: haystack.slice(at + query.length, at + query.length + CONTEXT),
+          })
+          cursor = at + query.length
+        }
+        results.push({ frame_id: f.id, name: f.name, matches: matches + (nameHit ? 1 : 0), snippets })
+        if (results.length >= (limit ?? 10)) break
+      }
+      return withFeedback(structured({ results }), canvas_id, agent_name ? actorFrom(agent_name) : undefined)
+    },
+  )
+
+  tool(
     'export_frame',
     {
       title: 'Export a frame — image or code',
@@ -2979,6 +3512,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
           .describe(
             'react only: scope the stylesheet under [data-frame="<id>"] instead of emitting global element selectors — use it when the host page has its own global styles',
           ),
+        agent_name: agentName.optional(),
       },
       outputSchema: {
         format: z.string(),
@@ -2996,10 +3530,15 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
         note: z.string().optional(),
       },
     },
-    async ({ frame_id, format, quality, scoped_css }) => {
+    async ({ frame_id, format, quality, scoped_css, agent_name }) => {
       const f = frameFor(frame_id)
       if (!f) return noFrame(frame_id)
-      if (format === 'html') return structured({ format: 'html', html: f.html })
+      /* the only read tool that was missing agent_name: without it a call
+         cannot deliver pending human feedback, so an agent could export in a
+         loop and never hear the human telling it what is wrong */
+      arrive(f.canvasId, agent_name)
+      const actor = agent_name ? actorFrom(agent_name) : undefined
+      if (format === 'html') return withFeedback(structured({ format: 'html', html: f.html }), f.canvasId, actor)
 
       if (format === 'spec') {
         /* this renders a Chromium page, like every other render tool */
@@ -3008,7 +3547,11 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
         const probe = await specProbe(f)
         if (!probe) return err('upstream_failed', 'could not render this frame to measure it')
         const [report] = await persist.listFrameReviews(frame_id, 1)
-        return structured({ format: 'spec', spec_md: specMd(f, report, probe, canvasFor(f.canvasId)?.tokens) })
+        return withFeedback(
+          structured({ format: 'spec', spec_md: specMd(f, report, probe, canvasFor(f.canvasId)?.tokens) }),
+          f.canvasId,
+          actor,
+        )
       }
 
       if (format === 'react') {
@@ -3027,34 +3570,44 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
            library expects, and the export says which assets to copy */
         const reactAssets = [...assets.extractAssetIds(f.html)]
         const react = rewriteAssetUrls(exported.jsx, './')
-        return structured({
-          format: 'react',
-          ...exported,
-          jsx: react.html,
-          notes: [
-            ...exported.notes,
-            ...(reactAssets.length
-              ? [
-                  `${reactAssets.length} asset reference(s) were rewritten to ./assets/<id>.<ext> — copy them from the canvas's asset list (list_assets) next to the component.`,
-                ]
-              : []),
-            ...(react.external.length
-              ? [`${react.external.length} third-party URL(s) stay external: ${react.external.slice(0, 5).join(', ')}`]
-              : []),
-          ],
-        })
+        return withFeedback(
+          structured({
+            format: 'react',
+            ...exported,
+            jsx: react.html,
+            notes: [
+              ...exported.notes,
+              ...(reactAssets.length
+                ? [
+                    `${reactAssets.length} asset reference(s) were rewritten to ./assets/<id>.<ext> — copy them from the canvas's asset list (list_assets) next to the component.`,
+                  ]
+                : []),
+              ...(react.external.length
+                ? [
+                    `${react.external.length} third-party URL(s) stay external: ${react.external.slice(0, 5).join(', ')}`,
+                  ]
+                : []),
+            ],
+          }),
+          f.canvasId,
+          actor,
+        )
       }
 
       const ext = format === 'jpg' ? 'jpg' : 'png'
       const q = ext === 'jpg' ? `&quality=${quality ?? 90}` : ''
-      return structured({
-        format: ext,
-        image_url: `${PUBLIC_ORIGIN}/i/${frame_id}.${ext}?scale=2${q}`,
-        download_url: `${PUBLIC_ORIGIN}/i/${frame_id}.${ext}?scale=2${q}&download`,
-        width: f.width * 2,
-        height: f.height * 2,
-        note: 'Public URL, no auth needed. To publish: fetch the URL and upload the bytes to the target platform (e.g. WordPress POST /wp/v2/media), or hotlink it directly — it always shows the current design.',
-      })
+      return withFeedback(
+        structured({
+          format: ext,
+          image_url: `${PUBLIC_ORIGIN}/i/${frame_id}.${ext}?scale=2${q}`,
+          download_url: `${PUBLIC_ORIGIN}/i/${frame_id}.${ext}?scale=2${q}&download`,
+          width: f.width * 2,
+          height: f.height * 2,
+          note: 'Public URL, no auth needed. To publish: fetch the URL and upload the bytes to the target platform (e.g. WordPress POST /wp/v2/media), or hotlink it directly — it always shows the current design.',
+        }),
+        f.canvasId,
+        actor,
+      )
     },
   )
 
@@ -3623,15 +4176,21 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
     {
       title: 'Import an editable webpage',
       description:
-        'Import ONE public webpage into a canvas as an editable HTML snapshot. The rendered DOM is captured, scripts/iframes are removed, stylesheets are inlined, and the resulting source frame appears on the canvas for comparison or editing. Use this when a referenced or redesign-target page should be visible to everyone; leave the imported source frame unchanged and make the new design in a separate frame. For inspection without changing the canvas, use view_website.',
+        'Import ONE public webpage into a canvas as an editable HTML snapshot. The rendered DOM is captured, scripts/iframes are removed, stylesheets are inlined, and the resulting source frame appears on the canvas for comparison or editing. Use this when a referenced or redesign-target page should be visible to everyone; leave the imported source frame unchanged and make the new design in a separate frame. With as_reference: true the page is instead pinned to the canvas Memory as a style reference and no frame is left behind — that is the right call when the page is a look-and-feel reference rather than something to compare against. For inspection without changing the canvas, use view_website.',
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
       inputSchema: {
         url: z.string().describe('The page URL — a bare domain like "acme.io" is loaded over https'),
         canvas_id: z.string().describe('Canvas that should receive the imported source frame'),
+        as_reference: z
+          .boolean()
+          .optional()
+          .describe(
+            'Pin the page to the canvas Memory as a style reference instead of leaving the source frame on the canvas (default false)',
+          ),
         agent_name: agentName,
       },
     },
-    async ({ url, canvas_id, agent_name }, extra) => {
+    async ({ url, canvas_id, agent_name, as_reference }, extra) => {
       if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
       await progress(extra, 0, `Fetching ${url}…`)
       let normalizedUrl: string
@@ -3651,6 +4210,48 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
           includePreview: true,
         })
         if (!frame) return noCanvas(canvas_id)
+
+        /* as_reference: the page is source material, not a frame to keep — pin
+           it to Memory and take the frame back off the canvas, so a reference
+           import never litters the board with the thing it references. */
+        if (as_reference) {
+          const content: Array<{ type: 'image'; data: string; mimeType: string } | { type: 'text'; text: string }> = []
+          const preview = imported.preview
+          if (preview) {
+            content.push({ type: 'image', data: preview.screenshot.toString('base64'), mimeType: 'image/jpeg' })
+          }
+          let ref: MemoryReference | undefined
+          try {
+            ref = actions.pinReference(canvas_id, frame.id, actor)
+          } catch (e) {
+            /* pinReference refuses a duplicate pin and a full Memory — both are
+               the caller's to act on, not an upstream failure */
+            return err('conflict', e instanceof Error ? e.message : 'could not pin this page to Memory', {
+              hint: 'call get_canvas to see what Memory already holds, or import without as_reference',
+            })
+          }
+          if (!ref) return noCanvas(canvas_id)
+          actions.deleteFrame(frame.id, actor)
+          content.push({
+            type: 'text',
+            text: JSON.stringify(
+              {
+                ok: true,
+                reference: {
+                  reference_id: ref.id,
+                  title: ref.title,
+                  width: Math.round(ref.width),
+                  height: Math.round(ref.height),
+                },
+                source_url: preview?.finalUrl ?? normalizedUrl,
+                note: `Pinned “${ref.title}” to the canvas Memory as a style reference — read it with get_reference, and call get_canvas to see it listed. No source frame was left on the canvas.`,
+              },
+              null,
+              2,
+            ),
+          })
+          return withStatusNudge(withFeedback({ content }, canvas_id, actor), canvas_id, actor)
+        }
 
         const preview = imported.preview
         const content: Array<{ type: 'image'; data: string; mimeType: string } | { type: 'text'; text: string }> = []
@@ -4010,6 +4611,15 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
           .describe('Device scale factor: 1 (default) or 2 for a retina-resolution image'),
         device: deviceName,
         viewport: viewportOverride,
+        width: z
+          .number()
+          .int()
+          .min(1)
+          .max(20_000)
+          .optional()
+          .describe(
+            'Render at this width instead of the frame’s own — a breakpoint that is not a named device. Ignored when device or viewport is set.',
+          ),
         full_page: z.boolean().optional().describe('Capture the whole document height, not just the viewport'),
         clip: z
           .object({
@@ -4023,14 +4633,17 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
         agent_name: agentName,
       },
     },
-    async ({ frame_id, scale, device, viewport, full_page, clip, agent_name }, extra) => {
+    async ({ frame_id, scale, device, viewport, full_page, clip, width: renderWidth, agent_name }, extra) => {
       const budget = takeRender(agent_name)
       if (budget) return budget
       const f = frameFor(frame_id)
       if (!f) return noFrame(frame_id)
       arrive(f.canvasId, agent_name)
       await progress(extra, 0, `Rendering “${f.name}”…`)
-      const resolved = resolveViewport(device, viewport)
+      /* an explicit width renders one breakpoint at the frame's own height —
+         how a design is checked at a width the device presets do not name */
+      const resolved =
+        resolveViewport(device, viewport) ?? (renderWidth ? { width: renderWidth, height: f.height } : undefined)
       if (clip && (clip.x < 0 || clip.y < 0 || clip.x + clip.width > f.width || clip.y + clip.height > f.height))
         return err(
           'invalid_input',
@@ -4197,6 +4810,10 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
         canvas_id: z.string(),
         frame_id: z.string(),
         selector: z.string().describe('A CSS selector for one element, e.g. ".card:nth-of-type(2) > h3"'),
+        full_text: z
+          .boolean()
+          .optional()
+          .describe('Return the element’s whole text instead of the first 400 characters'),
         agent_name: agentName,
       },
       outputSchema: {
@@ -4207,6 +4824,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
         id: z.string().optional(),
         classes: z.array(z.string()),
         text: z.string(),
+        text_truncated: z.boolean().optional(),
         attrs: z.record(z.string(), z.string()),
         inline_style: z.string(),
         computed: z.record(z.string(), z.unknown()),
@@ -4214,13 +4832,13 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ canvas_id, frame_id, selector, agent_name }) => {
+    async ({ canvas_id, frame_id, selector, full_text, agent_name }) => {
       const frame = frameFor(frame_id)
       if (!frame || frame.canvasId !== canvas_id) return noFrame(frame_id)
       const budget = takeRender(agent_name)
       if (budget) return budget
       try {
-        return structured(await getElement(frame, selector))
+        return structured(await getElement(frame, selector, { full_text }))
       } catch (e) {
         if (e instanceof ElementEditError) return err(e.code, e.message)
         throw e
@@ -4250,6 +4868,19 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
                 .optional()
                 .describe('Attributes, e.g. {"aria-label": "Close"}; null removes'),
               text: z.string().max(20_000).optional().describe('Replacement text content'),
+              text_replace: z
+                .object({
+                  old_str: z.string().describe('The exact text to find inside this element'),
+                  new_str: z.string().describe('What to put in its place'),
+                  html: z
+                    .boolean()
+                    .optional()
+                    .describe('Treat new_str as inline markup (strong, em, a, span, …) instead of literal characters'),
+                })
+                .optional()
+                .describe(
+                  "Replace one occurrence of old_str in the element's own text, leaving its child elements alone — the way to bold one word in a paragraph. Zero or several matches changes nothing and is reported.",
+                ),
             }),
           )
           .min(1)
@@ -4760,7 +5391,14 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
           })
           continue
         }
-        const parsed = z.object(entry.inputSchema).safeParse({ ...rest, canvas_id })
+        /* the batch runs as this session's agent, exactly as a direct call
+           would: an op that omitted agent_name inherits the session's, and
+           still fails validation when the session has none */
+        const parsed = z.object(entry.inputSchema).safeParse({
+          ...(rest.agent_name === undefined && session.agentName ? { agent_name: session.agentName } : {}),
+          ...rest,
+          canvas_id,
+        })
         if (!parsed.success) {
           prepared.push({
             index,
@@ -4904,7 +5542,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
       const c = canvasFor(canvasId)
       if (!c) throw new ResourceError('not_found', `no canvas with id ${canvasId} accessible to this account`)
       const visible = c.frames.filter((f) => !f.demo)
-      const view: CanvasView = {
+      const view: CanvasViewWithBreakpoints = {
         id: c.id,
         name: c.name,
         frames: visible.map((f) =>
@@ -4933,6 +5571,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
           htmlBytes: r.html.length,
           pinnedBy: r.pinnedBy,
         })),
+        ...(c.breakpoints?.length ? { breakpoints: c.breakpoints } : {}),
         tokens_present: !!c.tokens,
       }
       return { contents: [{ uri: uri.href, mimeType: 'application/json', text: JSON.stringify(view, null, 2) }] }
@@ -5495,28 +6134,55 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
     {
       title: 'Review a frame across viewports',
       description:
-        'The full quality gate in one call: design-token lint, accessibility audit, and layout analysis (overflow, clipping, overlap, truncation) at mobile, tablet and desktop widths in a single render batch. Call it on every frame you touched before you report the work done — it is what "I checked my work" means here. summary.errors and summary.critical are the counts that must be zero; warnings are judgement calls.',
+        'The full quality gate in one call: design-token lint, accessibility audit, and layout analysis (overflow, clipping, overlap, truncation) at mobile, tablet and desktop widths in a single render batch. A canvas that declares breakpoints is reviewed at those widths too, and every viewport in the result is reported by its label. Call it on every frame you touched before you report the work done — it is what "I checked my work" means here. summary.errors and summary.critical are the counts that must be zero; warnings are judgement calls.',
       inputSchema: {
         canvas_id: z.string(),
         frame_id: z.string(),
-        device: z.enum(['mobile', 'tablet', 'desktop']).optional().describe('Just one viewport instead of all three'),
+        device: z
+          .enum(['mobile', 'tablet', 'desktop'])
+          .optional()
+          .describe('Just one viewport instead of all three; the canvas’s breakpoints are still reviewed'),
         agent_name: agentName,
+      },
+      outputSchema: {
+        frame_id: z.string(),
+        html_sha: z.string(),
+        frame_updated_at: z.number(),
+        reviewed_at: z.number(),
+        viewports: z.array(
+          z.object({
+            viewport: z.object({ width: z.number(), height: z.number() }),
+            label: z.string().optional(),
+            verdict: z.enum(['pass', 'fail']),
+          }),
+        ),
+        failing_viewports: z.array(z.string()),
+        verdict: z.enum(['pass', 'fail']),
+        summary: z.record(z.string(), z.number()),
+        blocking: z.array(z.object({ rule: z.string(), selector: z.string(), detail: z.string(), source: z.string() })),
       },
     },
     async ({ canvas_id, frame_id, device, agent_name }) => {
       const budget = takeRender(agent_name)
       if (budget) return budget
 
+      const canvas = canvasFor(canvas_id)
       const f = frameFor(frame_id)
-      if (!f || f.canvasId !== canvas_id || !canvasFor(canvas_id)) return noFrame(frame_id)
+      if (!f || f.canvasId !== canvas_id || !canvas) return noFrame(frame_id)
       arrive(canvas_id, agent_name)
-      const tokens = canvasFor(canvas_id)?.tokens
-      const report = await reviewFrame(f, tokens, device ? { viewports: [VIEWPORTS[device]] } : {})
+      /* the canvas's breakpoints are the widths this design claims to support,
+         so they are reviewed on top of the device presets rather than instead
+         of them — a named width is what makes a finding attributable */
+      const breakpoints = canvas.breakpoints ?? []
+      const report = await reviewFrame(f, canvas.tokens, {
+        ...(device ? { viewports: [VIEWPORTS[device]] } : {}),
+        ...(breakpoints.length ? { breakpoints } : {}),
+      })
       /* Persist it: a human reading the checks panel usually reads them after
          the agent that produced them is gone, and the delivery gate reads the
          newest stored report rather than trusting a claim. */
       await persist.saveFrameReview(reviewToRecord(report, f.canvasId, agent_name ?? owner ?? 'agent'))
-      const text = `verdict: ${report.verdict} — critical a11y: ${report.summary.critical}, layout errors: ${report.summary.errors}, content errors: ${report.summary.content_errors}, off-token colors: ${report.summary.off_token}, warnings: ${report.summary.warnings} across ${report.viewports.length} viewport(s)${
+      const text = `verdict: ${report.verdict} — critical a11y: ${report.summary.critical}, layout errors: ${report.summary.errors}, content errors: ${report.summary.content_errors}, off-token colors: ${report.summary.off_token}, warnings: ${report.summary.warnings} across ${report.viewports.length} viewport(s) (${report.viewports.map((entry) => entry.label ?? entry.viewport.width).join(', ')})${
         report.blocking.length
           ? `. Blocking (${report.blocking.length}): ${report.blocking
               .slice(0, 5)
@@ -5633,15 +6299,29 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
         offset: z.number().min(0).optional(),
         agent_name: agentName,
       },
+      outputSchema: {
+        assets: z.array(
+          z.object({
+            id: z.string(),
+            url: z.string(),
+            mime: z.string(),
+            bytes: z.number(),
+            at: z.number(),
+          }),
+        ),
+        ...pagedShape,
+      },
     },
     async ({ canvas_id, limit, offset, agent_name }) => {
       if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
       arrive(canvas_id, agent_name)
       const listing = await assets.listAssets(canvas_id, { limit, offset })
+      const hasMore = (offset ?? 0) + listing.assets.length < listing.total
       return structured({
         assets: listing.assets,
         total: listing.total,
-        has_more: (offset ?? 0) + listing.assets.length < listing.total,
+        has_more: hasMore,
+        ...(hasMore ? { next_offset: (offset ?? 0) + listing.assets.length } : {}),
       })
     },
   )

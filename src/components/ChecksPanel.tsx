@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react'
 import type { FrameReview } from '../../shared/types'
 import { useStore } from '../lib/store'
-import { api } from '../lib/api'
+import { api, ApiError } from '../lib/api'
 import { timeAgo } from '../lib/time'
 import { cn } from '@/lib/utils'
+import { Button } from './ui/button'
 import { PanelBody } from './ui/panel'
 import { ListSection } from './ui/list'
 import { AGENT_ROLES } from '../../shared/agents'
@@ -64,6 +65,10 @@ export function ChecksPanel() {
   const questions = useStore((s) => s.questions)
   const runEvents = useStore((s) => s.runEvents)
   const [reviews, setReviews] = useState<Record<string, (FrameReview & { current: boolean })[]>>({})
+  /* the frame whose check is in flight, and why the last one failed: both are
+     per-panel rather than per-frame — only one run is ever outstanding */
+  const [running, setRunning] = useState<string | null>(null)
+  const [error, setError] = useState<{ frameId: string; message: string } | null>(null)
   /* which frame set the reports in hand belong to: "loading" is derived from
      that rather than set before the request, so the effect never has to touch
      state synchronously */
@@ -99,6 +104,24 @@ export function ChecksPanel() {
   }, [wantedKey, signature]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const loading = wanted.length > 0 && loadedKey !== wantedKey
+
+  /* Ask the server to run the gate now and show what it recorded. The report
+     is the same one ready_for_review stores, so it replaces what this panel
+     was showing rather than sitting beside it. */
+  const runChecks = (frameId: string) => {
+    setRunning(frameId)
+    setError(null)
+    api
+      .runFrameReviews(frameId)
+      .then((report) => setReviews((prev) => ({ ...prev, [frameId]: [report, ...(prev[frameId] ?? [])] })))
+      .catch((err: unknown) => {
+        /* the route refuses with a plain sentence (rate limit, renderer down);
+           show that rather than "429 {...}" */
+        const fallback = err instanceof Error ? err.message : 'the checks could not run'
+        setError({ frameId, message: err instanceof ApiError ? String(err.body.error ?? fallback) : fallback })
+      })
+      .finally(() => setRunning(null))
+  }
 
   if (!wanted.length) {
     return (
@@ -139,7 +162,20 @@ export function ChecksPanel() {
                   {loading ? '…' : 'not checked'}
                 </span>
               )}
+              {/* the checks are three renders the server runs on demand, so a
+                  reviewer can ask for a fresh verdict instead of waiting for
+                  an agent to hand the frame back */}
+              <Button
+                variant="ghost"
+                size="sm"
+                className="ml-auto flex-none px-2 py-0.5 text-[11px]"
+                disabled={running !== null}
+                onClick={() => runChecks(frame.id)}
+              >
+                {running === frame.id ? 'Checking…' : 'Run checks'}
+              </Button>
             </div>
+            {error?.frameId === frame.id && <p className="mb-1.5 text-[11.5px] text-accent-ink">{error.message}</p>}
             {report ? (
               <div className="rounded-[10px] border border-line-soft bg-white px-3 py-2.5 shadow-card">
                 <div className="text-[11.5px] text-ink-soft">
@@ -194,7 +230,8 @@ export function ChecksPanel() {
               </div>
             ) : (
               <p className="text-[11.5px] text-ink-faint">
-                No check recorded for this frame. An agent calls ready_for_review before handing work back.
+                No check recorded for this frame. Run checks above, or let an agent call ready_for_review before it
+                hands work back.
               </p>
             )}
           </div>

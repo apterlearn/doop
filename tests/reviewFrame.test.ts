@@ -1,7 +1,16 @@
-import { describe, expect, it } from 'vitest'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import { Client } from '@modelcontextprotocol/sdk/client/index.js'
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { reportIsCurrent, reviewFrame } from '../server/review.ts'
 import { findBrowserPath } from '../server/screenshot.ts'
-import type { DesignTokens, Frame } from '../shared/types.ts'
+import { buildMcpServer } from '../server/mcp.ts'
+import { store } from '../server/store.ts'
+import { closeDb, initDb } from '../server/db/index.ts'
+import * as persist from '../server/db/persist.ts'
+import type { Canvas, DesignTokens, Frame } from '../shared/types.ts'
 
 /* review_frame is the verification gate's whole input, so it is checked
    against a real render (skipped where no browser is installed, like the other
@@ -163,4 +172,152 @@ describe.skipIf(!findBrowserPath())('review provenance and verdicts', () => {
     expect(report.verdict).toBe('pass')
     expect(report.failing_viewports).toEqual([])
   })
+})
+
+/* A layout that only fits above 700px: it overflows the phone preset and a
+   640px breakpoint, and fits the tablet preset and a 900px one. That is what
+   makes a finding attributable to a width instead of to "the design is
+   broken". */
+const WIDE = `<!doctype html><html lang="en"><head><title>Wide</title>
+      <meta name="description" content="A layout that only overflows below 700px.">
+      <style>
+        body { margin:0; font-family: Inter, system-ui; background:#ffffff; color:#111110; }
+        h1 { font-size: 32px; line-height: 1.25; }
+        a:hover { text-decoration: underline }
+        a:focus-visible { outline: 2px solid #111110 }
+      </style></head>
+      <body><main style="min-height:600px"><h1>Wide</h1>
+      <div style="width:700px;height:40px;background:#111110"></div>
+      <a href="/start" style="display:inline-block;min-width:44px;min-height:44px;color:#111110">Start</a>
+      </main></body></html>`
+
+const BREAKPOINTS = [
+  { name: 'sm', min_width: 640 },
+  { name: 'md', min_width: 900 },
+]
+
+describe.skipIf(!findBrowserPath())('review at the canvas’s own breakpoints', () => {
+  it('reviews every breakpoint after the presets, and names the width that failed', async () => {
+    const report = await reviewFrame(frame(WIDE), TOKENS, { breakpoints: BREAKPOINTS })
+
+    expect(report.viewports.map((entry) => entry.label)).toEqual(['mobile', 'tablet', 'desktop', 'sm', 'md'])
+    expect(report.viewports.map((entry) => entry.viewport.width)).toEqual([390, 834, 1440, 640, 900])
+    /* a breakpoint is rendered at least as tall as a phone, so a short frame is
+       not judged on a slice of itself */
+    expect(report.viewports.slice(3).map((entry) => entry.viewport.height)).toEqual([844, 844])
+    /* 700px of content overflows the phone preset and sm, and nothing wider —
+       so the failing set is the point of the test, and the breakpoint is named
+       the way the canvas named it */
+    expect(report.failing_viewports).toEqual(['mobile', 'sm'])
+    expect(report.viewports[3]!.verdict).toBe('fail')
+    expect(report.viewports[4]!.verdict).toBe('pass')
+  }, 120_000)
+
+  it('keeps the three device presets when the canvas declares no breakpoints', async () => {
+    const report = await reviewFrame(frame(WIDE), TOKENS, { breakpoints: [] })
+
+    expect(report.viewports.map((entry) => entry.label)).toEqual(['mobile', 'tablet', 'desktop'])
+    expect(report.viewports.map((entry) => entry.viewport.width)).toEqual([390, 834, 1440])
+  }, 60_000)
+})
+
+/* The tool-level wiring: review_frame reads the canvas's own breakpoints, and
+   the screenshot and audit tools render a width that is not a device preset.
+   Both are only real if they survive the MCP surface — published schema
+   included — so this drives the actual server over an in-memory transport
+   against the real store and database, like the other MCP suites. */
+const dataRoot = mkdtempSync(path.join(tmpdir(), 'doop-review-breakpoints-'))
+const OWNER_ID = 'breakpoints-owner'
+const CANVAS_ID = 'c-breakpoints'
+const MCP_FRAME: Frame = { ...frame(WIDE), id: 'f-breakpoints', canvasId: CANVAS_ID, name: 'Wide', width: 1200 }
+
+const CANVAS: Canvas = {
+  id: CANVAS_ID,
+  name: 'Breakpoints',
+  ownerId: OWNER_ID,
+  createdAt: 0,
+  updatedAt: 0,
+  frames: [MCP_FRAME],
+}
+
+describe.skipIf(!findBrowserPath())('review_frame and width over the MCP surface', () => {
+  beforeAll(async () => {
+    process.chdir(dataRoot)
+    await initDb()
+    store.init([CANVAS])
+    /* the Wave-1 setter the tool reads through — not a hand-set field */
+    store.setBreakpoints(CANVAS_ID, BREAKPOINTS, 'alice')
+  }, 60_000)
+
+  afterAll(async () => {
+    /* the same drain the server runs on shutdown: frame writes are debounced,
+       and a pending one would be in flight while the database closes */
+    await persist.flush((id) => store.getFrame(id))
+    await closeDb()
+    process.chdir(tmpdir())
+    rmSync(dataRoot, { recursive: true, force: true })
+  }, 60_000)
+
+  async function connect() {
+    const server = buildMcpServer('Review Owner', OWNER_ID)
+    const client = new Client({ name: 'doop-review-breakpoints', version: '1.0.0' })
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
+    await server.connect(serverTransport)
+    await client.connect(clientTransport)
+    return {
+      client,
+      close: async () => {
+        await client.close()
+        await server.close()
+      },
+    }
+  }
+
+  it('reviews the canvas’s breakpoints and labels them in the structured result', async () => {
+    const { client, close } = await connect()
+    try {
+      const result = (await client.callTool({
+        name: 'review_frame',
+        arguments: { canvas_id: CANVAS_ID, frame_id: MCP_FRAME.id, agent_name: 'Reviewer' },
+      })) as unknown as {
+        isError?: boolean
+        structuredContent: { viewports: { label?: string }[]; failing_viewports: string[] }
+      }
+
+      /* the published output schema has to accept the report, or the SDK turns
+         every call into an InvalidParams error */
+      expect(result.isError).toBeFalsy()
+      expect(result.structuredContent.viewports.map((entry) => entry.label)).toEqual([
+        'mobile',
+        'tablet',
+        'desktop',
+        'sm',
+        'md',
+      ])
+      expect(result.structuredContent.failing_viewports).toEqual(['mobile', 'sm'])
+    } finally {
+      await close()
+    }
+  }, 120_000)
+
+  it('renders a screenshot and an audit at an arbitrary width', async () => {
+    const { client, close } = await connect()
+    try {
+      const shot = (await client.callTool({
+        name: 'get_frame_screenshot',
+        arguments: { frame_id: MCP_FRAME.id, width: 320, agent_name: 'Reviewer' },
+      })) as unknown as { content: { type: string; text?: string }[] }
+      const caption = shot.content.find((block) => block.type === 'text')?.text ?? ''
+      /* the width asked for, at the frame's own height */
+      expect(caption).toContain('(320×600')
+
+      const audit = (await client.callTool({
+        name: 'audit_frame',
+        arguments: { frame_id: MCP_FRAME.id, width: 320, agent_name: 'Reviewer' },
+      })) as unknown as { structuredContent: { viewport: { width: number; height: number } } }
+      expect(audit.structuredContent.viewport).toEqual({ width: 320, height: 600 })
+    } finally {
+      await close()
+    }
+  }, 60_000)
 })

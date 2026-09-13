@@ -5,6 +5,7 @@ import type {
   AgentQuestion,
   AgentTask,
   Canvas,
+  CanvasFocus,
   DesignDecision,
   DesignTokens,
   ElementComment,
@@ -37,6 +38,9 @@ export interface Viewport {
 interface State {
   canvas: Canvas | null
   presences: Record<string, Presence>
+  /** what each connected client is looking at, keyed by clientId — how a
+   *  human points at "this" element without typing a selector */
+  focus: Record<string, Omit<CanvasFocus, 'clientId'>>
   cursors: Record<string, { x: number; y: number }>
   activity: ActivityItem[]
   /** agent task history (newest first) — every set_status becomes a task */
@@ -127,6 +131,11 @@ interface State {
   setPresences(list: Presence[]): void
   upsertPresence(p: Presence): void
   removePresence(clientId: string): void
+  /** record (or clear, with null) what another client is looking at */
+  setFocus(
+    clientId: string,
+    focus: { frameId: string | null; selector: string | null; pageId: string | null } | null,
+  ): void
   setCursor(clientId: string, x: number, y: number): void
   setEditing(clientId: string, frameId: string | null): void
   setStatus(clientId: string, status: string | null): void
@@ -220,6 +229,7 @@ function readLayersOpen(): boolean {
 export const useStore = create<State>((set, get) => ({
   canvas: null,
   presences: {},
+  focus: {},
   cursors: {},
   activity: [],
   tasks: [],
@@ -283,9 +293,22 @@ export const useStore = create<State>((set, get) => ({
     set((s) => {
       const presences = { ...s.presences }
       const cursors = { ...s.cursors }
+      const focus = { ...s.focus }
       delete presences[clientId]
       delete cursors[clientId]
-      return { presences, cursors }
+      /* someone who left is not still looking at anything */
+      delete focus[clientId]
+      return { presences, cursors, focus }
+    }),
+  setFocus: (clientId, f) =>
+    set((s) => {
+      const focus = { ...s.focus }
+      if (f) {
+        /* the name comes from presence: a client is in the room before it can
+           point at anything, so the entry is always addressable */
+        focus[clientId] = { name: s.presences[clientId]?.name ?? clientId, ...f, at: Date.now() }
+      } else delete focus[clientId]
+      return { focus }
     }),
   setCursor: (clientId, x, y) => set((s) => ({ cursors: { ...s.cursors, [clientId]: { x, y } } })),
   setEditing: (clientId, frameId) =>

@@ -74,9 +74,29 @@ async function connect(ownerName: string, ownerId: string) {
 }
 
 async function callTool(client: Client, name: string, args: Record<string, unknown>) {
-  const result = (await client.callTool({ name, arguments: args })) as unknown as CallResult
-  const raw = result.content.find((block) => block.type === 'text')?.text ?? ''
-  return { parsed: JSON.parse(raw) as Record<string, never>, raw, isError: result.isError }
+  const result = (await client.callTool({ name, arguments: args })) as unknown as CallResult & {
+    structuredContent?: Record<string, unknown>
+  }
+  const texts = result.content.filter((block) => block.type === 'text').map((block) => block.text ?? '')
+  const raw = texts[0] ?? ''
+  /* a schema refusal comes back as a plain MCP error string, not our JSON */
+  let parsed: Record<string, never>
+  try {
+    parsed = JSON.parse(raw) as Record<string, never>
+  } catch {
+    parsed = {} as Record<string, never>
+  }
+  return {
+    parsed,
+    raw,
+    /* every text block: the payload first, then the steering appended after it
+       (feedback, the session's substitutions, the focus nudge) */
+    text: texts.join('\n'),
+    isError: result.isError,
+    /* the session's substitutions are merged into the typed payload, which the
+       text block was serialized before — so they are only visible here */
+    structured: result.structuredContent ?? {},
+  }
 }
 
 function seedCanvas(shareWithOther = true): Canvas {
@@ -280,6 +300,115 @@ describe('agent identity is scoped to the account', () => {
       expect(actions.getTasks(CANVAS_ID).every((t) => t.endedAt !== undefined)).toBe(true)
     } finally {
       await b.close()
+    }
+  })
+})
+
+/* A session is per connected account, and the HTTP endpoint builds a fresh
+   server per POST — so the canvas an agent is working on has to be remembered
+   outside the request, or every call repeats it. Inheriting it is only safe if
+   the substitution is visible, which is what these assert. */
+describe('sticky session context', () => {
+  it('inherits the canvas and the agent name, and says which it used', async () => {
+    const a = await connect('Alice', OWNER_ID)
+    try {
+      /* the first call names both, and is not reported as a substitution */
+      const first = await callTool(a.client, 'get_canvas', { canvas_id: CANVAS_ID, agent_name: 'Claude' })
+      expect(first.isError).toBeFalsy()
+      expect(first.structured.used_active_context).toBeUndefined()
+      expect(first.structured.used_agent_name).toBeUndefined()
+
+      /* the second names neither: both come from the session, and the result
+         says so instead of defaulting silently */
+      const second = await callTool(a.client, 'list_frames', {})
+      expect(second.isError).toBeFalsy()
+      expect(second.structured.used_active_context).toEqual({ canvas_id: CANVAS_ID, from: 'session' })
+      expect(second.structured.used_agent_name).toBe(true)
+      expect(second.text).toContain(`using canvas ${CANVAS_ID} from this session`)
+      expect(second.text).toContain('pass canvas_id explicitly to target another')
+      /* it really was that canvas's frames, not an empty default */
+      expect((second.parsed as unknown as { frames: unknown[] }).frames).toHaveLength(1)
+
+      /* a WRITE inherits the same way: this is the call an agent makes most,
+         and the one where landing on the wrong canvas would be destructive */
+      const created = await callTool(a.client, 'create_frame', {
+        name: 'Inherited',
+        html: '<h1>hi</h1>',
+      })
+      expect(created.isError).toBeFalsy()
+      expect(created.structured.used_active_context).toEqual({ canvas_id: CANVAS_ID, from: 'session' })
+      expect(created.structured.used_agent_name).toBe(true)
+      const landed = store.getFrame((created.structured.frame as { id: string }).id)
+      expect(landed?.canvasId).toBe(CANVAS_ID)
+      expect(landed?.updatedBy).toBe('Claude')
+    } finally {
+      await a.close()
+    }
+  })
+
+  it('lets an explicit canvas_id win, and records it for the next call', async () => {
+    const other = store.createCanvas('Second canvas', OWNER_ID)
+    const a = await connect('Alice', OWNER_ID)
+    try {
+      await callTool(a.client, 'get_canvas', { canvas_id: CANVAS_ID, agent_name: 'Claude' })
+      const explicit = await callTool(a.client, 'list_frames', { canvas_id: other.id })
+      expect(explicit.isError).toBeFalsy()
+      expect(explicit.structured.used_active_context).toBeUndefined()
+      expect((explicit.parsed as unknown as { frames: unknown[] }).frames).toHaveLength(0)
+
+      /* the explicit call is what the session now points at */
+      const inherited = await callTool(a.client, 'list_frames', {})
+      expect(inherited.structured.used_active_context).toEqual({ canvas_id: other.id, from: 'session' })
+    } finally {
+      await a.close()
+    }
+  })
+
+  it('nudges a canvas-scoped read that resolves no agent name at all', async () => {
+    /* Carol's session has never seen a name, and her own canvas is the one she
+       is reading — so the call succeeds, but the feedback channel is silent and
+       she is told how to open it */
+    const hers = store.createCanvas('Carol canvas', 'carol-account')
+    const c = await connect('Carol', 'carol-account')
+    try {
+      const result = await callTool(c.client, 'get_canvas', { canvas_id: hers.id })
+      expect(result.isError).toBeFalsy()
+      expect(result.text).toContain('call with agent_name to receive human feedback')
+      /* a nudge, never a refusal: the call itself still worked */
+      expect((result.parsed as unknown as { id: string }).id).toBe(hers.id)
+    } finally {
+      await c.close()
+    }
+  })
+
+  it('refuses a canvas-scoped call when there is no canvas to default to', async () => {
+    /* a session that has never named a canvas: the schema no longer demands
+       canvas_id, so the refusal has to come from somewhere, and it has to say
+       what to do rather than fail as "no canvas with id undefined" */
+    const d = await connect('Dave', 'dave-account')
+    try {
+      const refused = await callTool(d.client, 'get_canvas', {})
+      expect(refused.isError).toBe(true)
+      expect(refused.parsed.error).toMatchObject({ code: 'invalid_input' })
+      expect(String((refused.parsed.error as unknown as { message: string }).message)).toContain(
+        'canvas_id is required',
+      )
+      expect(refused.raw).not.toContain('undefined')
+    } finally {
+      await d.close()
+    }
+  })
+
+  it('keeps agent_name required where the identity is the call', async () => {
+    const a = await connect('Alice', OWNER_ID)
+    try {
+      /* the session has a name by now, but claiming a card must still say who
+         is claiming it — a session default here would act as whoever used the
+         account last */
+      const refused = await callTool(a.client, 'take_card', { card_id: 'card-1' })
+      expect(refused.isError).toBe(true)
+    } finally {
+      await a.close()
     }
   })
 })

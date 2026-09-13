@@ -111,7 +111,7 @@ beforeEach(() => {
 })
 
 describe('get_comments MCP tool', () => {
-  it('is read-only with canvas_id required and frame/include_resolved/limit/offset/agent_name optional', async () => {
+  it('is read-only with canvas_id as its scope and frame/include_resolved/limit/offset/agent_name optional', async () => {
     const { client, close } = await connect()
     try {
       const { tools } = await client.listTools()
@@ -125,7 +125,10 @@ describe('get_comments MCP tool', () => {
       expect(Object.keys(schema.properties ?? {})).toEqual(
         expect.arrayContaining(['canvas_id', 'frame_id', 'include_resolved', 'limit', 'offset', 'agent_name']),
       )
-      expect(schema.required).toEqual(['canvas_id'])
+      /* canvas_id is the tool's scope, but a session that already named one
+         supplies it when omitted (sticky session context), so it is optional
+         on the wire */
+      expect(schema.required ?? []).not.toContain('canvas_id')
       expect(schema.properties?.include_resolved?.default).toBe(true)
       expect(schema.properties?.limit?.default).toBe(50)
     } finally {
@@ -281,7 +284,7 @@ describe('get_comments MCP tool', () => {
     }
   })
 
-  it('heartbeats for agent_name without delivering feedback', async () => {
+  it('heartbeats for the resolved agent_name without delivering feedback', async () => {
     vi.spyOn(actions, 'getComments').mockReturnValue([])
     const heartbeat = vi.spyOn(actions, 'heartbeatAgent').mockImplementation(() => {})
     const takeFeedback = vi.spyOn(actions, 'takeFeedbackFor')
@@ -292,9 +295,14 @@ describe('get_comments MCP tool', () => {
       expect(heartbeat.mock.calls[0]?.[0]).toBe(CANVAS.id)
       expect(takeFeedback).not.toHaveBeenCalled()
 
+      /* A call that omits the name still resolves one — the session remembers
+         the agent this account works as — so presence still follows it. What
+         must never change is that reading claims no feedback. */
       heartbeat.mockClear()
       await callComments(client, { canvas_id: CANVAS.id })
-      expect(heartbeat).not.toHaveBeenCalled()
+      expect(heartbeat).toHaveBeenCalledTimes(1)
+      expect(heartbeat.mock.calls[0]?.[1]).toMatchObject({ name: 'Claude' })
+      expect(takeFeedback).not.toHaveBeenCalled()
     } finally {
       await close()
     }

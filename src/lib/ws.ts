@@ -24,6 +24,13 @@ export function sendWs(msg: ClientMessage) {
   if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(msg))
 }
 
+/** Tell the room what this client is looking at: the frame, the element inside
+ *  it and the page. Debounced by the caller — the server drops repeats anyway,
+ *  so a burst costs a little bandwidth, never a message. */
+export function sendFocus(focus: { frameId: string | null; selector: string | null; pageId: string | null }) {
+  sendWs({ type: 'focus', ...focus })
+}
+
 function open() {
   if (!currentCanvasId) return
   const proto = location.protocol === 'https:' ? 'wss' : 'ws'
@@ -112,6 +119,9 @@ function handle(msg: ServerMessage) {
       break
     case 'editing':
       s.setEditing(msg.clientId, msg.frameId)
+      break
+    case 'focus':
+      s.setFocus(msg.clientId, { frameId: msg.frameId, selector: msg.selector, pageId: msg.pageId })
       break
     case 'status':
       s.setStatus(msg.clientId, msg.status)

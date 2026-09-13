@@ -112,6 +112,7 @@ function TargetChip({ task, frames }: { task: AgentTask; frames?: Frame[] }) {
   return (
     <div className="mt-[9px] font-mono text-[11px] text-brand">
       → {ids.map((id) => frames?.find((f) => f.id === id)?.name ?? id).join(', ')}
+      {task.targetSelector && <span className="text-ink-faint"> · {task.targetSelector}</span>}
     </div>
   )
 }
@@ -258,6 +259,12 @@ function PriorityControl({ canvasId, cards }: { canvasId: string; cards: AgentTa
 export function Board({ canvasId }: { canvasId: string }) {
   const tasks = useStore((s) => s.tasks)
   const frames = useStore((s) => s.canvas?.frames)
+  /* the canvas selection is what a card composed here is about, exactly as in
+     the prompt bar: the frame the human has selected, and the element inside
+     it when they picked one */
+  const selectedElement = useStore((s) => s.selectedElement)
+  const targetFrame = useStore((s) => s.canvas?.frames.find((f) => f.id === s.selectedId))
+  const activePageId = useStore((s) => s.activePageId)
   const [draft, setDraft] = useState<string | null>(null)
   const [agents, setAgents] = useState<string[]>([DEFAULT_ROLE_ID])
   const { allowance, refresh } = useAllowance()
@@ -328,8 +335,24 @@ export function Board({ canvasId }: { canvasId: string }) {
     const pipeline = agents.length > 0 ? agents : [DEFAULT_ROLE_ID]
     setDraft(null)
     if (!title) return
+    /* what the card is about, taken from the canvas selection at submit time:
+       the frame it is aimed at, the element inside it when one is picked, and
+       the page that frame is on (its own, or the tab being viewed) */
+    const pageId = targetFrame ? (targetFrame.pageId ?? activePageId) : undefined
     try {
-      await api.addCard(canvasId, title, pipeline)
+      await api.addCard(
+        canvasId,
+        title,
+        pipeline,
+        undefined,
+        targetFrame ? [targetFrame.id] : undefined,
+        targetFrame
+          ? {
+              ...(selectedElement?.frameId === targetFrame.id ? { selector: selectedElement.selector } : {}),
+              ...(pageId ? { pageId } : {}),
+            }
+          : undefined,
+      )
       posthog.capture('agent_task_queued', { pipeline_length: pipeline.length })
     } catch (err) {
       if (isResidentLimit(err)) useStore.getState().setLimitWall(true)
@@ -509,6 +532,15 @@ export function Board({ canvasId }: { canvasId: string }) {
                     if (e.key === 'Escape') setDraft(null)
                   }}
                 />
+                {targetFrame && (
+                  <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-brand">
+                    <span className="font-mono">→</span>
+                    <span className="font-semibold">{targetFrame.name}</span>
+                    {selectedElement?.frameId === targetFrame.id && (
+                      <span className="font-mono text-ink-faint">{selectedElement.selector}</span>
+                    )}
+                  </div>
+                )}
                 <div className="mt-1 border-t border-line pt-2.5">
                   <div className="flex flex-col gap-1.5 text-[10.5px] font-bold uppercase tracking-[0.08em] text-ink-faint">
                     <span>Assign to</span>

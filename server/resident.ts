@@ -453,7 +453,14 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
                 targets.length > 0
                   ? `\n  THIS CARD IS ABOUT: ${targets.join(', ')} — change that frame in place (rename/move/resize with update_frame, or edit its HTML). Do NOT deliver this one as a new frame elsewhere.`
                   : ''
-              return `- from ${c.queuedBy}: "${c.status}"${route}${refs}${subject}`
+              /* "fix this element": the selector the human pointed at, and the
+                 page it lives on, so the agent needs no lookup to reach it */
+              const element = c.targetSelector
+                ? `\n  TARGET ELEMENT: ${c.targetSelector}${c.targetPageId ? ` on page ${c.targetPageId}` : ''} — the human pointed at this element; find it with inspect_frame and edit it in place.`
+                : c.targetPageId
+                  ? `\n  Target page: ${c.targetPageId}`
+                  : ''
+              return `- from ${c.queuedBy}: "${c.status}"${route}${refs}${subject}${element}`
             })
             .join('\n'),
       )

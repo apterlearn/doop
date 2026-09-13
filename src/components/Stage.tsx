@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useStore, visibleFrames } from '../lib/store'
-import { sendWs } from '../lib/ws'
+import { sendFocus, sendWs } from '../lib/ws'
 import { throttle } from '../lib/throttle'
 import { FrameView } from './FrameView'
 import { FlowOverlay } from './FlowOverlay'
@@ -128,6 +128,25 @@ export function Stage({ onAddFrame }: { onAddFrame: (preset?: FramePreset) => vo
     })
     return () => cancelAnimationFrame(raf)
   }, [flyTo]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  /* Tell the room what this client is looking at: the selected frame, the
+     element picked inside it, and the page tab. This is the only way a human
+     can point an agent at "this element" without typing a selector, so it is
+     announced on every change of that tuple — debounced, because a click
+     lands selection and element separately and a page flip moves both.
+     `connected` is a dependency so a reconnect re-announces: the server drops
+     a client's focus when its socket closes. */
+  const selectedId = useStore((s) => s.selectedId)
+  const selectedElement = useStore((s) => s.selectedElement)
+  const connected = useStore((s) => s.connected)
+  useEffect(() => {
+    const timer = window.setTimeout(
+      () =>
+        sendFocus({ frameId: selectedId, selector: selectedElement?.selector ?? null, pageId: activePageId ?? null }),
+      300,
+    )
+    return () => window.clearTimeout(timer)
+  }, [selectedId, selectedElement, activePageId, connected])
 
   /* center one frame in the viewport and select it (shared frame links) */
   const focusFrame = useCallback(
