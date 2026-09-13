@@ -361,6 +361,23 @@ class Store {
     return c
   }
 
+  /** Replace (or clear, with undefined) the canvas's responsive breakpoints —
+   *  the widths `review_frame` renders a frame at. `by` is accepted for
+   *  call-site symmetry with setTokens; a breakpoint list carries no author.
+   *  Order and bounds are the caller's contract, not the store's. */
+  setBreakpoints(
+    canvasId: string,
+    breakpoints: { name: string; min_width: number }[] | undefined,
+    _by: string,
+  ): Canvas | undefined {
+    const c = this.canvases.get(canvasId)
+    if (!c) return undefined
+    c.breakpoints = breakpoints ? breakpoints.map((b) => ({ ...b })) : undefined
+    c.updatedAt = Date.now()
+    persist.saveCanvas(c)
+    return c
+  }
+
   getReferences(canvasId: string): MemoryReference[] {
     return this.canvases.get(canvasId)?.references ?? []
   }

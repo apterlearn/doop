@@ -139,3 +139,17 @@ export function mentionedRole(text: string): AgentRole | undefined {
   }
   return best?.role
 }
+
+/** The connected agent a piece of text @mentions, if any — the live agent
+ *  names, not roles (roles resolve through mentionedRole). Longest name first,
+ *  so "@Alex Smith" is not cut short to "@Alex"; casing comes from `names`. */
+export function mentionedAgent(text: string, names: string[]): string | undefined {
+  const candidates = names.filter((n) => n.length > 0).sort((a, b) => b.length - a.length)
+  let best: { name: string; at: number } | undefined
+  for (const name of candidates) {
+    const re = new RegExp(`@${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i')
+    const at = text.search(re)
+    if (at >= 0 && (!best || at < best.at)) best = { name, at }
+  }
+  return best?.name
+}

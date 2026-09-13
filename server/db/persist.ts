@@ -55,6 +55,7 @@ function canvasColumns(c: Canvas) {
     publishedReleaseId: c.publishedReleaseId ?? null,
     copyCount: c.copyCount ?? 0,
     tokens: c.tokens ?? null,
+    breakpoints: c.breakpoints ?? null,
     reviewMode: c.reviewMode ?? false,
     updatedAt: c.updatedAt,
   }
@@ -391,6 +392,12 @@ export async function listReleases(canvasId: string, limit = 50): Promise<Canvas
 export async function getRelease(id: string): Promise<CanvasRelease | undefined> {
   const [row] = await db.select().from(t.canvasReleases).where(eq(t.canvasReleases.id, id))
   return row ? toRelease(row) : undefined
+}
+
+/** Relabel a release. Only the name moves — the frozen frames and the tokens
+ *  a handoff link serves are the snapshot, and stay exactly as stored. */
+export async function renameRelease(id: string, name: string): Promise<void> {
+  await db.update(t.canvasReleases).set({ name }).where(eq(t.canvasReleases.id, id))
 }
 
 export async function deleteRelease(id: string): Promise<void> {
@@ -1070,6 +1077,7 @@ export async function hydrate(): Promise<Hydrated> {
     ...(c.publishedReleaseId ? { publishedReleaseId: c.publishedReleaseId } : {}),
     ...(c.copyCount ? { copyCount: c.copyCount } : {}),
     ...(c.tokens ? { tokens: c.tokens as DesignTokens } : {}),
+    ...(c.breakpoints ? { breakpoints: c.breakpoints as { name: string; min_width: number }[] } : {}),
     ...(c.reviewMode ? { reviewMode: true } : {}),
     createdAt: c.createdAt,
     updatedAt: c.updatedAt,

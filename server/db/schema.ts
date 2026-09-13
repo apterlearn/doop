@@ -28,6 +28,9 @@ export const canvases = pgTable('canvases', {
   /** design tokens (DesignTokens): the palette/type/scale every frame should
    *  use; null until an agent or human defines them */
   tokens: jsonb('tokens'),
+  /** responsive breakpoints ({ name, min_width }[]): the widths verification
+   *  renders a frame at; null until the canvas declares any */
+  breakpoints: jsonb('breakpoints'),
   createdAt: bigint('created_at', { mode: 'number' }).notNull(),
   updatedAt: bigint('updated_at', { mode: 'number' }).notNull(),
   /** when on, agent frame writes become frame_proposals instead of landing */

@@ -5,6 +5,7 @@ import * as actions from '../server/actions.ts'
 import { buildMcpServer } from '../server/mcp.ts'
 import { store } from '../server/store.ts'
 import { findBrowserPath } from '../server/screenshot.ts'
+import { ElementEditError, getElement, getFrameCss, setFrameCss, updateElements } from '../server/elementEdit.ts'
 import { probeFrame } from '../server/domProbe.ts'
 import { loadFramePage } from '../server/screenshot.ts'
 import { ELEMENT_KEY_SRC, ELEMENT_PATH_SRC } from '../shared/selector.ts'
@@ -518,6 +519,203 @@ describe.skipIf(!browser)('comment anchors', () => {
       } finally {
         await loaded.close()
       }
+    } finally {
+      await close()
+    }
+  })
+})
+
+/* Three things an element edit cannot express as an inline style or a
+   whole-text replacement: the frame's own stylesheet (media queries, states,
+   motion), a change to part of a sentence, and the text a long element is
+   actually carrying. */
+
+const TEXT_FIXTURE = `<!doctype html>
+<html><head></head><body>
+  <main>
+    <p id="copy">Ship the release <em>today</em> with the new tokens.</p>
+    <p id="repeat">check this, check this again</p>
+    <p id="markup">Buy the ticket now.</p>
+  </main>
+</body></html>`
+
+describe.skipIf(!browser)('frame stylesheet', () => {
+  it('writes one block and reads it back', async () => {
+    const frame = seedFrame()
+    const css = '.card { padding: 24px; }\n@media (max-width: 600px) { .card { padding: 8px; } }'
+    const { html } = await setFrameCss(frame, css)
+    expect(html.match(/data-doop-css/g) ?? []).toHaveLength(1)
+    /* the frame the write produced is the frame the read parses */
+    expect((await getFrameCss({ ...frame, html })).css).toBe(css)
+  })
+
+  it('replaces the block instead of stacking a second one', async () => {
+    const frame = seedFrame()
+    const first = await setFrameCss(frame, '.card { padding: 24px; }')
+    const second = await setFrameCss({ ...frame, html: first.html }, '.card { padding: 4px; }')
+    expect(second.html.match(/data-doop-css/g) ?? []).toHaveLength(1)
+    expect(second.html).toContain('padding: 4px')
+    expect(second.html).not.toContain('padding: 24px')
+    expect((await getFrameCss({ ...frame, html: second.html })).css).toBe('.card { padding: 4px; }')
+  })
+
+  it('gives a frame with no stylesheet one inside <head>', async () => {
+    const frame = seedFrame()
+    expect(frame.html).not.toContain('data-doop-css')
+    const { html } = await setFrameCss(frame, '.card { color: rgb(1, 2, 3); }')
+    const head = html.slice(html.indexOf('<head>'), html.indexOf('</head>'))
+    expect(head).toContain('data-doop-css')
+    expect(head).toContain('.card { color: rgb(1, 2, 3); }')
+    expect(await getFrameCss({ ...frame, html })).toEqual({ css: '.card { color: rgb(1, 2, 3); }' })
+  })
+
+  it('reads an empty stylesheet from a frame that has none', async () => {
+    expect(await getFrameCss(seedFrame())).toEqual({ css: '' })
+  })
+
+  it('refuses @import, which would fetch inside every viewer’s frame', async () => {
+    const error = await setFrameCss(seedFrame(), '@import url("https://fonts.example/x.css");').catch((e: unknown) => e)
+    expect(error).toBeInstanceOf(ElementEditError)
+    expect((error as ElementEditError).code).toBe('invalid_input')
+    expect((error as ElementEditError).message).toContain('@import')
+  })
+
+  it('refuses a stylesheet over 100 KB', async () => {
+    const error = await setFrameCss(seedFrame(), `.card { color: red; }\n/*${'x'.repeat(100_001)}*/`).catch(
+      (e: unknown) => e,
+    )
+    expect(error).toBeInstanceOf(ElementEditError)
+    expect((error as ElementEditError).code).toBe('too_large')
+  })
+})
+
+describe.skipIf(!browser)('partial text replacement', () => {
+  it('replaces one phrase inside a sentence and leaves the markup around it alone', async () => {
+    const frame = seedFrame(TEXT_FIXTURE)
+    const { html, applied } = await updateElements(frame, [
+      { selector: '#copy', text_replace: { old_str: 'the release', new_str: 'the hotfix' } },
+    ])
+    expect(applied).toBe(1)
+    expect(html).toContain('Ship the hotfix <em>today</em> with the new tokens.')
+  })
+
+  it('replaces the element’s own text only, never its children’s', async () => {
+    const frame = seedFrame(TEXT_FIXTURE)
+    /* “today” is inside the <em>, not in the paragraph's own text */
+    const error = await updateElements(frame, [
+      { selector: '#copy', text_replace: { old_str: 'today', new_str: 'tomorrow' } },
+    ]).catch((e: unknown) => e)
+    expect(error).toBeInstanceOf(ElementEditError)
+    expect((error as ElementEditError).code).toBe('not_found')
+    expect((error as ElementEditError).message).toContain('today')
+  })
+
+  it('applies nothing when the text is not there', async () => {
+    const frame = seedFrame(TEXT_FIXTURE)
+    const error = await updateElements(frame, [
+      { selector: '#markup', style: { color: 'rgb(9, 9, 9)' } },
+      { selector: '#copy', text_replace: { old_str: 'yesterday', new_str: 'tomorrow' } },
+    ]).catch((e: unknown) => e)
+    /* the batch is refused, so the style edit that would have landed beside it
+       did not land either */
+    expect(error).toBeInstanceOf(ElementEditError)
+    expect((error as ElementEditError).code).toBe('not_found')
+    expect((error as ElementEditError).message).toContain('yesterday')
+  })
+
+  it('refuses a phrase that occurs twice, and changes nothing', async () => {
+    const frame = seedFrame(TEXT_FIXTURE)
+    const error = await updateElements(frame, [
+      { selector: '#repeat', text_replace: { old_str: 'check this', new_str: 'checked' } },
+    ]).catch((e: unknown) => e)
+    expect(error).toBeInstanceOf(ElementEditError)
+    expect((error as ElementEditError).code).toBe('invalid_input')
+    expect((error as ElementEditError).message).toContain('occurs 2 times')
+  })
+
+  it('inserts inline markup when html is set', async () => {
+    const frame = seedFrame(TEXT_FIXTURE)
+    const { html } = await updateElements(frame, [
+      { selector: '#markup', text_replace: { old_str: 'ticket', new_str: '<strong>ticket</strong>', html: true } },
+    ])
+    expect(html).toContain('Buy the <strong>ticket</strong> now.')
+  })
+
+  it('refuses markup that would run code inside every viewer’s frame', async () => {
+    const frame = seedFrame(TEXT_FIXTURE)
+    const error = await updateElements(frame, [
+      {
+        selector: '#markup',
+        text_replace: { old_str: 'ticket', new_str: '<script>alert(1)</script>', html: true },
+      },
+    ]).catch((e: unknown) => e)
+    expect(error).toBeInstanceOf(ElementEditError)
+    expect((error as ElementEditError).code).toBe('invalid_input')
+  })
+
+  it('refuses a tag outside the inline allowlist', async () => {
+    const frame = seedFrame(TEXT_FIXTURE)
+    const error = await updateElements(frame, [
+      { selector: '#markup', text_replace: { old_str: 'ticket', new_str: '<section>x</section>', html: true } },
+    ]).catch((e: unknown) => e)
+    expect(error).toBeInstanceOf(ElementEditError)
+    expect((error as ElementEditError).code).toBe('invalid_input')
+    expect((error as ElementEditError).message).toContain('<section>')
+  })
+
+  it('refuses a link whose href is not a safe target', async () => {
+    const frame = seedFrame(TEXT_FIXTURE)
+    const error = await updateElements(frame, [
+      {
+        selector: '#markup',
+        text_replace: { old_str: 'ticket', new_str: '<a href="javascript:alert(1)">ticket</a>', html: true },
+      },
+    ]).catch((e: unknown) => e)
+    expect(error).toBeInstanceOf(ElementEditError)
+    expect((error as ElementEditError).code).toBe('invalid_input')
+  })
+
+  it('escapes the replacement when html is not set', async () => {
+    const frame = seedFrame(TEXT_FIXTURE)
+    const { html } = await updateElements(frame, [
+      { selector: '#markup', text_replace: { old_str: 'ticket', new_str: '<strong>ticket</strong>' } },
+    ])
+    expect(html).toContain('Buy the &lt;strong&gt;ticket&lt;/strong&gt; now.')
+  })
+})
+
+describe.skipIf(!browser)('reading element text', () => {
+  it('says when the text was clipped, and returns all of it on request', async () => {
+    const words = Array.from({ length: 200 }, (_, n) => `word${n}`).join(' ')
+    const frame = seedFrame(
+      `<!doctype html><html><head></head><body><p id="long">${words}</p><p id="short">brief</p></body></html>`,
+    )
+    const clipped = await getElement(frame, '#long')
+    expect(clipped.text).toHaveLength(400)
+    expect(clipped.text_truncated).toBe(true)
+
+    const whole = await getElement(frame, '#long', { full_text: true })
+    expect(whole.text).toBe(words)
+    expect(whole.text_truncated).toBeUndefined()
+
+    const short = await getElement(frame, '#short')
+    expect(short.text_truncated).toBeUndefined()
+  })
+
+  it('reports the clipped text through the tool as well', async () => {
+    const words = Array.from({ length: 200 }, (_, n) => `word${n}`).join(' ')
+    seedFrame(`<!doctype html><html><head></head><body><p id="long">${words}</p></body></html>`)
+    const { client, close } = await connect()
+    try {
+      const { parsed, isError } = await callTool(client, 'get_element', {
+        canvas_id: CANVAS_ID,
+        frame_id: 'f-element',
+        selector: '#long',
+        agent_name: 'Claude',
+      })
+      expect(isError).toBeFalsy()
+      expect(parsed.text_truncated).toBe(true)
+      expect(parsed.text as unknown as string).toHaveLength(400)
     } finally {
       await close()
     }

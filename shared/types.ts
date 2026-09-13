@@ -259,6 +259,9 @@ export interface Canvas {
   pages?: Page[]
   /** the canvas's design tokens — the palette, type and scale every frame should use */
   tokens?: DesignTokens
+  /** widths this canvas is designed at; verification renders one pass per
+   *  entry and labels findings with its name. Unset = device presets only */
+  breakpoints?: { name: string; min_width: number }[]
   /** when on, agent frame writes land as pending proposals a human must
    *  accept; unset/false means agent edits land canonically (the default) */
   reviewMode?: boolean
@@ -355,6 +358,9 @@ export interface FrameProposal {
   status: 'pending' | 'accepted' | 'rejected' | 'withdrawn' | 'stale'
   resolvedBy?: string
   resolvedAt?: number
+  /** why a human rejected it (or their note on accept), so the agent can fix
+   *  the right thing instead of guessing */
+  resolutionNote?: string
 }
 
 /** A blocking question an agent asked via ask_human. Open questions surface
@@ -373,6 +379,12 @@ export interface AgentQuestion {
   /** content key of that element — the anchor a stale selector falls back to */
   stableKey?: string
   text: string
+  /** offered answers when the asker framed a choice; unset = free text */
+  choices?: string[]
+  /** the choices are multi-select (default: single) */
+  multi?: boolean
+  /** an answer outside choices is allowed (default: not) */
+  allowOther?: boolean
   at: number
   status: 'open' | 'answered' | 'expired'
   answer?: string
@@ -409,6 +421,9 @@ export interface RunJournal {
   summary: string
   /** JSON string of what the run touched (frames, guides read) */
   decisions?: string
+  /** the frames the run changed, each with the version it started from and the
+   *  one it produced — the run's revertible change set */
+  frames?: { frameId: string; name: string; beforeVersionId?: string; afterVersionId?: string }[]
   at: number
 }
 
@@ -515,6 +530,10 @@ export interface AgentTask {
    *  material the agent must leave alone), these are the card's subject and the
    *  agent edits them in place. */
   targetFrameIds?: string[]
+  /** element selector on that frame the human pointed at — "fix THIS element" */
+  targetSelector?: string
+  /** page the target frame lives on, so the agent needs no lookup to reach it */
+  targetPageId?: string
   /** a human paused this card's run: the run was aborted and the card is
    *  skipped by the sweep until explicitly resumed. Not terminal like
    *  cancelledAt — a resume is one click, not a metered retry. */
@@ -650,6 +669,9 @@ export type ClientMessage =
   | { type: 'cursor'; x: number; y: number }
   | { type: 'editing'; frameId: string | null }
   | { type: 'frame:drag'; frameId: string; x: number; y: number; width: number; height: number }
+  /** what this client is looking at right now — frame, element selector and
+   *  page; nulls clear it. Lets a human point an agent at "this" */
+  | { type: 'focus'; frameId: string | null; selector: string | null; pageId: string | null }
 
 /** Who holds a frame's edit lock, as the server broadcasts it. */
 export interface FrameLockHolder {
@@ -734,6 +756,8 @@ export type ServerMessage =
   | { type: 'canvas:reviewMode'; reviewMode: boolean; actor: Actor }
   /** a frame edit lock was taken, released or expired (holder null = free) */
   | { type: 'frame:lock'; frameId: string; holder: { name: string; color: string; kind: ActorKind } | null }
+  /** another client's selection moved (nulls = cleared); sent to the canvas room */
+  | { type: 'focus'; clientId: string; frameId: string | null; selector: string | null; pageId: string | null }
 
 export const CURSOR_PALETTE = [
   '#2743EE', // cursor blue — the brand accent leads

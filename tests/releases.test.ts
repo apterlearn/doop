@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as actions from '../server/actions.ts'
 import { buildMcpServer } from '../server/mcp.ts'
 import { store } from '../server/store.ts'
@@ -181,6 +181,67 @@ describe('list_releases', () => {
     } finally {
       await close()
     }
+  })
+})
+
+describe('release names', () => {
+  it('renames a release without touching its frozen frames', async () => {
+    const { client, close } = await connect()
+    try {
+      const created = await callTool(client, 'create_release', {
+        canvas_id: canvas.id,
+        name: 'v1',
+        agent_name: 'Claude',
+      })
+      const releaseId = created.parsed.release_id as unknown as string
+
+      await persist.renameRelease(releaseId, 'v2 — final')
+
+      const renamed = await persist.getRelease(releaseId)
+      expect(renamed?.name).toBe('v2 — final')
+      /* the name is a label on the snapshot, not an edit to it */
+      expect(renamed?.frames[0]?.html).toBe('<h1>first</h1>')
+      expect((await persist.listReleases(canvas.id)).map((r) => r.name)).toEqual(['v2 — final'])
+    } finally {
+      await close()
+    }
+  })
+})
+
+describe('canvas breakpoints', () => {
+  /* Breakpoints are a column on the canvas row, so the proof that they stick
+     is a hydrate read-back against the real database — the same one boot runs. */
+  it('survives a save, and clearing the list survives too', async () => {
+    const listed = [
+      { name: 'mobile', min_width: 390 },
+      { name: 'desktop', min_width: 1280 },
+    ]
+    const before = Date.now()
+    const set = store.setBreakpoints(canvas.id, listed, 'Owner')
+    expect(set?.breakpoints).toEqual(listed)
+    expect(set!.updatedAt).toBeGreaterThanOrEqual(before)
+    /* the store owns its copy: a caller that keeps the array cannot reach in */
+    listed.push({ name: 'wide', min_width: 1600 })
+    expect(store.getCanvas(canvas.id)!.breakpoints).toHaveLength(2)
+
+    await vi.waitFor(async () => {
+      const stored = (await persist.hydrate()).canvases.find((c) => c.id === canvas.id)
+      expect(stored?.breakpoints).toEqual([
+        { name: 'mobile', min_width: 390 },
+        { name: 'desktop', min_width: 1280 },
+      ])
+    })
+
+    store.setBreakpoints(canvas.id, undefined, 'Owner')
+    expect(store.getCanvas(canvas.id)!.breakpoints).toBeUndefined()
+    await vi.waitFor(async () => {
+      const stored = (await persist.hydrate()).canvases.find((c) => c.id === canvas.id)
+      expect(stored?.breakpoints).toBeUndefined()
+    })
+  })
+
+  it('leaves an unknown canvas alone', () => {
+    expect(store.setBreakpoints('no-such-canvas', [{ name: 'mobile', min_width: 390 }], 'Owner')).toBeUndefined()
   })
 })
 

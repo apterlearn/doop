@@ -1,9 +1,16 @@
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 
-import { createAsset, getCanvasAsset, listAssets } from '../server/assets.ts'
+import {
+  createAsset,
+  deleteAsset,
+  framesReferencingAsset,
+  getAsset,
+  getCanvasAsset,
+  listAssets,
+} from '../server/assets.ts'
 import { closeDb, initDb } from '../server/db/index.ts'
 import {
   agentsMd,
@@ -197,6 +204,47 @@ describe('asset listing', () => {
     expect(found?.url).toBe(`/a/${asset.id}.png`)
     expect(await getCanvasAsset('c-somewhere-else', asset.id)).toBeUndefined()
     expect(await getCanvasAsset('c-bytes', 'missing')).toBeUndefined()
+  })
+
+  it('deletes an asset from the ledger and from storage, and tolerates a second delete', async () => {
+    const asset = await createAsset(PNG, { canvasId: 'c-del', uploadedBy: 'tester' })
+    expect(await getAsset(asset.id)).not.toBeNull()
+
+    const removed = await deleteAsset(asset.id)
+    expect(removed).toMatchObject({ id: asset.id, mime: 'image/png', size: PNG.length })
+    /* both layers: the row is gone from the listing and the bytes are gone */
+    expect(await getAsset(asset.id)).toBeNull()
+    expect((await listAssets('c-del')).total).toBe(0)
+    /* deleting what is not there is a miss, not a throw */
+    expect(await deleteAsset(asset.id)).toBeUndefined()
+  })
+
+  it('names the frames whose html still points at an asset', async () => {
+    const asset = await createAsset(PNG, { canvasId: 'c-ref', uploadedBy: 'tester' })
+    saveFrame(
+      {
+        id: 'f-ref',
+        canvasId: 'c-ref',
+        name: 'F',
+        html: `<img src="/a/${asset.id}.png">`,
+        x: 0,
+        y: 0,
+        width: 10,
+        height: 10,
+        createdAt: 1,
+        updatedAt: 1,
+        updatedBy: 'tester',
+      },
+      true,
+    )
+    /* the frame row is written fire-and-forget: wait for the read to see it
+       rather than for a duration */
+    await vi.waitFor(async () => expect(await framesReferencingAsset('c-ref', asset.id)).toEqual(['f-ref']), {
+      timeout: 5000,
+    })
+    /* another asset, another canvas: nothing */
+    expect(await framesReferencingAsset('c-ref', 'not-referenced')).toEqual([])
+    expect(await framesReferencingAsset('c-elsewhere', asset.id)).toEqual([])
   })
 })
 

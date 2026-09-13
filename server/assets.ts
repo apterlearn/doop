@@ -11,8 +11,8 @@ import * as storage from './storage.ts'
  * in use, tracked as a projection in asset_refs: every durable frame write
  * re-extracts that frame's /a/<id> references (db/persist.ts), and boot
  * rebuilds the whole table from hydrated frames — so a failed fire-and-
- * forget write self-heals. Nothing is ever deleted; if cleanup is wanted
- * some day, asset_refs is the ledger to build it on.
+ * forget write self-heals. Deletion is explicit (deleteAsset), and a caller
+ * that must not break a live URL checks framesReferencingAsset first.
  */
 
 export const MAX_ASSET_BYTES = 5 * 1024 * 1024
@@ -133,6 +133,20 @@ export async function getAsset(id: string): Promise<{ meta: AssetMeta; buf: Buff
   return { meta: { id: row.id, mime: row.mime, ext: row.ext, size: row.size }, buf }
 }
 
+/** Remove an asset: metadata row first, then the bytes — the same invariant
+ *  createAsset states from the other side, because a row without bytes would
+ *  serve 404s forever while an object without a row is an orphan a sweep can
+ *  find. asset_refs is deliberately left alone: it mirrors frame HTML, and a
+ *  frame that still points at this URL still references it. Returns the
+ *  removed asset, or undefined when there was nothing to remove. */
+export async function deleteAsset(id: string): Promise<AssetMeta | undefined> {
+  const [row] = await db.select().from(t.assets).where(eq(t.assets.id, id))
+  if (!row) return undefined
+  await db.delete(t.assets).where(eq(t.assets.id, id))
+  await storage.deleteObject(`${row.id}.${row.ext}`)
+  return { id: row.id, mime: row.mime, ext: row.ext, size: row.size }
+}
+
 /** Fetch a remote image through the SSRF guard, validating every redirect
  *  hop, with a hard size cap enforced while streaming. */
 export async function fetchRemote(rawUrl: string): Promise<Buffer> {
@@ -186,6 +200,21 @@ export async function reconcileAssetRefs(frames: { id: string; html: string }[])
       .onConflictDoNothing()
   }
   return rows.length
+}
+
+/** The canvas's frames whose HTML points at this asset, by id. HTML is the
+ *  ground truth (asset_refs is a projection of it), so this reads the frames
+ *  rather than the ledger — a delete that skipped a stale ref would still be
+ *  refused here. Sorted for a stable report. */
+export async function framesReferencingAsset(canvasId: string, assetId: string): Promise<string[]> {
+  const rows = await db
+    .select({ id: t.frames.id, html: t.frames.html })
+    .from(t.frames)
+    .where(eq(t.frames.canvasId, canvasId))
+  return rows
+    .filter((row) => extractAssetIds(row.html).has(assetId))
+    .map((row) => row.id)
+    .sort()
 }
 
 /* ------------------------------------------------------------------ */
