@@ -33,7 +33,8 @@ export interface Page {
 /** A canvas's design tokens: the named values every frame should use, so an
  *  agent has one palette/type/scale to conform to instead of inventing one per
  *  frame. Deliberately small — a design system for a canvas, not a theme
- *  editor. `cssForTokens` renders it as a :root block to paste into a frame. */
+ *  editor. `cssForTokens` renders it as a :root block, which the server
+ *  injects into every render (see shared/tokens.ts). */
 export interface DesignTokens {
   /** token name -> CSS color, e.g. { ink: '#111110' } */
   colors: Record<string, string>
@@ -42,6 +43,8 @@ export interface DesignTokens {
   spacing?: number[]
   radii?: number[]
   shadows?: string[]
+  /** type scale: px sizes, numeric weights (100–900) and unitless line heights */
+  type?: { size?: number[]; weight?: number[]; leading?: number[] }
   updatedAt: number
   updatedBy: string
 }
@@ -59,6 +62,23 @@ export interface FrameVersion {
   height: number
   savedAt: number
   savedBy: string
+}
+
+/** A stored verification report for one frame, as the checks panel and the
+ *  delivery gate read it. `htmlSha` names the exact document it describes: a
+ *  report whose hash no longer matches the frame is not evidence about it. */
+export interface FrameReview {
+  id: string
+  frameId: string
+  canvasId: string
+  htmlSha: string
+  frameUpdatedAt: number
+  verdict: 'pass' | 'fail'
+  summary: Record<string, number>
+  /** the full per-viewport report, for the checks panel */
+  report: unknown
+  reviewedAt: number
+  reviewedBy: string
 }
 
 /** A step of an agent's published plan. */
@@ -222,6 +242,10 @@ export interface Canvas {
   description?: string
   /** gallery shelf; meaningful only while published */
   category?: CommunityCategory
+  /** the release this listing is pinned to. When set, the gallery's preview
+   *  and the copies it hands out come from that frozen snapshot, so editing
+   *  the canvas afterwards does not change what a visitor sees or gets. */
+  publishedReleaseId?: string
   /** copies handed out by the gallery — its "trending" signal */
   copyCount?: number
   createdAt: number
@@ -346,6 +370,8 @@ export interface AgentQuestion {
   frameId?: string
   /** element selector the question is about, from inspect_frame */
   selector?: string
+  /** content key of that element — the anchor a stale selector falls back to */
+  stableKey?: string
   text: string
   at: number
   status: 'open' | 'answered' | 'expired'
@@ -575,6 +601,10 @@ export interface ElementComment {
   frameId: string
   /** CSS selector of the anchored element, resolved at comment time */
   selector: string
+  /** Content key of the anchored element (shared/selector.ts). A selector is a
+   *  positional path, so inserting a sibling above the element moves it; the
+   *  key is what lets the pin follow the content instead. */
+  stableKey?: string
   /** outerHTML excerpt of the element, for agent context and dead-anchor display */
   snippet: string
   from: string
@@ -621,6 +651,13 @@ export type ClientMessage =
   | { type: 'editing'; frameId: string | null }
   | { type: 'frame:drag'; frameId: string; x: number; y: number; width: number; height: number }
 
+/** Who holds a frame's edit lock, as the server broadcasts it. */
+export interface FrameLockHolder {
+  name: string
+  color: string
+  kind: ActorKind
+}
+
 export type ServerMessage =
   | {
       type: 'init'
@@ -643,6 +680,8 @@ export type ServerMessage =
       reviewMode: boolean
       /** per-agent tool-call timeline, newest first (a bounded recent window) */
       runEvents: RunEvent[]
+      /** frames an agent is mid-edit on, so a client joining now sees the holder */
+      frameLocks: Record<string, FrameLockHolder>
       serverBuild: string
     }
   | { type: 'presence:join'; presence: Presence }
@@ -658,7 +697,16 @@ export type ServerMessage =
   | { type: 'frame:created'; frame: Frame; actor: Actor }
   | { type: 'frame:updated'; frame: Frame; actor: Actor }
   | { type: 'frame:deleted'; frameId: string; actor: Actor }
-  | { type: 'frame:streaming'; frameId: string; active: boolean; actor: Actor }
+  | {
+      type: 'frame:streaming'
+      frameId: string
+      active: boolean
+      actor: Actor
+      /** why the stream ended: the agent delivered, went silent, replaced its
+       *  own document, was taken over by another writer, or was stopped
+       *  (absent while active) */
+      reason?: 'done' | 'idle' | 'taken over' | 'stopped' | 'replaced'
+    }
   | { type: 'canvas:renamed'; name: string; actor: Actor }
   /** a style-guide doc was written, moved (doc set) or deleted (doc null) */
   | { type: 'guidelines'; name: string; doc: GuidelineDoc | null; actor: Actor }

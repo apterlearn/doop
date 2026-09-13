@@ -83,7 +83,16 @@ function seed() {
     createdAt: 0,
     updatedAt: 0,
     frames: [],
-    pages: [{ id: `p-versions-${counter}`, canvasId: `c-versions-${counter}`, name: 'Page 1', position: 0, createdAt: 0, updatedAt: 0 }],
+    pages: [
+      {
+        id: `p-versions-${counter}`,
+        canvasId: `c-versions-${counter}`,
+        name: 'Page 1',
+        position: 0,
+        createdAt: 0,
+        updatedAt: 0,
+      },
+    ],
   }
   frame = {
     id: `f-versions-${counter}`,
@@ -153,7 +162,12 @@ describe('frame version history', () => {
     const { client, close } = await connect()
     try {
       const history = await callTool(client, 'get_frame_history', { frame_id: frame.id, agent_name: 'Claude' })
-      const versions = history.parsed.versions as unknown as { id: string; htmlBytes: number; savedAt: string; html?: string }[]
+      const versions = history.parsed.versions as unknown as {
+        id: string
+        htmlBytes: number
+        savedAt: string
+        html?: string
+      }[]
       expect(versions).toHaveLength(2)
       expect(versions[0]!.savedAt).toBe(new Date(20).toISOString())
       expect(versions[0]!.htmlBytes).toBe('<h1>ruined</h1>'.length)
@@ -184,7 +198,11 @@ describe('frame version history', () => {
     await persist.saveFrame(frame, true)
     await waitForVersions(frame.id, 1)
     const version = (await persist.listFrameVersions(frame.id, 1))[0]!
-    const other = actions.createFrame(canvas.id, { name: 'Other', html: '<p>other</p>' }, actions.resolveActor({ name: 'alice', kind: 'user' }))!
+    const other = actions.createFrame(
+      canvas.id,
+      { name: 'Other', html: '<p>other</p>' },
+      actions.resolveActor({ name: 'alice', kind: 'user' }),
+    )!
 
     const { client, close } = await connect()
     try {

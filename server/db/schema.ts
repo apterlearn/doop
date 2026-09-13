@@ -21,6 +21,8 @@ export const canvases = pgTable('canvases', {
   /** gallery blurb and category — meaningful only while published */
   description: text('description'),
   category: text('category'),
+  /** the release the listing is pinned to, or null for the live frames */
+  publishedReleaseId: text('published_release_id'),
   /** how many times the gallery has copied this canvas — the "trending" signal */
   copyCount: integer('copy_count').notNull().default(0),
   /** design tokens (DesignTokens): the palette/type/scale every frame should
@@ -246,6 +248,9 @@ export const comments = pgTable(
     canvasId: text('canvas_id').notNull(),
     frameId: text('frame_id').notNull(),
     selector: text('selector').notNull(),
+    /** content key of the anchored element (shared/selector.ts): the anchor a
+     *  stale selector falls back to, captured at comment time */
+    stableKey: text('stable_key'),
     snippet: text('snippet').notNull(),
     fromName: text('from_name').notNull(),
     fromUserId: text('from_user_id'),
@@ -355,6 +360,54 @@ export const frameVersions = pgTable(
     savedBy: text('saved_by').notNull(),
   },
   (t) => [index('frame_versions_frame_idx').on(t.frameId, t.savedAt)],
+)
+
+/** Verification reports, kept after the run that produced them.
+ *
+ *  A review is only evidence about the exact document it was made from, so the
+ *  row carries the hash of that HTML; the completion gate refuses a report
+ *  whose hash no longer matches the frame. Persisted because a human reading
+ *  the checks panel is usually reading them after the agent disconnected.
+ *  Append-only, capped per frame at write time. */
+export const frameReviews = pgTable(
+  'frame_reviews',
+  {
+    id: text('id').primaryKey(),
+    frameId: text('frame_id').notNull(),
+    canvasId: text('canvas_id').notNull(),
+    /** sha256 (truncated) of the frame HTML this report describes */
+    htmlSha: text('html_sha').notNull(),
+    /** the frame's updatedAt when it was reviewed */
+    frameUpdatedAt: bigint('frame_updated_at', { mode: 'number' }).notNull(),
+    verdict: text('verdict').notNull(),
+    summary: jsonb('summary').notNull(),
+    report: jsonb('report').notNull(),
+    reviewedAt: bigint('reviewed_at', { mode: 'number' }).notNull(),
+    reviewedBy: text('reviewed_by').notNull(),
+  },
+  (t) => [index('frame_reviews_frame_idx').on(t.frameId, t.reviewedAt)],
+)
+
+/** A frozen snapshot of a canvas's frames — what a handoff link points at.
+ *
+ *  Frames keep changing after a design is handed off, so "the version I sent
+ *  you" has to be a stored thing, not a timestamp. The frames are denormalized
+ *  into the row on purpose: a release must not change when a frame is edited,
+ *  renamed or deleted, which is exactly what a foreign key would let happen. */
+export const canvasReleases = pgTable(
+  'canvas_releases',
+  {
+    id: text('id').primaryKey(),
+    canvasId: text('canvas_id').notNull(),
+    name: text('name').notNull(),
+    /** the frames as they were: {id, name, width, height, x, y, html, pageId} */
+    frames: jsonb('frames').notNull(),
+    /** the design tokens at release time, when the canvas had any */
+    tokens: jsonb('tokens'),
+    createdAt: bigint('created_at', { mode: 'number' }).notNull(),
+    createdBy: text('created_by').notNull(),
+  },
+  (t) => [index('canvas_releases_canvas_idx').on(t.canvasId, t.createdAt)],
 )
 
 /** An agent's plan for one canvas: the ordered steps it is working through,
@@ -542,6 +595,8 @@ export const agentQuestions = pgTable(
     color: text('color').notNull(),
     frameId: text('frame_id'),
     selector: text('selector'),
+    /** content key of the element the question is about, like comments */
+    stableKey: text('stable_key'),
     text: text('text').notNull(),
     at: bigint('at', { mode: 'number' }).notNull(),
     status: text('status').notNull(),

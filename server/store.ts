@@ -97,13 +97,17 @@ class Store {
     id: string,
     ownerId: string,
     by: string,
-    options: { name?: string; dropDemo?: boolean } = {},
+    options: { name?: string; dropDemo?: boolean; frames?: Frame[] } = {},
   ): Promise<Canvas | undefined> {
     const source = this.canvases.get(id)
     if (!source) return undefined
     const now = Date.now()
     const canvasId = nanoid(10)
-    const sourceFrames = options.dropDemo ? source.frames.filter((frame) => !frame.demo) : source.frames
+    /* `frames` is how the gallery copies a release-published listing: the copy
+       must be the snapshot a visitor was shown, not whatever the canvas holds
+       now */
+    const sourceFrames =
+      options.frames ?? (options.dropDemo ? source.frames.filter((frame) => !frame.demo) : source.frames)
     const frameIds = new Map(sourceFrames.map((frame) => [frame.id, nanoid(10)]))
     const pages = source.pages?.map((page) => ({
       id: nanoid(10),
@@ -187,14 +191,21 @@ class Store {
 
   /** List (or re-describe) a canvas in the gallery. Keeps the original
    *  publish date on edits so "newest" stays honest. Not a design edit, so
-   *  updatedAt is left alone. */
-  publishCanvas(id: string, listing: { description: string; category: CommunityCategory }): Canvas | undefined {
+   *  updatedAt is left alone. `releaseId` pins the listing to a frozen
+   *  snapshot; omitting it lists the live frames. */
+  publishCanvas(
+    id: string,
+    listing: { description: string; category: CommunityCategory },
+    releaseId?: string,
+  ): Canvas | undefined {
     const c = this.canvases.get(id)
     if (!c) return undefined
     c.publishedAt ??= Date.now()
     c.category = listing.category
     if (listing.description) c.description = listing.description
     else delete c.description
+    if (releaseId) c.publishedReleaseId = releaseId
+    else delete c.publishedReleaseId
     persist.saveCanvas(c)
     return c
   }
@@ -205,6 +216,7 @@ class Store {
     delete c.publishedAt
     delete c.description
     delete c.category
+    delete c.publishedReleaseId
     persist.saveCanvas(c)
     return c
   }

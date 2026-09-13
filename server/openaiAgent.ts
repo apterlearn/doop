@@ -72,9 +72,20 @@ export interface TurnRequest {
   signal?: AbortSignal
 }
 
+/** Provider-reported token usage for one turn, in the same shape the
+ *  Anthropic transport reports so a run can add them up regardless of which
+ *  account paid. Absent when the provider sent none. */
+export interface TurnUsageReport {
+  input: number
+  output: number
+  cacheRead: number
+  cacheWrite: number
+}
+
 export interface TurnResult {
   content: TurnBlock[]
   stop_reason: StopReason
+  usage?: TurnUsageReport
 }
 
 /** The connection is no longer usable (revoked, expired past refresh, or the
@@ -203,6 +214,14 @@ interface ResponseBody {
   status?: string
   incomplete_details?: { reason?: string }
   error?: { message?: string } | null
+  /* the Responses API's usage block. `input_tokens` counts cached input too,
+     which is why the cached portion is subtracted below: the run's budget adds
+     input and cacheRead up, and counting it twice would spend it twice. */
+  usage?: {
+    input_tokens?: number
+    output_tokens?: number
+    input_tokens_details?: { cached_tokens?: number }
+  }
   output?: {
     type: string
     call_id?: string
@@ -246,7 +265,16 @@ function fromResponse(body: ResponseBody): TurnResult {
   /* a response with nothing in it would end the loop silently; make it a
      visible failure instead */
   if (content.length === 0 && !refused) throw new Error('OpenAI returned an empty response')
-  return { content, stop_reason: stop }
+  const cached = body.usage?.input_tokens_details?.cached_tokens ?? 0
+  const reported = body.usage
+    ? {
+        input: Math.max(0, (body.usage.input_tokens ?? 0) - cached),
+        output: body.usage.output_tokens ?? 0,
+        cacheRead: cached,
+        cacheWrite: 0,
+      }
+    : undefined
+  return { content, stop_reason: stop, ...(reported ? { usage: reported } : {}) }
 }
 
 /* ---------------------------------------------------------------- */

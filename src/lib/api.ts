@@ -1,12 +1,15 @@
 import type {
   ActivityItem,
+  AgentPlan,
   AgentQuestion,
   Canvas,
   CanvasMeta,
   CommunityCategory,
   CommunityItem,
+  DesignTokens,
   Frame,
   FrameProposal,
+  FrameReview,
   FrameVersion,
   Page,
   RunEvent,
@@ -274,8 +277,17 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ on }),
     }),
+  /** the frame's stored verification reports, newest first */
+  frameReviews: (frameId: string, limit = 5) =>
+    req<(FrameReview & { current: boolean })[]>(`/api/frames/${frameId}/reviews?limit=${limit}`),
   frameProposals: (canvasId: string, status?: 'pending') =>
     req<FrameProposal[]>(`/api/canvases/${canvasId}/frame-proposals${status ? `?status=${status}` : ''}`),
+  /* the canvas design tokens, as the Tokens panel edits them */
+  setTokens: (canvasId: string, tokens: DesignTokens | null) =>
+    req<{ tokens: DesignTokens | null }>(`/api/canvases/${canvasId}/tokens`, {
+      method: 'PATCH',
+      body: JSON.stringify({ tokens }),
+    }),
   resolveFrameProposal: (canvasId: string, proposalId: string, accept: boolean) =>
     req<FrameProposal>(`/api/canvases/${canvasId}/frame-proposals/${proposalId}`, {
       method: 'POST',
@@ -400,7 +412,7 @@ export const api = {
     req(`/api/canvases/${canvasId}/cards/${cardId}/done`, { method: 'POST' }),
   retryCard: (canvasId: string, cardId: string) =>
     req(`/api/canvases/${canvasId}/cards/${cardId}/retry`, { method: 'POST' }),
-  addComment: (frameId: string, input: { selector: string; snippet: string; text: string }) =>
+  addComment: (frameId: string, input: { selector: string; snippet: string; text: string; stableKey?: string }) =>
     req(`/api/frames/${frameId}/comments`, { method: 'POST', body: JSON.stringify(input) }),
   replyComment: (commentId: string, text: string) =>
     req(`/api/comments/${commentId}/replies`, { method: 'POST', body: JSON.stringify({ text }) }),
@@ -420,6 +432,7 @@ export const api = {
     req(`/api/canvases/${canvasId}/cards/reorder`, { method: 'POST', body: JSON.stringify({ ids }) }),
   setCardPriority: (canvasId: string, cardId: string, priority: number) =>
     req(`/api/canvases/${canvasId}/cards/${cardId}`, { method: 'PATCH', body: JSON.stringify({ priority }) }),
+  plans: (canvasId: string) => req<AgentPlan[]>(`/api/canvases/${canvasId}/plans`),
   runEvents: (canvasId: string, runId?: string, limit = 200) => {
     const q = new URLSearchParams({ limit: String(limit) })
     if (runId) q.set('run_id', runId)

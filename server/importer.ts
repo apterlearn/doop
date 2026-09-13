@@ -14,6 +14,7 @@ import {
   parsePublicHttpUrl,
 } from './publicUrl.ts'
 import { navigateWebsitePage, WebsiteCaptureUnavailableError } from './websiteAccess.ts'
+import { SNAPSHOT_CSP } from './snapshotCsp.ts'
 import { pruneUnusedCss } from './cssPrune.ts'
 import { IMPORT_SANITIZE_RULES, sanitizeImportedHtml, type SanitizeOptions } from './sanitizeHtml.ts'
 import {
@@ -41,20 +42,6 @@ const MAX_SITEMAPS = 12
 const DISCOVERY_CONCURRENCY = 6
 const MAX_CSS_IMPORTS = 16
 export const MAX_SITE_PAGES = 100
-
-const IMPORT_CSP = [
-  "default-src 'none'",
-  "script-src 'none'",
-  "connect-src 'none'",
-  "object-src 'none'",
-  "frame-src 'none'",
-  "worker-src 'none'",
-  "form-action 'none'",
-  "style-src 'unsafe-inline'",
-  'img-src data: blob: http: https:',
-  'font-src data: http: https:',
-  'media-src data: blob: http: https:',
-].join('; ')
 
 const NON_PAGE_EXTENSIONS =
   /\.(?:avif|bmp|css|csv|docx?|eot|gif|gz|ico|jpe?g|js|json|map|mov|mp3|mp4|mpeg|ogg|otf|pdf|png|pptx?|rar|rss|svg|tar|tiff?|txt|wav|webm|webp|woff2?|xlsx?|xml|zip)$/i
@@ -642,7 +629,7 @@ export async function importPage(rawUrl: string, options: { includePreview?: boo
        (images, srcset) keep resolving, plus every stylesheet inlined */
     const inject =
       `<meta name="${IMPORT_SOURCE_META}" content="${encodeURIComponent(requestedUrl.href)}">` +
-      `<meta http-equiv="Content-Security-Policy" content="${IMPORT_CSP}">` +
+      `<meta http-equiv="Content-Security-Policy" content="${SNAPSHOT_CSP}">` +
       `<base href="${documentBase.replace(/&/g, '&amp;').replace(/"/g, '&quot;')}">` +
       (css.trim() ? `<style data-doop-import>\n${css.replace(/<\/style/gi, '<\\/style')}\n</style>` : '')
     const headMatch = html.match(/<head[^>]*>/i)

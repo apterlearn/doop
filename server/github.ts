@@ -3,6 +3,7 @@ import { and, desc, eq } from 'drizzle-orm'
 import { db } from './db/index.ts'
 import { githubConnections } from './db/schema.ts'
 import { sanitizeSnapshotHtml } from './ingest.ts'
+import { SNAPSHOT_CSP } from './snapshotCsp.ts'
 import * as githubApp from './githubApp.ts'
 import type { Frame } from '../shared/types.ts'
 
@@ -142,6 +143,15 @@ export function listConnections(canvasId: string): Promise<GithubConnection[]> {
     .from(githubConnections)
     .where(eq(githubConnections.canvasId, canvasId))
     .orderBy(desc(githubConnections.createdAt))
+}
+
+/** Every connection on the server, newest first. Report-only: callers use it
+ *  to answer "is GitHub configured at all" without a canvas in hand — which is
+ *  a question a process with no database can still answer honestly ("none"),
+ *  so an unset db is an empty list rather than a crash. */
+export async function listAllConnections(): Promise<GithubConnection[]> {
+  if (!db) return []
+  return db.select().from(githubConnections).orderBy(desc(githubConnections.createdAt))
 }
 
 export async function getConnection(canvasId: string, id: string): Promise<GithubConnection | undefined> {
@@ -387,21 +397,6 @@ export async function fetchRepoFile(conn: GithubConnection, path: string): Promi
 /* Marker + frame HTML                                                 */
 
 const GITHUB_META = 'doop-github-screen'
-
-/** Same lockdown the importer and ingest stamp on their snapshots. */
-const SNAPSHOT_CSP = [
-  "default-src 'none'",
-  "script-src 'none'",
-  "connect-src 'none'",
-  "object-src 'none'",
-  "frame-src 'none'",
-  "worker-src 'none'",
-  "form-action 'none'",
-  "style-src 'unsafe-inline'",
-  'img-src data: blob: http: https:',
-  'font-src data: http: https:',
-  'media-src data: blob: http: https:',
-].join('; ')
 
 export interface GithubMarker {
   connectionId: string

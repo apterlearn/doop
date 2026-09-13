@@ -19,6 +19,8 @@ desktop shell. Full details in `.context/TECHSTACK.md`, which `.context/INDEX.md
 Always use the `clean-code:typescript` skill when writing or reviewing TypeScript code in this
 repo.
 
+Working rules for agents (verification cost, scope) live in `AGENTS.md` — read it before editing.
+
 ## First-time setup after clone
 
 ```bash

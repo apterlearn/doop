@@ -1,4 +1,5 @@
 import type { Frame } from '../shared/types.ts'
+import { ELEMENT_KEY_SRC, ELEMENT_PATH_SRC } from '../shared/selector.ts'
 import { loadFramePage } from './screenshot.ts'
 
 /**
@@ -52,6 +53,8 @@ const SEMANTIC_TAGS = [
 
 export interface ProbeElement {
   selector: string
+  /** content key: the fallback an anchor uses when its selector goes stale */
+  key: string
   tag: string
   role?: string
   /** the element's visible text (alt text for images), untruncated */
@@ -81,6 +84,11 @@ export interface ProbeElement {
     font: string
     fontSize: string
     fontWeight: string
+    /** computed line-height in px; the lint compares the ratio to fontSize */
+    lineHeight: string
+    /** `none` is normalized to an empty string: a gradient or url() here is
+     *  what makes a contrast measurement unreliable */
+    backgroundImage: string
     borderRadius: string
     margin: string
     padding: string
@@ -89,6 +97,8 @@ export interface ProbeElement {
   fontSizePx: number
   fontWeight: number
   opacity: number
+  /** natural size of an <img>; naturalWidth 0 means the source did not load */
+  image?: { src: string; naturalWidth: number; naturalHeight: number; complete: boolean }
   attrs: {
     id?: string
     alt?: string
@@ -124,6 +134,8 @@ export interface FrameInspection {
   }
   elements: Array<{
     selector: string
+    /** content key: a stable fallback for anchoring when the selector goes stale */
+    key: string
     tag: string
     role?: string
     text?: string
@@ -132,9 +144,68 @@ export interface FrameInspection {
   }>
 }
 
+/** A value and how many elements used it — the raw evidence a design system is
+ *  derived from, before any rounding or top-N trimming. */
+export interface UsageCount {
+  value: string
+  count: number
+}
+
+/** A font the document declared, and whether the browser actually loaded it. */
+export interface ProbeFontFace {
+  family: string
+  status: string
+  weight: string
+  style: string
+}
+
+/** What the page says, as opposed to how it looks: the outline a content check
+ *  reads and a handoff summarises. */
+export interface ProbeContent {
+  title: string
+  description: string
+  headings: { level: number; text: string; selector: string }[]
+  sections: { selector: string; heading?: string; text: string; imageCount: number }[]
+  nav: { text: string; href: string }[]
+  ctas: { text: string; href: string; selector: string }[]
+  forms: { selector: string; fields: { label: string; type: string; name: string }[] }[]
+  images: { src: string; alt: string; width: number; height: number; selector: string }[]
+  truncated: boolean
+}
+
 export interface Probe {
-  document: { title: string; width: number; height: number; htmlChars: number; lang: string }
+  document: {
+    title: string
+    /** meta description (og:description as the fallback) */
+    description: string
+    lang: string
+    viewportMeta: string
+    fonts: ProbeFontFace[]
+    /** families the document asked for that did not load: a measurement taken
+     *  through a fallback is not a measurement of the intended typeface */
+    fontsFailed: string[]
+    width: number
+    height: number
+    htmlChars: number
+  }
   design: FrameInspection['design']
+  designEvidence: {
+    colors: UsageCount[]
+    backgrounds: UsageCount[]
+    fonts: UsageCount[]
+    fontSizes: UsageCount[]
+    fontWeights: UsageCount[]
+    lineHeights: UsageCount[]
+    /** line-height / font-size per element: the ratio a token can hold */
+    leading: UsageCount[]
+    spacing: UsageCount[]
+    radii: UsageCount[]
+    shadows: UsageCount[]
+  }
+  content: ProbeContent
+  /** the frame's own stylesheet text, token block excluded — the interaction
+   *  check reads the rules, not their computed result */
+  cssText: string
   elements: ProbeElement[]
 }
 
@@ -151,6 +222,10 @@ export async function probeFrame(
        serializes the callback without that runtime helper. A tiny in-page
        identity shim keeps the evaluated code independent of the loader. */
     await page.evaluate('globalThis.__name = (target) => target')
+    /* install the shared selector algorithm: the same source the parent page
+       and the frame runtime use, so an agent's selector matches a human's */
+    await page.evaluate(ELEMENT_PATH_SRC)
+    await page.evaluate(ELEMENT_KEY_SRC)
     const probed = await page.evaluate(
       (limits: {
         maxElements: number
@@ -175,23 +250,16 @@ export async function probeFrame(
           )
         }
 
+        /* the shared selector algorithm, installed into this page by
+           probeFrame (shared/selector.ts) */
         function selectorFor(el: Element): string {
-          if (el.id && el.id.length < 80) return `#${CSS.escape(el.id)}`
-          const parts: string[] = []
-          let node: Element | null = el
-          while (node && node !== document.body && parts.length < 7) {
-            const tag = node.tagName.toLowerCase()
-            const parent: Element | null = node.parentElement
-            if (!parent) {
-              parts.unshift(tag)
-              break
-            }
-            const sameTag = Array.from(parent.children).filter((child: Element) => child.tagName === node!.tagName)
-            const suffix = sameTag.length > 1 ? `:nth-of-type(${sameTag.indexOf(node) + 1})` : ''
-            parts.unshift(tag + suffix)
-            node = parent
-          }
-          return `body > ${parts.join(' > ')}`
+          return (globalThis as unknown as { doopElementPath: (el: Element) => string }).doopElementPath(el)
+        }
+
+        /* the element's content key, the fallback an anchor uses when its
+           positional selector goes stale (shared/selector.ts) */
+        function keyFor(el: Element): string {
+          return (globalThis as unknown as { doopElementKey: (el: Element) => string }).doopElementKey(el)
         }
 
         function cleanText(value: string | null | undefined): string | undefined {
@@ -249,6 +317,10 @@ export async function probeFrame(
           backgrounds: new Map<string, number>(),
           fonts: new Map<string, number>(),
           fontSizes: new Map<string, number>(),
+          fontWeights: new Map<string, number>(),
+          lineHeights: new Map<string, number>(),
+          leading: new Map<string, number>(),
+          spacing: new Map<string, number>(),
           radii: new Map<string, number>(),
           shadows: new Map<string, number>(),
         }
@@ -263,6 +335,27 @@ export async function probeFrame(
           bump(counts.backgrounds, normalizedColor(style.backgroundColor))
           bump(counts.fonts, style.fontFamily)
           bump(counts.fontSizes, style.fontSize)
+          bump(counts.fontWeights, style.fontWeight)
+          if (style.lineHeight !== 'normal') bump(counts.lineHeights, style.lineHeight)
+          /* the leading ratio is only knowable where both values are in hand:
+             counting sizes and line-heights separately loses the pairing */
+          {
+            const sizePx = parseFloat(style.fontSize)
+            const linePx = parseFloat(style.lineHeight)
+            if (sizePx > 0 && linePx > 0) {
+              const ratio = Math.round((linePx / sizePx) * 100) / 100
+              if (ratio >= 0.5 && ratio <= 3) bump(counts.leading, String(ratio))
+            }
+          }
+          /* the spacing scale a design actually uses: the px values in its
+             margins, paddings and gaps, which is what a token set codifies */
+          for (const value of [style.marginTop, style.marginRight, style.marginBottom, style.marginLeft]) {
+            if (value && value !== '0px' && value.endsWith('px')) bump(counts.spacing, value)
+          }
+          for (const value of [style.paddingTop, style.paddingRight, style.paddingBottom, style.paddingLeft]) {
+            if (value && value !== '0px' && value.endsWith('px')) bump(counts.spacing, value)
+          }
+          if (style.gap && style.gap !== 'normal' && style.gap.endsWith('px')) bump(counts.spacing, style.gap)
           if (style.borderRadius !== '0px') bump(counts.radii, style.borderRadius)
           if (style.boxShadow !== 'none') bump(counts.shadows, style.boxShadow)
         }
@@ -322,7 +415,18 @@ export async function probeFrame(
           }
           return {
             selector: selectorFor(el),
+            key: keyFor(el),
             tag,
+            ...(image
+              ? {
+                  image: {
+                    src: (el as HTMLImageElement).currentSrc || (el as HTMLImageElement).src || '',
+                    naturalWidth: (el as HTMLImageElement).naturalWidth,
+                    naturalHeight: (el as HTMLImageElement).naturalHeight,
+                    complete: (el as HTMLImageElement).complete,
+                  },
+                }
+              : {}),
             role: attr('role'),
             text: image
               ? cleanText(el.getAttribute('alt') || el.getAttribute('aria-label'))
@@ -349,6 +453,10 @@ export async function probeFrame(
               font: style.fontFamily,
               fontSize: style.fontSize,
               fontWeight: style.fontWeight,
+              lineHeight: style.lineHeight,
+              backgroundImage: style.backgroundImage === 'none' ? '' : style.backgroundImage,
+              direction: style.direction,
+              pointerEvents: style.pointerEvents,
               borderRadius: style.borderRadius,
               margin: `${style.marginTop} ${style.marginRight} ${style.marginBottom} ${style.marginLeft}`,
               padding: `${style.paddingTop} ${style.paddingRight} ${style.paddingBottom} ${style.paddingLeft}`,
@@ -380,6 +488,11 @@ export async function probeFrame(
             .sort((a, b) => b[1] - a[1])
             .slice(0, limit)
             .map(([value]) => value)
+        const topCounts = (map: Map<string, number>, limit: number) =>
+          [...map.entries()]
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, limit)
+            .map(([value, count]) => ({ value, count }))
         const rootStyle = getComputedStyle(document.documentElement)
         const cssVariables: Record<string, string> = {}
         for (const name of Array.from(rootStyle)) {
@@ -388,8 +501,161 @@ export async function probeFrame(
           if (value && value.length <= maxCssVariableChars) cssVariables[name] = value
         }
 
+        /* fonts: what the document asked for, and what actually loaded */
+        const fontFaces = Array.from(document.fonts).map((face) => ({
+          family: face.family.replace(/^["']|["']$/g, ''),
+          status: face.status,
+          weight: face.weight,
+          style: face.style,
+        }))
+        const loadedFamilies = new Set(
+          fontFaces.filter((face) => face.status === 'loaded').map((face) => face.family.toLowerCase()),
+        )
+        /* lowercase -> the family as the page wrote it, so the report names it
+           the way a person would search for it */
+        const wantedFamilies = new Map<string, string>()
+        for (const family of counts.fonts.keys()) {
+          /* a computed font-family list: the first family is the one that
+             decides how the text looks */
+          const first = family
+            .split(',')[0]!
+            .replace(/^["']|["']$/g, '')
+            .trim()
+          if (first) wantedFamilies.set(first.toLowerCase(), first)
+        }
+        const generic = new Set([
+          'sans-serif',
+          'serif',
+          'monospace',
+          'system-ui',
+          'cursive',
+          'fantasy',
+          'ui-sans-serif',
+          'ui-serif',
+          'ui-monospace',
+          'ui-rounded',
+          '-apple-system',
+          'blinkmacsystemfont',
+          'segoe ui',
+          'inherit',
+        ])
+        const fontsFailed = [
+          ...fontFaces.filter((face) => face.status === 'error').map((face) => face.family),
+          ...[...wantedFamilies.entries()]
+            .filter(([lower]) => !generic.has(lower) && !loadedFamilies.has(lower))
+            .map(([, original]) => original),
+        ].filter((family, index, all) => all.indexOf(family) === index)
+
+        const clean = (value: string | null | undefined, max = 300) =>
+          (value || '').replace(/\s+/g, ' ').trim().slice(0, max)
+
+        /* the frame's own stylesheet text: the interaction-state check needs
+           the rules, not their computed result */
+        let cssText = ''
+        for (const node of Array.from(document.querySelectorAll('style'))) {
+          if (node.hasAttribute('data-doop-tokens')) continue
+          cssText += (node.textContent || '') + '\n'
+          if (cssText.length > 200000) break
+        }
+
+        /* the content outline: what the page says, separated from how it looks */
+        const headings = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6'))
+          .slice(0, 60)
+          .map((el) => ({
+            level: Number(el.tagName.slice(1)),
+            text: clean(el.textContent, 200),
+            selector: selectorFor(el),
+          }))
+        const sectionNodes = Array.from(document.querySelectorAll('section,main > *,article'))
+          .filter((el) => el.tagName.toLowerCase() !== 'main')
+          .slice(0, 40)
+        const sections = sectionNodes.map((el) => {
+          const heading = el.querySelector('h1,h2,h3,h4,h5,h6')
+          return {
+            selector: selectorFor(el),
+            ...(heading ? { heading: clean(heading.textContent, 200) } : {}),
+            text: clean(el.textContent, 400),
+            imageCount: el.querySelectorAll('img').length,
+          }
+        })
+        const nav = Array.from(document.querySelectorAll('nav a, header a'))
+          .slice(0, 60)
+          .map((el) => ({ text: clean(el.textContent, 80), href: el.getAttribute('href') || '' }))
+        const ctas = Array.from(document.querySelectorAll('a,button'))
+          .filter((el) => clean(el.textContent, 80).length > 0)
+          .slice(0, 40)
+          .map((el) => ({
+            text: clean(el.textContent, 80),
+            href: el.getAttribute('href') || '',
+            selector: selectorFor(el),
+          }))
+        const forms = Array.from(document.querySelectorAll('form'))
+          .slice(0, 10)
+          .map((form) => ({
+            selector: selectorFor(form),
+            fields: Array.from(form.querySelectorAll('input,select,textarea'))
+              .slice(0, 30)
+              .map((field) => {
+                const id = field.getAttribute('id')
+                const label =
+                  (id ? document.querySelector(`label[for="${CSS.escape(id)}"]`)?.textContent : undefined) ||
+                  field.closest('label')?.textContent ||
+                  field.getAttribute('aria-label') ||
+                  ''
+                return {
+                  label: clean(label, 80),
+                  type: field.getAttribute('type') || field.tagName.toLowerCase(),
+                  name: field.getAttribute('name') || '',
+                }
+              }),
+          }))
+        const images = Array.from(document.querySelectorAll('img'))
+          .slice(0, 80)
+          .map((el) => ({
+            src: el.currentSrc || el.getAttribute('src') || '',
+            alt: el.getAttribute('alt') || '',
+            width: el.naturalWidth,
+            height: el.naturalHeight,
+            selector: selectorFor(el),
+          }))
+        const contentTruncated =
+          document.querySelectorAll('h1,h2,h3,h4,h5,h6').length > 60 ||
+          sectionNodes.length > 40 ||
+          document.querySelectorAll('img').length > 80
+
         return {
           title: document.title,
+          description:
+            document.querySelector('meta[name="description"]')?.getAttribute('content')?.trim() ||
+            document.querySelector('meta[property="og:description"]')?.getAttribute('content')?.trim() ||
+            '',
+          viewportMeta: document.querySelector('meta[name="viewport"]')?.getAttribute('content')?.trim() || '',
+          fonts: fontFaces.slice(0, 40),
+          fontsFailed,
+          cssText: cssText.slice(0, 200000),
+          content: {
+            title: document.title,
+            description: document.querySelector('meta[name="description"]')?.getAttribute('content')?.trim() || '',
+            headings,
+            sections,
+            nav,
+            ctas,
+            forms,
+            images,
+            truncated: contentTruncated,
+          },
+          designEvidence: {
+            colors: topCounts(counts.colors, 12),
+            backgrounds: topCounts(counts.backgrounds, 12),
+            fonts: topCounts(counts.fonts, 8),
+            fontSizes: topCounts(counts.fontSizes, 12),
+            fontWeights: topCounts(counts.fontWeights, 8),
+            lineHeights: topCounts(counts.lineHeights, 12),
+            leading: topCounts(counts.leading, 12),
+            spacing: topCounts(counts.spacing, 16),
+            radii: topCounts(counts.radii, 8),
+            shadows: topCounts(counts.shadows, 8),
+          },
           lang: document.documentElement.lang || '',
           design: {
             colors: top(counts.colors, 10),
@@ -415,12 +681,19 @@ export async function probeFrame(
     return {
       document: {
         title: probed.title,
+        description: probed.description,
         lang: probed.lang,
+        viewportMeta: probed.viewportMeta,
+        fonts: probed.fonts,
+        fontsFailed: probed.fontsFailed,
         width: Math.round(opts.viewport?.width ?? frame.width),
         height: Math.round(opts.viewport?.height ?? frame.height),
         htmlChars: frame.html.length,
       },
       design: probed.design,
+      designEvidence: probed.designEvidence,
+      content: probed.content,
+      cssText: probed.cssText,
       elements: probed.elements,
     }
   } finally {
@@ -462,6 +735,7 @@ export function selectInspectionElements(probe: Probe): FrameInspection['element
 
   return candidates.map((el) => ({
     selector: el.selector,
+    key: el.key,
     tag: el.tag,
     role: el.role,
     text: truncate(el.text, 180),

@@ -117,6 +117,8 @@ function element(over: Partial<ProbeElement> & { tag: string; selector: string; 
       font: 'system-ui',
       fontSize: '16px',
       fontWeight: '400',
+      lineHeight: 'normal',
+      backgroundImage: '',
       borderRadius: '0px',
       margin: '0px',
       padding: '0px',
@@ -127,13 +129,53 @@ function element(over: Partial<ProbeElement> & { tag: string; selector: string; 
     opacity: 1,
     attrs: { hiddenFromAT: false, focusable: false, wrappedInLabel: false },
     ...over,
+    /* `over` is a Partial, so the spread makes every field optional in the
+       inferred type; the required ones are restated to keep the result a
+       ProbeElement */
+    key: over.key ?? over.selector,
   }
 }
 
 function probeOf(elements: ProbeElement[]): Probe {
   return {
-    document: { title: 'fixture', lang: 'en', width: 800, height: 600, htmlChars: 100 },
+    document: {
+      title: 'fixture',
+      description: '',
+      lang: 'en',
+      viewportMeta: 'width=device-width, initial-scale=1',
+      fonts: [],
+      fontsFailed: [],
+      width: 800,
+      height: 600,
+      htmlChars: 100,
+    },
     design: { colors: [], backgrounds: [], fonts: [], fontSizes: [], radii: [], shadows: [], cssVariables: {} },
+    /* these fixtures exist to pin the geometry rules, which read `elements`
+       only; the derived-evidence fields are empty on purpose */
+    designEvidence: {
+      colors: [],
+      backgrounds: [],
+      fonts: [],
+      fontSizes: [],
+      fontWeights: [],
+      lineHeights: [],
+      leading: [],
+      spacing: [],
+      radii: [],
+      shadows: [],
+    },
+    content: {
+      title: 'fixture',
+      description: '',
+      headings: [],
+      sections: [],
+      nav: [],
+      ctas: [],
+      forms: [],
+      images: [],
+      truncated: false,
+    },
+    cssText: '',
     elements,
   }
 }
@@ -193,7 +235,7 @@ describe('selectInspectionElements', () => {
     const selected = selectInspectionElements(
       probeOf([element({ tag: 'h1', selector: '#t', top: 10, text: 'Title', role: 'heading' })]),
     )
-    expect(Object.keys(selected[0]!)).toEqual(['selector', 'tag', 'role', 'text', 'rect', 'style'])
+    expect(Object.keys(selected[0]!)).toEqual(['selector', 'key', 'tag', 'role', 'text', 'rect', 'style'])
     expect(Object.keys(selected[0]!.style)).toEqual(['color', 'background', 'font', 'fontSize', 'fontWeight'])
     expect(selected[0]!.role).toBe('heading')
   })

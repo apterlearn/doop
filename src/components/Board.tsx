@@ -12,7 +12,7 @@ import {
   roleById,
   roleName,
 } from '../../shared/agents'
-import type { AgentTask, Frame } from '../../shared/types'
+import type { AgentTask, Frame, TaskUsage } from '../../shared/types'
 import { posthog } from '../lib/posthog'
 import { MeterLine, isResidentLimit, useAllowance } from './TeamAllowance'
 import { Button } from './ui/button'
@@ -57,6 +57,20 @@ const countCls = 'font-mono text-[11px] text-ink-faint'
 const cardBase = 'group relative px-4 py-3.5'
 /* mirrors MAX_CARD_CHARS in server/actions.ts */
 const MAX_CARD_CHARS = 4_000
+/** What a card's run spent, as the provider reported it. Shown on the running
+ *  card so a human watching a long run can see the meter move. */
+function UsageLine({ usage }: { usage: TaskUsage }) {
+  const tokens = usage.input + usage.output + usage.cacheRead + usage.cacheWrite
+  if (tokens === 0) return null
+  return (
+    <div className="mt-1 text-[11px] tabular-nums text-ink-faint">
+      {tokens.toLocaleString()} tokens
+      {usage.cacheRead > 0 && <span> · {usage.cacheRead.toLocaleString()} cached</span>}
+      {usage.model && <span> · {usage.model}</span>}
+    </div>
+  )
+}
+
 const cardH3Cls =
   'line-clamp-8 break-words pr-4 font-display text-[14.5px] font-[650] leading-[1.35] tracking-[-0.01em]'
 const metaCls =
@@ -598,6 +612,7 @@ export function Board({ canvasId }: { canvasId: string }) {
                   <span> · {timeAgo(t.claimedAt ?? t.startedAt)}</span>
                 </div>
                 <TargetChip task={t} frames={frames} />
+                {t.usage && <UsageLine usage={t.usage} />}
                 {t.pausedAt ? (
                   <div className="mt-2.5 flex items-center gap-2.5">
                     <Button

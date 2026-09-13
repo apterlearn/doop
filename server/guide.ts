@@ -212,7 +212,8 @@ version, a pinned reference, another frame or a live URL, and shows you the chan
 
 Prefer targeted fixes over rewrites. Never delete and restart a mostly-good frame — the
 humans watching lose work they may have been reacting to. If you have already made a frame
-worse, revert_frame restores a saved version instead of rebuilding it by hand.
+worse, undo_last_change puts it back the way it was before your last write, and
+revert_frame restores any specific saved version instead of rebuilding it by hand.
 
 ## Design brief — before your first frame
 
@@ -452,10 +453,17 @@ The URL re-renders on change, so an embedded link stays current as the frame ite
   and close it with resolve_comment. Use add_comment to ask a human a question about
   one specific element instead of burying it in a chat message.
 - Keep the SAME agent_name for your whole session. It is your identity in the room.
+- ask_human blocks up to wait_seconds and comes back either answered — with the answer,
+  when the human at your client answered it in their own UI — or status "open" when
+  nobody answered in time. "open" is not a failure and not a reason to ask again: carry
+  on with your best judgement and read the answer later with get_answers. One question
+  per decision, never a polling loop.
 - Every durable frame write is snapshotted: get_frame_history lists the saved versions of
   a frame (newest first, metadata only), get_frame_version reads one in full, and
-  revert_frame restores it. Reach for revert instead of rebuilding a frame that was
-  better before — a revert is an ordinary edit, visible live and versioned itself.
+  revert_frame restores it, and undo_last_change goes straight back to the state
+  before your own last write (undoing one frame, or every frame you touched in the
+  last half hour). Reach for revert or undo instead of rebuilding a frame that was
+  better before — both are ordinary edits, visible live and versioned themselves.
 - Frame writes are conflict-checked. Pass expected_updated_at (the updatedAt you read)
   and a write that would clobber someone else's change comes back as a conflict instead
   of silently winning; re-read and retry. If two agents are working the same frame,

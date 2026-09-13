@@ -2,6 +2,7 @@ import { desc, eq } from 'drizzle-orm'
 import { db } from './db/index.ts'
 import { githubConnections } from './db/schema.ts'
 import * as githubApp from './githubApp.ts'
+import type { GithubConnection } from './github.ts'
 import type { McpErrorCode } from './mcpErrors.ts'
 
 /**
@@ -20,13 +21,18 @@ import type { McpErrorCode } from './mcpErrors.ts'
 
 const GH_API = 'https://api.github.com'
 
+/** GitHub caps `per_page` at 100, so a busy pull request can spill past one
+ *  page. Ten pages is a thousand items — beyond that the read reports itself
+ *  as partial instead of quietly returning half a review. */
+const MAX_PAGES = 10
+
 export interface CommitFilesInput {
   /** "owner/name", as stored on the connection */
   repo: string
   /** the branch to commit to — created from `base` when it does not exist */
   branch: string
-  /** the branch (or commit) the new branch starts from, and the PR target */
-  base: string
+  /** the PR target; defaults to the connection's branch */
+  base?: string
   files: { path: string; content: string }[]
   /** the commit message; its first line becomes the pull request title */
   message: string
@@ -86,8 +92,10 @@ function refPath(branch: string): string {
 
 /** The newest connection for the repo wins: it is the one the user configured
  *  last, and App installations are preferred implicitly by re-minting their
- *  token (which fails loudly when the install is gone). */
-async function credentialFor(repo: string, canvasId?: string): Promise<string> {
+ *  token (which fails loudly when the install is gone). A canvasId narrows the
+ *  lookup to one canvas's connections, so a handoff can never spend a
+ *  credential the caller was never granted. */
+async function connectionFor(repo: string, canvasId?: string): Promise<GithubConnection> {
   const rows = canvasId
     ? await db
         .select()
@@ -100,6 +108,11 @@ async function credentialFor(repo: string, canvasId?: string): Promise<string> {
     throw new GithubWriteError(0, `no GitHub connection for ${repo} — connect the repository to this canvas first`, {
       code: 'unsupported',
     })
+  return conn
+}
+
+/** The credential a connection should spend right now. */
+async function credentialFor(conn: GithubConnection): Promise<string> {
   if (conn.installationId) return githubApp.installationToken(conn.installationId)
   return conn.token!
 }
@@ -108,7 +121,19 @@ async function credentialFor(repo: string, canvasId?: string): Promise<string> {
  *  write names the missing scopes, and an exhausted rate limit reports as 429
  *  so the caller gets a retryable error. */
 async function ghRequest<T>(token: string, method: string, path: string, body?: unknown): Promise<T> {
-  const res = await fetch(GH_API + path, {
+  return (await ghRequestPage<T>(token, method, path, body)).data
+}
+
+/** ghRequest, but keeping the `Link` header: a paginated read needs to know
+ *  whether another page exists. `path` may be absolute, which is the form
+ *  GitHub hands back in that header. */
+async function ghRequestPage<T>(
+  token: string,
+  method: string,
+  path: string,
+  body?: unknown,
+): Promise<{ data: T; link: string | null }> {
+  const res = await fetch(path.startsWith('http') ? path : GH_API + path, {
     method,
     headers: {
       Authorization: `Bearer ${token}`,
@@ -133,7 +158,26 @@ async function ghRequest<T>(token: string, method: string, path: string, body?: 
     if (status === 403) message += ' — the connection needs the contents:write and pull_requests:write permissions'
     throw new GithubWriteError(status, message, { path })
   }
-  return (text ? JSON.parse(text) : undefined) as T
+  return { data: (text ? JSON.parse(text) : undefined) as T, link: res.headers.get('link') }
+}
+
+/** Every page of a paginated list, following `Link: <url>; rel="next"` until
+ *  GitHub stops handing one out or MAX_PAGES is reached. `truncated` says the
+ *  cap cut the read short, so a caller never mistakes a partial list for the
+ *  whole thing. */
+async function ghRequestAll<T>(token: string, path: string): Promise<{ items: T[]; truncated: boolean }> {
+  const items: T[] = []
+  let next: string | undefined = path
+  for (let page = 0; next && page < MAX_PAGES; page++) {
+    const { data, link } = await ghRequestPage<T[]>(token, 'GET', next)
+    items.push(...data)
+    const header: string = link ?? ''
+    next = header
+      .split(',')
+      .map((part: string) => /<([^>]+)>\s*;\s*rel="next"/.exec(part)?.[1])
+      .find((url: string | undefined) => url !== undefined)
+  }
+  return { items, truncated: next !== undefined }
 }
 
 interface RefResponse {
@@ -197,14 +241,142 @@ async function openPullRequest(
   }
 }
 
+/** A comment or review on a pull request, as the handoff reads it back. */
+export interface PullRequestComment {
+  id: number
+  author: string
+  body: string
+  /** file the comment is attached to; absent on a conversation comment */
+  path?: string
+  /** line in the file's new version, when GitHub supplies one */
+  line?: number
+  createdAt: string
+  /** the commit the comment was made against */
+  commitId?: string
+  /** API URL of the comment itself */
+  url: string
+}
+
+export interface PullRequestReview {
+  author: string
+  state: string
+  body: string
+  submittedAt?: string
+}
+
+export interface PullRequestReviewSummary {
+  number: number
+  title: string
+  state: string
+  url: string
+  head: string
+  base: string
+  /** conversation comments, then inline review comments, then reviews */
+  comments: PullRequestComment[]
+  reviews: PullRequestReview[]
+  /** files the pull request touches */
+  files: string[]
+  /** true when a list hit the pagination cap and the read is partial */
+  truncated?: boolean
+}
+
+interface GithubCommentResponse {
+  id: number
+  user?: { login?: string } | null
+  body?: string | null
+  path?: string
+  line?: number | null
+  original_line?: number | null
+  created_at?: string
+  commit_id?: string
+  html_url?: string
+}
+
+function toComment(raw: GithubCommentResponse): PullRequestComment {
+  const line = raw.line ?? raw.original_line ?? undefined
+  return {
+    id: raw.id,
+    author: raw.user?.login ?? 'unknown',
+    body: raw.body ?? '',
+    ...(raw.path ? { path: raw.path } : {}),
+    ...(line === undefined || line === null ? {} : { line }),
+    createdAt: raw.created_at ?? '',
+    ...(raw.commit_id ? { commitId: raw.commit_id } : {}),
+    url: raw.html_url ?? '',
+  }
+}
+
+/** Everything a reviewer said about a pull request: the conversation, the
+ *  inline comments and the review verdicts. Read-only, and scoped to the same
+ *  canvas connection `open_pull_request` wrote through. */
+export async function readPullRequest(
+  repo: string,
+  pull: number,
+  canvasId?: string,
+): Promise<PullRequestReviewSummary> {
+  const normalized = normalizeRepo(repo)
+  if (!Number.isInteger(pull) || pull <= 0)
+    throw new GithubWriteError(0, 'pull must be a pull request number', { code: 'invalid_input' })
+  const conn = await connectionFor(normalized, canvasId)
+  /* the same resolution commitFiles uses: a connection may carry an
+     installation instead of a stored token, and the token column is nullable */
+  const token = await credentialFor(conn)
+  const base = `/repos/${normalized}/pulls/${pull}`
+  const [detail, issueComments, reviewComments, reviews, files] = await Promise.all([
+    ghRequest<{
+      number: number
+      title: string
+      state: string
+      html_url: string
+      head?: { ref?: string }
+      base?: { ref?: string }
+    }>(token, 'GET', base),
+    /* the conversation lives on the issue behind the pull request */
+    ghRequestAll<GithubCommentResponse>(token, `/repos/${normalized}/issues/${pull}/comments?per_page=100`),
+    /* the inline comments on the diff */
+    ghRequestAll<GithubCommentResponse>(token, `/repos/${normalized}/pulls/${pull}/comments?per_page=100`),
+    ghRequestAll<{ user?: { login?: string } | null; state?: string; body?: string | null; submitted_at?: string }>(
+      token,
+      `${base}/reviews?per_page=100`,
+    ),
+    ghRequestAll<{ filename: string }>(token, `${base}/files?per_page=100`),
+  ])
+  const truncated = [issueComments, reviewComments, reviews, files].some((page) => page.truncated)
+  return {
+    number: detail.number,
+    title: detail.title,
+    state: detail.state,
+    url: detail.html_url,
+    head: detail.head?.ref ?? '',
+    base: detail.base?.ref ?? '',
+    comments: [...issueComments.items.map(toComment), ...reviewComments.items.map(toComment)].sort((a, b) =>
+      a.createdAt.localeCompare(b.createdAt),
+    ),
+    reviews: reviews.items.map((review) => ({
+      author: review.user?.login ?? 'unknown',
+      state: review.state ?? '',
+      body: review.body ?? '',
+      ...(review.submitted_at ? { submittedAt: review.submitted_at } : {}),
+    })),
+    files: files.items.map((file) => file.filename),
+    ...(truncated ? { truncated: true } : {}),
+  }
+}
+
 /** Commit `files` to `branch` (creating it from `base` when missing) and open
  *  a pull request against `base`. */
 export async function commitFiles(input: CommitFilesInput): Promise<CommitFilesResult> {
   const repo = normalizeRepo(input.repo)
   const branch = input.branch.trim()
-  const base = input.base.trim()
   if (!branch) throw new GithubWriteError(0, 'branch is required', { code: 'invalid_input' })
-  if (!base) throw new GithubWriteError(0, 'base is required', { code: 'invalid_input' })
+  if (input.files.length === 0) throw new GithubWriteError(0, 'no files to commit', { code: 'invalid_input' })
+  if (input.files.some((file) => !file.path || file.path.startsWith('/')))
+    throw new GithubWriteError(0, 'file paths must be relative repository paths', { code: 'invalid_input' })
+
+  const conn = await connectionFor(repo, input.canvasId)
+  /* The connection's branch is the repo's default branch unless the user
+     pinned another one when connecting — never a hard-coded "main". */
+  const base = input.base?.trim() || conn.branch || 'main'
   if (branch === base)
     throw new GithubWriteError(
       0,
@@ -213,11 +385,7 @@ export async function commitFiles(input: CommitFilesInput): Promise<CommitFilesR
         code: 'invalid_input',
       },
     )
-  if (input.files.length === 0) throw new GithubWriteError(0, 'no files to commit', { code: 'invalid_input' })
-  if (input.files.some((file) => !file.path || file.path.startsWith('/')))
-    throw new GithubWriteError(0, 'file paths must be relative repository paths', { code: 'invalid_input' })
-
-  const token = await credentialFor(repo, input.canvasId)
+  const token = await credentialFor(conn)
   const baseCommit = await refCommit(token, repo, base)
   if (!baseCommit) throw new GithubWriteError(404, `base branch "${base}" not found in ${repo}`, { path: 'refs/heads' })
   /* base_tree needs a tree sha; the commit object carries it next to the sha

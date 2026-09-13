@@ -7,6 +7,7 @@ import { store } from './store.ts'
 import * as actions from './actions.ts'
 import type { Frame } from '../shared/types.ts'
 import { MAX_FRAME_HTML_BYTES } from './limits.ts'
+import { SNAPSHOT_CSP } from './snapshotCsp.ts'
 
 /**
  * Design sync: a PostHog-style snippet (public/doop-sync.js) embedded in an
@@ -68,23 +69,6 @@ export async function deleteSyncKey(canvasId: string, id: string): Promise<boole
 }
 
 /* ------------------------------------------------------------------ */
-
-/** Same lockdown the website importer stamps on its captures. Duplicated from
- *  importer.ts on purpose: this path must not load the Chromium-adjacent
- *  importer module, and the two snapshots want identical policies. */
-const SNAPSHOT_CSP = [
-  "default-src 'none'",
-  "script-src 'none'",
-  "connect-src 'none'",
-  "object-src 'none'",
-  "frame-src 'none'",
-  "worker-src 'none'",
-  "form-action 'none'",
-  "style-src 'unsafe-inline'",
-  'img-src data: blob: http: https:',
-  'font-src data: http: https:',
-  'media-src data: blob: http: https:',
-].join('; ')
 
 const SYNC_PAGE_META = 'doop-sync-page'
 

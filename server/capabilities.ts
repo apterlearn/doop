@@ -1,8 +1,9 @@
 import { findBrowserPath } from './screenshot.ts'
 import { contextDevConfigured } from './contextDev.ts'
-import { MAX_FRAME_HTML_BYTES } from './limits.ts'
+import { IMPORTS_PER_MIN, MAX_FRAME_HTML_BYTES, RENDERS_PER_MIN, SEARCHES_PER_MIN, UPLOADS_PER_MIN } from './limits.ts'
 import { MAX_ASSET_BYTES } from './assets.ts'
-import { listConnections, type GithubConnection } from './github.ts'
+import { listAllConnections, type GithubConnection } from './github.ts'
+import { dailyTokenCap, runTokenBudget } from './runBudget.ts'
 
 /**
  * Which optional integrations are actually live on THIS server. Agents fail
@@ -24,13 +25,12 @@ export interface ServerCapabilities {
     searches_per_min: number
     uploads_per_min: number
     imports_per_min: number
+    /** tokens one resident run may spend before it stops at a turn boundary */
+    run_token_budget: number
+    /** tokens one account may spend per day; null when uncapped */
+    account_daily_tokens: number | null
   }
 }
-
-const RENDERS_PER_MIN = 60
-const SEARCHES_PER_MIN = 20
-const UPLOADS_PER_MIN = 12
-const IMPORTS_PER_MIN = 10
 
 /** The chromium probe is expensive; ask once per process. */
 let screenshotCache: Promise<boolean> | undefined
@@ -53,15 +53,15 @@ export async function capabilities(): Promise<ServerCapabilities> {
       searches_per_min: SEARCHES_PER_MIN,
       uploads_per_min: UPLOADS_PER_MIN,
       imports_per_min: IMPORTS_PER_MIN,
+      run_token_budget: runTokenBudget(),
+      account_daily_tokens: dailyTokenCap() ?? null,
     },
   }
 }
 
 /** GitHub surface: the App (installation tokens), a stored PAT, or nothing. */
 async function githubMode(): Promise<'app' | 'pat' | 'none'> {
-  const conns = await listConnections('').catch(() => [] as GithubConnection[])
+  const conns = await listAllConnections().catch(() => [] as GithubConnection[])
   if (!conns.length) return 'none'
   return conns.some((c) => c.installationId) ? 'app' : 'pat'
 }
-
-export const LIMITS = { RENDERS_PER_MIN, SEARCHES_PER_MIN, UPLOADS_PER_MIN, IMPORTS_PER_MIN }

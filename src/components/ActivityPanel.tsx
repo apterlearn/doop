@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import type { AgentTask } from '../../shared/types'
+import type { AgentPlan, AgentTask, PlanStep } from '../../shared/types'
 import { useStore } from '../lib/store'
 import { api, type ConnectedAgent } from '../lib/api'
 import { timeAgo } from '../lib/time'
@@ -7,6 +7,8 @@ import { cn } from '@/lib/utils'
 import { AgentIcon } from './AgentIcon'
 import { MemoryPanel } from './MemoryPanel'
 import { ReviewPanel } from './ReviewPanel'
+import { TokensPanel } from './TokensPanel'
+import { ChecksPanel } from './ChecksPanel'
 import { RunPanel } from './RunPanel'
 import { Panel, PanelBody, PanelHeader, PanelTab, PanelTabPanel, PanelTabs, PanelTabsRoot } from './ui/panel'
 import { Button } from './ui/button'
@@ -15,6 +17,7 @@ import { PanelCollapseRightIcon } from './ui/icons'
 import { Input } from './ui/input'
 import { Dot } from './ui/dot'
 import { isResidentLimit } from './TeamAllowance'
+import { ListMeta, ListSection } from './ui/list'
 
 const emptyNote = 'px-4 py-6 text-center text-[13px] text-ink-faint'
 
@@ -65,8 +68,17 @@ export function ActivityPanel({
             >
               Memory
             </PanelTab>
+            <PanelTab
+              value="tokens"
+              title="The canvas design system — palette, type and scales every frame renders with"
+            >
+              Tokens
+            </PanelTab>
             <PanelTab value="review" title="Agent changes waiting for your approval, and their questions">
               Review
+            </PanelTab>
+            <PanelTab value="checks" title="What the automated quality checks found on each frame">
+              Checks
             </PanelTab>
             <PanelTab value="run" title="What the agent did, tool call by tool call">
               Run
@@ -93,8 +105,14 @@ export function ActivityPanel({
         <PanelTabPanel value="activity">
           <ActivityList />
         </PanelTabPanel>
+        <PanelTabPanel value="tokens">
+          <TokensPanel />
+        </PanelTabPanel>
         <PanelTabPanel value="review">
           <ReviewPanel />
+        </PanelTabPanel>
+        <PanelTabPanel value="checks">
+          <ChecksPanel />
         </PanelTabPanel>
         <PanelTabPanel value="run">
           <RunPanel />
@@ -142,11 +160,116 @@ function TaskList() {
 
   return (
     <PanelBody className="pt-1 pb-3">
+      <PlansSection />
       {groups.map(([key, list]) => (
         <TaskGroup key={key} list={list} />
       ))}
     </PanelBody>
   )
+}
+
+/* Every plan published on this canvas, in full — the task rows show only the
+   active step, which is enough to see progress but not enough to see what the
+   agent said it would do, or where it got stuck. */
+function PlansSection() {
+  const canvasId = useStore((s) => s.canvas?.id)
+  const plans = useStore((s) => s.plans)
+  const setPlans = useStore((s) => s.setPlans)
+
+  /* the ws stream carries plan events; this fills in plans published before
+     this client joined, or while it was on another canvas */
+  useEffect(() => {
+    if (!canvasId) return
+    let live = true
+    api
+      .plans(canvasId)
+      .then((rows) => {
+        if (!live) return
+        /* a plan broadcast can land between the request and this response, so
+           merge by recency instead of replacing the live array with a snapshot
+           taken before it */
+        const byAgent = new Map<string, AgentPlan>(
+          useStore.getState().plans.map((plan) => [`${plan.canvasId}:${plan.agentName}`, plan]),
+        )
+        for (const row of rows) {
+          const key = `${row.canvasId}:${row.agentName}`
+          const current = byAgent.get(key)
+          if (!current || row.updatedAt >= current.updatedAt) byAgent.set(key, row)
+        }
+        setPlans([...byAgent.values()])
+      })
+      .catch(console.error)
+    return () => {
+      live = false
+    }
+  }, [canvasId, setPlans])
+
+  if (plans.length === 0) return null
+
+  return (
+    <>
+      <ListSection>Plans</ListSection>
+      {plans.map((plan) => (
+        <div key={`${plan.canvasId}:${plan.agentName}`} className="border-b border-line-soft px-4 py-[9px]">
+          <div className="flex items-center gap-2 text-[12.5px] font-bold">
+            <AgentIcon name={plan.agentName} />
+            {plan.agentName}
+            <ListMeta className="ml-auto font-normal">
+              {plan.steps.filter((step) => step.status === 'done').length}/{plan.steps.length} ·{' '}
+              {timeAgo(plan.updatedAt)}
+            </ListMeta>
+          </div>
+          <ol className="mt-1.5 flex flex-col gap-1">
+            {plan.steps.map((step) => (
+              <li key={step.id} className="flex items-start gap-1.5 text-[12px] leading-[1.45]">
+                <span className={cn('mt-[3px] flex-none font-mono text-[10px]', PLAN_MARK[step.status])}>
+                  {PLAN_GLYPH[step.status]}
+                </span>
+                <span className="min-w-0">
+                  <span
+                    className={cn(
+                      step.status === 'done' && 'text-ink-faint line-through',
+                      step.status === 'active' && 'font-semibold',
+                      step.status === 'blocked' && 'font-semibold text-accent-ink',
+                      step.status === 'pending' && 'text-ink-soft',
+                    )}
+                  >
+                    {step.text}
+                  </span>
+                  {step.note && (
+                    <span
+                      className={cn(
+                        'mt-0.5 block text-[11.5px]',
+                        step.status === 'blocked' ? 'text-accent-ink' : 'text-ink-faint',
+                      )}
+                    >
+                      {step.note}
+                    </span>
+                  )}
+                </span>
+              </li>
+            ))}
+          </ol>
+        </div>
+      ))}
+    </>
+  )
+}
+
+/* A blocked step is the one a human has to act on, so it reads as an alert
+   rather than as one more pending line. */
+const PLAN_GLYPH: Record<PlanStep['status'], string> = {
+  pending: '○',
+  active: '◐',
+  done: '✓',
+  blocked: '!',
+}
+
+const PLAN_MARK: Record<PlanStep['status'], string> = {
+  pending: 'text-ink-faint',
+  active: 'text-brand',
+  done: 'text-ink-faint',
+  blocked: 'text-accent-ink',
 }
 
 /* Long histories collapse to the latest few per agent — the panel is a

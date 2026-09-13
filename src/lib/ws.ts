@@ -99,6 +99,7 @@ function handle(msg: ServerMessage) {
       s.setQuestions(msg.questions)
       s.setReviewModeLocal(msg.reviewMode)
       s.setRunEvents(msg.runEvents)
+      s.setFrameLocks(msg.frameLocks ?? {})
       break
     case 'presence:join':
       if (msg.presence.clientId !== me) s.upsertPresence(msg.presence)
@@ -140,7 +141,11 @@ function handle(msg: ServerMessage) {
       if (msg.actor.clientId !== me && !s.streams[msg.frame.id]) s.flash(msg.frame.id, msg.actor.color)
       break
     case 'frame:streaming':
-      s.setStream(msg.frameId, msg.active ? { name: msg.actor.name, color: msg.actor.color } : null)
+      s.setStream(
+        msg.frameId,
+        msg.active ? { name: msg.actor.name, color: msg.actor.color, isAgent: msg.actor.kind === 'agent' } : null,
+        msg.reason,
+      )
       break
     case 'frame:deleted':
       s.removeFrame(msg.frameId)

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useStore, visibleFrames } from '../lib/store'
 import { FRAME_BOOTSTRAP } from '../lib/frameRuntime'
+import { withTokenStyle } from '../../shared/tokens'
 import { Button } from './ui/button'
 import { XIcon } from './ui/icons'
 
@@ -25,7 +26,9 @@ export function PresentMode({ frameId, onClose }: { frameId: string; onClose: ()
     return () => window.removeEventListener('message', onMsg)
   }, [onClose])
 
-  const html = frame?.html ?? ''
+  /* presented the same way the canvas shows it: tokens bound at render time */
+  const tokens = useStore((s) => s.canvas?.tokens)
+  const html = useMemo(() => withTokenStyle(frame?.html ?? '', tokens), [frame?.html, tokens])
   useEffect(() => {
     if (!ready) return
     iframeRef.current?.contentWindow?.postMessage({ type: 'doop:html', html }, '*')

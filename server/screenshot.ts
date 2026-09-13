@@ -1,6 +1,8 @@
 import fs from 'node:fs'
 import puppeteer, { type Browser, type Page } from 'puppeteer-core'
-import type { Frame } from '../shared/types.ts'
+import type { DesignTokens, Frame } from '../shared/types.ts'
+import { withTokenStyle } from '../shared/tokens.ts'
+import { store } from './store.ts'
 import { guardPublicPageRequests } from './publicUrl.ts'
 
 /**
@@ -146,10 +148,15 @@ export const VIEWPORTS = {
 export type DeviceName = keyof typeof VIEWPORTS
 
 /** Load a frame into an isolated page. The viewport override is how the same
- *  design gets checked at a phone width without resizing the frame itself. */
+ *  design gets checked at a phone width without resizing the frame itself.
+ *
+ *  The canvas's design tokens are bound into the document here, at render
+ *  time: every screenshot, lint, review, diff and export sees the same token
+ *  values the browser shows, and no frame's stored HTML is touched. Pass
+ *  `tokens: null` to render the frame's own document verbatim. */
 export async function loadFramePage(
   frame: Frame,
-  opts: { viewport?: { width: number; height: number } } = {},
+  opts: { viewport?: { width: number; height: number }; tokens?: DesignTokens | null } = {},
 ): Promise<IsolatedPage> {
   const loaded = await openIsolatedPage()
   const { page } = loaded
@@ -165,13 +172,25 @@ export async function loadFramePage(
       height: Math.max(1, Math.min(Math.round(opts.viewport?.height ?? frame.height), 4000)),
       deviceScaleFactor: 1,
     })
+    const tokens = opts.tokens === undefined ? store.getCanvas(frame.canvasId)?.tokens : opts.tokens
     try {
-      await page.setContent(frame.html || '<!doctype html><html><body></body></html>', {
+      await page.setContent(withTokenStyle(frame.html || '<!doctype html><html><body></body></html>', tokens), {
         waitUntil: 'load',
         timeout: 8000,
       })
     } catch {
       /* Slow external resources: inspect whatever has rendered. */
+    }
+    /* Web fonts load after `load`, so a probe or screenshot taken straight away
+       measures the fallback face and reports text that reflows a moment later.
+       Wait for the font set, but never longer than 3s: a dead font CDN must
+       not hold a render hostage — the probe reports which families failed. */
+    try {
+      await page.evaluate(() =>
+        Promise.race([document.fonts.ready, new Promise((resolve) => setTimeout(resolve, 3000))]),
+      )
+    } catch {
+      /* no font API, or the page navigated away — carry on */
     }
     await new Promise((resolve) => setTimeout(resolve, 120))
     return loaded

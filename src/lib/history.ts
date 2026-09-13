@@ -46,7 +46,16 @@ function push(entry: Entry) {
 }
 
 function snapshot(f: Frame): Snapshot {
-  return { canvasId: f.canvasId, name: f.name, html: f.html, x: f.x, y: f.y, width: f.width, height: f.height, pageId: f.pageId }
+  return {
+    canvasId: f.canvasId,
+    name: f.name,
+    html: f.html,
+    x: f.x,
+    y: f.y,
+    width: f.width,
+    height: f.height,
+    pageId: f.pageId,
+  }
 }
 
 type UpdateEntry = Extract<Entry, { type: 'update' }>

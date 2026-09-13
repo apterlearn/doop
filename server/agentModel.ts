@@ -51,10 +51,16 @@ export interface AgentTurnResult {
   usage: TurnUsage
 }
 
-/** Usage the [OI]-shaped transports do not report: openaiAgent.ts's TurnResult
- *  carries only content and stop_reason, so a turn there accounts as zero
- *  rather than as an invented number. Shared, treated as immutable. */
+/** Usage for a turn whose provider reported none: openaiAgent.ts's TurnResult
+ *  omits `usage` when the response carried no usage block, and a turn is then
+ *  accounted as zero rather than as an invented number. Shared, treated as
+ *  immutable. */
 const NO_USAGE: TurnUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+
+/** The [OI]-shaped transports report usage when the response carries it. */
+function reportedUsage(result: { usage?: TurnUsage }): TurnUsage {
+  return result.usage ?? NO_USAGE
+}
 
 export interface AgentModel {
   provider: Provider
@@ -167,7 +173,7 @@ function azureTier(): AgentModel | null {
           maxTokens: req.maxTokens,
           signal: req.signal,
         })
-        return { ...result, usage: NO_USAGE }
+        return { ...result, usage: reportedUsage(result) }
       } catch (err) {
         /* these are the SERVER's credentials — "reconnect your account" would
            send users chasing a connection they don't have */
@@ -242,7 +248,7 @@ function byoModel(account: ModelAccount): AgentModel {
         maxTokens: req.maxTokens,
         signal: req.signal,
       })
-      return { ...result, usage: NO_USAGE }
+      return { ...result, usage: reportedUsage(result) }
     },
   }
 }

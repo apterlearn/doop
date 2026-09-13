@@ -6,6 +6,8 @@
  * panel and an outline in the frame refer to the same element.
  */
 
+import { elementPathOf } from '../../shared/selector'
+
 export type LayerKind = 'box' | 'text' | 'image' | 'svg'
 
 export interface LayerNode {
@@ -23,28 +25,10 @@ export interface LayerNode {
 const HIDDEN_TAGS = new Set(['SCRIPT', 'STYLE', 'LINK', 'META', 'TITLE', 'NOSCRIPT', 'TEMPLATE', 'BR', 'WBR'])
 const IMAGE_TAGS = new Set(['IMG', 'PICTURE', 'VIDEO', 'CANVAS'])
 
-function escapeIdent(id: string): string {
-  return typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(id) : id
-}
-
-/** Mirror of the runtime's cssPath — keep the two in lockstep. */
-export function elementPath(el: Element): string {
-  const parts: string[] = []
-  let cur: Element | null = el
-  while (cur && cur !== cur.ownerDocument.documentElement) {
-    if (cur.id) {
-      parts.unshift('#' + escapeIdent(cur.id))
-      break
-    }
-    let nth = 1
-    for (let s = cur.previousElementSibling; s; s = s.previousElementSibling) {
-      if (s.tagName === cur.tagName) nth++
-    }
-    parts.unshift(`${cur.tagName.toLowerCase()}:nth-of-type(${nth})`)
-    cur = cur.parentElement
-  }
-  return parts.join(' > ')
-}
+/** Re-exported under the name the panel has always used: the algorithm itself
+ *  is shared with the frame runtime and the server (shared/selector.ts), so a
+ *  row here and an element there are the same element. */
+export const elementPath = elementPathOf
 
 /** The nodes above the one with `selector`, outermost first — the rows that
  *  must be open for its row to show. Walked on the tree rather than derived

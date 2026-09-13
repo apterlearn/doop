@@ -2,8 +2,10 @@ import type Anthropic from '@anthropic-ai/sdk'
 import { nanoid } from 'nanoid'
 import { store } from './store.ts'
 import { ModelAuthError, pickModel } from './agentModel.ts'
+import type { AgentModel } from './agentModel.ts'
 import * as runLog from './runLog.ts'
-import { reviewFrame, type ReviewReport } from './review.ts'
+import * as persist from './db/persist.ts'
+import { reportIsCurrent, reviewFrame, reviewToRecord, type ReviewReport } from './review.ts'
 import * as plans from './plans.ts'
 import * as agentEvents from './agentEvents.ts'
 import { RESIDENT_TASK_LIMIT } from './allowance.ts'
@@ -12,6 +14,8 @@ import * as frameLocks from './frameLocks.ts'
 import { MAX_HTML_READ_CHARS, readFrameHtml, renderFrame } from './screenshot.ts'
 import { inspectFrame } from './domProbe.ts'
 import { AGENT_ROLES, DEFAULT_ROLE_ID, roleById, roleByAgentName, roleName } from '../shared/agents.ts'
+import { feedbackAbout, feedbackBlock, injectFeedback } from './feedbackText.ts'
+import * as runBudget from './runBudget.ts'
 import type { AgentRole } from '../shared/agents.ts'
 import * as imageSearch from './imageSearch.ts'
 import * as backgrounds from './backgrounds.ts'
@@ -21,7 +25,7 @@ import { viewWebsite, referencedUrls } from './website.ts'
 import { createImportedWebpageFrame, findImportedWebpageFrame } from './webpageImport.ts'
 import { DESIGN_BRIEF, DESIGN_QUALITY } from './guide.ts'
 import { describeInspiration, INSPIRATION_USAGE_NOTE, searchInspiration } from './inspiration.ts'
-import type { Frame } from '../shared/types.ts'
+import type { Frame, TaskFeedback } from '../shared/types.ts'
 import { websiteAccessErrorMessage } from './websiteAccess.ts'
 import { executeGuardedBatch } from './guardedBatch.ts'
 import { runRepoCards } from './githubRecon.ts'
@@ -54,6 +58,11 @@ const MAX_SWEEP_RUNS = 24
 const LARGE_HTML_CHARS = 60_000
 const MAX_REWRITE_CHUNK_CHARS = 12_000
 const MAX_REWRITE_CHARS = 100_000
+
+/* the tools the resident loop below actually registers — the shared feedback
+   wording names them, and naming the MCP surface's instead would send the
+   model to tools it does not have */
+const RESIDENT_FEEDBACK_TOOLS = { locate: 'inspect_frame / get_frame_html', review: 'screenshot_frame' }
 
 /* one run per canvas at a time; feedback arriving mid-run queues a re-run */
 const running = new Set<string>()
@@ -164,24 +173,37 @@ interface RunState {
   blockedWebsiteAccess?: string
   /** review_frame output per deliverable frame — the automated quality gate */
   reviewedFrames: Map<string, ReviewReport>
+  /** writes filed as proposals instead of landing: on a review-mode canvas
+   *  they are the run's deliverable, so they count as a change */
+  proposals: number
 }
 
 function deliverableFrameIds(runState: RunState): string[] {
   return [...runState.mutatedFrames].filter((id) => !runState.sourceFrames.has(id))
 }
 
-/** The first deliverable frame whose automated review still fails, with a
- *  human-readable reason. Absent review means it has not been checked yet. */
+/** The first deliverable frame whose automated review is missing, stale, or
+ *  failing — with a reason the model can act on.
+ *
+ *  A report is only evidence about the document it was made from, so a frame
+ *  edited after its review counts as unreviewed. Without that check, reviewing
+ *  early and editing afterwards passed the gate. */
 function failedReview(runState: RunState): { frameId: string; detail: string } | undefined {
   for (const id of deliverableFrameIds(runState)) {
     const report = runState.reviewedFrames.get(id)
     if (!report) return { frameId: id, detail: 'no review_frame report yet' }
-    const s = report.summary
-    if (s.critical > 0 || s.errors > 0 || s.off_token > 0)
+    const frame = store.getFrame(id)
+    if (frame && !reportIsCurrent(report, frame, store.getCanvas(frame.canvasId)?.tokens))
+      return { frameId: id, detail: 'the frame changed after it was reviewed — re-run review_frame' }
+    if (report.verdict === 'fail' || report.blocking.length) {
+      const worst = report.blocking.slice(0, 4).map((finding) => `${finding.rule} at ${finding.selector}`)
       return {
         frameId: id,
-        detail: `${s.critical} critical a11y, ${s.errors} layout errors, ${s.off_token} off-token colors`,
+        detail: worst.length
+          ? worst.join('; ')
+          : `${report.summary.critical} critical a11y, ${report.summary.errors} layout errors`,
       }
+    }
   }
   return undefined
 }
@@ -262,6 +284,19 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
   }
   const actor = actions.resolveActor({ name: role.name, kind: 'agent' })
 
+  /* A capped account must not pay for work it cannot finish: refuse the run
+     before anything is claimed, so the card stays queued for a human. */
+  const accountKey = model.userId ?? payer ?? 'server'
+  const capped = runBudget.dailyCapReached(accountKey)
+  if (capped) {
+    const reason = `Daily budget reached — this account has spent ${capped.spent.toLocaleString()} of ${capped.cap.toLocaleString()} tokens today. Raise DOOP_ACCOUNT_DAILY_TOKENS or retry tomorrow.`
+    for (const f of actions.takeFeedbackFor(canvasId, role.name, payer)) actions.failTaskFeedback(f.id, reason)
+    for (const c of actions.takeAgentCommentsFor(canvasId, role.name, payer)) actions.failComment(c.id, reason)
+    for (const c of actions.takeQueuedCardsFor(canvasId, role.name, payer)) actions.failCard(canvasId, c.id, reason)
+    stalled.add(payer)
+    return 'no-model'
+  }
+
   /* claim this agent's open work — the UI flips to "picked up" instantly.
      Claiming happens before the try so an agent with nothing to do never
      shows up in presence. */
@@ -290,10 +325,31 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
      is shorter than a big generation turn */
   const heartbeat = setInterval(() => actions.heartbeatAgent(canvasId, actor), 15_000)
 
+  /* what this run has spent, and the ceiling it stops at. The repo runner
+     drives the model itself, so its tokens are counted beside the loop's:
+     recon and sketch work bills the same account and counts against the same
+     budget. */
+  let usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+  const repoUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+  const spentTokens = () => runBudget.tokensUsed(usage) + runBudget.tokensUsed(repoUsage)
+  const runBudgetTokens = runBudget.runTokenBudget()
+  let budgetReached = false
+
   if (repoCards.length > 0) {
+    const counted: AgentModel = {
+      ...model,
+      run: async (request) => {
+        const result = await model.run(request)
+        repoUsage.input += result.usage.input
+        repoUsage.output += result.usage.output
+        repoUsage.cacheRead += result.usage.cacheRead
+        repoUsage.cacheWrite += result.usage.cacheWrite
+        return result
+      },
+    }
     if (!abort.signal.aborted) {
       try {
-        await runRepoCards(canvasId, repoCards, model, actor, abort.signal)
+        await runRepoCards(canvasId, repoCards, counted, actor, abort.signal)
       } catch (err) {
         /* the runner fails cards one by one; this is the backstop for a
            failure outside any card, so none stays claimed forever */
@@ -302,6 +358,9 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
           actions.failCard(canvasId, c.id, 'Doop hit a snag before finishing. Retry when you are ready.')
       }
     }
+    /* the run ends here on this path, so its spend is recorded here too */
+    runBudget.recordSpend(accountKey, spentTokens())
+    budgetReached = spentTokens() >= runBudgetTokens
     if (abort.signal.aborted) {
       /* the human stopped: release whatever the runner left claimed. Cards the
          stop already marked are skipped, so their attribution survives. */
@@ -312,7 +371,7 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
     }
     if (claimed.length === 0 && comments.length === 0 && cards.length === 0) {
       clearInterval(heartbeat)
-      actions.setAgentStatus(canvasId, actor, '')
+      actions.setAgentStatus(canvasId, actor, budgetReached ? 'Budget reached — continuing needs a human' : '')
       return 'ran'
     }
   }
@@ -462,7 +521,6 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
     console.log(
       `[resident] run start canvas=${canvasId} agent=${role.name} model=${model.label}${model.userId ? ` on=${model.userId}` : ''} feedback=${claimed.length} comments=${comments.length} cards=${cards.length}`,
     )
-    let usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
     /* a review pass legitimately ends without touching a frame; an
        originating pass that changed nothing has not delivered its card */
     const requireMutation = cards.length > 0 && !role.reviewer
@@ -474,6 +532,7 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
       verifiedFrames: new Set(),
       reviewedFrames: new Map(),
       rewriteDrafts: new Map(),
+      proposals: 0,
     }
     let refused = false
     let crashed = false
@@ -485,6 +544,9 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
     let outputLimitNudgeSent = false
     let reviewNudgeSent = false
     let turnsUsed = 0
+    /* feedback that arrived while this run was already working: picked up
+       between turns and completed (or failed) with the rest at the end */
+    const pickedUp: TaskFeedback[] = []
 
     try {
       /* canvas design docs ride as a second system block with their own cache
@@ -507,6 +569,42 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
         if (abort.signal.aborted) {
           cancelled = true
           break
+        }
+        /* A human asking for something now must reach the run that is working
+           now — waiting for the next sweep would mean the agent finishes a
+           design the human has already asked it to change. Their request rides
+           with the message the loop is about to send, so roles stay
+           alternating and no extra turn is spent picking it up. */
+        /* a run that has spent its budget stops here, between turns, with a
+           reason a human can act on — never mid-tool, never silently */
+        if (spentTokens() >= runBudgetTokens) {
+          budgetReached = true
+          actions.setAgentStatus(canvasId, actor, 'Budget reached — continuing needs a human')
+          break
+        }
+        const midRun = actions.takeFeedbackFor(canvasId, role.name, payer)
+        if (midRun.length > 0) {
+          pickedUp.push(...midRun)
+          const running = actions.getTasks(canvasId)
+          injectFeedback(
+            messages,
+            feedbackBlock(
+              midRun.map((f) => {
+                const task = running.find((t) => t.id === f.taskId)
+                return {
+                  from: f.from,
+                  text: f.text,
+                  about: feedbackAbout({
+                    ...(task?.status ? { taskStatus: task.status } : {}),
+                    mine: task?.agentName === actor.name,
+                    ...(task?.agentName ? { agentName: task.agentName } : {}),
+                  }),
+                }
+              }),
+              RESIDENT_FEEDBACK_TOOLS,
+            ),
+          )
+          actions.setAgentStatus(canvasId, actor, 'Picking up human feedback')
         }
         const res = await model.run({
           maxTokens: 16000,
@@ -638,7 +736,12 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
           continue
         }
 
-        if (requireMutation && deliverableFrameIds(runState).length === 0 && !mutationNudgeSent) {
+        if (
+          requireMutation &&
+          deliverableFrameIds(runState).length === 0 &&
+          runState.proposals === 0 &&
+          !mutationNudgeSent
+        ) {
           mutationNudgeSent = true
           messages.push({
             role: 'user',
@@ -660,7 +763,7 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
            zero critical a11y issues, zero layout errors, zero off-token
            colors. Screenshotting alone trusts the agent's own eye. */
         const failing = failedReview(runState)
-        if (cards.length > 0 && failing && !reviewNudgeSent) {
+        if (deliverableFrameIds(runState).length > 0 && failing && !reviewNudgeSent) {
           reviewNudgeSent = true
           messages.push({
             role: 'user',
@@ -699,14 +802,21 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
        or out-of-turns runs pause so nothing gets a false Done or auto-retry */
     const deliverableFrames = deliverableFrameIds(runState)
     const blockedWebsiteAccess = runState.blockedWebsiteAccess
-    const noMutation = finished && requireMutation && deliverableFrames.length === 0 && !blockedWebsiteAccess
+    const noMutation =
+      finished && requireMutation && deliverableFrames.length === 0 && runState.proposals === 0 && !blockedWebsiteAccess
+    /* The gate applies to every run that changed a deliverable frame, not
+       only to card runs: an @mention or a hand-back produces a design too, and
+       it is held to the same standard as a claimed card. */
+    const gated = deliverableFrameIds(runState).length > 0
     const unverifiedMutation =
       finished &&
       !blockedWebsiteAccess &&
-      cards.length > 0 &&
+      gated &&
       verificationFrameIds(runState).some((id) => !runState.verifiedFrames.has(id))
-    const failedGate = finished && !blockedWebsiteAccess && cards.length > 0 && !!failedReview(runState)
-    const exhausted = !finished && !refused && !crashed && !cancelled
+    const failedGate = finished && !blockedWebsiteAccess && gated && !!failedReview(runState)
+    /* a run stopped on its token budget stopped on purpose: it is not out of
+       turns, and its own status must survive */
+    const exhausted = !finished && !refused && !crashed && !cancelled && !budgetReached
     if (exhausted) actions.setAgentStatus(canvasId, actor, 'Ran out of turns — waiting for a retry')
     if (blockedWebsiteAccess && !staleAccount) {
       actions.setAgentStatus(canvasId, actor, 'Website blocked — needs screenshots')
@@ -715,7 +825,7 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
     if (unverifiedMutation) actions.setAgentStatus(canvasId, actor, 'Change not verified — waiting for a retry')
     if (failedGate) actions.setAgentStatus(canvasId, actor, 'Design checks failed — waiting for a retry')
     console.log(
-      `[resident] run end canvas=${canvasId} agent=${role.name} turns=${turnsUsed} finished=${finished} refused=${refused} crashed=${crashed} mutations=${runState.mutatedFrames.size} sources=${runState.sourceFrames.size} deliverables=${deliverableFrames.length} verified=${runState.verifiedFrames.size}`,
+      `[resident] run end canvas=${canvasId} agent=${role.name} turns=${turnsUsed} finished=${finished} refused=${refused} crashed=${crashed} mutations=${runState.mutatedFrames.size} sources=${runState.sourceFrames.size} deliverables=${deliverableFrames.length} proposals=${runState.proposals} verified=${runState.verifiedFrames.size}`,
     )
     if (finished) {
       /* The closing summary remains useful when a no-op card is returned to
@@ -730,7 +840,9 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
         actions.agentSummary(canvasId, actor, text)
       }
     }
-    /* what the run cost, on every card it served */
+    /* what the run cost, on every card it served, and against the account's
+       day — a run that stops on its budget is still accounted for */
+    runBudget.recordSpend(accountKey, spentTokens())
     if (usage.input > 0 || usage.output > 0) {
       actions.recordRunUsage(
         cards.map((c) => c.id),
@@ -763,7 +875,7 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
       }),
     })
     if (finished && !blockedWebsiteAccess && !noMutation && !unverifiedMutation && !failedGate) {
-      for (const f of claimed) actions.completeTaskFeedback(f.id)
+      for (const f of [...claimed, ...pickedUp]) actions.completeTaskFeedback(f.id)
       for (const c of comments) actions.resolveComment(c.id, actor)
       /* a card moves to the next agent in its pipeline, or finishes here */
       for (const c of cards) {
@@ -792,6 +904,8 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
         reason = `${role.name} could not take this request. Retry when you are ready.`
       } else if (crashed) {
         reason = `${role.name} hit a snag before finishing. Retry when you are ready.`
+      } else if (budgetReached) {
+        reason = `${role.name} reached this run's token budget (${runBudgetTokens.toLocaleString()}) before finishing. Retry to give it another budget, or raise DOOP_RUN_TOKEN_BUDGET.`
       } else if (exhausted) {
         reason = `${role.name} ran out of turns before finishing. Retry when you are ready.`
       } else if (noMutation) {
@@ -802,14 +916,15 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
       } else {
         reason = `${role.name} changed a frame but could not verify it. Retry when you are ready.`
       }
-      for (const f of claimed) actions.failTaskFeedback(f.id, reason)
+      for (const f of [...claimed, ...pickedUp]) actions.failTaskFeedback(f.id, reason)
       for (const c of comments) actions.failComment(c.id, reason)
       for (const c of cards) actions.failCard(canvasId, c.id, reason)
     }
   } finally {
     clearInterval(heartbeat)
-    /* a finished run holds nothing: its frames are free for the next agent */
-    frameLocks.releaseAllFor(canvasId, actor.name)
+    /* a finished run holds nothing: its frames are free for the next agent,
+       and the room is told so the "held by" chip does not outlive the run */
+    actions.releaseLocksForAgent(canvasId, actor.name)
     /* clear the status — this completes the agent's task in the panel */
     actions.setAgentStatus(canvasId, actor, '')
   }
@@ -1243,6 +1358,28 @@ async function execTool(
     tool_use_id: block.id,
     content,
   })
+  /* Review mode: the canvas rejects agent writes, so a design change becomes a
+     proposal a human accepts — the same contract the MCP surface follows. The
+     model is told plainly that nothing landed, so it does not believe the
+     design is on the canvas. */
+  const reviewDiverted = (op: {
+    kind: 'replace_html' | 'create_frame' | 'delete_frame'
+    frameId?: string
+    name?: string
+    html?: string
+    x?: number
+    y?: number
+    width?: number
+    height?: number
+    summary: string
+  }): Anthropic.ToolResultBlockParam | undefined => {
+    const proposal = actions.proposeInsteadOfWrite(canvasId, op, actor)
+    if (!proposal) return undefined
+    runState.proposals += 1
+    return fail(
+      `review mode — this change is filed as proposal ${proposal.id} (“${proposal.summary}”); a human must accept it before it lands on the canvas. Do NOT retry this write, do not screenshot to check it: finish the rest of the card and end your turn with a summary — the card advances when your turn ends.`,
+    )
+  }
 
   try {
     switch (block.name) {
@@ -1257,10 +1394,20 @@ async function execTool(
         if (html.length > MAX_REWRITE_CHUNK_CHARS) {
           return fail(`create_frame HTML must be compact (at most ${MAX_REWRITE_CHUNK_CHARS} characters)`)
         }
+        const name = String(raw.name || 'Frame')
+        const diverted = reviewDiverted({
+          kind: 'create_frame',
+          name,
+          html,
+          width: Number(raw.width) || 800,
+          height: Number(raw.height) || 500,
+          summary: `create “${name}”`,
+        })
+        if (diverted) return diverted
         const f = actions.createFrame(
           canvasId,
           {
-            name: String(raw.name || 'Frame'),
+            name,
             width: Number(raw.width) || 800,
             height: Number(raw.height) || 500,
             html,
@@ -1315,7 +1462,15 @@ async function execTool(
         if (count === 0) return fail('"find" text not found — call get_frame_html and copy the exact text')
         if (count > 1)
           return fail(`"find" text occurs ${count} times — include more surrounding context to make it unique`)
-        actions.updateFrame(input.frame_id, { html: f.html.replace(input.find, input.replace) }, actor)
+        const nextHtml = f.html.replace(input.find, input.replace)
+        const diverted = reviewDiverted({
+          kind: 'replace_html',
+          frameId: input.frame_id,
+          html: nextHtml,
+          summary: `edit “${f.name}”`,
+        })
+        if (diverted) return diverted
+        actions.updateFrame(input.frame_id, { html: nextHtml }, actor)
         runState.mutatedFrames.add(input.frame_id)
         runState.verifiedFrames.delete(input.frame_id)
         return ok('applied')
@@ -1334,6 +1489,13 @@ async function execTool(
             `set_frame_html is limited to ${MAX_REWRITE_CHUNK_CHARS} characters. Use begin_frame_rewrite, append_frame_rewrite chunks, and commit_frame_rewrite.`,
           )
         }
+        const diverted = reviewDiverted({
+          kind: 'replace_html',
+          frameId: input.frame_id,
+          html,
+          summary: `redesign “${f.name}”`,
+        })
+        if (diverted) return diverted
         actions.updateFrame(input.frame_id, { html }, actor)
         runState.mutatedFrames.add(input.frame_id)
         runState.verifiedFrames.delete(input.frame_id)
@@ -1371,6 +1533,16 @@ async function execTool(
         const html = completeHtml(draft)
         if (!html)
           return fail('rewrite draft is not a complete HTML document ending in </html>; append the missing content')
+        const diverted = reviewDiverted({
+          kind: 'replace_html',
+          frameId: input.frame_id,
+          html,
+          summary: `rewrite “${f.name}”`,
+        })
+        if (diverted) {
+          runState.rewriteDrafts.delete(input.frame_id)
+          return diverted
+        }
         actions.updateFrame(input.frame_id, { html }, actor)
         runState.rewriteDrafts.delete(input.frame_id)
         runState.mutatedFrames.add(input.frame_id)
@@ -1654,11 +1826,17 @@ async function execTool(
         if (!f || f.canvasId !== canvasId) return fail('frame not found on this canvas')
         const report = await reviewFrame(f, store.getCanvas(canvasId)?.tokens)
         runState.reviewedFrames.set(f.id, report)
+        await persist.saveFrameReview(reviewToRecord(report, canvasId, actor.name))
         const s = report.summary
+        if (report.verdict === 'pass')
+          return ok(`review passed: 0 blocking findings across ${report.viewports.length} viewport(s)`)
         return ok(
-          s.critical === 0 && s.errors === 0 && s.off_token === 0
-            ? `review passed: 0 critical a11y, 0 layout errors, 0 off-token colors across ${report.viewports.length} viewport(s)`
-            : `review FAILED — critical a11y: ${s.critical}, layout errors: ${s.errors}, warnings: ${s.warnings}, off-token colors: ${s.off_token}. Fix the failing selectors and re-run review_frame: ${JSON.stringify(report.viewports.map((v) => ({ viewport: v.viewport, lint: v.lint.violations.slice(0, 5), a11y: v.a11y.issues.slice(0, 5), layout: v.layout.issues.slice(0, 5) })))}`,
+          `review FAILED — ${report.blocking.length} blocking finding(s): ${report.blocking
+            .slice(0, 6)
+            .map((finding) => `${finding.rule} at ${finding.selector} (${finding.detail})`)
+            .join(
+              '; ',
+            )}. Failing viewports: ${report.failing_viewports.join(', ') || 'none'}. Also ${s.warnings} warning(s), ${s.off_token} off-token color(s). Fix the selectors and re-run review_frame.`,
         )
       }
       case 'set_plan': {
@@ -1738,6 +1916,10 @@ async function execTool(
     /* another agent holds the frame: report it like any tool error so the
        model can move to another frame instead of dying on the run */
     if (e instanceof frameLocks.FrameLockedError) return fail(e.message)
+    /* Review mode reached through a path that cannot be diverted into a
+       proposal (frame metadata, guides, decisions): report it as the tool
+       error it is, so the model stops rather than retrying. */
+    if (e instanceof actions.ReviewModeError) return fail(e.message)
     const blocked = websiteAccessErrorMessage(e, 'resident')
     if (blocked) runState.blockedWebsiteAccess = blocked
     return fail(blocked ?? (e instanceof Error ? e.message : 'tool failed'))

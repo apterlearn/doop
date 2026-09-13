@@ -14,17 +14,20 @@ import * as frameLocks from './frameLocks.ts'
 import * as notifications from './notifications.ts'
 import { getImage, renderHtmlPreview } from './previews.ts'
 import { diffFrames } from './visualDiff.ts'
-import type { AgentQuestion, FrameProposal } from '../shared/types.ts'
+import type { AgentQuestion, DesignTokens, FrameProposal } from '../shared/types.ts'
 
 import { canAccessCanvas, hasDurableCanvasAccess, isAdmin } from './access.ts'
-import { auth, initAuth, syncAdmins, getUserName, PUBLIC_ORIGIN, loginProvidersConfig } from './auth.ts'
+import { auth, initAuth, syncAdmins, getUserName, loadOidcConfig, PUBLIC_ORIGIN, loginProvidersConfig } from './auth.ts'
 import { adminRouter } from './admin.ts'
-import { communityRouter, parseListing, publishableFrames } from './community.ts'
+import { communityRouter, parseListing, publishCanvas, unpublishCanvas } from './community.ts'
 import * as demo from './demo.ts'
 
 import { closeDb, db, initDb } from './db/index.ts'
 import * as authSchema from './db/auth-schema.ts'
 import * as persist from './db/persist.ts'
+import { htmlBundle } from './codeExport.ts'
+import { SNAPSHOT_CSP } from './snapshotCsp.ts'
+import { frameSha } from './review.ts'
 import { handleMcpRequest } from './mcp.ts'
 import { groupClients } from './mcpClients.ts'
 /* static, not dynamic: nothing imports this entrypoint, so there is no cycle,
@@ -50,6 +53,7 @@ import { serverTierInfo } from './agentModel.ts'
 import { AGENT_MODELS } from './openaiAgent.ts'
 import { mentionedRole } from '../shared/agents.ts'
 import { colorFor } from '../shared/types.ts'
+import type { FrameLockHolder } from '../shared/types.ts'
 import type { ClientMessage, Presence, ServerMessage } from '../shared/types.ts'
 
 const PORT = Number(process.env.PORT || 4400)
@@ -74,6 +78,11 @@ const BUILD_ID = (() => {
 })()
 
 /* boot: connect the DB, hydrate memory, import pre-DB store.json once */
+
+/* A half-configured SSO set is a misconfiguration, and the only useful thing to
+   do about it is refuse to run — checked before the database is opened, so a
+   self-hoster finds out in a second instead of after a boot's worth of work. */
+loadOidcConfig()
 await initDb()
 await backgrounds.initBackgrounds()
 initAuth()
@@ -225,6 +234,12 @@ function agentTouch(
     }
   }
 }
+
+setInterval(() => {
+  /* a lock that lapses while the room still shows its holder is a lie: the
+     sweep is what makes "held by X" disappear when X stops responding */
+  actions.sweepExpiredLocks()
+}, 5000)
 
 setInterval(() => {
   const now = Date.now()
@@ -809,20 +824,40 @@ app.get('/api/canvases/:id', (req, res) => {
 app.put('/api/canvases/:id/publish', (req, res) => {
   const c = requireCanvas(req, res, req.params.id)
   if (!c) return
-  if (c.ownerId !== req.user!.id) return res.status(403).json({ error: 'only the owner can publish a canvas' })
-  if (!publishableFrames(c).length) return res.status(400).json({ error: 'add a frame before publishing' })
   const listing = parseListing(req.body)
   if (typeof listing === 'string') return res.status(400).json({ error: listing })
-  const published = store.publishCanvas(c.id, listing)!
-  res.json({ publishedAt: published.publishedAt, description: published.description, category: published.category })
+  const result = publishCanvas(c, listing, { id: req.user!.id, name: req.user!.name })
+  if (!result.ok) return res.status(result.status).json({ error: result.error })
+  const { publishedAt, description, category } = result.canvas
+  res.json({ publishedAt, description, category })
 })
 
 app.delete('/api/canvases/:id/publish', (req, res) => {
   const c = requireCanvas(req, res, req.params.id)
   if (!c) return
-  if (c.ownerId !== req.user!.id) return res.status(403).json({ error: 'only the owner can unpublish a canvas' })
-  store.unpublishCanvas(c.id)
+  const result = unpublishCanvas(c, { id: req.user!.id, name: req.user!.name })
+  if (!result.ok) return res.status(result.status).json({ error: result.error })
   res.json({ ok: true })
+})
+
+/* A release is a frozen artifact: the URL a handoff link points at. No
+   session, no access check — the id is unguessable and the snapshot cannot
+   change, which is exactly what makes it safe to send to someone. */
+app.get('/p/:canvasId/:releaseId', async (req, res) => {
+  const release = await persist.getRelease(req.params.releaseId)
+  if (!release || release.canvasId !== req.params.canvasId) return res.status(404).send('no such release')
+  try {
+    const bundle = await htmlBundle(persist.releaseFrames(release), release.tokens)
+    res.setHeader('Content-Type', 'text/html; charset=utf-8')
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable')
+    /* Stored frame HTML on the app's own origin: same lockdown an imported or
+       synced snapshot gets, or an inline handler in any frame runs with the
+       viewer's session when the link is opened. */
+    res.setHeader('Content-Security-Policy', SNAPSHOT_CSP)
+    res.send(bundle.html)
+  } catch (e) {
+    res.status(500).send(e instanceof Error ? e.message : 'could not render this release')
+  }
 })
 
 app.post('/api/canvases/:id/claim', (req, res) => {
@@ -1272,6 +1307,26 @@ app.post('/api/canvases/:id/review-mode', (req, res) => {
   res.json({ reviewMode: on })
 })
 
+/** The canvas design tokens. Any collaborator may edit them: they are the
+ *  canvas's shared palette/type/scale, and the panel is where a human sets
+ *  them without an agent in the loop. Validation errors come back verbatim. */
+app.patch('/api/canvases/:id/tokens', (req, res) => {
+  if (!requireCanvas(req, res, req.params.id)) return
+  const body = req.body as { tokens?: DesignTokens | null } | undefined
+  const tokens = body?.tokens ?? undefined
+  /* the body is caller-controlled and `validateTokens` walks it with `?? {}`
+     guards that a string sails through, so the shape is checked here */
+  if (tokens !== undefined && tokens !== null && (typeof tokens !== 'object' || Array.isArray(tokens)))
+    return res.status(400).json({ error: 'tokens must be an object' })
+  try {
+    const canvas = actions.setTokens(req.params.id, tokens ?? undefined, resolveActorFromReq(req))
+    if (!canvas) return res.status(404).json({ error: 'canvas not found' })
+    res.json({ tokens: canvas.tokens ?? null })
+  } catch (e) {
+    res.status(400).json({ error: e instanceof Error ? e.message : 'invalid tokens' })
+  }
+})
+
 /* ---- agent review, questions, run timeline, versions, queue ---- */
 
 /** Pending agent frame-change proposals for review mode. */
@@ -1307,6 +1362,13 @@ app.get('/api/canvases/:id/questions', (req, res) => {
   if (!requireCanvas(req, res, req.params.id)) return
   const status = typeof req.query.status === 'string' ? (req.query.status as AgentQuestion['status']) : undefined
   res.json(actions.getQuestions(req.params.id, status))
+})
+
+/** Every agent plan on this canvas, newest first — the panel's backfill for a
+ *  client that joined after the plan was published. */
+app.get('/api/canvases/:id/plans', (req, res) => {
+  if (!requireCanvas(req, res, req.params.id)) return
+  res.json(actions.getPlans(req.params.id))
 })
 
 app.post('/api/canvases/:id/questions/:qid', (req, res) => {
@@ -1367,6 +1429,19 @@ app.get('/api/frames/:frameId/versions', async (req, res) => {
   if (!frame) return
   const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 20))
   res.json(await persist.listFrameVersions(frame.id, limit))
+})
+
+/** The verification reports for a frame, newest first — what the checks panel
+ *  reads. A report carries the hash of the HTML it describes, so the panel can
+ *  say whether it is still current rather than showing a stale pass. */
+app.get('/api/frames/:frameId/reviews', async (req, res) => {
+  const frame = requireFrame(req, res, req.params.frameId)
+  if (!frame) return
+  const limit = Math.min(20, Math.max(1, Number(req.query.limit) || 5))
+  const reviews = await persist.listFrameReviews(frame.id, limit)
+  const canvas = store.getCanvas(frame.canvasId)
+  const current = frameSha(frame, canvas?.tokens)
+  res.json(reviews.map((review) => ({ ...review, current: review.htmlSha === current })))
 })
 
 app.get('/api/frames/:frameId/versions/:versionId', async (req, res) => {
@@ -1432,13 +1507,32 @@ app.post('/api/frames/render-preview', async (req, res) => {
   }
 })
 
+/** Every live lock on this canvas, as the room's clients store it. */
+function locksForCanvas(canvasId: string): Record<string, FrameLockHolder> {
+  const out: Record<string, FrameLockHolder> = {}
+  for (const lock of frameLocks.activeLocks()) {
+    if (lock.canvasId !== canvasId) continue
+    out[lock.frameId] = { name: lock.agentName, color: colorFor(lock.agentName), kind: 'agent' }
+  }
+  return out
+}
+
 /** Take a frame's edit lock away from a stuck agent. */
 app.post('/api/frames/:frameId/unlock', (req, res) => {
   const frame = requireFrame(req, res, req.params.frameId)
   if (!frame) return
-  frameLocks.release(frame.id, 'human:' + req.user!.name)
-  broadcast(frame.canvasId, { type: 'frame:lock', frameId: frame.id, holder: null })
-  res.json({ unlocked: true })
+  /* the lock is held by the agent, not by a human: "unlock" means "release
+     whoever holds it", which is the human's escape hatch from a stuck agent */
+  const held = frameLocks.activeLocks().find((lock) => lock.frameId === frame.id)
+  actions.releaseAllFrameLocks(frame.id)
+  if (held) {
+    actions.logActivity(
+      frame.canvasId,
+      { name: req.user!.name, kind: 'user', color: colorFor(req.user!.name) },
+      `took the edit lock back from ${held.agentName}`,
+    )
+  }
+  res.json({ unlocked: true, held_by: held?.agentName ?? null })
 })
 
 /** Per-user email preference for agent events. */
@@ -1557,7 +1651,7 @@ app.delete('/api/frames/:id', (req, res) => {
 
 app.post('/api/frames/:id/comments', async (req, res) => {
   if (!requireFrame(req, res, req.params.id)) return
-  const { selector, snippet, text } = req.body ?? {}
+  const { selector, snippet, text, stableKey } = req.body ?? {}
   /* a comment that @mentions a resident agent is a new command to the team,
      so it's metered like a card; plain comments and replies stay free */
   if (mentionedRole(String(text ?? ''))) {
@@ -1568,7 +1662,12 @@ app.post('/api/frames/:id/comments', async (req, res) => {
   }
   const comment = actions.addElementComment(
     req.params.id,
-    { selector: String(selector ?? ''), snippet: String(snippet ?? ''), text: String(text ?? '') },
+    {
+      selector: String(selector ?? ''),
+      snippet: String(snippet ?? ''),
+      text: String(text ?? ''),
+      ...(stableKey ? { stableKey: String(stableKey) } : {}),
+    },
     actions.resolveActor({ name: req.user!.name, kind: 'user' }),
     req.user!.id,
   )
@@ -1951,6 +2050,7 @@ wss.on('connection', (ws, upgradeReq) => {
         questions: actions.getQuestions(msg.canvasId),
         reviewMode: !!canvas.reviewMode,
         runEvents: runLog.getRunEvents(msg.canvasId, { limit: 200 }),
+        frameLocks: locksForCanvas(msg.canvasId),
         selfColor: presence.color,
         serverBuild: BUILD_ID,
       })

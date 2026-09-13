@@ -5,7 +5,8 @@ import * as frameLocks from './frameLocks.ts'
 import * as agentEvents from './agentEvents.ts'
 import * as thumbs from './thumbs.ts'
 import { colorFor } from '../shared/types.ts'
-import { validateTokens } from './designLint.ts'
+import { validateTokens } from './tokenCss.ts'
+import { stripTokenStyle } from '../shared/tokens.ts'
 import { DEFAULT_ROLE_ID, mentionedRole, normalizePipeline, roleByAgentName, roleName } from '../shared/agents.ts'
 import { decodeEscapedHtml, looksEscapedHtml, repairEscapedHtml } from './escapedHtml.ts'
 import type {
@@ -94,6 +95,10 @@ export function hydrateLogs(data: {
   for (const [canvasId, list] of data.decisions) decisionLog.set(canvasId, list)
   for (const [canvasId, list] of data.proposals) proposalLog.set(canvasId, list)
   for (const [canvasId, byAgent] of data.plans ?? []) planLog.set(canvasId, byAgent)
+  /* A stop is per-canvas session state like the task log: a canvas whose logs
+     were just re-read has no stop outstanding against it. */
+  for (const canvasId of data.tasks.keys()) cancellations.delete(canvasId)
+  interruptedStreams.clear()
   failInterruptedWork()
 }
 
@@ -142,7 +147,7 @@ export function getActivity(canvasId: string): ActivityItem[] {
   return activityLog.get(canvasId) ?? []
 }
 
-function logActivity(canvasId: string, actor: Actor, message: string, frameId?: string) {
+export function logActivity(canvasId: string, actor: Actor, message: string, frameId?: string) {
   const item: ActivityItem = {
     id: nanoid(8),
     actorName: actor.name,
@@ -175,11 +180,99 @@ export function resolveActor(
   return { name, kind, color: colorFor(name), clientId: raw?.clientId, owner: raw?.owner, ownerId: raw?.ownerId }
 }
 
+/* ------------------------------------------------------------------ */
+/* Frame locks                                                         */
+/*                                                                     */
+/* A lock is only useful if everyone can see it. The room is told when a */
+/* lock is taken, released, taken over or expires, so the human looking  */
+/* at the frame sees "held by X" and can take it back — which is the     */
+/* whole point of a cooperative lock.                                    */
+/* ------------------------------------------------------------------ */
+
+function broadcastLock(
+  frameId: string,
+  canvasId: string,
+  holder: { name: string; color: string; kind: Actor['kind'] } | null,
+) {
+  broadcast(canvasId, { type: 'frame:lock', frameId, holder })
+}
+
+/** Take a frame's edit lock, telling the room. Returns the lock, or the
+ *  current holder when someone else has it. */
+export function acquireFrameLock(frameId: string, actor: Actor, ttlMs?: number): ReturnType<typeof frameLocks.acquire> {
+  const frame = store.getFrame(frameId)
+  const result = frameLocks.acquire(frameId, frame?.canvasId ?? '', actor.name, actor.owner, ttlMs)
+  if (frame && !('heldBy' in result)) {
+    broadcastLock(frameId, frame.canvasId, { name: actor.name, color: actor.color, kind: actor.kind })
+  }
+  return result
+}
+
+/** Release a frame's lock, telling the room. */
+export function releaseFrameLock(frameId: string, actorName: string): boolean {
+  const frame = store.getFrame(frameId)
+  const released = frameLocks.release(frameId, actorName)
+  if (frame && released) broadcastLock(frameId, frame.canvasId, null)
+  return released
+}
+
+/** Release every lock on a frame, whoever holds it, telling the room. */
+export function releaseAllFrameLocks(frameId: string): boolean {
+  const frame = store.getFrame(frameId)
+  const held = frameLocks.releaseAll(frameId)
+  if (frame && held) broadcastLock(frameId, frame.canvasId, null)
+  return !!held
+}
+
+/** Drop everything this agent holds on a canvas, telling the room about each
+ *  frame it frees. Run teardown, stop, and an agent's own cleanup all land
+ *  here, so no lock outlives the work that took it. */
+export function releaseLocksForAgent(canvasId: string, agentName: string): string[] {
+  const released = frameLocks.releaseAllFor(canvasId, agentName)
+  for (const frameId of released) broadcastLock(frameId, canvasId, null)
+  return released
+}
+
+/** Expired locks are gone from the map but still shown in the room until the
+ *  room is told. Called on a timer by the server. */
+export function sweepExpiredLocks(now = Date.now()): number {
+  const expired = frameLocks.takeExpired(now)
+  for (const lock of expired) broadcastLock(lock.frameId, lock.canvasId, null)
+  return expired.length
+}
+
 /** Refuse a write to a frame another agent has locked. Shared by every
  *  mutation path so external agents and the resident team obey one rule. */
 function assertUnlocked(frameId: string, actor: Actor) {
   const holder = frameLocks.heldBy(frameId, actor.name)
   if (holder) throw new frameLocks.FrameLockedError(holder)
+}
+
+/**
+ * Thrown when an agent writes to a canvas whose owner turned review mode on:
+ * the change has to be delivered as a FrameProposal a human accepts. Both
+ * caller surfaces translate this — the MCP layer into an `unsupported` result
+ * naming the propose tools, the resident team into a proposal — so the rule
+ * itself lives here, on the one path every write goes through, and no tool can
+ * quietly bypass it.
+ */
+export class ReviewModeError extends Error {
+  readonly canvasId: string
+
+  constructor(canvasId: string) {
+    super(
+      'this canvas is in review mode — agent changes need human approval. Deliver the change as a proposal instead: it lands the moment a human accepts it.',
+    )
+    this.name = 'ReviewModeError'
+    this.canvasId = canvasId
+  }
+}
+
+/** One gate for every agent write: a human is never gated, an agent on a
+ *  review-mode canvas is. */
+function assertAgentWriteAllowed(canvasId: string, actor: Actor) {
+  if (actor.kind !== 'agent') return
+  if (store.getCanvas(canvasId)?.reviewMode) throw new ReviewModeError(canvasId)
 }
 
 function touch(canvasId: string, actor: Actor, frameId?: string | null) {
@@ -516,7 +609,7 @@ export function findQuestion(questionId: string): AgentQuestion | undefined {
  *  event bus into the agent's parked wait. */
 export function askQuestion(
   canvasId: string,
-  input: { text: string; frameId?: string; selector?: string; waitSeconds?: number },
+  input: { text: string; frameId?: string; selector?: string; stableKey?: string; waitSeconds?: number },
   actor: Actor,
 ): AgentQuestion | undefined {
   const text = input.text.trim().slice(0, 2000)
@@ -530,6 +623,7 @@ export function askQuestion(
     color: actor.color,
     ...(input.frameId ? { frameId: input.frameId } : {}),
     ...(input.selector ? { selector: input.selector } : {}),
+    ...(input.stableKey ? { stableKey: input.stableKey } : {}),
     text,
     at: Date.now(),
     status: 'open',
@@ -576,6 +670,47 @@ export function answerQuestion(
   return question
 }
 
+/** Record a question the agent's own client answered out of band (MCP
+ *  elicitation). The humans in the room never saw it asked, so it is stored
+ *  already answered: the transcript gets the full exchange, get_answers shows
+ *  it to later agents, and nobody is emailed about a question that is settled. */
+export function recordElicitedAnswer(
+  canvasId: string,
+  input: { text: string; answer: string; frameId?: string; selector?: string; stableKey?: string },
+  agent: Actor,
+  answeredBy: Actor,
+): AgentQuestion | undefined {
+  const text = input.text.trim().slice(0, 2000)
+  const answer = input.answer.trim().slice(0, 2000)
+  if (!text || !answer || !store.getCanvas(canvasId)) return undefined
+  const question: AgentQuestion = {
+    id: nanoid(8),
+    canvasId,
+    agentName: agent.name,
+    ...(agent.owner ? { owner: agent.owner } : {}),
+    ...(agent.ownerId ? { ownerId: agent.ownerId } : {}),
+    color: agent.color,
+    ...(input.frameId ? { frameId: input.frameId } : {}),
+    ...(input.selector ? { selector: input.selector } : {}),
+    ...(input.stableKey ? { stableKey: input.stableKey } : {}),
+    text,
+    at: Date.now(),
+    status: 'answered',
+    answer,
+    answeredBy: answeredBy.name,
+    answeredAt: Date.now(),
+    /* asked and answered in the same breath: it never waits for anyone */
+    expiresAt: Date.now(),
+  }
+  const list = questionLog.get(canvasId) ?? []
+  list.unshift(question)
+  if (list.length > 100) list.length = 100
+  questionLog.set(canvasId, list)
+  persist.saveQuestion(question)
+  broadcast(canvasId, { type: 'question', question })
+  return question
+}
+
 /** A question nobody answered before its wait expired — the agent moved on. */
 export function expireQuestion(questionId: string): AgentQuestion | undefined {
   for (const [canvasId, list] of questionLog) {
@@ -613,7 +748,7 @@ export function findComment(commentId: string): ElementComment | undefined {
 
 export function addElementComment(
   frameId: string,
-  input: { selector: string; snippet: string; text: string },
+  input: { selector: string; snippet: string; text: string; stableKey?: string },
   actor: Actor,
   fromUserId?: string,
 ): ElementComment | undefined {
@@ -621,7 +756,11 @@ export function addElementComment(
   if (!frame) return undefined
   return postComment(
     frame,
-    { selector: String(input.selector ?? '').slice(0, 300), snippet: String(input.snippet ?? '').slice(0, 400) },
+    {
+      selector: String(input.selector ?? '').slice(0, 300),
+      snippet: String(input.snippet ?? '').slice(0, 400),
+      ...(input.stableKey ? { stableKey: String(input.stableKey).slice(0, 300) } : {}),
+    },
     input.text,
     actor,
     fromUserId,
@@ -641,7 +780,12 @@ export function replyToComment(
   const { root, frame } = open
   return postComment(
     frame,
-    { selector: root.selector, snippet: root.snippet, parentId: root.id },
+    {
+      selector: root.selector,
+      snippet: root.snippet,
+      ...(root.stableKey ? { stableKey: root.stableKey } : {}),
+      parentId: root.id,
+    },
     text,
     actor,
     fromUserId,
@@ -663,7 +807,7 @@ export function openThread(commentId: string): { root: ElementComment; frame: Fr
 
 function postComment(
   frame: Frame,
-  anchor: { selector: string; snippet: string; parentId?: string },
+  anchor: { selector: string; snippet: string; stableKey?: string; parentId?: string },
   text: string,
   actor: Actor,
   fromUserId?: string,
@@ -681,6 +825,7 @@ function postComment(
     canvasId: frame.canvasId,
     frameId: frame.id,
     selector: anchor.selector,
+    ...(anchor.stableKey ? { stableKey: anchor.stableKey } : {}),
     snippet: anchor.snippet,
     from: actor.name,
     ...(fromUserId ? { fromUserId } : {}),
@@ -859,7 +1004,7 @@ function endAutoTask(canvasId: string, actor: Actor) {
 
 /** Close an agent's open tasks, e.g. when its presence expires. */
 export function endAgentTasks(canvasId: string, agentName: string, ownerId?: string) {
-  frameLocks.releaseAllFor(canvasId, agentName)
+  releaseLocksForAgent(canvasId, agentName)
   /* a finished plan is history the panel does not need; the activity log keeps
      the record of what happened */
   if (planLog.get(canvasId)?.delete(agentName)) persist.deletePlan(canvasId, agentName)
@@ -964,8 +1109,13 @@ export function cancelAgentWork(canvasId: string, agentName: string, by: string,
   }
   /* no work was stopped — do not abort whatever run happens to be live */
   if (stopped > 0) {
+    /* a stopped agent's stream ends here, and the frame says why rather than
+       leaving a border that only times out */
+    for (const [frameId, state] of streams) {
+      if (state.actor.name === agentName && store.getFrame(frameId)?.canvasId === canvasId) state.endedBy = 'stopped'
+    }
     /* a stopped run holds nothing: its frames are free for the human to edit */
-    frameLocks.releaseAllFor(canvasId, agentName)
+    releaseLocksForAgent(canvasId, agentName)
     cancel(canvasId)
     logActivity(canvasId, resolveActor({ name: by, kind: 'user' }), `stopped ${agentName}`)
   }
@@ -1283,9 +1433,54 @@ interface StreamState {
   /** the opening chunk was HTML-escaped: decode every chunk of this stream */
   escaped: boolean
   lastActivity: number
+  /** set when something other than the agent ended the stream, so the end can
+   *  say why (a human's edit, a takeover, a stop) */
+  endedBy?: 'idle' | 'taken over' | 'stopped' | 'replaced'
 }
 
 const streams = new Map<string, StreamState>() // frameId -> state
+
+/** A stream a human cut short by editing its frame. The agent that was
+ *  streaming is told on its next tool call: its design's base moved under it,
+ *  so appending the next chunk onto what is there now would corrupt the page. */
+interface InterruptedStream {
+  frameId: string
+  frameName: string
+  canvasId: string
+  /** the human who took the frame over */
+  by: string
+  /** the agent whose stream was open */
+  agentName: string
+  ownerId?: string
+  at: number
+}
+
+/** frameId -> the interruption, until the streaming agent is told. */
+const interruptedStreams = new Map<string, InterruptedStream>()
+
+/** How long an interruption keeps being reported. An agent that never comes
+ *  back must not be told about an edit from an hour ago on its next session. */
+const INTERRUPTED_TTL_MS = 15 * 60_000
+
+/** The interruptions this agent has not been told about yet, cleared as they
+ *  are read — the notice is about a state change, not a standing fact. */
+export function takeInterruptedStreams(canvasId: string, agentName: string, ownerId?: string): InterruptedStream[] {
+  const now = Date.now()
+  const out: InterruptedStream[] = []
+  for (const [frameId, record] of interruptedStreams) {
+    if (now - record.at > INTERRUPTED_TTL_MS) {
+      interruptedStreams.delete(frameId)
+      continue
+    }
+    if (record.canvasId !== canvasId || record.agentName !== agentName) continue
+    /* same account-scoping rule as a stop: an interruption recorded for an
+       agent name without an account reaches any agent of that name */
+    if (record.ownerId !== undefined && ownerId !== undefined && record.ownerId !== ownerId) continue
+    interruptedStreams.delete(frameId)
+    out.push(record)
+  }
+  return out
+}
 
 interface RevealState {
   actor: Actor
@@ -1340,7 +1535,9 @@ function finishReveal(frameId: string) {
   reveals.delete(frameId)
   const frame = store.getFrame(frameId)
   if (!frame) return
-  broadcast(frame.canvasId, { type: 'frame:streaming', frameId, active: false, actor: r.actor })
+  /* a reveal is a normal completion: saying nothing here would let the viewer
+     read the end as an agent that went silent mid-stream */
+  broadcast(frame.canvasId, { type: 'frame:streaming', frameId, active: false, actor: r.actor, reason: 'done' })
   endAutoTask(frame.canvasId, r.actor)
 }
 
@@ -1350,7 +1547,16 @@ function finishStream(frameId: string, logDone: boolean) {
   streams.delete(frameId)
   const frame = store.getFrame(frameId)
   if (!frame) return
-  broadcast(frame.canvasId, { type: 'frame:streaming', frameId, active: false, actor: s.actor })
+  broadcast(frame.canvasId, {
+    type: 'frame:streaming',
+    frameId,
+    active: false,
+    actor: s.actor,
+    /* why it ended: "done" is a delivery, "idle" is an agent that went
+       silent mid-stream, "taken over" is a writer who moved in. The viewer
+       is told which, instead of watching the border vanish unexplained. */
+    reason: logDone ? 'done' : (s.endedBy ?? 'idle'),
+  })
   if (logDone) logActivity(frame.canvasId, s.actor, `finished designing “${frame.name}”`, frameId)
   endAutoTask(frame.canvasId, s.actor)
 }
@@ -1380,10 +1586,22 @@ setInterval(() => {
     const partial = r.shown >= total ? frame.html : healPartialHtml(frame.html.slice(0, r.shown))
     broadcast(frame.canvasId, { type: 'frame:updated', frame: { ...frame, html: partial }, actor: r.actor })
   }
-  for (const [frameId, s] of streams) {
-    if (now - s.lastActivity > STREAM_IDLE_MS) finishStream(frameId, false) // agent died mid-stream
-  }
+  sweepIdleStreams(now)
 }, TICK_MS)
+
+/** Close streams whose agent stopped writing. An agent that dies mid-stream
+ *  must not leave a frame marked "designing" forever; the end says it went
+ *  silent rather than reporting a delivery. */
+export function sweepIdleStreams(now = Date.now()): number {
+  let closed = 0
+  for (const [frameId, state] of streams) {
+    if (now - state.lastActivity > STREAM_IDLE_MS) {
+      finishStream(frameId, false)
+      closed += 1
+    }
+  }
+  return closed
+}
 
 export function appendFrameHtml(
   frameId: string,
@@ -1393,6 +1611,7 @@ export function appendFrameHtml(
 ): Frame | undefined {
   const before = store.getFrame(frameId)
   if (!before) return undefined
+  assertAgentWriteAllowed(before.canvasId, actor)
   /* A streaming agent keeps its own lock alive chunk by chunk; a writer who
      holds no lock (the common case) is unaffected. */
   assertUnlocked(frameId, actor)
@@ -1404,7 +1623,7 @@ export function appendFrameHtml(
      sample) and must never be sniffed on its own */
   const escaped = starting ? looksEscapedHtml(chunk) : (streams.get(frameId)?.escaped ?? false)
   const piece = escaped ? decodeEscapedHtml(chunk) : chunk
-  const html = opts.start ? piece : before.html + piece
+  const html = stripTokenStyle(opts.start ? piece : before.html + piece)
   const frame = store.updateFrame(frameId, { html }, actor.name)!
 
   if (starting) {
@@ -1446,7 +1665,11 @@ export function createFrame(
   },
   actor: Actor,
 ): Frame | undefined {
-  if (input.html !== undefined) input = { ...input, html: repairEscapedHtml(input.html) }
+  assertAgentWriteAllowed(canvasId, actor)
+  /* The token block is bound at render time, never stored: a document that
+     carries one (an export round-tripped back in, a client that serialized a
+     rendered frame) is stripped on the way in. */
+  if (input.html !== undefined) input = { ...input, html: stripTokenStyle(repairEscapedHtml(input.html)) }
   const frame = store.createFrame(canvasId, input, actor.name)
   if (!frame) return undefined
   if (actor.kind === 'agent' && frame.html.length > 0) {
@@ -1469,15 +1692,20 @@ export function updateFrame(
 ): Frame | undefined {
   const before = store.getFrame(frameId)
   if (!before) return undefined
+  assertAgentWriteAllowed(before.canvasId, actor)
   assertUnlocked(frameId, actor)
   frameLocks.refresh(frameId, actor.name)
-  if (patch.html !== undefined) patch = { ...patch, html: repairEscapedHtml(patch.html) }
+  if (patch.html !== undefined) patch = { ...patch, html: stripTokenStyle(repairEscapedHtml(patch.html)) }
   const prevName = before.name
   const prevHtml = before.html
   const frame = store.updateFrame(frameId, patch, actor.name)!
 
   const htmlChanged = patch.html !== undefined && patch.html !== prevHtml
   if (htmlChanged && actor.kind === 'agent') {
+    /* another writer replacing the document takes the stream over; the same
+       agent replacing its own is still working, and says so through presence */
+    const replaced = streams.get(frameId)
+    if (replaced && !replaced.endedBy) replaced.endedBy = replaced.actor.name === actor.name ? 'replaced' : 'taken over'
     finishStream(frameId, false) /* a full replace ends an open append stream */
     const prefix = commonPrefixLen(prevHtml, frame.html)
     /* mostly-unchanged replace (small tweak): broadcast at once — the client
@@ -1500,7 +1728,24 @@ export function updateFrame(
     }
   } else {
     if (htmlChanged) {
-      /* a human takes over: cancel any live stream or playback */
+      /* a human takes over: cancel any live stream or playback, and tell the
+         agent that was streaming — its next append would land on a base it
+         never saw */
+      const cut = streams.get(frameId)
+      if (cut) {
+        /* the first reason recorded wins: an agent that was stopped and then
+           had its frame edited by a human ended because it was stopped */
+        if (!cut.endedBy) cut.endedBy = 'taken over'
+        interruptedStreams.set(frameId, {
+          frameId,
+          frameName: frame.name,
+          canvasId: frame.canvasId,
+          by: actor.name,
+          agentName: cut.actor.name,
+          ...(cut.actor.ownerId ? { ownerId: cut.actor.ownerId } : {}),
+          at: Date.now(),
+        })
+      }
       finishStream(frameId, false)
       finishReveal(frameId)
     }
@@ -1517,9 +1762,15 @@ export function updateFrame(
 }
 
 export function deleteFrame(frameId: string, actor: Actor): Frame | undefined {
-  if (store.getFrame(frameId)) assertUnlocked(frameId, actor)
+  const existing = store.getFrame(frameId)
+  if (existing) {
+    assertAgentWriteAllowed(existing.canvasId, actor)
+    assertUnlocked(frameId, actor)
+  }
   /* close any live stream or playback while the frame still exists,
      so their auto “Designing…” tasks end with it */
+  const dying = streams.get(frameId)
+  if (dying && !dying.endedBy) dying.endedBy = 'taken over'
   finishStream(frameId, false)
   finishReveal(frameId)
   const frame = store.deleteFrame(frameId)
@@ -1544,6 +1795,9 @@ export function deleteCanvas(canvasId: string): boolean {
   decisionLog.delete(canvasId)
   proposalLog.delete(canvasId)
   cancellations.delete(canvasId)
+  for (const [frameId, record] of interruptedStreams) {
+    if (record.canvasId === canvasId) interruptedStreams.delete(frameId)
+  }
   return true
 }
 
@@ -1561,6 +1815,7 @@ export function renameCanvas(canvasId: string, name: string, actor: Actor) {
 /* ------------------------------------------------------------------ */
 
 export function createPage(canvasId: string, name: string, actor: Actor) {
+  assertAgentWriteAllowed(canvasId, actor)
   const page = store.createPage(canvasId, name)
   if (!page) return undefined
   const canvas = store.getCanvas(canvasId)!
@@ -1570,6 +1825,8 @@ export function createPage(canvasId: string, name: string, actor: Actor) {
 }
 
 export function renamePage(pageId: string, name: string, actor: Actor) {
+  const canvasId = store.getPage(pageId)?.canvas.id
+  if (canvasId) assertAgentWriteAllowed(canvasId, actor)
   const page = store.renamePage(pageId, name)
   if (!page) return undefined
   const canvas = store.getCanvas(page.canvasId)!
@@ -1588,6 +1845,8 @@ export function reorderPage(pageId: string, position: number, actor: Actor) {
 }
 
 export function deletePage(pageId: string, actor: Actor) {
+  const owner = store.getPage(pageId)?.canvas.id
+  if (owner) assertAgentWriteAllowed(owner, actor)
   const result = store.deletePage(pageId)
   if (!result) return undefined
   const { canvas, page, frames } = result
@@ -1611,6 +1870,8 @@ export function duplicatePage(pageId: string, actor: Actor) {
 }
 
 export function moveFrameToPage(frameId: string, pageId: string, actor: Actor) {
+  const moving = store.getFrame(frameId)
+  if (moving) assertAgentWriteAllowed(moving.canvasId, actor)
   const frame = store.moveFrameToPage(frameId, pageId)
   if (!frame) return undefined
   const page = store.getPage(pageId)!.page
@@ -1758,6 +2019,7 @@ export function getPlan(canvasId: string, agentName: string): AgentPlan | undefi
 /** Replace the canvas's design tokens (or clear them with undefined).
  *  Validates first, so an invalid token never reaches the store. */
 export function setTokens(canvasId: string, tokens: DesignTokens | undefined, actor: Actor): Canvas | undefined {
+  assertAgentWriteAllowed(canvasId, actor)
   if (tokens) validateTokens(tokens)
   const canvas = store.setTokens(canvasId, tokens, actor.name)
   if (!canvas) return undefined
@@ -1778,6 +2040,7 @@ export function setGuideline(
   pos?: { x: number; y: number },
   title?: string,
 ): GuidelineDoc | null | undefined {
+  assertAgentWriteAllowed(canvasId, actor)
   const slug = name.trim().toLowerCase()
   if (!GUIDELINE_NAME_RE.test(slug))
     throw new Error(`invalid doc name “${name}” — use a lowercase slug like "feature-image" (a-z, 0-9, hyphens)`)
@@ -1912,6 +2175,7 @@ export const MAX_DECISION_CHARS = 500
  *  when the canvas is missing, null when it was a duplicate re-report. */
 export function recordChatDecision(canvasId: string, text: string, actor: Actor): DesignDecision | null | undefined {
   if (!store.getCanvas(canvasId)) return undefined
+  assertAgentWriteAllowed(canvasId, actor)
   const clean = text.replace(/\s+/g, ' ').trim()
   if (!clean) throw new Error('decision text is empty')
   if (clean.length > MAX_DECISION_CHARS)
@@ -2201,7 +2465,7 @@ export function pauseAgentWork(canvasId: string, agentName: string, by: string):
     paused++
   }
   if (paused > 0) {
-    frameLocks.releaseAllFor(canvasId, agentName)
+    releaseLocksForAgent(canvasId, agentName)
     cancel(canvasId)
     logActivity(canvasId, resolveActor({ name: by, kind: 'user' }), `paused ${agentName}`)
   }
@@ -2308,7 +2572,10 @@ export function recordRunUsage(taskIds: string[], usage: TaskUsage): void {
 export async function revertFrame(frameId: string, versionId: string, actor: Actor): Promise<Frame | undefined> {
   const version = await persist.getFrameVersion(versionId)
   if (!version || version.frameId !== frameId) return undefined
-  frameLocks.release(frameId, actor.name)
+  /* through the wrapper, not frameLocks.release: the room has to be told the
+     frame is free, or the "held by" chip sticks and the HTML editor stays
+     disabled for everyone */
+  releaseFrameLock(frameId, actor.name)
   return updateFrame(
     frameId,
     {

@@ -1,7 +1,6 @@
 import { create } from 'zustand'
 import type {
   ActivityItem,
-  ActorKind,
   AgentPlan,
   AgentQuestion,
   AgentTask,
@@ -10,6 +9,7 @@ import type {
   DesignTokens,
   ElementComment,
   Frame,
+  FrameLockHolder,
   FrameProposal,
   FrameVersion,
   GuidelineDoc,
@@ -22,15 +22,11 @@ import type {
 } from '../../shared/types'
 import type { SnapGuide } from './snap'
 
-/** Which tab the side panel shows. */
-export type PanelTab = 'tasks' | 'activity' | 'memory' | 'agents' | 'review' | 'run'
+/** Why a frame's design stream ended, as the server reports it. */
+export type StreamEndReason = 'done' | 'idle' | 'taken over' | 'stopped' | 'replaced'
 
-/** Who holds a frame's edit lock, as the server broadcasts it. */
-export interface FrameLockHolder {
-  name: string
-  color: string
-  kind: ActorKind
-}
+/** Which tab the side panel shows. */
+export type PanelTab = 'tasks' | 'activity' | 'memory' | 'tokens' | 'agents' | 'review' | 'checks' | 'run'
 
 export interface Viewport {
   x: number
@@ -106,8 +102,12 @@ interface State {
   updateReady: boolean
   /** frameId -> color, set briefly when a remote actor updates a frame */
   flashes: Record<string, { color: string; at: number }>
-  /** frameId -> actor currently streaming a design into it */
-  streams: Record<string, { name: string; color: string }>
+  /** frameId -> actor currently streaming a design into it. `isAgent` is what
+   *  the Stop control keys off: a human's stream is not stoppable. */
+  streams: Record<string, { name: string; color: string; isAgent: boolean }>
+  /** frameId -> how the last stream into it ended, so the frame can say so
+   *  instead of dropping its border unexplained */
+  streamEnds: Record<string, { name: string; color: string; isAgent: boolean; reason: StreamEndReason; at: number }>
   /** the free-tier wall is showing — in the store so any surface that hits
    *  the resident-task limit (board, prompt bar, element comment) can raise it */
   limitWall: boolean
@@ -163,7 +163,13 @@ interface State {
   setRunEvents(events: RunEvent[]): void
   pushRunEvent(event: RunEvent): void
   setFrameVersions(frameId: string, versions: FrameVersion[]): void
+  setStream(
+    frameId: string,
+    actor: { name: string; color: string; isAgent: boolean } | null,
+    reason?: StreamEndReason,
+  ): void
   setFrameLock(frameId: string, holder: FrameLockHolder | null): void
+  setFrameLocks(locks: Record<string, FrameLockHolder>): void
   setReviewModeLocal(on: boolean): void
   /** open the side panel on a tab from anywhere (a question pin, a toast) */
   requestPanel(tab: PanelTab): void
@@ -190,7 +196,6 @@ interface State {
   setViewport(v: Viewport): void
   setSnapGuides(guides: SnapGuide[]): void
   flash(frameId: string, color: string): void
-  setStream(frameId: string, actor: { name: string; color: string } | null): void
 }
 
 /** Frames the current surface shows: the active page's frames, or all of them
@@ -248,10 +253,17 @@ export const useStore = create<State>((set, get) => ({
   updateReady: false,
   flashes: {},
   streams: {},
+  streamEnds: {},
 
   /* leaving a canvas drops its per-frame state: locks and loaded version
      lists belong to frames that no longer exist on screen */
-  setCanvas: (canvas) => set(canvas ? { canvas } : { canvas: null, frameLocks: {}, frameVersions: {} }),
+  setCanvas: (canvas) =>
+    set(
+      canvas
+        ? { canvas, streams: {}, streamEnds: {} }
+        : { canvas: null, streams: {}, frameLocks: {}, frameVersions: {}, streamEnds: {} },
+    ),
+  setFrameLocks: (frameLocks) => set({ frameLocks }),
   setActivePage: (activePageId) => set({ activePageId }),
   setPagesLocal: (pages) =>
     set((s) => {
@@ -483,12 +495,24 @@ export const useStore = create<State>((set, get) => ({
      so unsnapped drags don't render the (empty) guide layer each frame */
   setSnapGuides: (snapGuides) =>
     set((s) => (snapGuides.length === 0 && s.snapGuides.length === 0 ? s : { snapGuides })),
-  setStream: (frameId, actor) =>
+  setStream: (frameId, actor, reason) =>
     set((s) => {
       const streams = { ...s.streams }
-      if (actor) streams[frameId] = actor
-      else delete streams[frameId]
-      return { streams }
+      const streamEnds = { ...s.streamEnds }
+      if (actor) {
+        streams[frameId] = actor
+        delete streamEnds[frameId]
+      } else {
+        const ending = streams[frameId]
+        delete streams[frameId]
+        /* the actor is gone from `streams` by design, so the end is recorded
+           here: the frame needs the name and color to say who finished */
+        /* the server always names the reason; a missing one is not evidence
+           the agent went silent, and "agent silent" is an alarm the viewer
+           should only ever get on purpose */
+        if (ending) streamEnds[frameId] = { ...ending, reason: reason ?? 'done', at: Date.now() }
+      }
+      return { streams, streamEnds }
     }),
   flash: (frameId, color) => {
     set((s) => ({ flashes: { ...s.flashes, [frameId]: { color, at: Date.now() } } }))

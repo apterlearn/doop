@@ -45,9 +45,7 @@ export function PagesBar() {
                 )}
               >
                 <span className="overflow-hidden text-ellipsis whitespace-nowrap">{page.name}</span>
-                <span className={cn('text-[9.5px]', isActive ? 'text-ink-faint' : 'text-ink-faint/70')}>
-                  {count}
-                </span>
+                <span className={cn('text-[9.5px]', isActive ? 'text-ink-faint' : 'text-ink-faint/70')}>{count}</span>
               </button>
             </ContextMenuTrigger>
             <ContextMenuContent>
@@ -73,11 +71,7 @@ export function PagesBar() {
               >
                 Duplicate
               </ContextMenuItem>
-              <ContextMenuItem
-                tone="danger"
-                disabled={pages.length < 2}
-                onSelect={() => setDeleteTarget(page.id)}
-              >
+              <ContextMenuItem tone="danger" disabled={pages.length < 2} onSelect={() => setDeleteTarget(page.id)}>
                 Delete
               </ContextMenuItem>
             </ContextMenuContent>
@@ -150,7 +144,6 @@ function InlineRename({
     />
   )
 }
-
 
 function DeletePageModal({
   pageName,

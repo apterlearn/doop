@@ -1,0 +1,1 @@
+ALTER TABLE "canvases" ADD COLUMN "published_release_id" text;

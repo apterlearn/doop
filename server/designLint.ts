@@ -2,77 +2,17 @@ import type { DesignTokens, Frame } from '../shared/types.ts'
 import { probeFrame, type Probe } from './domProbe.ts'
 
 /**
- * Design tokens: validation, CSS rendering, and the conformance lint.
+ * The token conformance lint: does a rendered frame use the canvas's declared
+ * palette, type scale and spacing/radii scales, or has it drifted into
+ * near-miss shades and one-off paddings?
  *
- * A canvas's tokens are the one palette/type/scale its frames should share.
- * Validation lives here rather than in the MCP tool because the same rules
- * have to hold whichever surface writes them, and `cssForTokens` is the single
- * renderer — the MCP result, the `doop://canvas/{id}/tokens` resource and the
- * guide all show the identical `:root` block.
+ * Token validation and CSS rendering live elsewhere — server/tokenCss.ts and
+ * shared/tokens.ts — so this module stays a pure function over a probe.
  */
-
-export const MAX_TOKEN_COLORS = 64
-export const MAX_TOKEN_SPACING = 12
-export const MAX_TOKEN_RADII = 12
-export const MAX_TOKEN_SHADOWS = 8
-const TOKEN_NAME_RE = /^[a-z0-9][a-z0-9-]{0,31}$/
-const COLOR_RE = /^(#[0-9a-f]{3}|#[0-9a-f]{6}|#[0-9a-f]{8}|rgb|rgba|hsl|hsla|oklch|oklab|color)\(?/i
-const SHADOW_RE = /^(none|inset\s|[-\d.]+px\s)/i
-
-/** Throws with a caller-facing message on the first invalid token. */
-export function validateTokens(tokens: DesignTokens): void {
-  const colorNames = Object.keys(tokens.colors ?? {})
-  if (colorNames.length > MAX_TOKEN_COLORS)
-    throw new Error(`${colorNames.length} colors — the limit is ${MAX_TOKEN_COLORS}`)
-  for (const [name, value] of Object.entries(tokens.colors ?? {})) {
-    if (!TOKEN_NAME_RE.test(name))
-      throw new Error(`invalid color token name “${name}” — lowercase a-z, 0-9 and hyphens, starting alphanumeric`)
-    if (typeof value !== 'string' || !COLOR_RE.test(value.trim()))
-      throw new Error(`invalid color for token “${name}”: ${String(value)} — use a hex, rgb(), hsl() or oklch() value`)
-  }
-  for (const key of ['display', 'body', 'mono'] as const) {
-    const font = tokens.fonts?.[key]
-    if (font !== undefined && (typeof font !== 'string' || !font.trim()))
-      throw new Error(`fonts.${key} is empty — name a font family or omit the key`)
-  }
-  const numeric = (values: number[] | undefined, key: string, limit: number, positive: boolean) => {
-    if (values === undefined) return
-    if (values.length > limit) throw new Error(`${values.length} ${key} values — the limit is ${limit}`)
-    for (const value of values) {
-      if (!Number.isFinite(value) || (positive ? value <= 0 : value < 0))
-        throw new Error(`invalid ${key} value ${value} — use ${positive ? 'positive' : 'non-negative'} numbers in px`)
-    }
-  }
-  numeric(tokens.spacing, 'spacing', MAX_TOKEN_SPACING, true)
-  numeric(tokens.radii, 'radii', MAX_TOKEN_RADII, false)
-  if (tokens.shadows !== undefined) {
-    if (tokens.shadows.length > MAX_TOKEN_SHADOWS)
-      throw new Error(`${tokens.shadows.length} shadows — the limit is ${MAX_TOKEN_SHADOWS}`)
-    for (const shadow of tokens.shadows) {
-      if (typeof shadow !== 'string' || !SHADOW_RE.test(shadow.trim()))
-        throw new Error(`invalid shadow “${String(shadow)}” — use a CSS box-shadow value`)
-    }
-  }
-}
-
-/** The tokens as a ready-to-paste `:root` block. The one place a token becomes
- *  CSS, so every surface that shows them shows the same thing. */
-export function cssForTokens(tokens: DesignTokens): string {
-  const lines: string[] = []
-  for (const [name, value] of Object.entries(tokens.colors ?? {})) lines.push(`  --color-${name}: ${value.trim()};`)
-  for (const [key, value] of Object.entries(tokens.fonts ?? {})) {
-    if (value) lines.push(`  --font-${key}: ${value.trim()};`)
-  }
-  for (const value of tokens.spacing ?? []) lines.push(`  --space-${value}: ${value}px;`)
-  for (const value of tokens.radii ?? []) lines.push(`  --radius-${value}: ${value}px;`)
-  for (const [index, value] of (tokens.shadows ?? []).entries())
-    lines.push(`  --shadow-${index + 1}: ${value.trim()};`)
-  return `:root {\n${lines.join('\n')}\n}`
-}
 
 /* ---- design lint ---- */
 
-export type LintRule = 'off_token_color' | 'off_token_font' | 'off_scale_radius' | 'off_grid_spacing'
+export type LintRule = 'off_token_color' | 'off_token_font' | 'off_token_type' | 'off_scale_radius' | 'off_grid_spacing'
 
 export interface LintViolation {
   rule: LintRule
@@ -143,7 +83,10 @@ export function colorDistance(a: string, b: string): number | undefined {
 
 /** The first family in a CSS font stack, lowercased and unquoted. */
 function firstFamily(stack: string): string {
-  return (stack.split(',')[0] ?? '').trim().replace(/^["']|["']$/g, '').toLowerCase()
+  return (stack.split(',')[0] ?? '')
+    .trim()
+    .replace(/^["']|["']$/g, '')
+    .toLowerCase()
 }
 
 function px(value: string): number | undefined {
@@ -157,6 +100,7 @@ export function lintProbe(probe: Probe, tokens: DesignTokens | undefined): LintR
   const empty: Record<LintRule, number> = {
     off_token_color: 0,
     off_token_font: 0,
+    off_token_type: 0,
     off_scale_radius: 0,
     off_grid_spacing: 0,
   }
@@ -169,6 +113,9 @@ export function lintProbe(probe: Probe, tokens: DesignTokens | undefined): LintR
   const fontTokens = Object.values(tokens.fonts ?? {}).filter((f): f is string => !!f)
   const spacingScale = tokens.spacing ?? []
   const radiiScale = tokens.radii ?? []
+  const sizeScale = tokens.type?.size ?? []
+  const weightScale = tokens.type?.weight ?? []
+  const leadingScale = tokens.type?.leading ?? []
   const violations: LintViolation[] = []
 
   const nearestColor = (value: string): { token: string; distance: number } | undefined => {
@@ -201,6 +148,43 @@ export function lintProbe(probe: Probe, tokens: DesignTokens | undefined): LintR
           value: family,
           expected: fontTokens.join(', '),
         })
+      }
+    }
+    if (sizeScale.length || weightScale.length || leadingScale.length) {
+      const fontSize = el.fontSizePx
+      if (fontSize > 0 && sizeScale.length) {
+        const nearest = sizeScale.reduce((a, b) => (Math.abs(b - fontSize) < Math.abs(a - fontSize) ? b : a))
+        /* half a pixel is sub-perceptual at every size a design uses; beyond
+           that the frame invented a size of its own */
+        if (Math.abs(nearest - fontSize) > 0.5) {
+          violations.push({
+            rule: 'off_token_type',
+            selector: el.selector,
+            value: `${fontSize}px`,
+            expected: sizeScale.map((s) => `${s}px`).join(', '),
+          })
+        }
+      }
+      if (el.fontWeight > 0 && weightScale.length && !weightScale.includes(el.fontWeight)) {
+        violations.push({
+          rule: 'off_token_type',
+          selector: el.selector,
+          value: `font-weight ${el.fontWeight}`,
+          expected: weightScale.join(', '),
+        })
+      }
+      const lineHeightPx = Number.parseFloat(el.style.lineHeight)
+      if (fontSize > 0 && lineHeightPx > 0 && leadingScale.length) {
+        const ratio = lineHeightPx / fontSize
+        const nearest = leadingScale.reduce((a, b) => (Math.abs(b - ratio) < Math.abs(a - ratio) ? b : a))
+        if (Math.abs(nearest - ratio) > 0.05) {
+          violations.push({
+            rule: 'off_token_type',
+            selector: el.selector,
+            value: `line-height ${ratio.toFixed(2)}`,
+            expected: leadingScale.join(', '),
+          })
+        }
       }
     }
     if (radiiScale.length) {

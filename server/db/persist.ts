@@ -19,6 +19,7 @@ import type {
   DesignTokens,
   Frame,
   FrameProposal,
+  FrameReview,
   FrameVersion,
   GuidelineDoc,
   MemoryProposal,
@@ -51,6 +52,7 @@ function canvasColumns(c: Canvas) {
     publishedAt: c.publishedAt ?? null,
     description: c.description ?? null,
     category: c.category ?? null,
+    publishedReleaseId: c.publishedReleaseId ?? null,
     copyCount: c.copyCount ?? 0,
     tokens: c.tokens ?? null,
     reviewMode: c.reviewMode ?? false,
@@ -268,6 +270,166 @@ export async function getFrameVersion(versionId: string): Promise<FrameVersion |
   return row
 }
 
+/* Verification reports: append-only, capped per frame. Written from the
+   review_frame tool and the resident gate, read by the checks panel and by
+   the gate itself when it decides whether a delivery may complete. */
+const MAX_FRAME_REVIEWS = 20
+
+export async function saveFrameReview(review: FrameReview): Promise<void> {
+  await db.insert(t.frameReviews).values({
+    id: review.id,
+    frameId: review.frameId,
+    canvasId: review.canvasId,
+    htmlSha: review.htmlSha,
+    frameUpdatedAt: review.frameUpdatedAt,
+    verdict: review.verdict,
+    summary: review.summary,
+    report: review.report as object,
+    reviewedAt: review.reviewedAt,
+    reviewedBy: review.reviewedBy,
+  })
+  const excess = await db
+    .select({ id: t.frameReviews.id })
+    .from(t.frameReviews)
+    .where(eq(t.frameReviews.frameId, review.frameId))
+    .orderBy(desc(t.frameReviews.reviewedAt))
+    .offset(MAX_FRAME_REVIEWS)
+  if (excess.length) {
+    await db.delete(t.frameReviews).where(
+      inArray(
+        t.frameReviews.id,
+        excess.map((row) => row.id),
+      ),
+    )
+  }
+}
+
+/** The report summary as stored: a jsonb column is `unknown` at the boundary,
+ *  so it is narrowed here rather than cast. */
+function numericRecord(value: unknown): Record<string, number> {
+  if (!value || typeof value !== 'object') return {}
+  const out: Record<string, number> = {}
+  for (const [key, entry] of Object.entries(value)) {
+    if (typeof entry === 'number') out[key] = entry
+  }
+  return out
+}
+
+/* ---- releases ---- */
+
+/** The frames a release froze: the fields a render needs, and nothing that
+ *  can change afterwards. */
+export interface ReleaseFrame {
+  id: string
+  name: string
+  width: number
+  height: number
+  x: number
+  y: number
+  html: string
+  pageId?: string
+}
+
+export interface CanvasRelease {
+  id: string
+  canvasId: string
+  name: string
+  frames: ReleaseFrame[]
+  tokens?: DesignTokens
+  createdAt: number
+  createdBy: string
+}
+
+/** A release's frozen frames as ordinary frames, so every path that reads a
+ *  snapshot — the public preview, a handoff, a gallery listing, a copy — reads
+ *  it the same way. `updatedAt` is the release time: the snapshot is the
+ *  canvas as it stood then. */
+export function releaseFrames(release: CanvasRelease): Frame[] {
+  return release.frames.map((frame) => ({
+    id: frame.id,
+    canvasId: release.canvasId,
+    name: frame.name,
+    x: frame.x,
+    y: frame.y,
+    width: frame.width,
+    height: frame.height,
+    html: frame.html,
+    createdAt: 0,
+    updatedAt: release.createdAt,
+    updatedBy: release.createdBy,
+    ...(frame.pageId ? { pageId: frame.pageId } : {}),
+  }))
+}
+
+/** Store a release. Frames are copied into the row, so a later edit to the
+ *  canvas cannot reach it. */
+export async function saveRelease(release: CanvasRelease): Promise<void> {
+  await db.insert(t.canvasReleases).values({
+    id: release.id,
+    canvasId: release.canvasId,
+    name: release.name,
+    frames: release.frames as unknown as object,
+    tokens: (release.tokens ?? null) as object | null,
+    createdAt: release.createdAt,
+    createdBy: release.createdBy,
+  })
+}
+
+/** A canvas's releases, newest first. */
+export async function listReleases(canvasId: string, limit = 50): Promise<CanvasRelease[]> {
+  const rows = await db
+    .select()
+    .from(t.canvasReleases)
+    .where(eq(t.canvasReleases.canvasId, canvasId))
+    .orderBy(desc(t.canvasReleases.createdAt))
+    .limit(limit)
+  return rows.map(toRelease)
+}
+
+/** One release, by id — the public preview route and the restore path both
+ *  need it without a canvas id in hand. */
+export async function getRelease(id: string): Promise<CanvasRelease | undefined> {
+  const [row] = await db.select().from(t.canvasReleases).where(eq(t.canvasReleases.id, id))
+  return row ? toRelease(row) : undefined
+}
+
+export async function deleteRelease(id: string): Promise<void> {
+  await db.delete(t.canvasReleases).where(eq(t.canvasReleases.id, id))
+}
+
+function toRelease(row: typeof t.canvasReleases.$inferSelect): CanvasRelease {
+  return {
+    id: row.id,
+    canvasId: row.canvasId,
+    name: row.name,
+    frames: row.frames as unknown as ReleaseFrame[],
+    ...(row.tokens ? { tokens: row.tokens as unknown as DesignTokens } : {}),
+    createdAt: row.createdAt,
+    createdBy: row.createdBy,
+  }
+}
+
+export async function listFrameReviews(frameId: string, limit = 10): Promise<FrameReview[]> {
+  const rows = await db
+    .select()
+    .from(t.frameReviews)
+    .where(eq(t.frameReviews.frameId, frameId))
+    .orderBy(desc(t.frameReviews.reviewedAt))
+    .limit(limit)
+  return rows.map((row) => ({
+    id: row.id,
+    frameId: row.frameId,
+    canvasId: row.canvasId,
+    htmlSha: row.htmlSha,
+    frameUpdatedAt: row.frameUpdatedAt,
+    verdict: row.verdict === 'pass' ? 'pass' : 'fail',
+    summary: numericRecord(row.summary),
+    report: row.report,
+    reviewedAt: row.reviewedAt,
+    reviewedBy: row.reviewedBy,
+  }))
+}
+
 async function appendFrameVersion(f: Frame) {
   const [newest] = await db
     .select({ html: t.frameVersions.html })
@@ -446,6 +608,7 @@ export function saveQuestion(q: AgentQuestion) {
     color: q.color,
     frameId: q.frameId ?? null,
     selector: q.selector ?? null,
+    stableKey: q.stableKey ?? null,
     text: q.text,
     at: q.at,
     status: q.status,
@@ -595,6 +758,7 @@ export function deleteCanvas(canvasId: string) {
   swallow(db.delete(t.guidelines).where(eq(t.guidelines.canvasId, canvasId)))
   swallow(db.delete(t.guidelineVersions).where(eq(t.guidelineVersions.canvasId, canvasId)))
   swallow(db.delete(t.frameVersions).where(eq(t.frameVersions.canvasId, canvasId)))
+  swallow(db.delete(t.frameReviews).where(eq(t.frameReviews.canvasId, canvasId)))
   swallow(db.delete(t.memoryReferences).where(eq(t.memoryReferences.canvasId, canvasId)))
   swallow(db.delete(t.decisions).where(eq(t.decisions.canvasId, canvasId)))
   swallow(db.delete(t.memoryProposals).where(eq(t.memoryProposals.canvasId, canvasId)))
@@ -612,6 +776,7 @@ export function deleteFrame(frameId: string) {
   swallow(db.delete(t.frames).where(eq(t.frames.id, frameId)))
   swallow(db.delete(t.assetRefs).where(eq(t.assetRefs.frameId, frameId)))
   swallow(db.delete(t.frameVersions).where(eq(t.frameVersions.frameId, frameId)))
+  swallow(db.delete(t.frameReviews).where(eq(t.frameReviews.frameId, frameId)))
 }
 
 /** Drop one card row. Used when a human removes a card from the board. */
@@ -760,6 +925,7 @@ export function saveComment(c: ElementComment) {
     canvasId: c.canvasId,
     frameId: c.frameId,
     selector: c.selector,
+    stableKey: c.stableKey ?? null,
     snippet: c.snippet,
     fromName: c.from,
     fromUserId: c.fromUserId ?? null,
@@ -901,6 +1067,7 @@ export async function hydrate(): Promise<Hydrated> {
     ...(c.publishedAt != null ? { publishedAt: c.publishedAt } : {}),
     ...(c.description ? { description: c.description } : {}),
     ...(isCommunityCategory(c.category) ? { category: c.category } : {}),
+    ...(c.publishedReleaseId ? { publishedReleaseId: c.publishedReleaseId } : {}),
     ...(c.copyCount ? { copyCount: c.copyCount } : {}),
     ...(c.tokens ? { tokens: c.tokens as DesignTokens } : {}),
     ...(c.reviewMode ? { reviewMode: true } : {}),
@@ -1090,6 +1257,7 @@ export async function hydrate(): Promise<Hydrated> {
       canvasId: row.canvasId,
       frameId: row.frameId,
       selector: row.selector,
+      ...(row.stableKey != null ? { stableKey: row.stableKey } : {}),
       snippet: row.snippet,
       from: row.fromName,
       ...(row.fromUserId != null ? { fromUserId: row.fromUserId } : {}),
@@ -1218,6 +1386,7 @@ export async function hydrate(): Promise<Hydrated> {
       color: row.color,
       ...(row.frameId != null ? { frameId: row.frameId } : {}),
       ...(row.selector != null ? { selector: row.selector } : {}),
+      ...(row.stableKey != null ? { stableKey: row.stableKey } : {}),
       text: row.text,
       at: row.at,
       status: row.status as AgentQuestion['status'],

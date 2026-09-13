@@ -58,6 +58,13 @@ function comment(overrides: Partial<ElementComment> & { id: string }): ElementCo
   }
 }
 
+/* Reading a comment now reports how its anchor resolved. The fixtures carry a
+   positional selector and no key, and the server cannot check that against the
+   frame without a render, so they read back as unverified. */
+function anchored(comments: ElementComment[]) {
+  return comments.map((c) => ({ ...c, anchor: 'unverified' }))
+}
+
 interface CallResult {
   content: Array<{ type: string; text?: string }>
   isError?: boolean
@@ -144,8 +151,13 @@ describe('get_comments MCP tool', () => {
       const { parsed, isError } = await callComments(client, { canvas_id: CANVAS.id })
       expect(isError).toBeFalsy()
       expect(spy).toHaveBeenCalledWith(CANVAS.id)
-      expect(parsed).toEqual({ comments: stored, total: 2, has_more: false })
-      expect((parsed as { comments: unknown[] }).comments).toEqual([reply, root])
+      expect(parsed).toEqual({ comments: anchored(stored), total: 2, has_more: false })
+      /* the anchor state rides along: a selector with no key cannot be checked
+         against the frame without a render, so it reports as unverified */
+      expect((parsed as { comments: { anchor?: string }[] }).comments.map((c) => c.anchor)).toEqual([
+        'unverified',
+        'unverified',
+      ])
     } finally {
       await close()
     }
@@ -160,7 +172,7 @@ describe('get_comments MCP tool', () => {
     const { client, close } = await connect()
     try {
       const { parsed } = await callComments(client, { canvas_id: CANVAS.id, frame_id: FRAME_B.id })
-      expect(parsed).toEqual({ comments: [stored[0]], total: 1, has_more: false })
+      expect(parsed).toEqual({ comments: anchored([stored[0]!]), total: 1, has_more: false })
     } finally {
       await close()
     }
@@ -175,7 +187,7 @@ describe('get_comments MCP tool', () => {
       const withDefault = await callComments(client, { canvas_id: CANVAS.id })
       expect((withDefault.parsed as { comments: unknown[] }).comments).toHaveLength(2)
       const unresolvedOnly = await callComments(client, { canvas_id: CANVAS.id, include_resolved: false })
-      expect(unresolvedOnly.parsed).toEqual({ comments: [open], total: 1, has_more: false })
+      expect(unresolvedOnly.parsed).toEqual({ comments: anchored([open]), total: 1, has_more: false })
     } finally {
       await close()
     }
@@ -223,7 +235,7 @@ describe('get_comments MCP tool', () => {
       try {
         const { parsed, isError } = await callComments(client, { canvas_id: CANVAS.id })
         expect(isError).toBeFalsy()
-        expect(parsed).toEqual({ comments: stored, total: 1, has_more: false })
+        expect(parsed).toEqual({ comments: anchored(stored), total: 1, has_more: false })
       } finally {
         await close()
       }

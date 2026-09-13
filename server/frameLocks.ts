@@ -25,22 +25,21 @@ export const MAX_LOCK_TTL_MS = 600_000
 const locks = new Map<string, FrameLock>()
 
 /** The live lock on this frame, if it belongs to someone else. `undefined`
- *  when the frame is free, the lock has expired, or the caller holds it. */
+ *  when the frame is free, the lock has expired, or the caller holds it. An
+ *  expired lock is reported as absent but left in place: `takeExpired` is what
+ *  removes it, and it is the only path that tells the room the holder is gone. */
 export function heldBy(frameId: string, agentName: string): FrameLock | undefined {
   const lock = locks.get(frameId)
   if (!lock) return undefined
-  if (lock.expiresAt <= Date.now()) {
-    locks.delete(frameId)
-    return undefined
-  }
+  if (lock.expiresAt <= Date.now()) return undefined
   return lock.agentName === agentName ? undefined : lock
 }
 
-/** Every live lock, for reporting and tests. */
+/** Every live lock, for reporting and tests. Expired entries are omitted but
+ *  left for `takeExpired`, so the room still hears about them. */
 export function activeLocks(): FrameLock[] {
   const now = Date.now()
-  for (const [frameId, lock] of locks) if (lock.expiresAt <= now) locks.delete(frameId)
-  return [...locks.values()]
+  return [...locks.values()].filter((lock) => lock.expiresAt > now)
 }
 
 /** Take the lock, or report who holds it. A lock you already hold is renewed
@@ -82,21 +81,38 @@ export function release(frameId: string, agentName: string): boolean {
 }
 
 /** Drop everything this agent holds on a canvas — run teardown, stop, or an
- *  explicit end_frame_edit for a frame it no longer knows about. */
-export function releaseAllFor(canvasId: string, agentName: string): number {
-  let released = 0
+ *  explicit end_frame_edit for a frame it no longer knows about. Returns the
+ *  frames it released, so the caller can tell the room they are free. */
+export function releaseAllFor(canvasId: string, agentName: string): string[] {
+  const released: string[] = []
   for (const [frameId, lock] of locks) {
     if (lock.canvasId === canvasId && lock.agentName === agentName) {
       locks.delete(frameId)
-      released += 1
+      released.push(frameId)
     }
   }
   return released
 }
 
 /** Release every lock on a frame, whoever holds it (takeover). */
-export function releaseAll(frameId: string): void {
+export function releaseAll(frameId: string): FrameLock | undefined {
+  const lock = locks.get(frameId)
   locks.delete(frameId)
+  return lock
+}
+
+/** Expired locks, removed and returned. A lock that expires silently leaves
+ *  the room showing a holder that is gone, so the sweep reports what it
+ *  dropped. */
+export function takeExpired(now = Date.now()): FrameLock[] {
+  const expired: FrameLock[] = []
+  for (const [frameId, lock] of locks) {
+    if (lock.expiresAt <= now) {
+      locks.delete(frameId)
+      expired.push(lock)
+    }
+  }
+  return expired
 }
 
 /** Thrown by the shared mutation layer when a write hits someone else's lock,
@@ -104,9 +120,7 @@ export function releaseAll(frameId: string): void {
 export class FrameLockedError extends Error {
   readonly holder: FrameLock
   constructor(holder: FrameLock) {
-    super(
-      `frame is being edited by ${holder.agentName} until ${new Date(holder.expiresAt).toISOString()}`,
-    )
+    super(`frame is being edited by ${holder.agentName} until ${new Date(holder.expiresAt).toISOString()}`)
     this.name = 'FrameLockedError'
     this.holder = holder
   }

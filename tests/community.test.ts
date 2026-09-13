@@ -1,5 +1,7 @@
+import { createHash } from 'node:crypto'
 import { afterAll, beforeAll, expect, it } from 'vitest'
 import { Client, startServer, type Server } from './harness.ts'
+import { findBrowserPath } from '../server/screenshot.ts'
 
 const PORT = 4960
 
@@ -136,4 +138,151 @@ it('keeps a listing across a restart', async () => {
   expect(listing).toMatchObject([
     { id: canvas.id, description: 'Survives reboots.', category: 'dashboard', copyCount: 1 },
   ])
+}, 60_000)
+
+/** A bearer token for an MCP connection, obtained the way a real client does:
+ *  register the client, approve it in the browser (the session cookie stands in
+ *  for the human clicking Allow), then exchange the code with PKCE. */
+async function mcpToken(client: Client): Promise<string> {
+  const redirect = 'http://localhost:9999/callback'
+  const registered = await (
+    await fetch(`${server.base}/api/auth/mcp/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        redirect_uris: [redirect],
+        client_name: 'test client',
+        token_endpoint_auth_method: 'none',
+      }),
+    })
+  ).json()
+  const verifier = 'a'.repeat(64)
+  const challenge = createHash('sha256').update(verifier).digest('base64url')
+  const authorize = await client.get(
+    `/api/auth/mcp/authorize?client_id=${registered.client_id}&redirect_uri=${encodeURIComponent(redirect)}` +
+      `&response_type=code&code_challenge=${challenge}&code_challenge_method=s256`,
+  )
+  const code = new URL(authorize.headers.get('location')!).searchParams.get('code')!
+  const token = await (
+    await fetch(`${server.base}/api/auth/mcp/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        code,
+        code_verifier: verifier,
+        client_id: registered.client_id,
+        redirect_uri: redirect,
+      }),
+    })
+  ).json()
+  return token.access_token as string
+}
+
+/** One MCP tool call over HTTP, as an agent would make it. */
+async function mcpCall(token: string, name: string, args: Record<string, unknown>) {
+  const res = await fetch(`${server.base}/mcp`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json, text/event-stream',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } }),
+  })
+  const body = await res.text()
+  const payload = body.startsWith('event:') ? JSON.parse(body.split('data: ')[1]!.trim()) : JSON.parse(body)
+  const text = payload.result.content.find((b: { type: string }) => b.type === 'text')?.text ?? '{}'
+  return JSON.parse(text) as Record<string, never>
+}
+
+/* Rendering the release needs the shared headless browser, like every other
+   render-backed assertion in this repo. */
+it.skipIf(!findBrowserPath())(
+  'serves a release to anyone with the link, frozen against later edits',
+  async () => {
+    /* a client for the CURRENT server: the restart test above replaced it */
+    const owner = new Client(server)
+    await owner.post('/api/auth/sign-in/email', { email: 'author@test.dev', password: 'password12345' })
+    const { canvas, frame } = await canvasWithFrame(owner, 'Handoff')
+
+    /* the release is created by an agent over MCP, through the same OAuth path a
+     real client uses */
+    const token = await mcpToken(owner)
+    const created = await mcpCall(token, 'create_release', { canvas_id: canvas.id, name: 'v1', agent_name: 'Claude' })
+    const releaseId = created.release_id as unknown as string
+    expect(String(created.url)).toContain(`/p/${canvas.id}/${releaseId}`)
+
+    /* no session at all: the link is the credential */
+    const preview = await fetch(`${server.base}/p/${canvas.id}/${releaseId}`)
+    expect(preview.status).toBe(200)
+    expect(preview.headers.get('cache-control')).toContain('immutable')
+    /* frame HTML the server did not author, served from its own origin: an
+       inline handler in any frame would otherwise run with the viewer's
+       session when the link is opened */
+    const csp = preview.headers.get('content-security-policy') ?? ''
+    expect(csp).toContain("script-src 'none'")
+    expect(csp).toContain("default-src 'none'")
+    const html = await preview.text()
+    expect(html).toContain('hello')
+
+    /* the canvas moves on; the link does not */
+    await owner.patch(`/api/frames/${frame.id}`, { html: '<h1>changed later</h1>' })
+    const again = await (await fetch(`${server.base}/p/${canvas.id}/${releaseId}`)).text()
+    expect(again).toContain('hello')
+    expect(again).not.toContain('changed later')
+
+    /* an id under another canvas does not resolve */
+    expect((await fetch(`${server.base}/p/not-this-canvas/${releaseId}`)).status).toBe(404)
+  },
+  60_000,
+)
+
+it('shows and hands out the release a listing is pinned to, not the live canvas', async () => {
+  const owner = new Client(server)
+  await owner.post('/api/auth/sign-in/email', { email: 'author@test.dev', password: 'password12345' })
+  /* the restart test above replaced the server, so the visitors of the first
+     one are pointed at a port nothing listens on */
+  const guest = new Client(server)
+  await guest.post('/api/auth/sign-in/email', { email: 'visitor@test.dev', password: 'password12345' })
+  const { canvas, frame } = await canvasWithFrame(owner, 'Pinned page')
+  const token = await mcpToken(owner)
+  const created = await mcpCall(token, 'create_release', {
+    canvas_id: canvas.id,
+    name: 'v1',
+    agent_name: 'Claude',
+  })
+  const releaseId = created.release_id as unknown as string
+  const published = await mcpCall(token, 'publish_canvas', {
+    canvas_id: canvas.id,
+    description: 'A frozen hero.',
+    category: 'website',
+    release_id: releaseId,
+    agent_name: 'Claude',
+  })
+  expect(published.error).toBeUndefined()
+
+  /* the canvas moves on: the frame is renamed and rewritten */
+  await owner.patch(`/api/frames/${frame.id}`, { html: '<h1>changed later</h1>', name: 'Hero v2' })
+
+  /* what the visitor sees is the snapshot, so a later edit cannot change the
+     listing under them */
+  const [listing] = await (await guest.get('/api/community')).json()
+  expect(listing.id).toBe(canvas.id)
+  expect(listing.frames).toEqual([{ id: frame.id, name: 'Hero', width: frame.width, height: frame.height }])
+
+  /* and the copy they take is that snapshot too */
+  const copied = await guest.post(`/api/community/${canvas.id}/copy`)
+  const copy = await copied.json()
+  expect(copied.status, JSON.stringify(copy)).toBe(200)
+  expect(copy.frames[0].html).toBe('<h1>hello</h1>')
+
+  /* delisting drops the pin: the next listing is the live canvas again */
+  expect((await owner.delete(`/api/canvases/${canvas.id}/publish`)).status).toBe(200)
+  await owner.req(`/api/canvases/${canvas.id}/publish`, {
+    method: 'PUT',
+    body: JSON.stringify({ category: 'website' }),
+  })
+  const [live] = await (await guest.get('/api/community')).json()
+  expect(live.frames[0].name).toBe('Hero v2')
 }, 60_000)

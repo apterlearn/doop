@@ -197,6 +197,54 @@ describe('review mode', () => {
     expect((res.parsed as { error: { code: string } }).error.code).toBe('unsupported')
     await close()
   })
+
+  it('on: every write path is refused, including the ones with no early gate', async () => {
+    actions.setCanvasReviewMode(
+      canvas.id,
+      true,
+      actions.resolveActor({ name: 'owner', kind: 'user', ownerId: OWNER_ID }),
+    )
+    const { client, close } = await connect()
+    const page = store.getCanvas(canvas.id)!.pages![0]!
+    const writes: [string, Record<string, unknown>][] = [
+      ['set_frame_html', { frame_id: frame.id, html: '<html><body><p>x</p></body></html>' }],
+      ['append_frame_html', { frame_id: frame.id, html_chunk: '<p>streamed</p>', start: true, done: true }],
+      ['edit_frame_html', { frame_id: frame.id, old_str: '<h1>Hi</h1>', new_str: '<h1>Changed</h1>' }],
+      ['update_frame', { frame_id: frame.id, name: 'Renamed' }],
+      ['duplicate_frame', { frame_id: frame.id }],
+      ['move_frame', { frame_id: frame.id, page: page.name }],
+      ['delete_frame', { frame_id: frame.id }],
+      ['create_frame', { canvas_id: canvas.id, name: 'New', html: '<html><body>n</body></html>' }],
+      ['create_page', { canvas_id: canvas.id, name: 'Page 2' }],
+      ['rename_page', { page_id: page.id, name: 'Renamed page' }],
+      ['set_tokens', { canvas_id: canvas.id, tokens: { colors: { ink: '#111111' } } }],
+      ['set_guidelines', { canvas_id: canvas.id, name: 'brand', markdown: '# Brand' }],
+      ['save_decision', { canvas_id: canvas.id, decision: 'keep it dark' }],
+      ['add_comment', { frame_id: frame.id, selector: 'h1', text: 'note' }],
+    ]
+    for (const [name, args] of writes) {
+      const res = await callTool(client, name, { ...args, agent_name: 'ux lead' })
+      expect(res.isError, `${name} must be refused in review mode`).toBe(true)
+      expect((res.parsed as { error: { code: string } }).error.code, name).toBe('unsupported')
+    }
+    /* nothing landed */
+    expect(store.getFrame(frame.id)?.name).toBe('Hero')
+    expect(store.getFrame(frame.id)?.html).toContain('<h1>Hi</h1>')
+    expect(store.getCanvas(canvas.id)?.tokens).toBeUndefined()
+    expect(actions.getComments(canvas.id)).toHaveLength(0)
+    await close()
+  })
+
+  it('on: a human write still lands', async () => {
+    actions.setCanvasReviewMode(
+      canvas.id,
+      true,
+      actions.resolveActor({ name: 'owner', kind: 'user', ownerId: OWNER_ID }),
+    )
+    const human = actions.resolveActor({ name: 'alice', kind: 'user', ownerId: OWNER_ID })
+    const updated = actions.updateFrame(frame.id, { html: '<html><body><p>human</p></body></html>' }, human)
+    expect(updated?.html).toContain('human')
+  })
 })
 
 describe('ask_human', () => {

@@ -29,11 +29,7 @@ export interface McpErrorPayload {
 
 const RETRYABLE: ReadonlySet<McpErrorCode> = new Set(['rate_limited', 'conflict', 'upstream_failed'])
 
-export function mcpErrorPayload(
-  code: McpErrorCode,
-  message: string,
-  extra?: Record<string, unknown>,
-): McpErrorPayload {
+export function mcpErrorPayload(code: McpErrorCode, message: string, extra?: Record<string, unknown>): McpErrorPayload {
   return { error: { code, message, retryable: RETRYABLE.has(code), ...extra } }
 }
 
@@ -51,4 +47,19 @@ export function codeFor(e: unknown): McpErrorCode {
     return (e as { code: McpErrorCode }).code
   }
   return 'upstream_failed'
+}
+
+/**
+ * A resource read failed. `resources/read` has no result envelope to carry a
+ * code, so the code travels inside the thrown message as the same JSON payload
+ * a tool would return — one taxonomy for both surfaces.
+ */
+export class ResourceError extends Error {
+  readonly code: McpErrorCode
+
+  constructor(code: McpErrorCode, message: string) {
+    super(JSON.stringify(mcpErrorPayload(code, message), null, 2))
+    this.name = 'ResourceError'
+    this.code = code
+  }
 }

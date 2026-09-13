@@ -137,7 +137,8 @@ describe.skipIf(!findBrowserPath())('the agent design loop, end to end', () => {
       )
       expect(tokens.css).toContain('--color-ink: #111110;')
       expect(
-        payload<CanvasView>(await call(client, 'get_canvas', { canvas_id: canvasId, agent_name: 'Claude' })).tokens_present,
+        payload<CanvasView>(await call(client, 'get_canvas', { canvas_id: canvasId, agent_name: 'Claude' }))
+          .tokens_present,
       ).toBe(true)
 
       /* ---- 3. publish a plan, then start it ---- */
@@ -194,9 +195,10 @@ describe.skipIf(!findBrowserPath())('the agent design loop, end to end', () => {
       expect(store.getCanvas(canvasId)!.frames).toHaveLength(1)
 
       /* ---- 5. measure it instead of eyeballing it ---- */
-      const audit = payload<{ counts: { critical: number }; issues: { rule: string; selector: string; value?: string }[] }>(
-        await call(client, 'audit_frame', { frame_id: hero.id, agent_name: 'Claude' }),
-      )
+      const audit = payload<{
+        counts: { critical: number }
+        issues: { rule: string; selector: string; value?: string }[]
+      }>(await call(client, 'audit_frame', { frame_id: hero.id, agent_name: 'Claude' }))
       expect(audit.counts.critical).toBeGreaterThanOrEqual(1)
       const contrast = audit.issues.find((i) => i.rule === 'contrast')!
       expect(contrast.value).toBe('4.48')
@@ -235,7 +237,9 @@ describe.skipIf(!findBrowserPath())('the agent design loop, end to end', () => {
       expect([meta.width, meta.height]).toEqual([390, 844])
 
       /* ---- 9. a stale write is refused, the retry lands ---- */
-      const read = payload<{ updatedAt: string }>(await call(client, 'get_frame', { frame_id: hero.id, agent_name: 'Claude' }))
+      const read = payload<{ updatedAt: string }>(
+        await call(client, 'get_frame', { frame_id: hero.id, agent_name: 'Claude' }),
+      )
       actions.updateFrame(hero.id, { html: FIXED }, actions.resolveActor({ name: 'alice', kind: 'user' }))
       const stale = await call(client, 'set_frame_html', {
         frame_id: hero.id,

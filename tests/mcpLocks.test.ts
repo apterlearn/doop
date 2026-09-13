@@ -5,7 +5,7 @@ import * as actions from '../server/actions.ts'
 import { buildMcpServer } from '../server/mcp.ts'
 import { store } from '../server/store.ts'
 import * as frameLocks from '../server/frameLocks.ts'
-import type { Canvas } from '../shared/types.ts'
+import type { Canvas, ServerMessage } from '../shared/types.ts'
 
 /* Frame locks: two agents on one canvas, each a real MCP server over its own
    in-memory transport, writing to the same frame through the real store. */
@@ -103,11 +103,16 @@ function seedCanvas(): Canvas {
   return canvas
 }
 
+/* Every lock transition has to reach the room: a "held by X" chip that never
+   appears (or never clears) is worse than no lock at all. */
+let room: ServerMessage[] = []
+
 beforeEach(() => {
   vi.restoreAllMocks()
   frameLocks.clearLocks()
+  room = []
   actions.wire(
-    () => {},
+    (canvasId, msg) => room.push(msg),
     () => {},
   )
   actions.hydrateLogs({
@@ -201,6 +206,111 @@ describe('frame locking between agents', () => {
     } finally {
       await a.close()
       await b.close()
+    }
+  })
+
+  it('tells the room who holds a frame, and when it is free again', async () => {
+    const a = await connect()
+    try {
+      await callTool(a.client, 'begin_frame_edit', { frame_id: FRAME_ID, agent_name: 'AgentA' })
+      expect(room.filter((m) => m.type === 'frame:lock')).toEqual([
+        { type: 'frame:lock', frameId: FRAME_ID, holder: { name: 'AgentA', color: expect.any(String), kind: 'agent' } },
+      ])
+
+      /* an agent that releases on its own clears the room's chip */
+      room = []
+      await callTool(a.client, 'end_frame_edit', { frame_id: FRAME_ID, agent_name: 'AgentA' })
+      expect(room.filter((m) => m.type === 'frame:lock')).toEqual([
+        { type: 'frame:lock', frameId: FRAME_ID, holder: null },
+      ])
+    } finally {
+      await a.close()
+    }
+  })
+
+  it('clears the room’s chip when a takeover displaces the holder', async () => {
+    const a = await connect()
+    const b = await connect()
+    try {
+      await callTool(a.client, 'begin_frame_edit', { frame_id: FRAME_ID, ttl_seconds: 300, agent_name: 'AgentA' })
+      room = []
+      await callTool(b.client, 'set_frame_html', {
+        frame_id: FRAME_ID,
+        html: '<h1>from B</h1>',
+        takeover: true,
+        agent_name: 'AgentB',
+      })
+      const locks = room.filter((m) => m.type === 'frame:lock')
+      /* the chip never names a holder that is not the live one */
+      expect(locks.at(-1)).toEqual({
+        type: 'frame:lock',
+        frameId: FRAME_ID,
+        holder: { name: 'AgentB', color: expect.any(String), kind: 'agent' },
+      })
+      expect(frameLocks.activeLocks().find((l) => l.frameId === FRAME_ID)?.agentName).toBe('AgentB')
+    } finally {
+      await a.close()
+      await b.close()
+    }
+  })
+
+  it('frees the frame and says so when an agent’s run tears down', async () => {
+    const a = await connect()
+    try {
+      /* its own agent name: stopping one is remembered for the canvas, and the
+         other tests in this file reuse AgentA */
+      await callTool(a.client, 'begin_frame_edit', { frame_id: FRAME_ID, ttl_seconds: 300, agent_name: 'AgentStop' })
+      /* an open card, so the stop is a real teardown rather than a bare call
+         into the lock module */
+      actions.setAgentStatus(
+        CANVAS_ID,
+        actions.resolveActor({ name: 'AgentStop', kind: 'agent' }),
+        'Polishing the hero',
+      )
+      room = []
+      /* what the Stop button does */
+      expect(actions.cancelAgentWork(CANVAS_ID, 'AgentStop', 'alice')).toBeGreaterThan(0)
+      expect(room.filter((m) => m.type === 'frame:lock')).toEqual([
+        { type: 'frame:lock', frameId: FRAME_ID, holder: null },
+      ])
+      expect(frameLocks.activeLocks()).toEqual([])
+    } finally {
+      await a.close()
+    }
+  })
+
+  it('frees the frame for the human who takes the lock back', async () => {
+    const a = await connect()
+    try {
+      await callTool(a.client, 'begin_frame_edit', { frame_id: FRAME_ID, ttl_seconds: 300, agent_name: 'AgentA' })
+      const human = actions.resolveActor({ name: 'alice', kind: 'user' })
+      /* the lock blocks the human's own edit too — that is what makes taking it
+         back necessary rather than cosmetic */
+      expect(() => actions.updateFrame(FRAME_ID, { html: '<h1>by alice</h1>' }, human)).toThrow(/AgentA/)
+      /* what the Take over button does */
+      actions.releaseAllFrameLocks(FRAME_ID)
+      expect(actions.updateFrame(FRAME_ID, { html: '<h1>by alice</h1>' }, human)).toBeDefined()
+      expect(store.getFrame(FRAME_ID)!.html).toBe('<h1>by alice</h1>')
+      expect(frameLocks.activeLocks()).toEqual([])
+    } finally {
+      await a.close()
+    }
+  })
+
+  it('reports a lapsed lock to the room instead of showing a holder that is gone', async () => {
+    const a = await connect()
+    try {
+      await callTool(a.client, 'begin_frame_edit', { frame_id: FRAME_ID, ttl_seconds: 1, agent_name: 'AgentA' })
+      room = []
+      /* one tick past expiry, as the server's sweep would see it */
+      const swept = actions.sweepExpiredLocks(Date.now() + 2000)
+      expect(swept).toBe(1)
+      expect(room.filter((m) => m.type === 'frame:lock')).toEqual([
+        { type: 'frame:lock', frameId: FRAME_ID, holder: null },
+      ])
+      expect(frameLocks.activeLocks()).toEqual([])
+    } finally {
+      await a.close()
     }
   })
 })

@@ -52,6 +52,8 @@ vi.mock('../server/db/persist.ts', () => ({
   deleteCanvas: () => {},
   savePlan: () => {},
   deletePlan: () => {},
+  /* the export reads a frame's newest verification report into its spec */
+  listFrameReviews: async () => [],
 }))
 
 const OWNER_ID = 'export-owner'
@@ -288,11 +290,34 @@ describe.skipIf(!findBrowserPath())('code handoff over real renders', () => {
   it('bundles every frame into one document with scoped styles, and zips it', async () => {
     const frames = seedCanvas([
       page('<main class="card"><h1>One</h1></main>'),
-      page('<main class="card"><h1>Two</h1></main>'),
+      /* the second frame declares its typeface the way a real design does:
+         a webfont sheet and a @font-face rule, neither of which a single HTML
+         file can carry on its own */
+      page('<main class="card"><h1>Two</h1></main>').replace(
+        '</head>',
+        '<link rel="stylesheet" href="https://fonts.example.com/inter.css">' +
+          '<style>@font-face { font-family: Inter; src: url("https://fonts.example.com/inter.woff2") format("woff2"); }</style>' +
+          '</head>',
+      ),
     ])
     const canvasId = frames[0]!.canvasId
     const { client, close } = await connect()
     try {
+      /* a canvas with a real design system: the export carries it as tokens,
+         as a document and as identity files */
+      const setTokens = await callTool(client, 'set_tokens', {
+        canvas_id: canvasId,
+        tokens: {
+          colors: { ink: '#111110', paper: '#ffffff' },
+          fonts: { body: 'Inter' },
+          spacing: [4, 8],
+          radii: [8],
+          shadows: ['0px 1px 2px rgba(0, 0, 0, 0.2)'],
+          type: { size: [16], weight: [600], leading: [1.5] },
+        },
+        agent_name: 'Claude',
+      })
+      expect(setTokens.isError).toBeFalsy()
       const html = await callTool(client, 'export_canvas', {
         canvas_id: canvasId,
         format: 'html',
@@ -325,10 +350,87 @@ describe.skipIf(!findBrowserPath())('code handoff over real renders', () => {
         expect(listing).toContain('canvas.html')
         expect(listing).toContain('README.md')
         expect(listing).toContain('frames/')
+        expect(listing).toContain('tokens.dtcg.json')
+        expect(listing).toContain('DESIGN.md')
+        /* a bundle opened offline renders in the frame's typeface, so the
+           fonts travel as their own file */
+        expect(listing).toContain('fonts.css')
+        expect(listing).toContain('AGENTS.md')
+        /* one build spec per frame, rendered from the real document */
+        expect(listing).toContain(`specs/01-${frames[0]!.id}.spec.md`)
         execFileSync('unzip', ['-o', '-q', zipPath, '-d', dir])
         /* each frame's original document is in the archive untouched */
         expect(readFileSync(path.join(dir, 'frames', '01-' + frames[0]!.id + '.html'), 'utf8')).toBe(frames[0]!.html)
         expect(readFileSync(path.join(dir, 'canvas.html'), 'utf8')).toContain('<h1>One</h1>')
+
+        /* the tokens travel in the interchange format, not only as our JSON */
+        /* groups nest (type.size), so the index is loose and the shape is what
+           each assertion pins */
+        const dtcg = JSON.parse(readFileSync(path.join(dir, 'tokens.dtcg.json'), 'utf8')) as Record<
+          string,
+          Record<string, { $type?: string; $value?: unknown; [k: string]: unknown }>
+        >
+        expect(dtcg.color?.ink).toEqual({ $type: 'color', $value: '#111110' })
+        expect(dtcg.space?.['4']).toEqual({ $type: 'dimension', $value: { value: 4, unit: 'px' } })
+        expect(dtcg.radius?.['8']).toEqual({ $type: 'dimension', $value: { value: 8, unit: 'px' } })
+        expect(dtcg.type?.size?.['16']).toEqual({ $type: 'dimension', $value: { value: 16, unit: 'px' } })
+        expect(dtcg.font?.body).toEqual({ $type: 'fontFamily', $value: ['Inter'] })
+        /* a shadow the spec's shape can hold is parsed; a hex color and four
+           lengths, in the order the spec names them */
+        expect(dtcg.shadow?.['1']).toEqual({
+          $type: 'shadow',
+          $value: {
+            color: 'rgba(0, 0, 0, 0.2)',
+            offsetX: { value: 0, unit: 'px' },
+            offsetY: { value: 1, unit: 'px' },
+            blur: { value: 2, unit: 'px' },
+          },
+        })
+
+        const design = readFileSync(path.join(dir, 'DESIGN.md'), 'utf8')
+        /* the normative section order, and the tokens inside it */
+        const order = [
+          '## Overview',
+          '## Colors',
+          '## Typography',
+          '## Layout',
+          '## Elevation & Depth',
+          '## Shapes',
+          "## Do's and Don'ts",
+        ]
+        const positions = order.map((heading) => design.indexOf(heading))
+        expect(positions.every((at) => at >= 0)).toBe(true)
+        expect(positions).toEqual([...positions].sort((a, b) => a - b))
+        expect(design).toContain('#111110')
+        expect(design).toContain('Inter')
+
+        /* the fonts file carries the sheet the frame linked and its @font-face
+           rule, and the bundle inlines the same CSS so canvas.html renders
+           offline without it */
+        const fonts = readFileSync(path.join(dir, 'fonts.css'), 'utf8')
+        expect(fonts).toContain('@import url("https://fonts.example.com/inter.css");')
+        expect(fonts).toContain('@font-face')
+        expect(fonts).toContain('https://fonts.example.com/inter.woff2')
+        const bundled = readFileSync(path.join(dir, 'canvas.html'), 'utf8')
+        expect(bundled).toContain('@font-face')
+        expect(bundled).toContain('https://fonts.example.com/inter.css')
+
+        const spec = readFileSync(path.join(dir, `specs/01-${frames[0]!.id}.spec.md`), 'utf8')
+        expect(spec).toContain(`# ${frames[0]!.name} — build spec`)
+        /* measurements, not a screenshot: the values the frame renders at */
+        expect(spec).toContain('## Type ramp')
+        expect(spec).toContain('32px')
+        expect(spec).toContain('## Colors')
+        /* the palette the design actually paints, as computed — not the token list */
+        expect(spec).toContain('`rgb(17, 17, 16)`')
+        /* a frame that was never reviewed says so, rather than implying it passed */
+        expect(spec).toContain('No verification report')
+
+        const agents = readFileSync(path.join(dir, 'AGENTS.md'), 'utf8')
+        expect(agents).toContain(canvasId)
+        expect(agents).toContain('/mcp')
+        expect(agents).toContain('ready_for_review')
+        expect(agents).toContain('get_guide')
       } finally {
         rmSync(dir, { recursive: true, force: true })
       }

@@ -141,9 +141,7 @@ describe('canvas pages', () => {
   })
 
   it('deleting a page deletes its frames', async () => {
-    const second: Page = await (
-      await client.post(`/api/canvases/${canvasId}/pages`, { name: 'Sandbox' })
-    ).json()
+    const second: Page = await (await client.post(`/api/canvases/${canvasId}/pages`, { name: 'Sandbox' })).json()
 
     const f1: Frame = await (
       await client.post(`/api/canvases/${canvasId}/frames`, { name: 'A', pageId: second.id })
@@ -168,11 +166,7 @@ describe('canvas pages', () => {
     const source = canvas.pages![0]!
     const seeded: Frame[] = []
     for (const name of ['Seed A', 'Seed B']) {
-      seeded.push(
-        await (
-          await client.post(`/api/canvases/${canvasId}/frames`, { name, pageId: source.id })
-        ).json(),
-      )
+      seeded.push(await (await client.post(`/api/canvases/${canvasId}/frames`, { name, pageId: source.id })).json())
     }
 
     const res = await client.post(`/api/pages/${source.id}/duplicate`)

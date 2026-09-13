@@ -238,7 +238,7 @@ export function auditProbe(probe: Probe): A11yReport {
       !!el.attrs.ariaLabel ||
       !!el.attrs.ariaLabelledby ||
       el.attrs.wrappedInLabel ||
-      !!el.attrs.id && probe.elements.some((label) => label.tag === 'label' && label.attrs.htmlFor === el.attrs.id)
+      (!!el.attrs.id && probe.elements.some((label) => label.tag === 'label' && label.attrs.htmlFor === el.attrs.id))
     if (!labelled) {
       issues.push({
         rule: 'form_label',

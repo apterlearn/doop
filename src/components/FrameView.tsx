@@ -1,13 +1,14 @@
-import { memo, useEffect, useRef, useState } from 'react'
+import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import type { ElementComment, Frame } from '../../shared/types'
 import { colorFor } from '../../shared/types'
-import { useStore } from '../lib/store'
+import { useStore, type StreamEndReason } from '../lib/store'
 import { registerFrameWindow, unregisterFrameWindow } from '../lib/frameBridge'
 import { api } from '../lib/api'
 import { sendWs } from '../lib/ws'
 import { throttle } from '../lib/throttle'
 import { getIdentity } from '../lib/identity'
 import { FRAME_BOOTSTRAP } from '../lib/frameRuntime'
+import { stripTokenStyle, withTokenStyle } from '../../shared/tokens'
 import { recordCreate, recordUpdate, recordUpdates, trackSave } from '../lib/history'
 import { snapFrame } from '../lib/snap'
 import { gesture } from '../lib/gesture'
@@ -35,6 +36,24 @@ const EDITOR_CHIP =
   'inline-flex items-center gap-1 rounded-full px-[7px] py-0.5 text-[10px] font-bold text-white animate-[chip-in_0.25s_ease]'
 /* the element toolbar's buttons sit on ink and stay compact */
 const EL_TOOLBAR_BTN = 'rounded-[7px] px-2 py-1 text-xs'
+
+/* A stream's end is information: the viewer is told whether the design was
+   delivered, the agent went quiet, someone took the frame over, or a human
+   stopped the work. */
+function streamEndLabel(reason: StreamEndReason): string {
+  if (reason === 'done') return '✓ finished designing'
+  if (reason === 'idle') return 'stream ended (agent silent)'
+  if (reason === 'replaced') return 'stream ended'
+  return `stream ended (${reason})`
+}
+
+function streamEndTitle(name: string, reason: StreamEndReason): string {
+  if (reason === 'done') return `${name} finished designing`
+  if (reason === 'idle') return `${name} stopped responding mid-stream — its next write resumes the design`
+  if (reason === 'taken over') return `someone else edited this frame while ${name} was streaming`
+  if (reason === 'replaced') return `${name} replaced the document it was streaming into`
+  return `${name}'s work was stopped`
+}
 
 /* Figma-style ⌥⇧-drag duplicate cursor: a doubled pointer, hotspot on the
    front arrow's tip. `copy` is the fallback where custom cursors fail. */
@@ -78,6 +97,8 @@ function useThrottledValue<T>(value: T, ms: number): T {
 
 interface ProbeHit {
   selector: string
+  /** content key from the runtime — the anchor a stale selector falls back to */
+  key?: string
   tag: string
   text: string
   snippet: string
@@ -106,6 +127,21 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
   const select = useStore((s) => s.select)
   const flash = useStore((s) => s.flashes[frame.id])
   const stream = useStore((s) => s.streams[frame.id])
+  const streamEnd = useStore((s) => s.streamEnds[frame.id])
+  /* the end notice is transient: "finished designing" is a confirmation, not
+     a state, so it clears itself after a beat. The notice is derived from the
+     store and only the dismissal is state — a full replace by the streaming
+     agent itself is not an end the viewer needs told about (it is still there,
+     still working), and a notice is stale once a newer end replaces it. */
+  const [dismissedAt, setDismissedAt] = useState<number | null>(null)
+  const endAt = streamEnd?.at
+  const endReason = streamEnd?.reason
+  useEffect(() => {
+    if (endAt === undefined || endReason === 'replaced') return
+    const t = window.setTimeout(() => setDismissedAt(endAt), endReason === 'done' ? 2000 : 6000)
+    return () => window.clearTimeout(t)
+  }, [endAt, endReason])
+  const endNotice = streamEnd && endReason !== 'replaced' && dismissedAt !== endAt ? streamEnd : null
   /* select the stable presences map, derive in render — a selector that
      builds a fresh array re-renders every frame on EVERY store update
      (zustand compares by identity), which defeats the memo above */
@@ -262,7 +298,12 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
     window.addEventListener('pointerup', onUp)
   }
 
-  const html = useThrottledValue(frame.html, 150)
+  /* The canvas's design tokens are bound in here, at render time: the stored
+     frame HTML stays pure, and changing the tokens restyles every frame
+     without rewriting one. */
+  const tokens = useStore((s) => s.canvas?.tokens)
+  const throttledHtml = useThrottledValue(frame.html, 150)
+  const html = useMemo(() => withTokenStyle(throttledHtml, tokens), [throttledHtml, tokens])
   const remoteEditor = editors[0]
 
   /* The iframe loads a bootstrap once; HTML is posted in and DOM-morphed in
@@ -375,11 +416,17 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
   useEffect(() => {
     if (!runtimeReady) return
     for (const c of comments) {
-      iframeRef.current?.contentWindow?.postMessage({ type: 'doop:locate', reqId: c.id, selector: c.selector }, '*')
+      iframeRef.current?.contentWindow?.postMessage(
+        { type: 'doop:locate', reqId: c.id, selector: c.selector, key: c.stableKey },
+        '*',
+      )
     }
     for (const q of openQuestions) {
       if (q.selector)
-        iframeRef.current?.contentWindow?.postMessage({ type: 'doop:locate', reqId: q.id, selector: q.selector }, '*')
+        iframeRef.current?.contentWindow?.postMessage(
+          { type: 'doop:locate', reqId: q.id, selector: q.selector, key: q.stableKey },
+          '*',
+        )
     }
   }, [runtimeReady, html, commentKey, questionKey]) // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -393,6 +440,9 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
 
   /* deselecting the frame drops its element selection too, so a stale
      outline never reappears when the frame is picked again */
+  /* how each pin's anchor resolved: 'key' means the selector went stale and the
+     content key found the element, 'lost' that the element is gone */
+  const [pinAnchor, setPinAnchor] = useState<Record<string, string>>({})
   const [wasSelected, setWasSelected] = useState(selected)
   if (wasSelected !== selected) {
     setWasSelected(selected)
@@ -462,6 +512,10 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
         }
         const rect = ev.data.rect as { x: number; y: number; width: number } | null
         setPinPos((m) => ({ ...m, [ev.data.reqId]: rect ? { x: rect.x + rect.width, y: rect.y } : null }))
+        /* the anchor moved (the key found it) or is gone; either way the human
+           should see which, not lose the pin silently */
+        const anchor = typeof ev.data.anchor === 'string' ? (ev.data.anchor as string) : 'selector'
+        setPinAnchor((m) => (m[ev.data.reqId] === anchor ? m : { ...m, [ev.data.reqId]: anchor }))
       }
     }
     window.addEventListener('message', onMsg)
@@ -511,10 +565,14 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
     function onMsg(ev: MessageEvent) {
       if (ev.source !== iframeRef.current?.contentWindow) return
       if (ev.data?.type === 'doop:edited' && typeof ev.data.html === 'string') {
+        /* the runtime serializes the document it was given, token block
+           included — strip it so the injected style never becomes part of the
+           frame, in the store, the history or the server */
+        const next = stripTokenStyle(ev.data.html)
         const before = useStore.getState().canvas?.frames.find((f) => f.id === frame.id)?.html
-        useStore.getState().patchFrameLocal(frame.id, { html: ev.data.html })
-        api.updateFrame(frame.id, { html: ev.data.html }).catch(console.error)
-        if (before !== undefined) recordUpdate(frame.id, { html: before }, { html: ev.data.html })
+        useStore.getState().patchFrameLocal(frame.id, { html: next })
+        api.updateFrame(frame.id, { html: next }).catch(console.error)
+        if (before !== undefined) recordUpdate(frame.id, { html: before }, { html: next })
       }
       if (ev.data?.type === 'doop:edit-esc') {
         setEditing(false)
@@ -625,6 +683,30 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
                   <AgentIcon name={stream.name} size={9} color="#fff" />
                   {stream.name} is designing
                   <span className="after:content-['…'] after:[animation:ellipsis_1.2s_steps(4)_infinite]" />
+                  {stream.isAgent && (
+                    <Tooltip label={`Stop ${stream.name}`} side="top">
+                      <button
+                        type="button"
+                        aria-label={`Stop ${stream.name}`}
+                        className="-mr-0.5 ml-0.5 grid size-[13px] flex-none cursor-pointer place-items-center rounded-full bg-white/25 leading-none hover:bg-white/40"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          api.stopAgentWork(frame.canvasId, stream.name).catch(console.error)
+                        }}
+                      >
+                        <span className="block size-[7px] rounded-[1px] bg-white" />
+                      </button>
+                    </Tooltip>
+                  )}
+                </span>
+              )}
+              {!stream && endNotice && (
+                <span
+                  className={EDITOR_CHIP}
+                  style={{ background: endNotice.reason === 'done' ? endNotice.color : 'var(--ink-soft, #6b7280)' }}
+                  title={streamEndTitle(endNotice.name, endNotice.reason as StreamEndReason)}
+                >
+                  {streamEndLabel(endNotice.reason as StreamEndReason)}
                 </span>
               )}
               {editors
@@ -752,10 +834,59 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
               <div className="pointer-events-none absolute inset-0">
                 {comments.map((c) => {
                   const pos = pinPos[c.id]
-                  if (!pos) return null
                   const open = openThread === c.id
                   const replies = frameComments.filter((r) => r.parentId === c.id).reverse() // store is newest-first
                   const thread = [c, ...replies.sort((a, b) => a.at - b.at)]
+                  const onReply = (text: string) =>
+                    api
+                      .replyComment(c.id, text)
+                      .then(() => posthog.capture('element_comment_replied'))
+                      .catch((err) => {
+                        /* the wall explains a hit limit; anything else
+                           surfaces in the thread so the draft survives */
+                        if (isResidentLimit(err)) useStore.getState().setLimitWall(true)
+                        throw err
+                      })
+                  const onResolve = () => {
+                    api
+                      .resolveComment(c.id)
+                      .then(() => posthog.capture('element_comment_resolved'))
+                      .catch(console.error)
+                    setOpenThread(null)
+                  }
+                  const onRetry = (id: string) =>
+                    api.retryComment(id).catch((err) => {
+                      if (isResidentLimit(err)) useStore.getState().setLimitWall(true)
+                      else console.error(err)
+                    })
+                  /* An anchor that resolves to nothing has no position to draw
+                     at. Rather than dropping the pin (and the conversation with
+                     it), pin it to the frame's corner and say the element is
+                     gone — the thread stays readable and resolvable. */
+                  if (!pos) {
+                    const anchor = pinAnchor[c.id]
+                    if (anchor !== 'lost' && anchor !== 'ambiguous') return null
+                    return (
+                      <div key={c.id} className="pointer-events-auto absolute bottom-2 left-2 z-[4] max-w-[220px]">
+                        <button
+                          type="button"
+                          className="w-full cursor-pointer truncate rounded-md border border-line bg-paper px-2 py-1 text-left text-[11.5px] text-ink-soft shadow-card"
+                          title={`${c.from}: ${c.text} — the element this was pinned to no longer exists`}
+                          onPointerDown={(e) => e.stopPropagation()}
+                          onClick={() => {
+                            setProbe(null)
+                            setComposing(false)
+                            setOpenThread(open ? null : c.id)
+                          }}
+                        >
+                          {anchor === 'ambiguous' ? '⚠' : '⌫'} {c.text}
+                        </button>
+                        {open && (
+                          <CommentThread thread={thread} onReply={onReply} onResolve={onResolve} onRetry={onRetry} />
+                        )}
+                      </div>
+                    )
+                  }
                   /* the pin reflects the newest agent request in the thread */
                   const agentItem = [...thread].reverse().find((x) => x.forAgent && !x.resolvedAt)
                   const working = agentItem?.claimedBy && !agentItem.failedAt
@@ -781,37 +912,13 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
                         setComposing(false)
                         setOpenThread(open ? null : c.id)
                       }}
-                      title={`${c.from}: ${c.text}${thread.length > 1 ? ` (${thread.length - 1} replies)` : ''}`}
+                      title={`${c.from}: ${c.text}${thread.length > 1 ? ` (${thread.length - 1} replies)` : ''}${
+                        pinAnchor[c.id] === 'key' ? ' — the element moved; the pin followed it' : ''
+                      }`}
                     >
                       {agentItem?.failedAt ? '!' : working ? '✦' : '💬'}
                       {open && (
-                        <CommentThread
-                          thread={thread}
-                          onReply={(text) =>
-                            api
-                              .replyComment(c.id, text)
-                              .then(() => posthog.capture('element_comment_replied'))
-                              .catch((err) => {
-                                /* the wall explains a hit limit; anything else
-                                   surfaces in the thread so the draft survives */
-                                if (isResidentLimit(err)) useStore.getState().setLimitWall(true)
-                                throw err
-                              })
-                          }
-                          onResolve={() => {
-                            api
-                              .resolveComment(c.id)
-                              .then(() => posthog.capture('element_comment_resolved'))
-                              .catch(console.error)
-                            setOpenThread(null)
-                          }}
-                          onRetry={(id) =>
-                            api.retryComment(id).catch((err) => {
-                              if (isResidentLimit(err)) useStore.getState().setLimitWall(true)
-                              else console.error(err)
-                            })
-                          }
-                        />
+                        <CommentThread thread={thread} onReply={onReply} onResolve={onResolve} onRetry={onRetry} />
                       )}
                     </div>
                   )
@@ -923,7 +1030,12 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
                         initialText={composePrefill}
                         onSubmit={(text) => {
                           api
-                            .addComment(frame.id, { selector: anchor.selector, snippet: anchor.snippet, text })
+                            .addComment(frame.id, {
+                              selector: anchor.selector,
+                              snippet: anchor.snippet,
+                              text,
+                              ...(anchor.key ? { stableKey: anchor.key } : {}),
+                            })
                             .then(() => posthog.capture('element_comment_created'))
                             .catch((err) => {
                               /* an @mention past the free tier raises the wall */

@@ -4,6 +4,8 @@
  * elements are touched, so updates render in place with no white reload flash.
  * Works inside sandbox="allow-scripts" (no same-origin access needed).
  */
+import { ELEMENT_KEY_SRC, ELEMENT_PATH_SRC } from '../../shared/selector'
+
 export const FRAME_BOOTSTRAP = `<!doctype html>
 <html><head></head><body><script data-v-boot>
 (function () {
@@ -267,20 +269,12 @@ export const FRAME_BOOTSTRAP = `<!doctype html>
      boundary in design px; the crisp-render zoom is unapplied on both ends. */
   var curZoom = 1
 
-  function cssPath(el) {
-    var parts = []
-    while (el && el.nodeType === 1 && el !== document.documentElement) {
-      if (el.id) { parts.unshift('#' + CSS.escape(el.id)); break }
-      var tag = el.tagName.toLowerCase()
-      var nth = 1
-      for (var s = el.previousElementSibling; s; s = s.previousElementSibling) {
-        if (s.tagName === el.tagName) nth++
-      }
-      parts.unshift(tag + ':nth-of-type(' + nth + ')')
-      el = el.parentElement
-    }
-    return parts.join(' > ')
-  }
+  /* the selector algorithm is shared with the parent page and the server:
+     ELEMENT_PATH_SRC is the same source that runs in both (shared/selector.ts) */
+  ${ELEMENT_PATH_SRC}
+  ${ELEMENT_KEY_SRC}
+  var cssPath = globalThis.doopElementPath
+  var elementKey = globalThis.doopElementKey
 
   function designRect(el) {
     var r = el.getBoundingClientRect()
@@ -292,6 +286,7 @@ export const FRAME_BOOTSTRAP = `<!doctype html>
     if (snippet.length > 400) snippet = snippet.slice(0, 397) + '...'
     return {
       selector: cssPath(el),
+      key: elementKey(el),
       tag: el.tagName.toLowerCase(),
       text: (el.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 80),
       snippet: snippet,
@@ -458,12 +453,35 @@ export const FRAME_BOOTSTRAP = `<!doctype html>
       parent.postMessage({ type: 'doop:code-result', reqId: d.reqId, html: elementCode(d.selector) }, '*')
     }
     if (d.type === 'doop:locate') {
+      /* a stored anchor can go stale: the selector is a positional path, so
+         inserting a sibling above the element moves it. Fall back to the
+         content key before giving up, and report a moved or lost anchor so
+         the pin is not silently dropped. */
       var found = null
+      var anchor = 'selector'
       try {
         var target = d.selector ? document.querySelector(d.selector) : null
-        if (target) found = designRect(target)
-      } catch (e) { /* bad selector -> null */ }
-      parent.postMessage({ type: 'doop:located', reqId: d.reqId, rect: found }, '*')
+        if (d.key) {
+          var matches = []
+          var all = document.querySelectorAll('*')
+          for (var i = 0; i < all.length; i++) {
+            if (elementKey(all[i]) === d.key) matches.push(all[i])
+          }
+          if (matches.length === 1) {
+            /* a selector is a positional path: when the element it resolves to
+               is not the one the content key names, a sibling was inserted
+               above and the key is the truth */
+            if (matches[0] !== target) { target = matches[0]; anchor = 'key' }
+          } else if (matches.length > 1 && !target) {
+            /* several elements answer to this key and none is pinned: report
+               the ambiguity rather than picking one at random */
+            anchor = 'ambiguous'
+          }
+        }
+        if (target && anchor !== 'ambiguous') found = designRect(target)
+        else if (anchor === 'selector') anchor = 'lost'
+      } catch (e) { anchor = 'lost' }
+      parent.postMessage({ type: 'doop:located', reqId: d.reqId, rect: found, anchor: anchor }, '*')
     }
     /* re-rasterize crisply when the canvas is zoomed in: layout stays identical
        (viewport is scaled up by the same factor outside) but pixels are k-times denser */

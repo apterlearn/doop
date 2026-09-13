@@ -21,7 +21,6 @@ const MAX_ZOOM = 3
 
 const sendCursor = throttle((x: number, y: number) => sendWs({ type: 'cursor', x, y }), 50)
 
-
 /** Fixed sizes a new frame can start at; Auto (no preset) lets the server
  *  auto-place a 640×480 frame to the right of the page's rightmost frame. */
 export interface FramePreset {

@@ -5,7 +5,9 @@ import * as actions from '../server/actions.ts'
 import { buildMcpServer } from '../server/mcp.ts'
 import { store } from '../server/store.ts'
 import { findBrowserPath } from '../server/screenshot.ts'
-import { colorDistance, cssForTokens, lintProbe, validateTokens } from '../server/designLint.ts'
+import { colorDistance, lintProbe } from '../server/designLint.ts'
+import { cssForTokens, stripTokenStyle, withTokenStyle } from '../shared/tokens.ts'
+import { validateTokens } from '../server/tokenCss.ts'
 import type { Probe, ProbeElement } from '../server/domProbe.ts'
 import type { Canvas, DesignTokens, Frame } from '../shared/types.ts'
 
@@ -117,6 +119,8 @@ function element(over: Partial<ProbeElement> & { selector: string }): ProbeEleme
       font: 'system-ui',
       fontSize: '16px',
       fontWeight: '400',
+      lineHeight: '24px',
+      backgroundImage: '',
       borderRadius: '0px',
       margin: '0px',
       padding: '0px',
@@ -127,13 +131,53 @@ function element(over: Partial<ProbeElement> & { selector: string }): ProbeEleme
     opacity: 1,
     attrs: { hiddenFromAT: false, focusable: false, wrappedInLabel: false },
     ...over,
+    /* `over` is a Partial, so the spread makes every field optional in the
+       inferred type; the required ones are restated to keep the result a
+       ProbeElement */
+    key: over.key ?? over.selector,
   }
 }
 
 function probeOf(elements: ProbeElement[]): Probe {
   return {
-    document: { title: '', lang: 'en', width: 800, height: 600, htmlChars: 10 },
+    document: {
+      title: '',
+      description: '',
+      lang: 'en',
+      viewportMeta: '',
+      fonts: [],
+      fontsFailed: [],
+      width: 800,
+      height: 600,
+      htmlChars: 10,
+    },
     design: { colors: [], backgrounds: [], fonts: [], fontSizes: [], radii: [], shadows: [], cssVariables: {} },
+    /* these fixtures exist to pin the geometry rules, which read `elements`
+       only; the derived-evidence fields are empty on purpose */
+    designEvidence: {
+      colors: [],
+      backgrounds: [],
+      fonts: [],
+      fontSizes: [],
+      fontWeights: [],
+      lineHeights: [],
+      leading: [],
+      spacing: [],
+      radii: [],
+      shadows: [],
+    },
+    content: {
+      title: 'fixture',
+      description: '',
+      headings: [],
+      sections: [],
+      nav: [],
+      ctas: [],
+      forms: [],
+      images: [],
+      truncated: false,
+    },
+    cssText: '',
     elements,
   }
 }
@@ -180,6 +224,26 @@ describe('token validation and rendering', () => {
     )
   })
 
+  it('rejects a value that would break out of the declaration it is written into', () => {
+    /* a token value lands verbatim in `--color-ink: <value>;`, so anything that
+       can close the declaration or the <style> element would inject markup */
+    expect(() => validateTokens(tokens({ colors: { ink: '#111110; } * { display: none } :root { --x: 1' } }))).toThrow(
+      /invalid color for token “ink”/,
+    )
+    expect(() => validateTokens(tokens({ colors: { ink: 'rgb(0,0,0)</style><script>alert(1)</script>' } }))).toThrow(
+      /invalid color for token “ink”/,
+    )
+    expect(() => validateTokens(tokens({ shadows: ['0 1px 2px; } body { display: none }'] }))).toThrow(/invalid shadow/)
+  })
+
+  it('accepts the colour-first box-shadow a computed style gives back', () => {
+    expect(() => validateTokens(tokens({ shadows: ['rgba(0, 0, 0, 0.2) 0px 1px 2px 0px'] }))).not.toThrow()
+    expect(() => validateTokens(tokens({ shadows: ['0 1px 2px rgba(0,0,0,.2)'] }))).not.toThrow()
+    expect(() => validateTokens(tokens({ shadows: ['inset 0 1px 2px #000'] }))).not.toThrow()
+    expect(() => validateTokens(tokens({ shadows: ['0 1px 2px rgba(0,0,0,.2), inset 0 0 0 1px #fff'] }))).not.toThrow()
+    expect(() => validateTokens(tokens({ shadows: ['hello'] }))).toThrow(/invalid shadow/)
+  })
+
   it('renders the tokens as a :root block', () => {
     const css = cssForTokens(tokens({ shadows: ['0 1px 2px rgba(0,0,0,.2)'] }))
     expect(css).toContain('--color-ink: #111110;')
@@ -197,6 +261,45 @@ describe('token validation and rendering', () => {
     expect(colorDistance('#111110', '#121212')!).toBeLessThan(3)
     expect(colorDistance('#111110', '#ff0000')!).toBeGreaterThan(50)
     expect(colorDistance('oklch(0.5 0 0)', '#fff')).toBeUndefined()
+  })
+
+  it('renders a type scale', () => {
+    const css = cssForTokens(tokens({ type: { size: [14, 16, 20], weight: [400, 700], leading: [1.2, 1.5] } }))
+    expect(css).toContain('--text-14: 14px;')
+    expect(css).toContain('--text-20: 20px;')
+    expect(css).toContain('--weight-700: 700;')
+    expect(css).toContain('--leading-1.5: 1.5;')
+  })
+})
+
+describe('binding tokens into a document', () => {
+  it('inserts the block last in <head>, and is idempotent', () => {
+    const html = '<html><head><style>:root { --color-ink: red; }</style></head><body><h1>Hi</h1></body></html>'
+    const once = withTokenStyle(html, tokens())
+    expect(once).toContain('data-doop-tokens')
+    expect(once).toContain('--color-ink: #111110;')
+    /* last in head: the canvas palette wins the tie against the frame's own */
+    expect(once.indexOf('data-doop-tokens')).toBeGreaterThan(once.indexOf('--color-ink: red'))
+    expect(once.indexOf('data-doop-tokens')).toBeLessThan(once.indexOf('</head>'))
+    expect(withTokenStyle(once, tokens())).toBe(once)
+  })
+
+  it('binds into a document with no head, and into a bare fragment', () => {
+    const bodyOnly = withTokenStyle('<body><h1>Hi</h1></body>', tokens())
+    expect(bodyOnly.indexOf('data-doop-tokens')).toBeLessThan(bodyOnly.indexOf('<body>'))
+    expect(withTokenStyle('<h1>Hi</h1>', tokens()).startsWith('<style data-doop-tokens>')).toBe(true)
+  })
+
+  it('round-trips: stripping leaves the original document byte-identical', () => {
+    const html = '<html><head><title>x</title></head><body class="a"><h1>Hi</h1></body></html>'
+    expect(stripTokenStyle(withTokenStyle(html, tokens()))).toBe(html)
+    expect(withTokenStyle(html, null)).toBe(html)
+    expect(withTokenStyle(html, undefined)).toBe(html)
+  })
+
+  it('leaves a frame that opts out alone', () => {
+    const html = '<html data-doop-tokens="off"><head></head><body><h1>Hi</h1></body></html>'
+    expect(withTokenStyle(html, tokens())).toBe(html)
   })
 })
 
@@ -262,6 +365,7 @@ describe('lintProbe', () => {
     expect(report.counts).toEqual({
       off_token_color: 0,
       off_token_font: 0,
+      off_token_type: 0,
       off_scale_radius: 0,
       off_grid_spacing: 0,
     })
@@ -279,6 +383,38 @@ describe('lintProbe', () => {
       tokens(),
     )
     expect(report.violations).toEqual([])
+  })
+
+  it('flags a size, weight and leading off the declared type scale', () => {
+    const scale = tokens({ type: { size: [14, 16, 20], weight: [400, 700], leading: [1.2, 1.5] } })
+    const off = lintProbe(
+      probeOf([
+        element({
+          selector: '#off',
+          fontSizePx: 17,
+          fontWeight: 600,
+          style: { ...element({ selector: '#off' }).style, fontSize: '17px', fontWeight: '600', lineHeight: '24px' },
+        }),
+      ]),
+      scale,
+    )
+    expect(off.counts.off_token_type).toBe(3)
+    const size = off.violations.find((v) => v.value === '17px')
+    /* names the nearest token so the fix is mechanical */
+    expect(size?.expected).toBe('14px, 16px, 20px')
+
+    const on = lintProbe(
+      probeOf([
+        element({
+          selector: '#on',
+          fontSizePx: 16,
+          fontWeight: 700,
+          style: { ...element({ selector: '#on' }).style, fontSize: '16px', fontWeight: '700', lineHeight: '24px' },
+        }),
+      ]),
+      scale,
+    )
+    expect(on.counts.off_token_type).toBe(0)
   })
 })
 
@@ -372,6 +508,28 @@ describe('token tools', () => {
         agent_name: 'Claude',
       })
       expect(messages.map((m) => m.type)).toContain('tokens')
+    } finally {
+      await close()
+    }
+  })
+
+  it('serves the tokens as a resource that says when it changed', async () => {
+    const { client, close } = await connect()
+    try {
+      await callTool(client, 'set_tokens', {
+        canvas_id: CANVAS_ID,
+        tokens: { colors: { ink: '#111110' } },
+        agent_name: 'Claude',
+      })
+      const read = await client.readResource({ uri: `doop://canvas/${CANVAS_ID}/tokens` })
+      const content = read.contents[0] as { text?: string; _meta?: Record<string, unknown> }
+      expect(content.text).toContain('--color-ink: #111110;')
+      expect(content._meta?.updatedBy).toBe('Claude')
+
+      const listed = await client.listResources()
+      const tokensResource = listed.resources.find((r) => r.uri === `doop://canvas/${CANVAS_ID}/tokens`)
+      /* a client that caches the resource can tell when to read it again */
+      expect(tokensResource?.annotations?.lastModified).toBeTruthy()
     } finally {
       await close()
     }
