@@ -15,6 +15,8 @@ import {
   roleByAgentName,
   roleName,
 } from '../shared/agents.ts'
+import { MAX_FRAME_HTML_BYTES } from './limits.ts'
+import { insertElement, updateElements } from './elementEdit.ts'
 import { decodeEscapedHtml, looksEscapedHtml, repairEscapedHtml } from './escapedHtml.ts'
 import type {
   Actor,
@@ -23,6 +25,8 @@ import type {
   AgentTask,
   Canvas,
   CanvasFocus,
+  Component,
+  ComponentSummary,
   DesignDecision,
   DesignTokens,
   ElementComment,
@@ -40,6 +44,8 @@ import type {
   RepoScreenRef,
   ServerMessage,
   TaskFeedback,
+  ReviewPolicy,
+  UserMemory,
 } from '../shared/types.ts'
 
 /**
@@ -230,11 +236,42 @@ export function logActivity(canvasId: string, actor: Actor, message: string, fra
   broadcast(canvasId, { type: 'activity', item })
 }
 
-/** Owner flips review mode: agent frame writes now land as proposals. */
+/** Owner flips review mode: agent frame writes now land as proposals. The
+ *  legacy all-or-nothing switch — written through the policy store so the
+ *  boolean and the policy stay one fact: on is `all_writes` with no extra
+ *  approved tools, off is `off`. */
 export function setCanvasReviewMode(canvasId: string, on: boolean, actor: Actor) {
-  store.setReviewMode(canvasId, on)
+  store.setReviewPolicy(canvasId, on ? 'all_writes' : 'off')
   broadcast(canvasId, { type: 'canvas:reviewMode', reviewMode: on, actor })
   logActivity(canvasId, actor, on ? 'turned on review mode — agent changes need approval' : 'turned off review mode')
+}
+
+/** What a policy means, in the owner's own words for the activity feed. */
+function reviewPolicyWords(policy: ReviewPolicy, approvalTools: string[]): string {
+  if (policy === 'all_writes') return 'set review to all writes — every agent change needs approval'
+  if (policy === 'destructive')
+    return approvalTools.length
+      ? `set review to destructive writes plus ${approvalTools.join(', ')} — those need approval`
+      : 'set review to destructive writes — only destructive agent changes need approval'
+  return 'turned review off — agent changes land directly'
+}
+
+/** Owner sets the scoped review policy: which agent writes need approval
+ *  (`off` gates nothing, `destructive` gates destructive tools plus
+ *  `approvalTools`, `all_writes` gates everything). The store mirrors the
+ *  legacy reviewMode boolean, so the old toggle and the new policy agree. */
+export function setCanvasReviewPolicy(
+  canvasId: string,
+  policy: ReviewPolicy,
+  approvalTools: string[],
+  actor: Actor,
+): Canvas | undefined {
+  const tools = [...new Set(approvalTools.map((t) => t.trim()).filter(Boolean))]
+  const canvas = store.setReviewPolicy(canvasId, policy, tools)
+  if (!canvas) return undefined
+  broadcast(canvasId, { type: 'canvas:reviewPolicy', reviewPolicy: policy, approvalTools: tools, actor })
+  logActivity(canvasId, actor, reviewPolicyWords(policy, tools))
+  return canvas
 }
 
 export function resolveActor(
@@ -313,31 +350,77 @@ function assertUnlocked(frameId: string, actor: Actor) {
   if (holder) throw new frameLocks.FrameLockedError(holder)
 }
 
-/**
- * Thrown when an agent writes to a canvas whose owner turned review mode on:
- * the change has to be delivered as a FrameProposal a human accepts. Both
- * caller surfaces translate this — the MCP layer into an `unsupported` result
- * naming the propose tools, the resident team into a proposal — so the rule
- * itself lives here, on the one path every write goes through, and no tool can
- * quietly bypass it.
- */
 export class ReviewModeError extends Error {
   readonly canvasId: string
+  /** the tool the caller invoked, so an agent reading the refusal sees the
+   *  exact action that needs a human, not a generic one */
+  readonly toolName: string
+  /** the policy that refused the write — `all_writes` also covers the legacy
+   *  reviewMode boolean, which reads as that policy */
+  readonly policy: ReviewPolicy
 
-  constructor(canvasId: string) {
+  constructor(canvasId: string, toolName: string, policy: ReviewPolicy) {
     super(
-      'this canvas is in review mode — agent changes need human approval. Deliver the change as a proposal instead: it lands the moment a human accepts it.',
+      `this canvas approves agent writes through review — ${toolName} needs a human. Deliver with propose_frame_html / propose_frame_create / propose_frame_delete instead; they land the moment a human accepts.`,
     )
     this.name = 'ReviewModeError'
     this.canvasId = canvasId
+    this.toolName = toolName
+    this.policy = policy
   }
 }
 
-/** One gate for every agent write: a human is never gated, an agent on a
- *  review-mode canvas is. */
-function assertAgentWriteAllowed(canvasId: string, actor: Actor) {
+/** The tool each action answers to, for the review gate: an approval list and
+ *  the refusal message speak tool names, not action functions. Where one
+ *  action backs several tools (update_frame serves set_frame_html,
+ *  edit_frame_html and apply_ops), the action's own tool name stands for the
+ *  write itself — the gate is about the write, not the alias it arrived on. */
+const TOOL_NAME = {
+  appendFrameHtml: 'append_frame_html',
+  createFrame: 'create_frame',
+  updateFrame: 'update_frame',
+  deleteFrame: 'delete_frame',
+  createPage: 'create_page',
+  renamePage: 'rename_page',
+  deletePage: 'delete_page',
+  moveFrameToPage: 'move_frame',
+  setTokens: 'set_tokens',
+  setGuideline: 'set_guidelines',
+  recordChatDecision: 'save_decision',
+  createComponent: 'create_component',
+  updateComponent: 'update_component',
+  deleteComponent: 'delete_component',
+  insertComponent: 'insert_component',
+  detachComponent: 'detach_component',
+} as const
+
+/** What the canvas's policy says about one write. `all_writes` gates every
+ *  write, `destructive` gates the tools that declare themselves destructive
+ *  plus every tool the owner listed, `off` (or no policy at all) gates
+ *  nothing. A canvas still carrying the legacy reviewMode boolean reads as
+ *  `all_writes`, so nothing that was gated before is suddenly open. */
+function policyRequiresApproval(canvas: Canvas | undefined, toolName: string, destructive: boolean): boolean {
+  if (!canvas) return false
+  const policy = canvas.reviewMode ? 'all_writes' : (canvas.reviewPolicy ?? 'off')
+  if (policy === 'all_writes') return true
+  if (policy === 'destructive') return destructive || (canvas.approvalTools?.includes(toolName) ?? false)
+  return false
+}
+
+/** One gate for every agent write: a human is never gated, an agent writes
+ *  only through whatever review policy the canvas's owner set. `destructive`
+ *  is the caller's own annotation — delete_frame declares it, rename_page
+ *  does not — and matters only under the `destructive` policy. */
+function assertAgentWriteAllowed(
+  canvasId: string,
+  actor: Actor,
+  toolName: string,
+  opts: { destructive?: boolean } = {},
+) {
   if (actor.kind !== 'agent') return
-  if (store.getCanvas(canvasId)?.reviewMode) throw new ReviewModeError(canvasId)
+  const canvas = store.getCanvas(canvasId)
+  if (!policyRequiresApproval(canvas, toolName, opts.destructive ?? false)) return
+  throw new ReviewModeError(canvasId, toolName, canvas!.reviewMode ? 'all_writes' : (canvas!.reviewPolicy ?? 'off'))
 }
 
 function touch(canvasId: string, actor: Actor, frameId?: string | null) {
@@ -1882,7 +1965,7 @@ export function appendFrameHtml(
 ): Frame | undefined {
   const before = store.getFrame(frameId)
   if (!before) return undefined
-  assertAgentWriteAllowed(before.canvasId, actor)
+  assertAgentWriteAllowed(before.canvasId, actor, TOOL_NAME.appendFrameHtml)
   /* A streaming agent keeps its own lock alive chunk by chunk; a writer who
      holds no lock (the common case) is unaffected. */
   assertUnlocked(frameId, actor)
@@ -1936,7 +2019,7 @@ export function createFrame(
   },
   actor: Actor,
 ): Frame | undefined {
-  assertAgentWriteAllowed(canvasId, actor)
+  assertAgentWriteAllowed(canvasId, actor, TOOL_NAME.createFrame)
   /* The token block is bound at render time, never stored: a document that
      carries one (an export round-tripped back in, a client that serialized a
      rendered frame) is stripped on the way in. */
@@ -1963,7 +2046,7 @@ export function updateFrame(
 ): Frame | undefined {
   const before = store.getFrame(frameId)
   if (!before) return undefined
-  assertAgentWriteAllowed(before.canvasId, actor)
+  assertAgentWriteAllowed(before.canvasId, actor, TOOL_NAME.updateFrame)
   assertUnlocked(frameId, actor)
   frameLocks.refresh(frameId, actor.name)
   if (patch.html !== undefined) patch = { ...patch, html: stripTokenStyle(repairEscapedHtml(patch.html)) }
@@ -2045,7 +2128,7 @@ export function updateFrame(
 export function deleteFrame(frameId: string, actor: Actor): Frame | undefined {
   const existing = store.getFrame(frameId)
   if (existing) {
-    assertAgentWriteAllowed(existing.canvasId, actor)
+    assertAgentWriteAllowed(existing.canvasId, actor, TOOL_NAME.deleteFrame, { destructive: true })
     assertUnlocked(frameId, actor)
   }
   /* close any live stream or playback while the frame still exists,
@@ -2099,7 +2182,7 @@ export function renameCanvas(canvasId: string, name: string, actor: Actor) {
 /* ------------------------------------------------------------------ */
 
 export function createPage(canvasId: string, name: string, actor: Actor) {
-  assertAgentWriteAllowed(canvasId, actor)
+  assertAgentWriteAllowed(canvasId, actor, TOOL_NAME.createPage)
   const page = store.createPage(canvasId, name)
   if (!page) return undefined
   const canvas = store.getCanvas(canvasId)!
@@ -2110,7 +2193,7 @@ export function createPage(canvasId: string, name: string, actor: Actor) {
 
 export function renamePage(pageId: string, name: string, actor: Actor) {
   const canvasId = store.getPage(pageId)?.canvas.id
-  if (canvasId) assertAgentWriteAllowed(canvasId, actor)
+  if (canvasId) assertAgentWriteAllowed(canvasId, actor, TOOL_NAME.renamePage)
   const page = store.renamePage(pageId, name)
   if (!page) return undefined
   const canvas = store.getCanvas(page.canvasId)!
@@ -2130,7 +2213,7 @@ export function reorderPage(pageId: string, position: number, actor: Actor) {
 
 export function deletePage(pageId: string, actor: Actor) {
   const owner = store.getPage(pageId)?.canvas.id
-  if (owner) assertAgentWriteAllowed(owner, actor)
+  if (owner) assertAgentWriteAllowed(owner, actor, TOOL_NAME.deletePage, { destructive: true })
   const result = store.deletePage(pageId)
   if (!result) return undefined
   const { canvas, page, frames } = result
@@ -2155,7 +2238,7 @@ export function duplicatePage(pageId: string, actor: Actor) {
 
 export function moveFrameToPage(frameId: string, pageId: string, actor: Actor) {
   const moving = store.getFrame(frameId)
-  if (moving) assertAgentWriteAllowed(moving.canvasId, actor)
+  if (moving) assertAgentWriteAllowed(moving.canvasId, actor, TOOL_NAME.moveFrameToPage)
   const frame = store.moveFrameToPage(frameId, pageId)
   if (!frame) return undefined
   const page = store.getPage(pageId)!.page
@@ -2303,7 +2386,7 @@ export function getPlan(canvasId: string, agentName: string): AgentPlan | undefi
 /** Replace the canvas's design tokens (or clear them with undefined).
  *  Validates first, so an invalid token never reaches the store. */
 export function setTokens(canvasId: string, tokens: DesignTokens | undefined, actor: Actor): Canvas | undefined {
-  assertAgentWriteAllowed(canvasId, actor)
+  assertAgentWriteAllowed(canvasId, actor, TOOL_NAME.setTokens)
   if (tokens) validateTokens(tokens)
   const canvas = store.setTokens(canvasId, tokens, actor.name)
   if (!canvas) return undefined
@@ -2324,7 +2407,7 @@ export function setGuideline(
   pos?: { x: number; y: number },
   title?: string,
 ): GuidelineDoc | null | undefined {
-  assertAgentWriteAllowed(canvasId, actor)
+  assertAgentWriteAllowed(canvasId, actor, TOOL_NAME.setGuideline)
   const slug = name.trim().toLowerCase()
   if (!GUIDELINE_NAME_RE.test(slug))
     throw new Error(`invalid doc name “${name}” — use a lowercase slug like "feature-image" (a-z, 0-9, hyphens)`)
@@ -2459,7 +2542,7 @@ export const MAX_DECISION_CHARS = 500
  *  when the canvas is missing, null when it was a duplicate re-report. */
 export function recordChatDecision(canvasId: string, text: string, actor: Actor): DesignDecision | null | undefined {
   if (!store.getCanvas(canvasId)) return undefined
-  assertAgentWriteAllowed(canvasId, actor)
+  assertAgentWriteAllowed(canvasId, actor, TOOL_NAME.recordChatDecision)
   const clean = text.replace(/\s+/g, ' ').trim()
   if (!clean) throw new Error('decision text is empty')
   if (clean.length > MAX_DECISION_CHARS)
@@ -2601,6 +2684,12 @@ export function addFrameProposal(
     y?: number
     width?: number
     height?: number
+    /** `patch` delivers `edits` against the frame's current document instead
+     *  of a whole replacement document in `html` */
+    mode?: FrameProposal['mode']
+    edits?: FrameProposal['edits']
+    baseHtml?: string
+    diff?: FrameProposal['diff']
     summary: string
   },
   actor: Actor,
@@ -2608,6 +2697,10 @@ export function addFrameProposal(
   const target = input.frameId ? store.getFrame(input.frameId) : undefined
   if (input.frameId && !target) return undefined
   if ((input.kind === 'replace_html' || input.kind === 'delete_frame') && !target) return undefined
+  /* a patch-mode replace carries `edits` rather than a whole `html`, so it
+     is a valid replace without one */
+  if (input.kind === 'replace_html' && !(input.mode === 'patch' && input.edits?.length) && input.html === undefined)
+    return undefined
   if (input.kind === 'create_frame' && !store.getCanvas(canvasId)) return undefined
   const proposal: FrameProposal = {
     id: nanoid(8),
@@ -2619,6 +2712,10 @@ export function addFrameProposal(
     ...(input.y !== undefined ? { y: input.y } : {}),
     ...(input.width !== undefined ? { width: input.width } : {}),
     ...(input.height !== undefined ? { height: input.height } : {}),
+    ...(input.mode ? { mode: input.mode } : {}),
+    ...(input.mode === 'patch' && input.edits?.length ? { edits: input.edits } : {}),
+    ...(input.baseHtml !== undefined ? { baseHtml: input.baseHtml } : {}),
+    ...(input.diff ? { diff: input.diff } : {}),
     baseUpdatedAt: target?.updatedAt ?? Date.now(),
     summary: input.summary.trim().slice(0, 500) || input.kind.replace('_', ' '),
     agentName: actor.name,
@@ -2645,42 +2742,78 @@ export function addFrameProposal(
 
 /** A human accepted or rejected a proposal. Accepting after the frame moved
  *  again marks it stale instead of overwriting the newer design — unless the
- *  reviewer passed `force`, which applies it anyway. A reject may carry a note
- *  saying why, which the agent reads back through list_change_proposals. */
-export function resolveFrameProposal(
+ *  reviewer passed `force`, which applies it anyway. A patch-mode proposal
+ *  can be accepted hunk by hunk: each accepted edit is applied as an exact
+ *  replacement against the frame's CURRENT html, and an edit that no longer
+ *  fits (the text moved on) is skipped and reported, never forced. A reject
+ *  may carry a note saying why, which the agent reads back through
+ *  list_change_proposals. */
+export function resolveFrameProposalDetailed(
   canvasId: string,
   proposalId: string,
   accept: boolean,
   actor: Actor,
-  opts?: { note?: string; force?: boolean },
-): FrameProposal | undefined {
+  opts?: { note?: string; force?: boolean; hunks?: { index: number; accept: boolean }[] },
+): { proposal: FrameProposal; applied: number[]; skipped: { index: number; reason: string }[] } | undefined {
   const proposal = (frameProposalLog.get(canvasId) ?? []).find((p) => p.id === proposalId)
-  if (!proposal || proposal.status !== 'pending') return proposal
+  if (!proposal || proposal.status !== 'pending') return undefined
+  const applied: number[] = []
+  const skipped: { index: number; reason: string }[] = []
   if (accept) {
     const frame = proposal.frameId ? store.getFrame(proposal.frameId) : undefined
     /* the frame moved on since the agent read it: without an explicit
-       "apply anyway" this is a stale decision, not an overwrite */
-    if (frame && frame.updatedAt !== proposal.baseUpdatedAt && !opts?.force) {
+       "apply anyway" this is a stale decision, not an overwrite. A patch
+       needs no such guard — its hunks are checked against the live document
+       one by one, so it can never overwrite a design it did not read. */
+    const stale = frame && frame.updatedAt !== proposal.baseUpdatedAt && !opts?.force && proposal.mode !== 'patch'
+    if (stale) {
       proposal.status = 'stale'
-    } else {
-      if (proposal.kind === 'replace_html' && frame) {
-        updateFrame(frame.id, { html: proposal.html ?? frame.html }, actor)
-      } else if (proposal.kind === 'delete_frame' && frame) {
-        deleteFrame(frame.id, actor)
-      } else if (proposal.kind === 'create_frame') {
-        createFrame(
-          canvasId,
-          {
-            name: proposal.name ?? 'Proposed frame',
-            html: proposal.html,
-            ...(proposal.x !== undefined ? { x: proposal.x } : {}),
-            ...(proposal.y !== undefined ? { y: proposal.y } : {}),
-            ...(proposal.width !== undefined ? { width: proposal.width } : {}),
-            ...(proposal.height !== undefined ? { height: proposal.height } : {}),
-          },
-          actor,
-        )
+    } else if (proposal.kind === 'replace_html' && proposal.mode === 'patch' && proposal.edits?.length && frame) {
+      const wanted = opts?.hunks
+      /* only the hunks the reviewer accepted, in proposal order; with no
+         hunk list at all, every edit is the proposal */
+      const order = wanted
+        ? proposal.edits.map((_, i) => i).filter((i) => wanted.some((h) => h.index === i && h.accept))
+        : proposal.edits.map((_, i) => i)
+      let html = frame.html
+      for (const index of order) {
+        const edit = proposal.edits[index]!
+        const at = html.indexOf(edit.old_str)
+        if (at === -1) {
+          skipped.push({ index, reason: 'the text it replaces is no longer in the frame' })
+          continue
+        }
+        if (html.indexOf(edit.old_str, at + 1) !== -1) {
+          skipped.push({ index, reason: 'the text it replaces occurs more than once — ambiguous' })
+          continue
+        }
+        html = html.slice(0, at) + edit.new_str + html.slice(at + edit.old_str.length)
+        applied.push(index)
       }
+      if (applied.length) updateFrame(frame.id, { html }, actor)
+      proposal.resolutionNote = `applied ${applied.length} of ${proposal.edits.length} hunks${
+        skipped.length ? ` (${skipped.map((s) => `#${s.index}: ${s.reason}`).join('; ')})` : ''
+      }`
+      proposal.status = 'accepted'
+    } else if (proposal.kind === 'replace_html' && frame) {
+      updateFrame(frame.id, { html: proposal.html ?? frame.html }, actor)
+      proposal.status = 'accepted'
+    } else if (proposal.kind === 'delete_frame' && frame) {
+      deleteFrame(frame.id, actor)
+      proposal.status = 'accepted'
+    } else if (proposal.kind === 'create_frame') {
+      createFrame(
+        canvasId,
+        {
+          name: proposal.name ?? 'Proposed frame',
+          html: proposal.html,
+          ...(proposal.x !== undefined ? { x: proposal.x } : {}),
+          ...(proposal.y !== undefined ? { y: proposal.y } : {}),
+          ...(proposal.width !== undefined ? { width: proposal.width } : {}),
+          ...(proposal.height !== undefined ? { height: proposal.height } : {}),
+        },
+        actor,
+      )
       proposal.status = 'accepted'
     }
   } else {
@@ -2702,6 +2835,52 @@ export function resolveFrameProposal(
     },
   })
   logActivity(canvasId, actor, `${accept ? 'accepted' : 'rejected'} ${proposal.agentName}’s proposal`)
+  return { proposal, applied, skipped }
+}
+
+/** The ordinary resolve — same code path, unchanged return for every
+ *  existing caller. */
+export function resolveFrameProposal(
+  canvasId: string,
+  proposalId: string,
+  accept: boolean,
+  actor: Actor,
+  opts?: { note?: string; force?: boolean; hunks?: { index: number; accept: boolean }[] },
+): FrameProposal | undefined {
+  return resolveFrameProposalDetailed(canvasId, proposalId, accept, actor, opts)?.proposal
+}
+
+/** Re-base a stale patch proposal onto the frame's current html: each edit
+ *  that still fits exactly once is kept, the rest are dropped and reported
+ *  in the note. Only a patch can be rebased — a replace or a create carries
+ *  a whole document, and re-basing it would be applying it. */
+export function rebaseProposal(canvasId: string, proposalId: string, actor: Actor): FrameProposal | undefined {
+  const proposal = (frameProposalLog.get(canvasId) ?? []).find((p) => p.id === proposalId)
+  const frame = proposal?.frameId ? store.getFrame(proposal.frameId) : undefined
+  if (!proposal || proposal.status !== 'stale' || proposal.mode !== 'patch' || !proposal.edits?.length || !frame)
+    return undefined
+  let html = frame.html
+  const dropped: string[] = []
+  const kept: number[] = []
+  for (const [index, edit] of proposal.edits.entries()) {
+    const at = html.indexOf(edit.old_str)
+    if (at === -1 || html.indexOf(edit.old_str, at + 1) !== -1) {
+      dropped.push(`#${index}`)
+      continue
+    }
+    html = html.slice(0, at) + edit.new_str + html.slice(at + edit.old_str.length)
+    kept.push(index)
+  }
+  if (kept.length) updateFrame(frame.id, { html }, actor)
+  proposal.status = 'pending'
+  proposal.baseHtml = frame.html
+  proposal.baseUpdatedAt = frame.updatedAt
+  proposal.resolutionNote = dropped.length
+    ? `rebased onto the current frame — dropped hunk${dropped.length === 1 ? '' : 's'} ${dropped.join(', ')} (their text moved on)`
+    : 'rebased onto the current frame — every hunk still applies'
+  persist.saveFrameProposal(canvasId, proposal)
+  broadcast(canvasId, { type: 'frameProposal', proposal })
+  logActivity(canvasId, actor, `rebased ${proposal.agentName}’s patch proposal onto the current frame`)
   return proposal
 }
 
@@ -2717,8 +2896,9 @@ export function withdrawFrameProposal(canvasId: string, proposalId: string, acto
 }
 
 /** Gate every agent frame write through review mode. Returns the proposal
- *  instead of writing when the canvas is in review mode and the writer is an
- *  agent; otherwise returns undefined and the caller writes directly. */
+ *  instead of writing when the canvas's review policy gates the write and
+ *  the writer is an agent; otherwise returns undefined and the caller
+ *  writes directly. */
 export function proposeInsteadOfWrite(
   canvasId: string,
   op: {
@@ -2730,18 +2910,18 @@ export function proposeInsteadOfWrite(
     y?: number
     width?: number
     height?: number
+    mode?: FrameProposal['mode']
+    edits?: FrameProposal['edits']
+    baseHtml?: string
+    diff?: FrameProposal['diff']
     summary: string
   },
   actor: Actor,
 ): FrameProposal | undefined {
-  if (actor.kind !== 'agent' || !store.getCanvas(canvasId)?.reviewMode) return undefined
+  const canvas = store.getCanvas(canvasId)
+  if (actor.kind !== 'agent' || !canvas?.reviewMode) return undefined
   return addFrameProposal(canvasId, op, actor)
 }
-
-/* ------------------------------------------------------------------ */
-/* Pause / resume: an aborted run whose card is skipped by the sweep   */
-/* until a human resumes it. Not terminal — no metered retry needed.   */
-/* ------------------------------------------------------------------ */
 
 /** Pause a live run: abort the model call like a stop, but keep the card
  *  open and paused instead of cancelling it. */
@@ -2915,7 +3095,15 @@ export function recordRunJournal(input: {
   summary: string
   decisions?: string
   frames?: RunJournal['frames']
-}): void {
+  /** when the run's first turn started and when it stopped */
+  startedAt?: number
+  endedAt?: number
+  /** model turns taken, tool calls made, tokens spent and what they cost */
+  turns?: number
+  toolCalls?: number
+  tokens?: number
+  costUsd?: number | null
+}): RunJournal {
   /* newest first, one entry per frame: a run that wrote the same frame five
      times changed one frame, and the change set is what it touched */
   const frames = (input.frames ?? [])
@@ -2930,14 +3118,33 @@ export function recordRunJournal(input: {
     summary: input.summary.slice(0, 800),
     ...(input.decisions ? { decisions: input.decisions } : {}),
     ...(frames.length ? { frames } : {}),
+    ...(input.startedAt !== undefined ? { startedAt: input.startedAt } : {}),
+    ...(input.endedAt !== undefined ? { endedAt: input.endedAt } : {}),
+    ...(input.turns !== undefined ? { turns: input.turns } : {}),
+    ...(input.toolCalls !== undefined ? { toolCalls: input.toolCalls } : {}),
+    ...(input.tokens !== undefined ? { tokens: input.tokens } : {}),
+    ...(input.costUsd !== undefined ? { costUsd: input.costUsd } : {}),
     at: Date.now(),
   }
+
   const list = journalLog.get(input.canvasId) ?? []
   list.unshift(entry)
   if (list.length > 100) list.length = 100
   journalLog.set(input.canvasId, list)
   persist.saveJournal(entry)
+  return entry
 }
+
+/** The canvas's last runs, newest first, whatever agent ran them — the Run
+ *  tab's history view (getRunJournals is the per-agent kickoff read). */
+export function listRunJournals(canvasId: string, limit = 20): RunJournal[] {
+  return (journalLog.get(canvasId) ?? []).slice(0, limit)
+}
+
+/** How long after a run a frame may still be reverted — a write within this
+ *  window of the journal is the run's own tail, not someone else's later
+ *  work. The revert_run tool and the REST revert route both read it here. */
+export const REVERT_RUN_GRACE_MS = 5_000
 
 /** The role's last runs on this canvas, oldest first — kickoff context. */
 export function getRunJournals(canvasId: string, agentName: string, limit = 3): RunJournal[] {
@@ -2960,4 +3167,399 @@ export function getRunJournalBy(canvasId: string, query: { runId?: string; cardI
   }
   if (query.cardId) return list.find((j) => j.cardId === query.cardId)
   return undefined
+}
+
+/* ------------------------------------------------------------------ */
+/* Component library: reusable markup a frame instantiates by carrying */
+/* `data-doop-component` on one wrapper element. The frame HTML stays   */
+/* the only document — an instance is an element, not a pointer into a  */
+/* second store, so there is nothing to reconcile.                      */
+/* ------------------------------------------------------------------ */
+
+/** The attribute every instance wrapper carries, and the optional JSON
+ *  attribute beside it holding the instance's prop values. */
+const COMPONENT_ATTR = 'data-doop-component'
+const COMPONENT_OVERRIDES_ATTR = 'data-doop-overrides'
+
+/** The wrapper a component instance is inserted inside. Any element would
+ *  do; a div is the neutral one that never carries behaviour of its own. */
+function componentInstanceHtml(component: Component, overrides?: Record<string, string>): string {
+  const overridesAttr =
+    overrides && Object.keys(overrides).length > 0
+      ? ` ${COMPONENT_OVERRIDES_ATTR}="${JSON.stringify(overrides).replace(/&/g, '&amp;').replace(/"/g, '&quot;')}"`
+      : ''
+  return `<div ${COMPONENT_ATTR}="${component.id}"${overridesAttr}>${component.html}</div>`
+}
+
+/** The offset just past `</${tag}>` starting at `at`, skipping over nested
+ *  elements of the same name so a component containing its own kind of
+ *  wrapper cannot end the scan early. */
+function afterCloseTag(html: string, tag: string, at: number): number {
+  const name = tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const re = new RegExp(`</?${name}(?=[\\s/>])`, 'gi')
+  re.lastIndex = at
+  let depth = 1
+  for (let m = re.exec(html); m; m = re.exec(html)) {
+    if (m[0][1] === '/') {
+      if (--depth === 0) return m.index + m[0].length + 1 // past the `>`
+    } else if (html[m.index + m[0].length] !== '/') {
+      depth++ // an open tag; `<tag/` is self-closing and stays shallow
+    }
+  }
+  return -1
+}
+
+/** A component's size in the library panel until a real render says
+ *  otherwise — the same defaults a new frame gets. */
+const COMPONENT_DEFAULT_WIDTH = 640
+const COMPONENT_DEFAULT_HEIGHT = 480
+
+/** Replace the inner markup of every instance of `componentId` in a frame's
+ *  HTML, leaving each wrapper element — and so its data-doop-overrides —
+ *  exactly as the frame has it. Pure string work on purpose: propagation
+ *  runs across every frame of a canvas, and a render per frame would spend
+ *  the whole render budget restating markup nobody changed. */
+export function replaceComponentInstances(
+  html: string,
+  componentId: string,
+  inner: string,
+): { html: string; replaced: number } {
+  const marker = `${COMPONENT_ATTR}="${componentId}"`
+  let out = ''
+  let cursor = 0
+  let replaced = 0
+  for (;;) {
+    const at = html.indexOf(marker, cursor)
+    if (at === -1) break
+    /* the wrapper's open tag: from the marker back to its `<`, and forward
+       to the `>` that closes the tag */
+    const open = html.lastIndexOf('<', at)
+    const openEnd = html.indexOf('>', at)
+    const name = open >= 0 && openEnd > at ? /^<([a-zA-Z][a-zA-Z0-9:-]*)/.exec(html.slice(open))?.[1] : undefined
+    /* a marker that is not on a real open element (an attribute value, a
+       truncated document) is left where it is — it is not an instance */
+    if (!name || name === 'html' || name === 'body') {
+      cursor = at + marker.length
+      continue
+    }
+    const end = afterCloseTag(html, name, openEnd + 1)
+    if (end === -1) {
+      cursor = at + marker.length
+      continue
+    }
+    out += html.slice(cursor, openEnd + 1) + inner
+    cursor = end
+    replaced++
+  }
+  if (replaced === 0) return { html, replaced: 0 }
+  return { html: out + html.slice(cursor), replaced }
+}
+
+/** Every frame carrying at least one instance of this component, across
+ *  canvases. A projection over frame HTML, not a counter: the markup is the
+ *  only place an instance exists, so a stored count could only drift. */
+export function componentsUsing(componentId: string): { frameId: string; canvasId: string; name: string }[] {
+  const marker = `${COMPONENT_ATTR}="${componentId}"`
+  const used: { frameId: string; canvasId: string; name: string }[] = []
+  for (const canvas of store.canvases.values()) {
+    for (const frame of canvas.frames) {
+      if (frame.html.includes(marker)) used.push({ frameId: frame.id, canvasId: canvas.id, name: frame.name })
+    }
+  }
+  return used
+}
+
+/** The component library as the components panel lists it: metadata and how
+ *  widely each component is used, never the HTML (the panel previews render
+ *  it from get_component). */
+export function listComponentSummaries(canvasId: string): ComponentSummary[] {
+  const instances = new Map<string, number>()
+  for (const frame of store.getCanvas(canvasId)?.frames ?? []) {
+    for (const component of store.listComponents(canvasId)) {
+      if (frame.html.includes(`${COMPONENT_ATTR}="${component.id}"`))
+        instances.set(component.id, (instances.get(component.id) ?? 0) + 1)
+    }
+  }
+  return store.listComponents(canvasId).map((c) => ({
+    id: c.id,
+    name: c.name,
+    ...(c.description ? { description: c.description } : {}),
+    width: c.width,
+    height: c.height,
+    ...(c.variantOf ? { variantOf: c.variantOf } : {}),
+    instanceCount: instances.get(c.id) ?? 0,
+    updatedAt: new Date(c.updatedAt).toISOString(),
+    updatedBy: c.updatedBy,
+    htmlBytes: c.html.length,
+  }))
+}
+
+/** Mint a library component. The html is the component's whole design — what
+ *  insert_component stamps into frames — so it is bounded like a frame. */
+export function createComponent(
+  canvasId: string,
+  input: {
+    name: string
+    html: string
+    description?: string
+    props?: unknown
+    variantOf?: string
+    width?: number
+    height?: number
+  },
+  actor: Actor,
+): Component | undefined {
+  assertAgentWriteAllowed(canvasId, actor, TOOL_NAME.createComponent)
+  const name = input.name.trim()
+  if (!name) throw new Error('a component needs a name')
+  const bytes = Buffer.byteLength(input.html)
+  if (bytes > MAX_FRAME_HTML_BYTES)
+    throw new Error(`component html is ${bytes} bytes — the limit is ${MAX_FRAME_HTML_BYTES}`)
+  const component = store.createComponent(
+    canvasId,
+    {
+      name,
+      html: input.html,
+      ...(input.description?.trim() ? { description: input.description.trim() } : {}),
+      /* a component's natural size is a rendered question; the library needs
+         a number for the panel's preview, and it gets the frame default
+         unless the caller declared the real size */
+      width: input.width ?? COMPONENT_DEFAULT_WIDTH,
+      height: input.height ?? COMPONENT_DEFAULT_HEIGHT,
+      props: input.props,
+      ...(input.variantOf ? { variantOf: input.variantOf } : {}),
+    },
+    actor.name,
+  )
+  if (!component) return undefined
+  broadcast(canvasId, { type: 'component', componentId: component.id, component, actor })
+  logActivity(canvasId, actor, `created the component “${component.name}”`)
+  touch(canvasId, actor)
+  return component
+}
+
+/** Edit a library component. When the html changed, every frame carrying an
+ *  instance is rewritten with it unless the caller passed
+ *  `propagate: false` — a locked frame or a frame whose instance markup has
+ *  gone missing is skipped with a reason, never force-overwritten. */
+export function updateComponent(
+  componentId: string,
+  patch: { name?: string; description?: string; html?: string; props?: unknown },
+  actor: Actor,
+  opts: { propagate?: boolean } = {},
+):
+  | {
+      component: Component
+      updated: { frameId: string; name: string }[]
+      skipped: { frameId: string; name: string; reason: string }[]
+    }
+  | undefined {
+  const before = store.getComponent(componentId)
+  if (!before) return undefined
+  assertAgentWriteAllowed(before.canvasId, actor, TOOL_NAME.updateComponent)
+  if (patch.html !== undefined) {
+    const bytes = Buffer.byteLength(patch.html)
+    if (bytes > MAX_FRAME_HTML_BYTES)
+      throw new Error(`component html is ${bytes} bytes — the limit is ${MAX_FRAME_HTML_BYTES}`)
+  }
+  const component = store.updateComponent(
+    componentId,
+    {
+      ...(patch.name !== undefined ? { name: patch.name.trim() || before.name } : {}),
+      ...(patch.description !== undefined ? { description: patch.description.trim() || undefined } : {}),
+      ...(patch.html !== undefined ? { html: patch.html } : {}),
+      ...(patch.props !== undefined ? { props: patch.props } : {}),
+    },
+    actor.name,
+  )!
+  broadcast(before.canvasId, { type: 'component', componentId, component, actor })
+
+  let updated: { frameId: string; name: string }[] = []
+  let skipped: { frameId: string; name: string; reason: string }[] = []
+  if (patch.html !== undefined && opts.propagate !== false) {
+    ;({ updated, skipped } = propagateComponent(component, actor))
+  }
+  logActivity(
+    before.canvasId,
+    actor,
+    `updated the component “${component.name}”${
+      updated.length ? ` — ${updated.length} instance${updated.length === 1 ? '' : 's'} refreshed` : ''
+    }`,
+  )
+  touch(before.canvasId, actor)
+  return { component, updated, skipped }
+}
+
+/** Rewrite every frame that carries an instance of the component with the
+ *  component's current html. Runs through updateFrame, so each rewrite
+ *  versions, broadcasts, lock-checks and review-gates like any other write. */
+function propagateComponent(
+  component: Component,
+  actor: Actor,
+): { updated: { frameId: string; name: string }[]; skipped: { frameId: string; name: string; reason: string }[] } {
+  const updated: { frameId: string; name: string }[] = []
+  const skipped: { frameId: string; name: string; reason: string }[] = []
+  for (const use of componentsUsing(component.id)) {
+    const frame = store.getFrame(use.frameId)
+    if (!frame) continue
+    const next = replaceComponentInstances(frame.html, component.id, component.html)
+    if (next.replaced === 0) {
+      skipped.push({
+        frameId: frame.id,
+        name: frame.name,
+        reason: `no “${COMPONENT_ATTR}="${component.id}"” instance in this frame's markup to refresh`,
+      })
+      continue
+    }
+    try {
+      updateFrame(frame.id, { html: next.html }, actor)
+      updated.push({ frameId: frame.id, name: frame.name })
+    } catch (e) {
+      /* a locked frame or a review-gated one keeps its current markup and
+         says why — a propagation is best effort per frame, never a force */
+      skipped.push({
+        frameId: frame.id,
+        name: frame.name,
+        reason:
+          e instanceof frameLocks.FrameLockedError || e instanceof ReviewModeError ? e.message : 'could not update',
+      })
+    }
+  }
+  return { updated, skipped }
+}
+
+/** Delete a library component. Without `force`, a component still used by
+ *  frames is refused with the list — deleting it out from under instances
+ *  would leave markup nobody can trace. With `force`, the library row goes
+ *  and the instance markup stays exactly where it is: an instance is an
+ *  element in a frame, so it survives as ordinary markup. */
+export function deleteComponent(
+  componentId: string,
+  actor: Actor,
+  opts: { force?: boolean } = {},
+): { deleted: boolean; reason?: string } | undefined {
+  const component = store.getComponent(componentId)
+  if (!component) return undefined
+  assertAgentWriteAllowed(component.canvasId, actor, TOOL_NAME.deleteComponent, { destructive: true })
+  if (!opts.force) {
+    const uses = componentsUsing(componentId)
+    if (uses.length)
+      return {
+        deleted: false,
+        reason: `still used by ${uses.length} frame${uses.length === 1 ? '' : 's'} (${uses
+          .slice(0, 5)
+          .map((u) => `“${u.name}”`)
+          .join(', ')}${uses.length > 5 ? ', …' : ''}) — detach the instances or pass force to delete anyway`,
+      }
+  }
+  store.deleteComponent(componentId)
+  broadcast(component.canvasId, { type: 'component', componentId, component: null, actor })
+  logActivity(component.canvasId, actor, `deleted the component “${component.name}”`)
+  touch(component.canvasId, actor)
+  return { deleted: true }
+}
+
+/** Stamp an instance of a component into a frame: the component's html in one
+ *  wrapper element, inserted through the element-editing layer (one render)
+ *  and landed through updateFrame like any other write. `undefined` when the
+ *  component belongs to another canvas — the MCP surface reports that as
+ *  forbidden rather than letting one canvas's library leak into another. */
+export async function insertComponent(
+  frameId: string,
+  componentId: string,
+  input: { parent_selector: string; position: 'append' | 'prepend' | number; overrides?: Record<string, string> },
+  actor: Actor,
+): Promise<{ frame: Frame; selector: string } | undefined> {
+  const frame = store.getFrame(frameId)
+  if (!frame) return undefined
+  const component = store.getComponent(componentId)
+  if (!component || component.canvasId !== frame.canvasId) return undefined
+  assertAgentWriteAllowed(frame.canvasId, actor, TOOL_NAME.insertComponent)
+  const inserted = await insertElement(frame, {
+    parent_selector: input.parent_selector,
+    position: input.position,
+    html: componentInstanceHtml(component, input.overrides),
+  })
+  const updated = updateFrame(frame.id, { html: inserted.html }, actor)
+  if (!updated) return undefined
+  logActivity(frame.canvasId, actor, `inserted the component “${component.name}”`, frame.id)
+  return { frame: updated, selector: inserted.selector }
+}
+
+/** Make an instance ordinary markup again: strip its two data-doop
+ *  attributes and the frame keeps the markup without the link to the
+ *  library. `ElementEditError` (unknown selector, too many matches)
+ *  propagates to the caller. */
+export async function detachComponent(
+  frameId: string,
+  selector: string,
+  actor: Actor,
+): Promise<{ frame: Frame } | undefined> {
+  const frame = store.getFrame(frameId)
+  if (!frame) return undefined
+  assertAgentWriteAllowed(frame.canvasId, actor, TOOL_NAME.detachComponent)
+  const detached = await updateElements(frame, [
+    { selector, attrs: { [COMPONENT_ATTR]: null, [COMPONENT_OVERRIDES_ATTR]: null } },
+  ])
+  const updated = updateFrame(frame.id, { html: detached.html }, actor)
+  if (!updated) return undefined
+  logActivity(frame.canvasId, actor, `detached a component instance`, frame.id)
+  return { frame: updated }
+}
+
+/* ------------------------------------------------------------------ */
+/* Cross-canvas memory: what an agent learned about one user's taste,   */
+/* keyed by user, not canvas, so a new canvas does not start from zero. */
+/* Not review-gated — it is the agent's own notebook, not a canvas      */
+/* write.                                                               */
+/* ------------------------------------------------------------------ */
+
+const userMemory = new Map<string, UserMemory[]>() // userId -> newest first
+
+/** Fill the memory map from the database at boot. Replaces the lists it is
+ *  given, so re-hydrating is safe. */
+export function hydrateUserMemory(rows: UserMemory[]): void {
+  for (const row of rows) userMemory.set(row.userId, [row, ...(userMemory.get(row.userId) ?? [])])
+}
+
+/** What this user's agents have been taught, newest first. */
+export function getUserMemory(userId: string): UserMemory[] {
+  return userMemory.get(userId) ?? []
+}
+
+/** One thing worth carrying to the user's next canvas. Capped per user —
+ *  the oldest entry falls off, because a notebook nobody prunes stops
+ *  being a memory and becomes an archive. */
+export function remember(
+  userId: string,
+  kind: UserMemory['kind'],
+  text: string,
+  sourceCanvasId?: string,
+): UserMemory | undefined {
+  const clean = text.replace(/\s+/g, ' ').trim()
+  if (!clean) return undefined
+  const row: UserMemory = {
+    id: nanoid(8),
+    userId,
+    kind,
+    text: clean,
+    ...(sourceCanvasId ? { sourceCanvasId } : {}),
+    createdAt: Date.now(),
+  }
+  const list = userMemory.get(userId) ?? []
+  list.unshift(row)
+  if (list.length > 200) list.length = 200
+  userMemory.set(userId, list)
+  persist.saveUserMemory(row)
+  return row
+}
+
+/** Forget one thing. */
+export function forgetMemory(userId: string, id: string): boolean {
+  const list = userMemory.get(userId)
+  const idx = list?.findIndex((m) => m.id === id) ?? -1
+  if (!list || idx === -1) return false
+  list.splice(idx, 1)
+  persist.deleteUserMemory(id)
+  return true
 }

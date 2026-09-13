@@ -2,12 +2,14 @@ import { nanoid } from 'nanoid'
 import * as persist from './db/persist.ts'
 import type {
   Canvas,
+  Component,
   CommunityCategory,
   DesignTokens,
   Frame,
   GuidelineDoc,
   MemoryReference,
   Page,
+  ReviewPolicy,
 } from '../shared/types.ts'
 
 /**
@@ -30,6 +32,97 @@ class Store {
       this.canvases.set(c.id, c)
       for (const f of c.frames) this.frameIndex.set(f.id, c.id)
     }
+  }
+
+  /** The canvas's component library, keyed by canvas. Kept out of the Canvas
+   *  object itself so a component write never touches canvas.updatedAt. */
+  components = new Map<string, Component[]>()
+
+  /** Load every component row at boot. */
+  initComponents(rows: Component[]) {
+    for (const row of rows) {
+      const list = this.components.get(row.canvasId) ?? []
+      list.push(row)
+      this.components.set(row.canvasId, list)
+    }
+  }
+
+  /** The canvas's components, newest-updated first. */
+  listComponents(canvasId: string): Component[] {
+    return [...(this.components.get(canvasId) ?? [])].sort((a, b) => b.updatedAt - a.updatedAt)
+  }
+
+  /** No component index of its own — components are few and canvas-bound, so
+   *  the lookup scans the map, the way getPage finds a page. */
+  getComponent(componentId: string): Component | undefined {
+    for (const list of this.components.values()) {
+      const component = list.find((c) => c.id === componentId)
+      if (component) return component
+    }
+    return undefined
+  }
+
+  createComponent(
+    canvasId: string,
+    input: {
+      name: string
+      html: string
+      description?: string
+      width: number
+      height: number
+      props?: unknown
+      variantOf?: string
+    },
+    by: string,
+  ): Component | undefined {
+    if (!this.canvases.has(canvasId)) return undefined
+    const now = Date.now()
+    const component: Component = {
+      id: nanoid(10),
+      canvasId,
+      name: input.name,
+      ...(input.description ? { description: input.description } : {}),
+      html: input.html,
+      width: input.width,
+      height: input.height,
+      ...(input.props !== undefined ? { props: input.props } : {}),
+      ...(input.variantOf ? { variantOf: input.variantOf } : {}),
+      createdBy: by,
+      updatedBy: by,
+      createdAt: now,
+      updatedAt: now,
+    }
+    const list = this.components.get(canvasId) ?? []
+    list.push(component)
+    this.components.set(canvasId, list)
+    persist.saveComponent(component)
+    return component
+  }
+
+  updateComponent(
+    componentId: string,
+    patch: Partial<Pick<Component, 'name' | 'description' | 'html' | 'width' | 'height' | 'props' | 'variantOf'>>,
+    by: string,
+  ): Component | undefined {
+    const component = this.getComponent(componentId)
+    if (!component) return undefined
+    Object.assign(component, patch)
+    component.updatedAt = Date.now()
+    component.updatedBy = by
+    persist.saveComponent(component)
+    return component
+  }
+
+  deleteComponent(componentId: string): Component | undefined {
+    for (const [canvasId, list] of this.components) {
+      const idx = list.findIndex((c) => c.id === componentId)
+      if (idx === -1) continue
+      const [component] = list.splice(idx, 1)
+      if (list.length === 0) this.components.delete(canvasId)
+      persist.deleteComponentRow(componentId)
+      return component
+    }
+    return undefined
   }
 
   /** The dashboard row for one canvas. `viewerId` decides only whether the
@@ -156,12 +249,14 @@ class Store {
     return this.canvases.get(id)
   }
 
-  /** Remove a canvas and its frames from memory + database. */
+  /** Remove a canvas and its frames from memory + database. Its component
+   *  library goes with it — a component is canvas-owned content. */
   deleteCanvas(id: string): Canvas | undefined {
     const c = this.canvases.get(id)
     if (!c) return undefined
     for (const f of c.frames) this.frameIndex.delete(f.id)
     this.canvases.delete(id)
+    this.components.delete(id)
     persist.deleteCanvas(id)
     return c
   }
@@ -267,13 +362,39 @@ class Store {
     return c
   }
 
-  /** Owner-set review policy: agent frame writes become proposals. Like
-   *  setLinkAccess, this is not a design edit, so updatedAt is left alone. */
+  /** Owner-set review mode: agent frame writes become proposals. Kept as the
+   *  legacy all-or-nothing switch — the policy store (setReviewPolicy) is the
+   *  scoped replacement, and the gate reads a `reviewMode` canvas as
+   *  `all_writes`, so this stays true to what it always did. Like
+   *  setLinkAccess, not a design edit, so updatedAt is left alone. */
   setReviewMode(id: string, on: boolean): Canvas | undefined {
     const c = this.canvases.get(id)
     if (!c) return undefined
     if (on) c.reviewMode = true
     else delete c.reviewMode
+    persist.saveCanvas(c)
+    return c
+  }
+
+  /** Owner-set review policy: what an agent write must clear before it lands.
+   *  `off` (or undefined) is the unset default and clears both fields; the
+   *  empty approval list clears `approvalTools` the way `off` does. The legacy
+   *  boolean is mirrored here — one switch, so the room's review chip and the
+   *  gate can never disagree. Not a design edit, so updatedAt is left alone. */
+  setReviewPolicy(canvasId: string, policy: ReviewPolicy | undefined, approvalTools?: string[]): Canvas | undefined {
+    const c = this.canvases.get(canvasId)
+    if (!c) return undefined
+    if (policy && policy !== 'off') {
+      c.reviewPolicy = policy
+      if (approvalTools?.length) c.approvalTools = [...approvalTools]
+      else delete c.approvalTools
+      if (policy === 'all_writes') c.reviewMode = true
+      else delete c.reviewMode
+    } else {
+      delete c.reviewPolicy
+      delete c.approvalTools
+      delete c.reviewMode
+    }
     persist.saveCanvas(c)
     return c
   }

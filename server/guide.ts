@@ -5,7 +5,18 @@
 
 import { AGENT_ROLES } from '../shared/agents.ts'
 
-export const GUIDE_TOPICS = ['doop-instructions', 'streaming', 'review', 'images', 'redesign'] as const
+export const GUIDE_TOPICS = [
+  'doop-instructions',
+  'streaming',
+  'review',
+  'images',
+  'redesign',
+  'components',
+  'motion',
+  'tokens',
+  'scripts',
+  'memory',
+] as const
 export type GuideTopic = (typeof GUIDE_TOPICS)[number]
 
 /** Topic -> the `## ` heading(s) of DOOP_GUIDE that answer it. An empty list
@@ -16,6 +27,11 @@ const TOPIC_SECTIONS: Record<GuideTopic, string[]> = {
   review: ['Review checkpoints — MANDATORY', 'Design tokens — the values every frame shares'],
   images: ['Images — search first, then upload'],
   redesign: ['Redesigns — audit first, then two drafts'],
+  components: ['Components — reuse before you author'],
+  motion: ['Motion'],
+  tokens: ['Tokens — read, repair and check'],
+  scripts: ['Bulk edits and scripted changes'],
+  memory: ['Memory across canvases'],
 }
 
 /** The taste doctrine every design surface shares. The MCP guide serves it to
@@ -415,6 +431,93 @@ commit to directions, then deliver a choice:
   "go wild", "rebrand"), deliver ONE draft at that scope.
 - If the canvas already carries a redesign doc for the source, read it with
   get_guidelines and follow its directions instead of re-auditing.
+
+## Components — reuse before you author
+
+Before authoring a nav bar, pricing card, footer or any other repeated piece from
+scratch, check the canvas library: list_components (or search_components by name —
+"pricing", "nav", "testimonial") tells you what already exists. Reuse wins twice:
+the frame inherits a proven piece, and a later change reaches every instance at once.
+
+- get_component reads one entry's full markup and metadata — look at it before you
+  insert or edit, so you place the right piece and override the right props.
+- insert_component places an instance: one wrapper element under your parent_selector
+  (append, prepend, or a child index), with overrides for per-instance props
+  ({"title": "Spring sale"}). The instance tracks its component from then on.
+- update_component edits the library entry once and, with propagate: true (the
+  default), re-renders every frame carrying the component — the result names the
+  frames updated and the ones skipped (a locked frame is skipped, not blocked).
+- detach_component unbinds ONE instance: its markup stays exactly as it is, but later
+  update_component calls skip that frame.
+- An instance is an ordinary element carrying data-doop-component — the frame HTML
+  stays the only document, so every element tool keeps working on it.
+- A change to a component versions every frame it touches, like any other write:
+  get_frame_history still shows what each frame looked like before the propagation.
+
+## Motion
+
+Screenshots show one instant; motion is what a frame does over time. Read it with
+get_motion_context: the keyframes and media queries the stylesheet declares, which
+elements run transitions or animations and for how long, which @font-face faces the
+frame depends on, and whether it honors reduced motion. Scope it with selector for
+one subtree, e.g. when a frame feels "slow" and you need the numbers.
+
+- Motion and responsive rules are authored in set_frame_css — the frame's own
+  <style data-doop-css> block is the only place @media, :hover/:focus/:active,
+  transition and @keyframes can live. Inline styles cannot express any of those.
+- The motion lint rules (motion_no_reduced_motion, motion_long_duration,
+  motion_infinite_animation) are advisory, not blocking: they appear in
+  review_frame's advisory list, so judge them like any other warning.
+
+## Tokens — read, repair and check
+
+get_tokens is the canvas palette: the named colors, fonts, spacing scale and radii
+every frame should use, plus a ready-to-paste :root block. Read it before designing
+on a canvas that has tokens, and define it with set_tokens early on a new one.
+
+- get_token_usage says which token each element actually used — and what drifted:
+  per element, the token (or raw value) behind its color, background, font, radius
+  and spacing, plus each off-token finding with the value, the nearest token and
+  how far away it is. Scope it with selector for one subtree.
+- fix_frame_tokens repairs the drift: a fresh lint runs, every finding within the
+  fix tolerance is rewritten to its token, and each fixed entry names what moved
+  and what it became. Rehearse with dry_run, restrict with only.
+- lint_frame remains the read-only report — the check you run after building or
+  restyling, aiming for zero, that never changes anything itself.
+
+## Bulk edits and scripted changes
+
+Three widths of edit, narrowest first:
+
+- edit_frame_html for one exact replacement — copy, a color, one element's spacing.
+- apply_ops for a batch: one call carrying a list of ops, run in order, each
+  reported at its index (atomic: true validates everything first and applies
+  nothing if any op would fail).
+- run_frame_script for the structural change no fixed op expresses — a bulk
+  renumber, every repeated card rewritten. The script sees the live DOM through
+  the doop global; read the exact surface with frame_script_api first: doop.$ /
+  doop.$$ to find elements, doop.set for styles, doop.text to replace text,
+  doop.replace to swap an element for parsed HTML, doop.remove to drop one,
+  doop.attrs to set or remove attributes.
+
+The script body caps at 20 000 characters and times out after 5 seconds. It runs
+with no network access (fetch, XMLHttpRequest, WebSocket, EventSource and
+navigator.sendBeacon throw) and may not insert a script tag or an on* handler —
+a script edits the frame, nothing else.
+
+## Memory across canvases
+
+Some things outlive the canvas: taste, brand rules, working workflows. remember
+stores one durable fact per call — kind preference (styling taste), brand
+(identity rules) or workflow (how they like work done) — in one or two sentences,
+not a work log. get_memory reads them back.
+
+These follow the account, not the canvas: a new canvas does not start from zero,
+so read them when you arrive somewhere unfamiliar. And when a human states a
+preference in conversation with YOU ("likes generous whitespace", "never pure
+black", "mobile-first drafts first"), call remember — your chat is invisible to
+the canvas until you report it. One-off content edits (typos, copy tweaks) are
+not memory; design taste is.
 
 ## Design quality
 

@@ -32,7 +32,7 @@ import { handleMcpRequest } from './mcp.ts'
 import { groupClients } from './mcpClients.ts'
 /* static, not dynamic: nothing imports this entrypoint, so there is no cycle,
    and the canceller must be referenceable when actions is wired below */
-import { cancelCanvasRuns, onFeedback } from './resident.ts'
+import { cancelCanvasRuns, onFeedback, resumeInterruptedRuns } from './resident.ts'
 import {
   getAsset,
   reconcileAssetRefs,
@@ -93,7 +93,16 @@ if (data.canvases.length === 0 && (await persist.importLegacyJson())) {
 }
 store.init(data.canvases)
 actions.hydrateLogs(data)
+actions.hydrateUserMemory([...(data.userMemory?.values() ?? [])].flat())
+store.initComponents([...(data.components?.values() ?? [])].flat())
 seed()
+
+/* A run that was live when the process died has its transcript on disk: resume
+   it before anything else touches the board, so the cards it claimed come back
+   under the same run instead of being failed as interrupted. */
+resumeInterruptedRuns()
+  .then((n) => n && console.log(`[resident] resumed ${n} interrupted run(s)`))
+  .catch((e) => console.error('[resident] resume failed', e))
 
 /* Never-attempted queued cards get their first pickup after boot. Hydration
    marks interrupted claimed cards as failed, so they are excluded until a
@@ -1337,6 +1346,24 @@ const pageName = (raw: unknown) =>
     .trim()
     .slice(0, 80) || 'Untitled'
 
+/** Owner-only canvas policy: which agent writes need approval. `reviewMode`
+ *  stays the owner's on/off toggle and reads as `all_writes` while on. */
+app.post('/api/canvases/:id/review-policy', (req, res) => {
+  if (!requireCanvas(req, res, req.params.id)) return
+  const canvas = store.getCanvas(req.params.id)!
+  if (canvas.ownerId !== req.user!.id) return res.status(403).json({ error: 'only the owner can change review policy' })
+  const policy = req.body?.policy
+  if (policy !== 'off' && policy !== 'destructive' && policy !== 'all_writes')
+    return res.status(400).json({ error: "policy must be 'off', 'destructive' or 'all_writes'" })
+  const tools = Array.isArray(req.body?.approval_tools)
+    ? req.body.approval_tools.filter((t: unknown) => typeof t === 'string' && t).slice(0, 50)
+    : []
+  const actor = resolveActorFromReq(req)
+  const updated = actions.setCanvasReviewPolicy(req.params.id, policy, tools, actor)
+  if (!updated) return res.status(404).json({ error: 'canvas not found' })
+  res.json({ reviewPolicy: updated.reviewPolicy ?? 'off', approvalTools: updated.approvalTools ?? [] })
+})
+
 /** Owner-only canvas setting: agent frame writes land as proposals. */
 app.post('/api/canvases/:id/review-mode', (req, res) => {
   if (!requireCanvas(req, res, req.params.id)) return
@@ -1379,19 +1406,32 @@ app.get('/api/canvases/:id/frame-proposals', (req, res) => {
 
 /** Accept or reject a proposal — any collaborator with canvas access may.
  *  `note` rides back to the agent; `force` applies a proposal the stale guard
- *  would otherwise refuse. */
+ *  would otherwise refuse; `hunks` resolves a patch-mode proposal hunk by hunk,
+ *  applying only the accepted ones. */
 app.post('/api/canvases/:id/frame-proposals/:pid', (req, res) => {
   if (!requireCanvas(req, res, req.params.id)) return
   const note = typeof req.body?.note === 'string' ? req.body.note : undefined
-  const proposal = actions.resolveFrameProposal(
+  const hunks = Array.isArray(req.body?.hunks)
+    ? (req.body.hunks as { index?: unknown; accept?: unknown }[])
+        .filter((h) => typeof h?.index === 'number' && Number.isInteger(h.index))
+        .map((h) => ({ index: h.index as number, accept: h.accept !== false }))
+        .slice(0, 50)
+    : undefined
+  const outcome = actions.resolveFrameProposalDetailed(
     req.params.id,
     req.params.pid,
     !!req.body?.accept,
     resolveActorFromReq(req),
-    { ...(note ? { note } : {}), ...(req.body?.force ? { force: true } : {}) },
+    {
+      ...(note ? { note } : {}),
+      ...(req.body?.force ? { force: true } : {}),
+      ...(hunks?.length ? { hunks } : {}),
+    },
   )
-  if (!proposal) return res.status(404).json({ error: 'proposal not found' })
-  res.json(proposal)
+  if (!outcome) return res.status(404).json({ error: 'proposal not found' })
+  /* the proposal at the top level, so the existing client read is unchanged,
+     with the per-hunk outcome beside it for a reviewer that sent hunks */
+  res.json({ ...outcome.proposal, applied: outcome.applied, skipped: outcome.skipped })
 })
 
 /** Withdraw one of your own pending proposals. */
@@ -1436,11 +1476,92 @@ app.post('/api/canvases/:id/questions/:qid', (req, res) => {
   res.json(question)
 })
 
+/** A canvas's component library, newest-updated first. */
+app.get('/api/canvases/:id/components', (req, res) => {
+  if (!requireCanvas(req, res, req.params.id)) return
+  res.json(actions.listComponentSummaries(req.params.id))
+})
+
+/** Delete one component. Refused with 409 while frames still hold instances,
+ *  unless `force` is passed — the instances' markup is left alone either way,
+ *  it simply stops being bound to a library entry. */
+app.delete('/api/components/:id', (req, res) => {
+  const component = store.getComponent(req.params.id)
+  if (!component) return res.status(404).json({ error: 'component not found' })
+  if (!requireCanvas(req, res, component.canvasId)) return
+  const outcome = actions.deleteComponent(req.params.id, resolveActorFromReq(req), {
+    force: req.query.force === 'true',
+  })
+  if (!outcome) return res.status(404).json({ error: 'component not found' })
+  if (!outcome.deleted) return res.status(409).json({ error: outcome.reason })
+  res.json({ ok: true })
+})
+
 /** A run's tool-call timeline, newest first. */
 app.get('/api/canvases/:id/run-events', (req, res) => {
   if (!requireCanvas(req, res, req.params.id)) return
   const runId = typeof req.query.run_id === 'string' ? req.query.run_id : undefined
   res.json(runLog.getRunEvents(req.params.id, { runId, limit: Math.min(500, Number(req.query.limit) || 200) }))
+})
+
+/** What a run did: the journals for this canvas, newest first, optionally
+ *  narrowed to one agent. The client reads duration, turns, tool calls, tokens
+ *  and cost off these — the same record revert_run resolves a run from. */
+app.get('/api/canvases/:id/run-journals', (req, res) => {
+  if (!requireCanvas(req, res, req.params.id)) return
+  const agentName = typeof req.query.agent === 'string' ? req.query.agent : undefined
+  const limit = Math.min(100, Number(req.query.limit) || 20)
+  const journals = agentName
+    ? actions.getRunJournals(req.params.id, agentName, limit)
+    : actions.listRunJournals(req.params.id, limit)
+  res.json(journals)
+})
+
+/** How long after a run a frame may still be reverted: a write within this
+ *  window of the journal is the run's own tail, not someone's later work.
+ *  Shared with the revert_run tool, which applies the same rule. */
+const REVERT_RUN_GRACE_MS = 5_000
+
+/** Undo everything one run changed. A frame someone else has edited since the
+ *  run, or that no longer exists, is skipped and reported rather than
+ *  clobbered — the same rule the revert_run tool applies. */
+app.post('/api/canvases/:id/runs/:runId/revert', async (req, res) => {
+  if (!requireCanvas(req, res, req.params.id)) return
+  const actor = resolveActorFromReq(req)
+  const journal = actions.getRunJournalBy(req.params.id, { runId: req.params.runId })
+  if (!journal) return res.status(404).json({ error: 'no run journal for that run' })
+  const reverted: string[] = []
+  const skipped: { frame_id: string; reason: string }[] = []
+  for (const entry of journal.frames ?? []) {
+    if (!entry.beforeVersionId) {
+      skipped.push({ frame_id: entry.frameId, reason: 'no starting version was recorded for this frame' })
+      continue
+    }
+    const frame = store.getFrame(entry.frameId)
+    if (!frame || frame.canvasId !== req.params.id) {
+      skipped.push({ frame_id: entry.frameId, reason: 'the frame no longer exists' })
+      continue
+    }
+    if (frame.updatedAt > journal.at + REVERT_RUN_GRACE_MS) {
+      skipped.push({
+        frame_id: entry.frameId,
+        reason: `changed after the run by ${frame.updatedBy} — reverting would discard that work`,
+      })
+      continue
+    }
+    try {
+      const restored = await actions.revertFrame(entry.frameId, entry.beforeVersionId, actor)
+      if (!restored) {
+        skipped.push({ frame_id: entry.frameId, reason: 'the recorded version is no longer stored' })
+        continue
+      }
+      reverted.push(entry.frameId)
+    } catch (e) {
+      if (!(e instanceof frameLocks.FrameLockedError)) throw e
+      skipped.push({ frame_id: entry.frameId, reason: `still locked by ${e.holder.agentName}` })
+    }
+  }
+  res.json({ reverted, skipped })
 })
 
 /** Pause a live agent run (the card stays open, skipped by the sweep). */
@@ -2020,9 +2141,43 @@ app.get('/api/frames/:id/screenshot.png', async (req, res) => {
   }
 })
 
+/** A component's thumbnail, rendered from its own markup through the frame
+ *  renderer: a component is a document fragment, so it is measured as a
+ *  frame of its declared size. */
+app.get('/api/components/:id/screenshot.png', async (req, res) => {
+  const component = store.getComponent(req.params.id)
+  if (!component) return res.status(404).json({ error: 'component not found' })
+  if (!requireCanvas(req, res, component.canvasId)) return
+  try {
+    const { renderFrame } = await import('./screenshot.ts')
+    const png = await renderFrame(
+      {
+        id: `component-${component.id}`,
+        canvasId: component.canvasId,
+        name: component.name,
+        x: 0,
+        y: 0,
+        width: component.width,
+        height: component.height,
+        html: component.html,
+        createdAt: component.createdAt,
+        updatedAt: component.updatedAt,
+        updatedBy: component.updatedBy,
+      },
+      req.query.scale === '2' ? 2 : 1,
+    )
+    res.type('png').send(png)
+  } catch (e) {
+    res.status(500).json({ error: e instanceof Error ? e.message : 'render failed' })
+  }
+})
+
 /* MCP endpoint — point any MCP-capable AI at http://localhost:PORT/mcp.
-   Protected by OAuth: unauthenticated calls get 401 + discovery pointers. */
-app.all('/mcp', handleMcpRequest)
+   Protected by OAuth: unauthenticated calls get 401 + discovery pointers.
+   /mcp/readonly registers only tools that declare readOnlyHint, so a reviewer
+   or monitoring agent can be connected without being handed write access. */
+app.all('/mcp', (req, res) => handleMcpRequest(req, res))
+app.all('/mcp/readonly', (req, res) => handleMcpRequest(req, res, { readonly: true }))
 
 /* OAuth discovery metadata at the root, where MCP clients look for it
    (better-auth serves these under /api/auth; we bridge the web-standard
@@ -2133,6 +2288,9 @@ wss.on('connection', (ws, upgradeReq) => {
         frameProposals: actions.getFrameProposals(msg.canvasId),
         questions: actions.getQuestions(msg.canvasId),
         reviewMode: !!canvas.reviewMode,
+        reviewPolicy: canvas.reviewPolicy ?? (canvas.reviewMode ? 'all_writes' : 'off'),
+        approvalTools: canvas.approvalTools ?? [],
+        components: actions.listComponentSummaries(msg.canvasId),
         runEvents: runLog.getRunEvents(msg.canvasId, { limit: 200 }),
         frameLocks: locksForCanvas(msg.canvasId),
         selfColor: presence.color,

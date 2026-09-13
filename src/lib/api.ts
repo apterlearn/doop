@@ -13,6 +13,7 @@ import type {
   FrameVersion,
   Page,
   RunEvent,
+  RunJournal,
 } from '../../shared/types'
 
 export type HomeActivity = ActivityItem & { canvasId: string; canvasName: string }
@@ -293,21 +294,28 @@ export const api = {
       body: JSON.stringify({ tokens }),
     }),
   /* a reject may carry a note the agent reads back; force applies a proposal
-     the stale guard would otherwise refuse */
+     the stale guard would otherwise refuse. A patch-mode proposal also carries
+     `hunks` — the reviewer's per-edit verdict — so an unchecked hunk is
+     dropped instead of applied; the response reports which hunks landed and
+     why any did not. */
   resolveFrameProposal: (
     canvasId: string,
     proposalId: string,
     accept: boolean,
-    opts?: { note?: string; force?: boolean },
+    opts?: { note?: string; force?: boolean; hunks?: { index: number; accept: boolean }[] },
   ) =>
-    req<FrameProposal>(`/api/canvases/${canvasId}/frame-proposals/${proposalId}`, {
-      method: 'POST',
-      body: JSON.stringify({
-        accept,
-        ...(opts?.note ? { note: opts.note } : {}),
-        ...(opts?.force ? { force: true } : {}),
-      }),
-    }),
+    req<FrameProposal & { applied?: number[]; skipped?: { index: number; reason: string }[] }>(
+      `/api/canvases/${canvasId}/frame-proposals/${proposalId}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          accept,
+          ...(opts?.note ? { note: opts.note } : {}),
+          ...(opts?.force ? { force: true } : {}),
+          ...(opts?.hunks ? { hunks: opts.hunks } : {}),
+        }),
+      },
+    ),
   /* the answer reaches a waiting agent inside its ask_human call */
   answerQuestion: (canvasId: string, questionId: string, answer: string) =>
     req<AgentQuestion>(`/api/canvases/${canvasId}/questions/${questionId}`, {
@@ -469,6 +477,21 @@ export const api = {
     if (runId) q.set('run_id', runId)
     return req<RunEvent[]>(`/api/canvases/${canvasId}/run-events?${q}`)
   },
+  /** what each run did — duration, turns, tool calls, tokens and cost — newest
+   *  first; optionally one agent's. The same records a run is reverted from. */
+  runJournals: (canvasId: string, agentName?: string, limit = 20) => {
+    const q = new URLSearchParams({ limit: String(limit) })
+    if (agentName) q.set('agent', agentName)
+    return req<RunJournal[]>(`/api/canvases/${canvasId}/run-journals?${q}`)
+  },
+  /** Undo everything one run changed: every frame it touched goes back to the
+   *  version the run started from. A frame someone edited since, or deleted,
+   *  comes back under `skipped` instead of being clobbered. */
+  revertRun: (canvasId: string, runId: string) =>
+    req<{ reverted: string[]; skipped: { frame_id: string; reason: string }[] }>(
+      `/api/canvases/${canvasId}/runs/${runId}/revert`,
+      { method: 'POST' },
+    ),
   listMcpAgents: () => req<ConnectedAgent[]>('/api/mcp-agents'),
   revokeMcpAgent: (clientId: string) => req(`/api/mcp-agents/${encodeURIComponent(clientId)}`, { method: 'DELETE' }),
 }

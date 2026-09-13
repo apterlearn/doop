@@ -298,6 +298,37 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
   }, [questions])
   const questionToast = questions.find((q) => q.id === questionToastId)
 
+  /* A proposed frame change is the other half of that: while review mode is on
+     the agent is parked until a human decides, so announce it in the same
+     stack with the same jump. Only proposals that arrived since this page
+     loaded are news — the ws-init batch is history — and a resolved proposal
+     (anything but `pending`) is never announced, which is also what keeps this
+     client's own accepts and rejects quiet. */
+  const frameProposals = useStore((s) => s.frameProposals)
+  const [proposalToastId, setProposalToastId] = useState<string | null>(null)
+  const [mutedFrameProposal, setMutedFrameProposal] = useState<string | null>(null)
+  const proposalToastTimer = useRef<number | null>(null)
+  const announcedProposals = useRef<Set<string> | null>(null)
+  useEffect(() => {
+    if (!loadedAt.current) loadedAt.current = Date.now()
+    const announced = announcedProposals.current ?? new Set<string>()
+    announcedProposals.current = announced
+    const fresh = frameProposals
+      .filter((p) => p.status === 'pending' && p.at > loadedAt.current && !announced.has(p.id))
+      .sort((a, b) => b.at - a.at)
+    for (const p of fresh) announced.add(p.id)
+    const proposal = fresh[0]
+    if (!proposal) return
+    setProposalToastId(proposal.id)
+    if (proposalToastTimer.current) window.clearTimeout(proposalToastTimer.current)
+    proposalToastTimer.current = window.setTimeout(() => setProposalToastId(null), 8000)
+  }, [frameProposals])
+  const proposalToast = frameProposals.find((p) => p.id === proposalToastId)
+  /* what the change is against: a named frame, or the frame it would create */
+  const proposalToastFrame = proposalToast
+    ? (canvas?.frames.find((f) => f.id === proposalToast.frameId)?.name ?? proposalToast.name ?? 'a new frame')
+    : ''
+
   /* a question pin (or this toast) asked for the panel: open it on that tab */
   const panelRequest = useStore((s) => s.panelRequest)
   useEffect(() => {
@@ -615,6 +646,29 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
                     className="py-[9px] pl-1.5 pr-2.5 text-[11px] hover:bg-transparent"
                     title="Hide for now"
                     onClick={() => setMutedQuestion(questionToast.id)}
+                  >
+                    ✕
+                  </Button>
+                </div>
+              )}
+              {proposalToast && mutedFrameProposal !== proposalToast.id && !(showActivity && panelTab === 'review') && (
+                <div className="flex items-center rounded-[10px] border border-brand bg-white shadow-card">
+                  <Button
+                    variant="bare"
+                    className="max-w-[300px] gap-1.5 py-[9px] pl-3.5 pr-1 text-[12.5px] font-bold text-brand hover:bg-transparent hover:text-brand"
+                    title={proposalToast.summary}
+                    onClick={() => useStore.getState().requestPanel('review')}
+                  >
+                    <ShieldIcon className="size-3 flex-none" />
+                    <span className="truncate">
+                      {proposalToast.agentName} proposes — {proposalToastFrame}
+                    </span>
+                  </Button>
+                  <Button
+                    variant="bare"
+                    className="py-[9px] pl-1.5 pr-2.5 text-[11px] hover:bg-transparent"
+                    title="Hide for now"
+                    onClick={() => setMutedFrameProposal(proposalToast.id)}
                   >
                     ✕
                   </Button>

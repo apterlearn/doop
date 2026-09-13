@@ -3,7 +3,7 @@ import { contextDevConfigured } from './contextDev.ts'
 import { IMPORTS_PER_MIN, MAX_FRAME_HTML_BYTES, RENDERS_PER_MIN, SEARCHES_PER_MIN, UPLOADS_PER_MIN } from './limits.ts'
 import { MAX_ASSET_BYTES } from './assets.ts'
 import { listAllConnections, type GithubConnection } from './github.ts'
-import { dailyTokenCap, runTokenBudget } from './runBudget.ts'
+import { dailyTokenCap, runCostBudget, runTokenBudget } from './runBudget.ts'
 
 /**
  * Which optional integrations are actually live on THIS server. Agents fail
@@ -29,6 +29,9 @@ export interface ServerCapabilities {
     run_token_budget: number
     /** tokens one account may spend per day; null when uncapped */
     account_daily_tokens: number | null
+    /** USD one resident run may spend before it stops at a turn boundary;
+     *  null when uncapped, and a run on an unpriced model never reaches it */
+    run_cost_budget_usd: number | null
   }
 }
 
@@ -55,6 +58,7 @@ export async function capabilities(): Promise<ServerCapabilities> {
       imports_per_min: IMPORTS_PER_MIN,
       run_token_budget: runTokenBudget(),
       account_daily_tokens: dailyTokenCap() ?? null,
+      run_cost_budget_usd: runCostBudget() ?? null,
     },
   }
 }

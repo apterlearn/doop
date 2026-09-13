@@ -469,6 +469,72 @@ export async function insertElement(
   })
 }
 
+/**
+ * Move an element under another parent, keeping the node itself: identity
+ * (`data-doop-key`, an anchor, a comment's selector) survives a move, where
+ * delete + insert mints a new element and drops everything pinned to the old
+ * one. The selector and the parent must each match exactly one element, so a
+ * move can never land somewhere the caller did not name.
+ */
+export async function moveElement(
+  frame: Frame,
+  input: { selector: string; parent_selector: string; position: 'append' | 'prepend' | number },
+): Promise<{ html: string }> {
+  return withRenderedFrame(frame, async (page) => {
+    const outcome = await page.evaluate(
+      (args: { selector: string; parentSelector: string; position: 'append' | 'prepend' | number }) => {
+        const nodes = Array.from(document.querySelectorAll(args.selector))
+        if (nodes.length === 0) return { ok: false as const, reason: 'no_element' as const }
+        /* one element moves: two matches would move a node the caller did not
+           choose, and a half-applied move cannot be undone */
+        if (nodes.length > 1) return { ok: false as const, reason: 'many_elements' as const, count: nodes.length }
+        const el = nodes[0]!
+        const parents = Array.from(document.querySelectorAll(args.parentSelector))
+        if (parents.length === 0) return { ok: false as const, reason: 'no_parent' as const }
+        if (parents.length > 1) return { ok: false as const, reason: 'many_parents' as const, count: parents.length }
+        const parent = parents[0]!
+        /* `el.contains(parent)` is true for the element itself and for every
+           descendant: moving a node inside its own subtree detaches the subtree
+           from the document and takes the node with it */
+        if (el.contains(parent)) return { ok: false as const, reason: 'inside_self' as const }
+        if (args.position === 'append') parent.append(el)
+        else if (args.position === 'prepend') parent.prepend(el)
+        else {
+          /* the moved node is not one of the children an index counts: leaving
+             it in would place a node moving down inside its own parent one slot
+             too early */
+          const children = Array.from(parent.children).filter((child) => child !== el)
+          const index = Math.max(0, Math.min(args.position, children.length))
+          if (index >= children.length) parent.append(el)
+          else children[index]!.before(el)
+        }
+        const doctype = document.doctype ? '<!doctype html>\n' : ''
+        return { ok: true as const, html: doctype + document.documentElement.outerHTML }
+      },
+      { selector: input.selector, parentSelector: input.parent_selector, position: input.position },
+    )
+    if (!outcome.ok) {
+      if (outcome.reason === 'no_element') missing(input.selector)
+      if (outcome.reason === 'no_parent') missing(input.parent_selector)
+      if (outcome.reason === 'many_elements')
+        throw new ElementEditError(
+          'invalid_input',
+          `“${input.selector}” matches ${outcome.count} elements — nothing was moved; narrow the selector to the one element to move`,
+        )
+      if (outcome.reason === 'many_parents')
+        throw new ElementEditError(
+          'invalid_input',
+          `“${input.parent_selector}” matches ${outcome.count} elements — nothing was moved; narrow the selector to the one parent`,
+        )
+      throw new ElementEditError(
+        'invalid_input',
+        `“${input.parent_selector}” is “${input.selector}” or inside it — a node cannot be moved inside itself; nothing was moved`,
+      )
+    }
+    return { html: outcome.html }
+  })
+}
+
 export async function deleteElement(frame: Frame, selector: string): Promise<{ html: string }> {
   return withRenderedFrame(frame, async (page) => {
     {
@@ -490,6 +556,185 @@ export async function deleteElement(frame: Frame, selector: string): Promise<{ h
           'an agent may not delete <html> or <body> — rewrite the frame instead',
         )
       return { html: outcome.html! }
+    }
+  })
+}
+
+/** A frame script is an escape hatch for the one structural change the element
+ *  tools cannot express — a bulk renumber, a repeated card rewritten. 20 000
+ *  characters is a page of code; beyond that the caller wanted a program, and
+ *  a program belongs in the frame's own document. */
+const MAX_FRAME_SCRIPT = 20_000
+
+/** A script that never settles must not hold a render open. The page is closed
+ *  on the way out, which is what actually stops the work — the race only stops
+ *  the wait. */
+const FRAME_SCRIPT_TIMEOUT_MS = 5_000
+
+/**
+ * The surface a frame script runs against, as the documentation the MCP layer
+ * serves verbatim. One definition: the tool's help text and the methods
+ * installed below cannot drift apart.
+ */
+export const FRAME_SCRIPT_API = `# run_frame_script — the doop surface
+
+A script runs inside the rendered frame with a \`doop\` global in scope. Its
+return value is discarded; the frame's new HTML is the result.
+
+  doop.$(sel)                  first match, or null
+  doop.$$(sel)                 every match, as an array
+  doop.set(el, prop, value)    el.style.setProperty(prop, value)
+  doop.text(el, s)             replace the element's text
+  doop.replace(el, html)       replace the element with parsed HTML
+  doop.remove(el)              remove the element
+  doop.attrs(el, obj)          set attributes; a null value removes one
+
+Every method does nothing when the element is null or undefined, so a miss is a
+no-op rather than a crash.
+
+Limits: the script is at most ${MAX_FRAME_SCRIPT} characters and runs for at
+most ${FRAME_SCRIPT_TIMEOUT_MS} ms. It may not add a <script>, <iframe>,
+<object>, <embed>, <link>, <meta> or an on* handler. A script edits the frame,
+it does not reach the network: fetch, XMLHttpRequest, WebSocket, EventSource
+and navigator.sendBeacon throw, and the render refuses private hosts and
+non-http schemes at the request layer.`
+
+/** The page-side `doop` surface. Installed as a global before the script runs,
+ *  so a script reads like the element API it wraps instead of raw DOM. */
+function installDoopSurface(): void {
+  const asElement = (value: unknown): Element | null => (value instanceof Element ? value : null)
+  const doop = {
+    $: (selector: string): Element | null => document.querySelector(selector),
+    $$: (selector: string): Element[] => Array.from(document.querySelectorAll(selector)),
+    set: (el: unknown, prop: string, value: string): void => {
+      const target = asElement(el)
+      if (target) (target as HTMLElement).style.setProperty(prop, value)
+    },
+    text: (el: unknown, value: string): void => {
+      const target = asElement(el)
+      if (target) target.textContent = value
+    },
+    replace: (el: unknown, html: string): void => {
+      const target = asElement(el)
+      if (target) target.replaceWith(document.createRange().createContextualFragment(html))
+    },
+    remove: (el: unknown): void => {
+      asElement(el)?.remove()
+    },
+    attrs: (el: unknown, attrs: Record<string, string | null>): void => {
+      const target = asElement(el)
+      if (!target) return
+      for (const [name, value] of Object.entries(attrs ?? {})) {
+        if (value === null) target.removeAttribute(name)
+        else target.setAttribute(name, String(value))
+      }
+    },
+  }
+  ;(globalThis as unknown as { doop: typeof doop }).doop = doop
+}
+
+/**
+ * A frame script edits a document; it has no business on the network. The
+ * render already installs the request-layer guard (publicUrl.ts), which refuses
+ * private hosts, non-http schemes and websockets — but a public URL is proxied
+ * through the server rather than refused, so the reach-out APIs a script would
+ * use are replaced for the duration. The error names the API, so a script that
+ * tried learns what it did instead of seeing a bare failure.
+ */
+function blockFrameNetwork(): void {
+  const refuse = (api: string) => () => {
+    throw new Error(
+      `${api} is not available in a frame script — a script edits the frame, it does not reach the network`,
+    )
+  }
+  const scope = globalThis as unknown as Record<string, unknown>
+  scope.fetch = refuse('fetch')
+  scope.XMLHttpRequest = refuse('XMLHttpRequest')
+  scope.WebSocket = refuse('WebSocket')
+  scope.EventSource = refuse('EventSource')
+  ;(navigator as unknown as { sendBeacon: () => void }).sendBeacon = refuse('navigator.sendBeacon')
+}
+
+/**
+ * The script as the body of an async IIFE, compiled by the browser's own
+ * evaluator. It is source text rather than a function because a rendered frame
+ * may carry the imported-snapshot CSP (`script-src 'none'`, server/snapshotCsp.ts),
+ * which refuses `new Function` — the expression the inspector compiles is the
+ * only way in.
+ *
+ * The forbidden-markup check is a delta against the document as it arrived. A
+ * frame imported from a site already carries <meta> and <link>, and refusing
+ * every script for markup it did not write would make the escape hatch
+ * unusable on exactly the frames that need it most.
+ */
+function frameScriptExpression(script: string): string {
+  return `(async () => {
+  const forbidden = new RegExp(${JSON.stringify(FORBIDDEN_MARKUP.source)}, ${JSON.stringify(`${FORBIDDEN_MARKUP.flags}g`)})
+  const before = document.documentElement.outerHTML.match(forbidden) ?? []
+  await (async () => {
+${script}
+  })()
+  const html = document.documentElement.outerHTML
+  const remaining = [...before]
+  const added = []
+  for (const hit of html.match(forbidden) ?? []) {
+    const at = remaining.indexOf(hit)
+    if (at === -1) added.push(hit)
+    else remaining.splice(at, 1)
+  }
+  return { added, html: (document.doctype ? '<!doctype html>\\n' : '') + html }
+})()`
+}
+
+/**
+ * Run a script against the rendered frame and return its new HTML. The escape
+ * hatch for the structural edits the element tools cannot express: it sees the
+ * same rendered document they do, writes through the same serialization, and is
+ * held to the same markup rules, so a scripted edit is an edit like any other
+ * rather than a second write path.
+ */
+export async function runFrameScript(
+  frame: Frame,
+  script: string,
+  opts: { timeoutMs?: number } = {},
+): Promise<{ html: string }> {
+  if (script.length > MAX_FRAME_SCRIPT)
+    throw new ElementEditError(
+      'invalid_input',
+      `script is ${script.length} characters; the limit is ${MAX_FRAME_SCRIPT}. A frame script is for one structural change — do the rest with the element tools, or split the work into several scripts.`,
+    )
+  const timeoutMs = opts.timeoutMs ?? FRAME_SCRIPT_TIMEOUT_MS
+  return withRenderedFrame(frame, async (page) => {
+    await page.evaluate(installDoopSurface)
+    await page.evaluate(blockFrameNetwork)
+    let timer: NodeJS.Timeout | undefined
+    const expired = new Promise<'timeout'>((resolve) => {
+      timer = setTimeout(() => resolve('timeout'), timeoutMs)
+    })
+    try {
+      /* both branches settle, so a script that rejects after the clock ran out
+         is a value here rather than an unhandled rejection */
+      const outcome = await Promise.race([
+        page.evaluate(frameScriptExpression(script)).then(
+          (value) => value as { added: string[]; html: string },
+          (error: unknown) => (error instanceof Error ? error : new Error(String(error))),
+        ),
+        expired,
+      ])
+      if (outcome === 'timeout')
+        throw new ElementEditError(
+          'invalid_input',
+          `the script did not finish within ${timeoutMs} ms — nothing was saved; the frame is closed, so a script cannot outlive the call`,
+        )
+      if (outcome instanceof Error) throw new ElementEditError('invalid_input', `the script failed: ${outcome.message}`)
+      if (outcome.added.length)
+        throw new ElementEditError(
+          'invalid_input',
+          `the script added “${outcome.added[0]}” — a frame script may not add <script>, <iframe>, <object>, <embed>, <link>, <meta> or an on* handler`,
+        )
+      return { html: outcome.html }
+    } finally {
+      clearTimeout(timer)
     }
   })
 }

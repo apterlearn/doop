@@ -93,6 +93,18 @@ export interface ProbeElement {
     margin: string
     padding: string
     gap: string
+    /** How the element changes over time, as computed. The probe always fills
+     *  these; they are optional only so a hand-built probe fixture need not.
+     *  An element that does not transition still computes `all` for
+     *  transitionProperty with a `0s` duration, so the duration is what
+     *  separates motion from its absence. */
+    transition?: string
+    transitionDuration?: string
+    transitionProperty?: string
+    animationName?: string
+    animationDuration?: string
+    animationIterationCount?: string
+    transform?: string
   }
   fontSizePx: number
   fontWeight: number
@@ -173,6 +185,21 @@ export interface ProbeContent {
   truncated: boolean
 }
 
+/** What a frame's own CSS declares about time. Parsed from the stylesheet text
+ *  rather than read from computed styles: an animation that never ran, a
+ *  keyframe nothing references and a reduced-motion escape hatch all exist only
+ *  as source, and a screenshot shows one frame of the result. */
+export interface ProbeMotion {
+  keyframes: { name: string; steps: number }[]
+  mediaQueries: { prelude: string; rules: number }[]
+  reducedMotion: boolean
+  fontFaces: { family: string; src: string; display?: string }[]
+}
+
+/** Entries each motion list carries: a frame with more keyframes or media
+ *  queries than this is summarised rather than enumerated. */
+const MAX_MOTION_RULES = 40
+
 export interface Probe {
   document: {
     title: string
@@ -206,6 +233,9 @@ export interface Probe {
   /** the frame's own stylesheet text, token block excluded — the interaction
    *  check reads the rules, not their computed result */
   cssText: string
+  /** the motion and at-rules that stylesheet declares. Absent only on a
+   *  hand-built probe fixture. */
+  motion?: ProbeMotion
   elements: ProbeElement[]
 }
 
@@ -464,6 +494,15 @@ export async function probeFrame(
               margin: `${style.marginTop} ${style.marginRight} ${style.marginBottom} ${style.marginLeft}`,
               padding: `${style.paddingTop} ${style.paddingRight} ${style.paddingBottom} ${style.paddingLeft}`,
               gap: style.rowGap === style.columnGap ? style.rowGap : `${style.rowGap} ${style.columnGap}`,
+              /* read from the same getComputedStyle the rest of the record
+                 uses: one read per element, not one per property */
+              transition: style.transition,
+              transitionDuration: style.transitionDuration,
+              transitionProperty: style.transitionProperty,
+              animationName: style.animationName,
+              animationDuration: style.animationDuration,
+              animationIterationCount: style.animationIterationCount,
+              transform: style.transform,
             },
             fontSizePx: Number.parseFloat(style.fontSize) || 0,
             fontWeight: Number.parseInt(style.fontWeight, 10) || 400,
@@ -697,11 +736,144 @@ export async function probeFrame(
       designEvidence: probed.designEvidence,
       content: probed.content,
       cssText: probed.cssText,
+      motion: parseMotionCss(probed.cssText),
       elements: probed.elements,
     }
   } finally {
     await loaded.close()
   }
+}
+
+/** The index of the `}` closing the block that opens at `open`, counting
+ *  nested blocks and ignoring braces inside strings: `content: "}"` does not
+ *  end a rule. Undefined when the stylesheet stops mid-block. */
+function closingBrace(css: string, open: number): number | undefined {
+  let depth = 0
+  let quote = ''
+  for (let i = open; i < css.length; i += 1) {
+    const char = css[i]!
+    if (quote) {
+      if (char === '\\') i += 1
+      else if (char === quote) quote = ''
+      continue
+    }
+    if (char === '"' || char === "'") quote = char
+    else if (char === '{') depth += 1
+    else if (char === '}') {
+      depth -= 1
+      if (depth === 0) return i
+    }
+  }
+  return undefined
+}
+
+/** How many blocks an at-rule body holds at its top level: the steps of a
+ *  keyframe, or the rules inside a media query. Nested blocks count once, for
+ *  the rule that opens them. */
+function topLevelBlocks(body: string): number {
+  let count = 0
+  let depth = 0
+  let quote = ''
+  for (let i = 0; i < body.length; i += 1) {
+    const char = body[i]!
+    if (quote) {
+      if (char === '\\') i += 1
+      else if (char === quote) quote = ''
+      continue
+    }
+    if (char === '"' || char === "'") quote = char
+    else if (char === '{') {
+      if (depth === 0) count += 1
+      depth += 1
+    } else if (char === '}') depth = Math.max(0, depth - 1)
+  }
+  return count
+}
+
+/** Split a declaration block on its top-level `;`: a `;` inside a url() (a data
+ *  URI) or inside a string is part of the value, not the end of a declaration. */
+function splitDeclarations(body: string): string[] {
+  const parts: string[] = []
+  let depth = 0
+  let quote = ''
+  let start = 0
+  for (let i = 0; i < body.length; i += 1) {
+    const char = body[i]!
+    if (quote) {
+      if (char === '\\') i += 1
+      else if (char === quote) quote = ''
+      continue
+    }
+    if (char === '"' || char === "'") quote = char
+    else if (char === '(') depth += 1
+    else if (char === ')') depth = Math.max(0, depth - 1)
+    else if (char === ';' && depth === 0) {
+      parts.push(body.slice(start, i))
+      start = i + 1
+    }
+  }
+  parts.push(body.slice(start))
+  return parts
+}
+
+/** The `@font-face` declarations worth reporting: which family, where it loads
+ *  from, and how it swaps in. A face missing its family or its src is not a
+ *  font, so it is dropped rather than reported half-formed. */
+function fontFaceFrom(body: string): ProbeMotion['fontFaces'][number] | undefined {
+  const parts = splitDeclarations(body)
+  const declaration = (name: string): string | undefined => {
+    for (const part of parts) {
+      const colon = part.indexOf(':')
+      if (colon === -1) continue
+      if (part.slice(0, colon).trim().toLowerCase() === name) return part.slice(colon + 1).trim()
+    }
+    return undefined
+  }
+  const family = declaration('font-family')
+    ?.replace(/^["']|["']$/g, '')
+    .trim()
+  const src = declaration('src')
+  if (!family || !src) return undefined
+  const display = declaration('font-display')
+  return { family, src, ...(display ? { display } : {}) }
+}
+
+/** The keyframes, media queries, reduced-motion escape hatch and font faces a
+ *  stylesheet declares. Brace-matched rather than regexed — a media query full
+ *  of keyframes is exactly where a regex stops being a parser — and pure over
+ *  the text, so the parse is verifiable without a browser. */
+export function parseMotionCss(cssText: string): ProbeMotion {
+  /* comments are not rules: a comment describing the reduced-motion query must
+     not read as the escape hatch it describes */
+  const css = cssText.replace(/\/\*[\s\S]*?\*\//g, ' ')
+  const keyframes: ProbeMotion['keyframes'] = []
+  const mediaQueries: ProbeMotion['mediaQueries'] = []
+  const fontFaces: ProbeMotion['fontFaces'] = []
+  /* the vendor-prefixed forms are the same at-rule: `@-webkit-keyframes` names
+     a keyframe too */
+  const atRule = /@(?:-[a-z]+-)?(keyframes|media|font-face)\b([^{;]*)/gi
+  let match: RegExpExecArray | null
+  while ((match = atRule.exec(css))) {
+    const kind = match[1]!.toLowerCase()
+    const open = css.indexOf('{', match.index + match[0].length)
+    if (open === -1) break
+    const close = closingBrace(css, open)
+    if (close === undefined) break
+    const body = css.slice(open + 1, close)
+    if (kind === 'keyframes') {
+      /* the name is the last token of the prelude, so `@keyframes  spin` and
+         the prefixed spelling both yield `spin` */
+      const name = match[2]!.trim().split(/\s+/).pop() || ''
+      if (name && keyframes.length < MAX_MOTION_RULES) keyframes.push({ name, steps: topLevelBlocks(body) })
+    } else if (kind === 'media') {
+      if (mediaQueries.length < MAX_MOTION_RULES)
+        mediaQueries.push({ prelude: match[2]!.trim(), rules: topLevelBlocks(body) })
+    } else {
+      const face = fontFaceFrom(body)
+      if (face && fontFaces.length < MAX_MOTION_RULES) fontFaces.push(face)
+    }
+  }
+  return { keyframes, mediaQueries, reducedMotion: /prefers-reduced-motion/i.test(css), fontFaces }
 }
 
 function truncate(value: string | undefined, max: number): string | undefined {

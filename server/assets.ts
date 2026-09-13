@@ -23,6 +23,12 @@ const MIME_EXT = {
   'image/webp': 'webp',
   'image/gif': 'gif',
   'image/svg+xml': 'svg',
+  /* brand faces ride the same store: upload_font puts the bytes here and the
+     frame's @font-face points at /a/<id>.woff2. Three sfnt flavours, because
+     a face arrives in whichever one the foundry shipped. */
+  'font/woff2': 'woff2',
+  'font/woff': 'woff',
+  'font/ttf': 'ttf',
   /* not an image, but the same store serves it: export_canvas's zip is
      archived here so the tool can hand back a URL instead of a base64 blob
      the agent would have to carry in context. */
@@ -41,6 +47,12 @@ function sniffMime(buf: Buffer): AssetMime | undefined {
   /* zip local-file / end-of-central-directory / spanned signatures */
   if (buf.length >= 4 && buf[0] === 0x50 && buf[1] === 0x4b && (buf[2] === 3 || buf[2] === 5 || buf[2] === 7))
     return 'application/zip'
+  /* Font signatures: wOF2 and wOFF are the two WOFF wrappers, 0x00010000 the
+     sfnt version a TrueType face opens with. They sit with the other magic
+     numbers, above the text sniff, which would read these bytes as mojibake. */
+  if (buf.length >= 4 && buf.toString('latin1', 0, 4) === 'wOF2') return 'font/woff2'
+  if (buf.length >= 4 && buf.toString('latin1', 0, 4) === 'wOFF') return 'font/woff'
+  if (buf.length >= 4 && buf[0] === 0x00 && buf[1] === 0x01 && buf[2] === 0x00 && buf[3] === 0x00) return 'font/ttf'
   const head = buf.toString('utf8', 0, Math.min(buf.length, 1500)).trimStart()
   if (head.startsWith('<svg') || (head.startsWith('<?xml') && head.includes('<svg'))) return 'image/svg+xml'
   return undefined
@@ -113,7 +125,7 @@ export async function createAsset(
   if (buf.length > MAX_ASSET_BYTES)
     throw new Error(`file is ${(buf.length / 1024 / 1024).toFixed(1)} MB — the limit is 5 MB`)
   const mime = sniffMime(buf)
-  if (!mime) throw new Error('unsupported file type — png, jpg, webp, gif, svg and zip are accepted')
+  if (!mime) throw new Error('unsupported file type — png, jpg, webp, gif, svg, zip, woff2, woff and ttf are accepted')
   const ext = MIME_EXT[mime]
   const id = nanoid(10)
   /* object first, row second: an orphaned object is swept later, but a row

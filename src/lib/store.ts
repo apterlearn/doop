@@ -6,6 +6,7 @@ import type {
   AgentTask,
   Canvas,
   CanvasFocus,
+  ComponentSummary,
   DesignDecision,
   DesignTokens,
   ElementComment,
@@ -18,7 +19,9 @@ import type {
   MemoryReference,
   Page,
   Presence,
+  ReviewPolicy,
   RunEvent,
+  RunJournal,
   TaskFeedback,
 } from '../../shared/types'
 import type { SnapGuide } from './snap'
@@ -27,7 +30,8 @@ import type { SnapGuide } from './snap'
 export type StreamEndReason = 'done' | 'idle' | 'taken over' | 'stopped' | 'replaced'
 
 /** Which tab the side panel shows. */
-export type PanelTab = 'tasks' | 'activity' | 'memory' | 'tokens' | 'agents' | 'review' | 'checks' | 'run'
+export type PanelTab =
+  'tasks' | 'activity' | 'memory' | 'tokens' | 'agents' | 'review' | 'checks' | 'run' | 'components'
 
 export interface Viewport {
   x: number
@@ -62,6 +66,9 @@ interface State {
   questions: AgentQuestion[]
   /** the resident agents' tool-call timeline, newest first */
   runEvents: RunEvent[]
+  /** what each run did — duration, turns, tool calls, tokens and cost — as
+   *  the Run tab and the Agents tab's undo read them, newest first */
+  runJournals: RunJournal[]
   /** frameId -> saved versions, loaded on demand by the Inspector's History */
   frameVersions: Record<string, FrameVersion[]>
   /** frameId -> the actor editing it right now; agents hold these, humans
@@ -69,6 +76,13 @@ interface State {
   frameLocks: Record<string, FrameLockHolder>
   /** the canvas refuses agent frame writes until a human approves them */
   reviewMode: boolean
+  /** what an agent write must clear before it lands, and the tool names gated
+   *  on top of the tools that declare themselves destructive */
+  reviewPolicy: ReviewPolicy
+  approvalTools: string[]
+  /** the canvas component library — reusable pieces agents can instance into
+   *  frames, listed by the Components tab */
+  components: ComponentSummary[]
   /** which tab the side panel shows — in the store so a Memory-suggestion
    *  toast anywhere in the app can jump straight to the Memory tab */
   panelTab: PanelTab
@@ -171,6 +185,9 @@ interface State {
   upsertQuestion(question: AgentQuestion): void
   setRunEvents(events: RunEvent[]): void
   pushRunEvent(event: RunEvent): void
+  /** the canvas's run journals, newest first — the Run tab's totals and the
+   *  undo action's change set come from here, not from the event stream */
+  setRunJournals(journals: RunJournal[]): void
   setFrameVersions(frameId: string, versions: FrameVersion[]): void
   setStream(
     frameId: string,
@@ -180,6 +197,12 @@ interface State {
   setFrameLock(frameId: string, holder: FrameLockHolder | null): void
   setFrameLocks(locks: Record<string, FrameLockHolder>): void
   setReviewModeLocal(on: boolean): void
+  /** the review policy and its extra gated tools, as the canvas last reported */
+  setReviewPolicyLocal(policy: ReviewPolicy, approvalTools: string[]): void
+  setComponents(list: ComponentSummary[]): void
+  /** upsert a component by id (summary set), or drop it when it was deleted
+   *  (summary null) — newest-updated first either way */
+  upsertComponent(summary: ComponentSummary | null, id: string): void
   /** open the side panel on a tab from anywhere (a question pin, a toast) */
   requestPanel(tab: PanelTab): void
   clearPanelRequest(): void
@@ -245,9 +268,13 @@ export const useStore = create<State>((set, get) => ({
   frameProposals: [],
   questions: [],
   runEvents: [],
+  runJournals: [],
   frameVersions: {},
   frameLocks: {},
   reviewMode: false,
+  reviewPolicy: 'off',
+  approvalTools: [],
+  components: [],
   panelRequest: null,
   selectedIds: [],
   selectedId: null,
@@ -310,18 +337,30 @@ export const useStore = create<State>((set, get) => ({
       } else delete focus[clientId]
       return { focus }
     }),
-  setCursor: (clientId, x, y) => set((s) => ({ cursors: { ...s.cursors, [clientId]: { x, y } } })),
+  /* Every live message from a client is evidence it is alive: `lastSeen` is
+     what the silence indicator reads, and a value frozen at join time would
+     report a working agent as stuck. */
+  setCursor: (clientId, x, y) =>
+    set((s) => {
+      const p = s.presences[clientId]
+      return {
+        cursors: { ...s.cursors, [clientId]: { x, y } },
+        presences: p ? { ...s.presences, [clientId]: { ...p, lastSeen: Date.now() } } : s.presences,
+      }
+    }),
   setEditing: (clientId, frameId) =>
     set((s) => {
       const p = s.presences[clientId]
       if (!p) return {}
-      return { presences: { ...s.presences, [clientId]: { ...p, activeFrameId: frameId } } }
+      return { presences: { ...s.presences, [clientId]: { ...p, activeFrameId: frameId, lastSeen: Date.now() } } }
     }),
   setStatus: (clientId, status) =>
     set((s) => {
       const p = s.presences[clientId]
       if (!p) return {}
-      return { presences: { ...s.presences, [clientId]: { ...p, status: status ?? undefined } } }
+      return {
+        presences: { ...s.presences, [clientId]: { ...p, status: status ?? undefined, lastSeen: Date.now() } },
+      }
     }),
   setActivity: (activity) => set({ activity }),
   pushActivity: (item) =>
@@ -410,6 +449,7 @@ export const useStore = create<State>((set, get) => ({
     set((s) =>
       s.runEvents.some((e) => e.id === event.id) ? {} : { runEvents: [event, ...s.runEvents].slice(0, 500) },
     ),
+  setRunJournals: (journals) => set({ runJournals: (journals ?? []).slice(0, 100) }),
   setFrameVersions: (frameId, versions) => set((s) => ({ frameVersions: { ...s.frameVersions, [frameId]: versions } })),
   setFrameLock: (frameId, holder) =>
     set((s) => {
@@ -419,6 +459,18 @@ export const useStore = create<State>((set, get) => ({
       return { frameLocks }
     }),
   setReviewModeLocal: (reviewMode) => set({ reviewMode }),
+  setReviewPolicyLocal: (reviewPolicy, approvalTools) => set({ reviewPolicy, approvalTools }),
+  setComponents: (components) => set({ components }),
+  /* A component arrives whole on the wire while the panel lists summaries, so
+     the caller builds the summary and this only places it: replace by id, or
+     drop it when it was deleted, then keep the newest-updated first. */
+  upsertComponent: (summary, id) =>
+    set((s) => {
+      const rest = s.components.filter((c) => c.id !== id)
+      const components = summary ? [summary, ...rest] : rest
+      components.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))
+      return { components }
+    }),
   requestPanel: (tab) => set({ panelRequest: { tab, at: Date.now() } }),
   clearPanelRequest: () => set({ panelRequest: null }),
   renameCanvasLocal: (name) => set((s) => (s.canvas ? { canvas: { ...s.canvas, name } } : {})),

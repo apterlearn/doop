@@ -1,7 +1,8 @@
 /**
  * What a resident run is allowed to spend.
  *
- * Two ceilings, both in tokens — the unit providers actually report:
+ * Two ceilings in tokens — the unit providers actually report — and one in
+ * money, priced by modelPrices.ts from the model the run is on:
  *
  *  - `DOOP_RUN_TOKEN_BUDGET` (default 250 000): input + output for ONE run. A
  *    run that crosses it stops at the next turn boundary and hands the card
@@ -10,11 +11,10 @@
  *  - `DOOP_ACCOUNT_DAILY_TOKENS` (default unset = no cap): everything billed to
  *    one account in a rolling day. Once crossed, new runs for that account are
  *    refused before they start, naming the cap.
- *
- * Money would be the friendlier unit, but nothing in this repo knows a model's
- * price: the providers report tokens, and only some of them report cost. A
- * cap in the unit we can actually measure beats a dollar figure derived from a
- * price table we would have to invent.
+ *  - `DOOP_RUN_COST_BUDGET_USD` (default unset = no cap): the same one-run
+ *    ceiling in dollars, which is the friendlier unit now that a price table
+ *    exists. Only runs on a priced model have a cost to count; an unpriced
+ *    model has no figure to compare against and stays bounded by tokens alone.
  *
  * In-process and per-day on purpose: this is a guard rail for a self-hosted
  * canvas, not a billing ledger. The counters reset when the process restarts,
@@ -28,6 +28,14 @@ function positiveInt(value: string | undefined): number | undefined {
   return Number.isFinite(n) && n > 0 ? n : undefined
 }
 
+/* money is not whole units: a self-hoster caps a run at $2.50, and parseInt
+   would read that as $2 */
+function positiveFloat(value: string | undefined): number | undefined {
+  if (!value) return undefined
+  const n = Number(value)
+  return Number.isFinite(n) && n > 0 ? n : undefined
+}
+
 /** Tokens one run may spend, input + output, before it stops at a turn boundary. */
 export function runTokenBudget(): number {
   return positiveInt(process.env.DOOP_RUN_TOKEN_BUDGET) ?? DEFAULT_RUN_TOKEN_BUDGET
@@ -36,6 +44,12 @@ export function runTokenBudget(): number {
 /** Tokens one account may spend per day. `undefined` means uncapped. */
 export function dailyTokenCap(): number | undefined {
   return positiveInt(process.env.DOOP_ACCOUNT_DAILY_TOKENS)
+}
+
+/** USD one run may spend before it stops at a turn boundary. `undefined` means
+ *  uncapped, and a run on an unpriced model never reaches the ceiling. */
+export function runCostBudget(): number | undefined {
+  return positiveFloat(process.env.DOOP_RUN_COST_BUDGET_USD)
 }
 
 /** Total tokens a turn used, as the budget counts them. */

@@ -47,6 +47,11 @@ export const RENDERS_PER_MIN = positiveInt(process.env.DOOP_RENDERS_PER_MIN, 60)
 /** Photo search burns the shared Pexels quota (200 req/hour on the free tier). */
 export const SEARCHES_PER_MIN = 12
 
+/** Image generation is the one call that spends money per result and takes
+ *  tens of seconds, so it gets a tighter per-user rate than search. Override
+ *  with DOOP_IMAGES_PER_MIN. */
+export const IMAGES_PER_MIN = positiveInt(process.env.DOOP_IMAGES_PER_MIN, 6)
+
 /** Uploads write into the asset store, mirroring the browser upload route. */
 export const UPLOADS_PER_MIN = 15
 

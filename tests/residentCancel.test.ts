@@ -55,6 +55,10 @@ const prompts: string[] = []
    genuinely in flight. */
 let turnGate: { promise: Promise<void>; release: () => void } | null = null
 
+/** What the stubbed model reports as its stop reason, so a test can drive the
+ *  provider-refusal path the loop has to react to. */
+let stopReason: 'end_turn' | 'refusal' = 'end_turn'
+
 vi.mock('../server/agentModel.ts', () => ({
   ModelAuthError: class ModelAuthError extends Error {},
   pickModel: async () => ({
@@ -77,7 +81,7 @@ vi.mock('../server/agentModel.ts', () => ({
       if (turnGate) await turnGate.promise
       return {
         content: [{ type: 'text' as const, text: 'done' }],
-        stop_reason: 'end_turn',
+        stop_reason: stopReason,
         usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0 },
       }
     },
@@ -113,6 +117,7 @@ beforeEach(() => {
   turns.length = 0
   prompts.length = 0
   turnGate = null
+  stopReason = 'end_turn'
   /* the real canceller: without it a stop cannot reach the in-flight call */
   actions.wire(
     () => {},
@@ -202,6 +207,26 @@ describe('a paused resident run', () => {
        it stopped — otherwise the agent redoes work the human paused */
     expect(prompts.at(-1)).toContain('paused by alice')
     expect(prompts.at(-1)).toContain('Make a hero')
+  })
+})
+
+describe('a refused resident run', () => {
+  it('fails the card instead of advancing it as if the work were done', async () => {
+    stopReason = 'refusal'
+    resident.onFeedback(CANVAS)
+    await vi.waitFor(() => expect(terminal()).toBeTruthy())
+
+    /* a refusal is not something a nudge or another turn can fix: the run ends
+       on the turn that produced it rather than burning the turn budget */
+    expect(turns.length).toBe(1)
+    const card = actions.getTasks(CANVAS).find((t) => t.id === cardId)!
+    expect(card.failedAt).toBeGreaterThan(0)
+    expect(card.failureReason).toContain('could not take this request')
+    /* the failure is retryable: the run's own close is `failed`, not a
+       delivery, and the card never reaches the next stage */
+    expect(card.endedAt).toBeUndefined()
+    expect(card.stage).toBe(0)
+    expect(actions.getRunJournals(CANVAS, AGENT)[0]!.summary).not.toContain('delivered')
   })
 })
 

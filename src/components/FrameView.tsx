@@ -1,5 +1,5 @@
 import { memo, useEffect, useMemo, useRef, useState } from 'react'
-import type { ElementComment, Frame } from '../../shared/types'
+import type { AgentQuestion, ElementComment, Frame } from '../../shared/types'
 import { colorFor } from '../../shared/types'
 import { useStore, type StreamEndReason } from '../lib/store'
 import { registerFrameWindow, unregisterFrameWindow } from '../lib/frameBridge'
@@ -27,6 +27,7 @@ import { posthog } from '../lib/posthog'
 import { isResidentLimit } from './TeamAllowance'
 import { cn } from '@/lib/utils'
 import { Button } from './ui/button'
+import { Input } from './ui/input'
 import { Textarea } from './ui/textarea'
 import { Tooltip } from './ui/tooltip'
 import { GithubIcon, SyncIcon } from './ui/icons'
@@ -46,11 +47,13 @@ const EL_TOOLBAR_BTN = 'rounded-[7px] px-2 py-1 text-xs'
 
 /* A stream's end is information: the viewer is told whether the design was
    delivered, the agent went quiet, someone took the frame over, or a human
-   stopped the work. */
-function streamEndLabel(reason: StreamEndReason): string {
+   stopped the work. A takeover is the one case that is about the agent that
+   was streaming — a human's edit cut its stream — so it names it. */
+function streamEndLabel(name: string, reason: StreamEndReason): string {
   if (reason === 'done') return '✓ finished designing'
   if (reason === 'idle') return 'stream ended (agent silent)'
   if (reason === 'replaced') return 'stream ended'
+  if (reason === 'taken over') return `${name}'s stream was cut`
   return `stream ended (${reason})`
 }
 
@@ -356,6 +359,11 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
   const [activeHit, setActiveHit] = useState<ProbeHit | null>(null)
   const [composing, setComposing] = useState(false)
   const [openThread, setOpenThread] = useState<string | null>(null)
+  /* a question can be answered at its pin: the agent is parked on it, so
+     sending the reviewer to another tab to type one line is a detour */
+  const [answeringId, setAnsweringId] = useState<string | null>(null)
+  const [answerDraft, setAnswerDraft] = useState('')
+  const [answerBusy, setAnswerBusy] = useState(false)
   const [pinPos, setPinPos] = useState<Record<string, { x: number; y: number } | null>>({})
   const probeReq = useRef(0)
   const probeTimer = useRef<number | null>(null)
@@ -402,6 +410,23 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
     setComposePrefill('')
     setCodeView(null)
     setOpenThread(null)
+    setAnsweringId(null)
+  }
+
+  /** The pin's answer box posts the same call the Review tab's does: the
+   *  answer reaches the agent inside its ask_human wait. */
+  function answerQuestion(q: AgentQuestion) {
+    const text = answerDraft.trim()
+    if (!text || answerBusy) return
+    setAnswerBusy(true)
+    api
+      .answerQuestion(q.canvasId, q.id, text)
+      .then(() => {
+        setAnswerDraft('')
+        setAnsweringId(null)
+      })
+      .catch(console.error)
+      .finally(() => setAnswerBusy(false))
   }
 
   /* delayed slightly so the second click of a double-click (→ edit mode)
@@ -713,7 +738,7 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
                   style={{ background: endNotice.reason === 'done' ? endNotice.color : 'var(--ink-soft, #6b7280)' }}
                   title={streamEndTitle(endNotice.name, endNotice.reason as StreamEndReason)}
                 >
-                  {streamEndLabel(endNotice.reason as StreamEndReason)}
+                  {streamEndLabel(endNotice.name, endNotice.reason as StreamEndReason)}
                 </span>
               )}
               {editors
@@ -932,7 +957,8 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
                 })}
 
                 {/* open agent questions: an agent is parked mid-task waiting
-                on a human, so its pin stays up and answers in the Review tab */}
+                on a human, so its pin stays up and takes the answer here —
+                the Review tab link stays for the questions that offer choices */}
                 {openQuestions.map((q) => {
                   const pos = q.selector ? pinPos[q.id] : QUESTION_PIN_POS
                   if (!pos) return null
@@ -946,29 +972,73 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
                         onPointerDown={(e) => e.stopPropagation()}
                         onClick={(e) => {
                           e.stopPropagation()
-                          useStore.getState().requestPanel('review')
+                          setAnswerDraft('')
+                          setAnsweringId(answeringId === q.id ? null : q.id)
                         }}
                         title={`${q.agentName} asks: ${q.text}`}
                       >
                         ?
                       </div>
                       <div
-                        className="pointer-events-auto absolute z-[5] [transform:translate(-12px,-50%)_scale(min(calc(1/var(--zoom,1)),2.4))]"
+                        className="pointer-events-auto absolute z-[5] flex flex-col items-start gap-1 [transform:translate(-12px,-50%)_scale(min(calc(1/var(--zoom,1)),2.4))]"
                         style={{ left: x, top: y - 20 }}
                         onPointerDown={(e) => e.stopPropagation()}
                       >
-                        <Button
-                          variant="ghost"
-                          className="max-w-[260px] gap-1.5 whitespace-nowrap rounded-full border-line bg-surface px-2.5 py-1 text-[10.5px] font-bold shadow-card hover:bg-surface"
-                          title={`${q.agentName} asks: ${q.text}`}
-                          onClick={(e) => {
-                            e.stopPropagation()
-                            useStore.getState().requestPanel('review')
-                          }}
-                        >
-                          <span className="truncate">{q.text}</span>
-                          <span className="flex-none text-accent-ink">Answer →</span>
-                        </Button>
+                        <div className="flex items-center gap-1">
+                          <Button
+                            variant="ghost"
+                            className="max-w-[260px] gap-1.5 whitespace-nowrap rounded-full border-line bg-surface px-2.5 py-1 text-[10.5px] font-bold shadow-card hover:bg-surface"
+                            title={`${q.agentName} asks: ${q.text}`}
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              setAnswerDraft('')
+                              setAnsweringId(answeringId === q.id ? null : q.id)
+                            }}
+                          >
+                            <span className="truncate">{q.text}</span>
+                            <span className="flex-none text-accent-ink">
+                              {answeringId === q.id ? 'Cancel' : 'Answer'}
+                            </span>
+                          </Button>
+                          {/* the Review tab stays reachable: a question that
+                              offered choices is answered there */}
+                          <Button
+                            variant="bare"
+                            className="flex-none px-1 py-0 text-[10px] font-bold text-ink-faint hover:bg-transparent hover:text-ink"
+                            title="Answer in the Review tab"
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              useStore.getState().requestPanel('review')
+                            }}
+                          >
+                            Review →
+                          </Button>
+                        </div>
+                        {answeringId === q.id && (
+                          <div className="flex items-center gap-1">
+                            <Input
+                              inputSize="sm"
+                              autoFocus
+                              className="h-7 w-[190px] rounded-full border-line px-2.5 text-[11.5px] md:text-[11.5px]"
+                              placeholder={`Answer ${q.agentName}…`}
+                              value={answerDraft}
+                              onChange={(e) => setAnswerDraft(e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') answerQuestion(q)
+                                if (e.key === 'Escape') setAnsweringId(null)
+                              }}
+                            />
+                            <Button
+                              variant="primary"
+                              size="sm"
+                              className="h-7 flex-none rounded-full px-2.5 text-[11px]"
+                              disabled={!answerDraft.trim() || answerBusy}
+                              onClick={() => answerQuestion(q)}
+                            >
+                              Send
+                            </Button>
+                          </div>
+                        )}
                       </div>
                     </div>
                   )

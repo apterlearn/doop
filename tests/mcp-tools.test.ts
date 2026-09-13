@@ -19,6 +19,7 @@ vi.mock('../server/db/persist.ts', async (importOriginal) => ({
   deleteFrame: () => {},
   saveTask: () => {},
   saveActivity: () => {},
+  saveComponent: () => {},
   saveFeedback: () => {},
   saveComment: () => {},
   saveQuestion: () => {},
@@ -415,6 +416,43 @@ describe('MCP phase-0 tool contract', () => {
       /* an empty list clears them, and the canvas stops reporting any */
       await call(client, 'set_breakpoints', { canvas_id: canvas.id, agent_name: 'Claude', breakpoints: [] })
       expect(store.getCanvas(canvas.id)!.breakpoints).toBeUndefined()
+    } finally {
+      await close()
+    }
+  })
+
+  it('saves a component at the size its caller declares', async () => {
+    const canvas = store.createCanvas('Components', OWNER_ID)
+    const { client, close } = await connect()
+    try {
+      const sized = await call(client, 'create_component', {
+        canvas_id: canvas.id,
+        agent_name: 'Claude',
+        name: 'Pricing card',
+        html: '<div class="card">Pro</div>',
+        width: 320,
+        height: 480,
+      })
+      expect(sized.isError, sized.text).toBe(false)
+      const component = sized.structured.component as { id: string; width: number; height: number }
+      /* the declared size is the component's own artboard: the library panel
+         and insert_component both read it, so a card saved as 320x480 must not
+         come back as the default frame size */
+      expect(component).toMatchObject({ width: 320, height: 480 })
+
+      const listed = await call(client, 'list_components', { canvas_id: canvas.id })
+      expect(listed.structured.components).toEqual([
+        expect.objectContaining({ id: component.id, width: 320, height: 480 }),
+      ])
+
+      /* a caller with no size in mind gets the size a new frame gets */
+      const defaulted = await call(client, 'create_component', {
+        canvas_id: canvas.id,
+        agent_name: 'Claude',
+        name: 'Nav bar',
+        html: '<nav>Doop</nav>',
+      })
+      expect(defaulted.structured.component).toMatchObject({ width: 640, height: 480 })
     } finally {
       await close()
     }

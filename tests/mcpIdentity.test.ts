@@ -500,15 +500,24 @@ describe('progress notifications', () => {
     await server.connect(serverTransport)
     await client.connect(clientTransport)
     try {
-      await client.callTool({
+      const call = await client.callTool({
         name: 'get_frame_screenshot',
         arguments: { frame_id: FRAME_ID, agent_name: 'Claude' },
         _meta: { progressToken: 'shot-1' },
       })
+      /* whether the render actually ran: without a browser this call refuses
+         before its later phases, and the terminal fraction never ships */
+      const rendered = !('isError' in call && call.isError === true)
       const updates = sent.filter((m) => m.method === 'notifications/progress')
-      expect(updates).toHaveLength(1)
+      /* A render is the multi-second part of this call, so the phases are only
+         observable where a browser exists; without one the call fails before
+         the second phase, which is why the terminal assertion is conditional. */
+      expect(updates.length).toBeGreaterThanOrEqual(1)
       expect(updates[0]!.params).toMatchObject({ progressToken: 'shot-1', progress: 0 })
       expect(updates[0]!.params!.message).toContain('Hero')
+      const fractions = updates.map((m) => m.params!.progress!)
+      expect([...fractions].sort((a, b) => a - b)).toEqual(fractions)
+      if (rendered) expect(updates.at(-1)!.params).toMatchObject({ progressToken: 'shot-1', progress: 1 })
 
       /* no token on the request: nothing is reported, because nothing asked */
       sent.length = 0

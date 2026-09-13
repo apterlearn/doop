@@ -1,4 +1,4 @@
-import type { ClientMessage, ServerMessage } from '../../shared/types'
+import type { ClientMessage, Component, ComponentSummary, ServerMessage } from '../../shared/types'
 import { getIdentity } from './identity'
 import { useStore } from './store'
 
@@ -29,6 +29,24 @@ export function sendWs(msg: ClientMessage) {
  *  so a burst costs a little bandwidth, never a message. */
 export function sendFocus(focus: { frameId: string | null; selector: string | null; pageId: string | null }) {
   sendWs({ type: 'focus', ...focus })
+}
+
+/** The row a component message stands for. The canvas counts instances, which
+ *  the message does not carry, so a component already listed keeps its count;
+ *  a newly created one starts at zero until the next list load. */
+function summarizeComponent(c: Component, listed: ComponentSummary[]): ComponentSummary {
+  return {
+    id: c.id,
+    name: c.name,
+    description: c.description,
+    width: c.width,
+    height: c.height,
+    variantOf: c.variantOf,
+    instanceCount: listed.find((x) => x.id === c.id)?.instanceCount ?? 0,
+    updatedAt: new Date(c.updatedAt).toISOString(),
+    updatedBy: c.updatedBy,
+    htmlBytes: c.html.length,
+  }
 }
 
 function open() {
@@ -105,6 +123,8 @@ function handle(msg: ServerMessage) {
       s.setFrameProposals(msg.frameProposals)
       s.setQuestions(msg.questions)
       s.setReviewModeLocal(msg.reviewMode)
+      s.setReviewPolicyLocal(msg.reviewPolicy ?? (msg.reviewMode ? 'all_writes' : 'off'), msg.approvalTools ?? [])
+      s.setComponents(msg.components ?? [])
       s.setRunEvents(msg.runEvents)
       s.setFrameLocks(msg.frameLocks ?? {})
       break
@@ -195,6 +215,15 @@ function handle(msg: ServerMessage) {
       break
     case 'canvas:reviewMode':
       s.setReviewModeLocal(msg.reviewMode)
+      break
+    case 'canvas:reviewPolicy':
+      s.setReviewPolicyLocal(msg.reviewPolicy, msg.approvalTools)
+      break
+    case 'component':
+      /* a component broadcast carries the whole record while the panel lists
+         summaries, so the row is built here; the id is on the message either
+         way, which is how a deletion names the row it removes */
+      s.upsertComponent(msg.component ? summarizeComponent(msg.component, s.components) : null, msg.componentId)
       break
     case 'frame:lock':
       s.setFrameLock(msg.frameId, msg.holder)

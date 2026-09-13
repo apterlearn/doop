@@ -10,7 +10,7 @@ import { getAsset } from '../server/assets.ts'
 import { PUBLIC_ORIGIN } from '../server/auth.ts'
 import { closeDb, initDb } from '../server/db/index.ts'
 import * as persist from '../server/db/persist.ts'
-import { buildMcpServer, TOOL_DOMAINS } from '../server/mcp.ts'
+import { buildMcpServer, MUTATING_TOOLS, TOOL_DOMAINS } from '../server/mcp.ts'
 import { findBrowserPath } from '../server/screenshot.ts'
 import { store } from '../server/store.ts'
 import type { Canvas } from '../shared/types.ts'
@@ -226,6 +226,50 @@ describe('get_capabilities catalogues the registered surface', () => {
       const canvasRead = caps.tools.find((t) => t.name === 'get_canvas')!
       expect(canvasRead.destructive).toBe(false)
       expect(canvasRead.read_only).toBe(true)
+    } finally {
+      await close()
+    }
+  })
+
+  /* A write the wrapper does not replay is a write an agent cannot safely
+     retry, and a catalog that calls it retryable is worse than one that does
+     not: the drift is invisible until a retry duplicates work. So the rule is
+     asserted rather than remembered — every registered tool is either a read,
+     replayed by the wrapper, or declares itself not idempotent. */
+  it('leaves no state-changing tool outside the replay contract', async () => {
+    const { client, close } = await connect()
+    try {
+      const { tools } = await client.listTools()
+      const caps = await capabilitiesOf(client)
+
+      for (const tool of tools) {
+        const declared = tool.annotations
+        expect(
+          declared?.readOnlyHint === true || MUTATING_TOOLS[tool.name] === true || declared?.idempotentHint === false,
+          `${tool.name} is neither read-only, replayed by op_id, nor declared non-idempotent`,
+        ).toBe(true)
+      }
+      /* the tools that DO change state under some arguments, named here so a
+         rename or a dropped key fails loudly instead of quietly */
+      for (const name of ['extract_design_system', 'review_frame', 'get_feedback']) {
+        expect(caps.tools.find((t) => t.name === name)!.idempotent, `${name} must be retryable`).toBe(true)
+      }
+      /* ...and the one write-shaped tool that must NOT be replayed: its result
+         is a time window, so answering a retry with the first answer is wrong */
+      expect(caps.tools.find((t) => t.name === 'wait_for_events')!.idempotent).toBe(false)
+      /* every name in the list is a tool that exists: a stale key would mean a
+         tool was renamed and its replay silently stopped covering it */
+      for (const name of Object.keys(MUTATING_TOOLS)) {
+        expect(
+          tools.map((t) => t.name),
+          `${name} is in MUTATING_TOOLS but is not registered`,
+        ).toContain(name)
+      }
+      /* and the wrapper actually publishes the key it replays on */
+      const write = tools.find((t) => t.name === 'set_frame_html')!
+      expect(Object.keys((write.inputSchema as { properties?: Record<string, unknown> }).properties ?? {})).toContain(
+        'op_id',
+      )
     } finally {
       await close()
     }

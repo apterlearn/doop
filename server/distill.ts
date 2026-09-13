@@ -11,12 +11,24 @@ import * as actions from './actions.ts'
  *
  * Event-driven, not scheduled: captureDecision pokes maybeDistill, so quiet
  * canvases cost nothing. Enabled when ANTHROPIC_API_KEY is set; silently
- * disabled otherwise, like the resident agents.
+ * disabled otherwise, like the resident agents — unless a connected MCP client
+ * declares the `sampling` capability, in which case its model stands in and a
+ * self-hosted instance with no server key still learns from feedback.
  */
 
-const MODEL = process.env.DOOP_DISTILL_MODEL || 'claude-haiku-4-5-20251001'
+const MODEL = process.env.DOOP_DISTILL_MODEL || ''
 /** most recent unconsumed decisions the judge sees per run */
 const MAX_WINDOW = 15
+
+/** The connected MCP client's model, via MCP sampling. Set by buildMcpServer
+ *  when the client declares the capability and cleared when it does not, so a
+ *  sampler never outlives the connection that offered it. */
+type Sampler = (prompt: string, system: string) => Promise<string>
+let sampler: Sampler | null = null
+
+export function setSampler(fn: Sampler | null): void {
+  sampler = fn
+}
 
 let client: Anthropic | null = null
 
@@ -26,40 +38,56 @@ function getClient(): Anthropic | null {
   return client
 }
 
+/** A model is reachable: the server's own key, or the connected client's. */
+function enabled(): boolean {
+  return getClient() !== null || sampler !== null
+}
+
+/** A plain-text completion from whichever model is available. Callers gate on
+ *  enabled() first, so a throw here is a genuine transport failure. */
+async function complete(prompt: string, maxTokens: number): Promise<string> {
+  const anthropic = getClient()
+  if (anthropic) {
+    const res = await anthropic.messages.create({
+      model: MODEL,
+      max_tokens: maxTokens,
+      messages: [{ role: 'user', content: prompt }],
+    })
+    return res.content
+      .filter((b): b is (typeof res.content)[number] & { type: 'text' } => b.type === 'text')
+      .map((b) => b.text)
+      .join(' ')
+      .trim()
+  }
+  if (sampler) return (await sampler(prompt, '')).trim()
+  throw new Error('no model available for distillation')
+}
+
 const running = new Set<string>()
 
 /** A decision was captured: generalize its raw words into a short preference
  *  ("more white and blue, not so claude-esque" → "Prefer white and blue…"),
  *  then check whether enough decisions accumulated to propose a rule. */
 export function onDecision(canvasId: string, decisionId: string) {
-  if (!getClient()) return
+  if (!enabled()) return
   summarizeDecision(canvasId, decisionId)
     .catch((err) => console.error('[distill] summarize failed', err))
     .finally(() => maybeDistill(canvasId))
 }
 
 async function summarizeDecision(canvasId: string, decisionId: string) {
-  const anthropic = getClient()
+  if (!enabled()) return
   const decision = actions.getDecisions(canvasId).find((d) => d.id === decisionId)
-  if (!anthropic || !decision || decision.summary) return
-  const res = await anthropic.messages.create({
-    model: MODEL,
-    max_tokens: 100,
-    messages: [
-      {
-        role: 'user',
-        content: `Raw design feedback a human gave an agent on a shared canvas (the agent carried it out):
+  if (!decision || decision.summary) return
+  const summary = (
+    await complete(
+      `Raw design feedback a human gave an agent on a shared canvas (the agent carried it out):
 "${decision.text}"
 
 Rewrite it as ONE short, general style preference for this project's design memory. Generalize from the specific instance to the underlying taste — e.g. "make this button blue like the others" becomes "Prefer blue accent buttons". Imperative, under 90 characters, no quotes, no trailing period. Reply with the preference only.`,
-      },
-    ],
-  })
-  const summary = res.content
-    .filter((b): b is (typeof res.content)[number] & { type: 'text' } => b.type === 'text')
-    .map((b) => b.text)
-    .join(' ')
-    .trim()
+      100,
+    )
+  )
     .replace(/^["“]+|["”.]+$/g, '')
     .slice(0, 120)
   if (summary) {
@@ -74,7 +102,7 @@ Rewrite it as ONE short, general style preference for this project's design memo
    lives in the judge prompt, not in a counter. Decisions are only consumed
    when a rule IS proposed, so slow-building patterns keep their evidence. */
 export function maybeDistill(canvasId: string) {
-  if (!getClient() || running.has(canvasId)) return
+  if (!enabled() || running.has(canvasId)) return
   if (actions.undistilledDecisions(canvasId).length === 0) return
   /* one open proposal at a time — a stack of pending cards reads as spam */
   if (actions.getProposals(canvasId).some((p) => p.status === 'pending')) return
@@ -111,9 +139,47 @@ const DISTILL_TOOL: Anthropic.Tool = {
   },
 }
 
+/** The verdict as JSON for a client that samples for us: there is no
+ *  tool_choice on that wire, so the prompt asks for the same object the
+ *  distill_result tool returns. The field list is generated from the tool
+ *  definition so the two transports cannot drift. */
+const DISTILL_FIELDS = (DISTILL_TOOL.input_schema.properties ?? {}) as Record<string, { description?: string }>
+const SAMPLING_INSTRUCTION = `\n\nReply with ONLY a JSON object — no prose, no code fences — using these fields:\n${Object.entries(
+  DISTILL_FIELDS,
+)
+  .map(([key, spec]) => `- ${key}: ${spec.description ?? ''}`)
+  .join('\n')}\nAlways include has_rule; include the others only when it is true.`
+
+/** A sampling client has no tool description on the wire, so the tool's own
+ *  description becomes the system prompt. */
+const DISTILL_SYSTEM = `You maintain the design memory of a shared canvas. ${DISTILL_TOOL.description}`
+
+interface DistillVerdict {
+  has_rule?: boolean
+  guide_name?: string
+  guide_title?: string
+  rule?: string
+  rationale?: string
+}
+
+/** The judge's verdict, from either transport: with the server key the reply is
+ *  the distill_result tool's input object, with sampling it is JSON text. One
+ *  parser, so the two transports cannot drift on what a valid verdict is. */
+function parseVerdict(reply: { input?: unknown } | string): DistillVerdict {
+  if (typeof reply !== 'string') return (reply.input ?? {}) as DistillVerdict
+  /* tolerate prose or a code fence around the object: take the outermost braces */
+  const start = reply.indexOf('{')
+  const end = reply.lastIndexOf('}')
+  if (start === -1 || end <= start) return {}
+  try {
+    return JSON.parse(reply.slice(start, end + 1)) as DistillVerdict
+  } catch {
+    return {}
+  }
+}
+
 async function distill(canvasId: string) {
-  const anthropic = getClient()
-  if (!anthropic) return
+  if (!enabled()) return
   const decisions = actions.undistilledDecisions(canvasId).slice(0, MAX_WINDOW)
   if (decisions.length === 0) return
   const guides = store.getGuidelines(canvasId)
@@ -155,22 +221,25 @@ If these decisions reveal a durable style preference, distill it into ONE markdo
 Do not restate anything a guide already covers. Prefer an existing guide's slug; invent a new slug only when nothing fits.`
 
   console.log(`[distill] run canvas=${canvasId} decisions=${decisions.length}`)
-  const res = await anthropic.messages.create({
-    model: MODEL,
-    max_tokens: 1000,
-    tools: [DISTILL_TOOL],
-    tool_choice: { type: 'tool', name: 'distill_result' },
-    messages: [{ role: 'user', content: prompt }],
-  })
-
-  const block = res.content.find((b): b is Anthropic.ToolUseBlock => b.type === 'tool_use')
-  const input = (block?.input ?? {}) as {
-    has_rule?: boolean
-    guide_name?: string
-    guide_title?: string
-    rule?: string
-    rationale?: string
+  /* With the server key the model is handed the distill_result tool and returns
+     its verdict as an object; a sampling client has no tool_choice, so the same
+     prompt carries a JSON-only instruction and the text goes through the one
+     parser above. */
+  const anthropic = getClient()
+  let reply: { input?: unknown } | string
+  if (anthropic) {
+    const res = await anthropic.messages.create({
+      model: MODEL,
+      max_tokens: 1000,
+      tools: [DISTILL_TOOL],
+      tool_choice: { type: 'tool', name: 'distill_result' },
+      messages: [{ role: 'user', content: prompt }],
+    })
+    reply = res.content.find((b): b is Anthropic.ToolUseBlock => b.type === 'tool_use') ?? {}
+  } else {
+    reply = await sampler!(prompt + SAMPLING_INSTRUCTION, DISTILL_SYSTEM)
   }
+  const input = parseVerdict(reply)
   if (!input.has_rule || !input.rule?.trim()) {
     console.log(`[distill] no rule canvas=${canvasId}`)
     return

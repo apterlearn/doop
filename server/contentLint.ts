@@ -1,4 +1,5 @@
 import type { Probe, ProbeElement } from './domProbe.ts'
+import { elementMotion, MOTION_LONG_DURATION_MS } from './motion.ts'
 
 /**
  * Content and interaction checks: the failures a design review catches by
@@ -10,6 +11,11 @@ import type { Probe, ProbeElement } from './domProbe.ts'
  * never loaded, an empty page, a missing title, controls with no hover or
  * focus state. Those are exactly the things an agent generating a design
  * produces by accident.
+ *
+ * Motion is judged here too, and only ever as advice: a page that animates with
+ * no reduced-motion escape hatch, a duration long enough to feel broken and an
+ * animation that never stops are judgement calls, not defects, so `reviewFrame`
+ * folds them into `advisory` and never into `blocking`.
  */
 
 export type ContentRule =
@@ -21,6 +27,9 @@ export type ContentRule =
   | 'dead_zone'
   | 'missing_state'
   | 'contrast_unverified'
+  | 'motion_no_reduced_motion'
+  | 'motion_long_duration'
+  | 'motion_infinite_animation'
 
 export type ContentSeverity = 'error' | 'warning'
 
@@ -40,6 +49,9 @@ export interface ContentReport {
 }
 
 const MAX_ISSUES = 50
+/** Per-element motion rules report this many elements each: a frame with 300
+ *  animated elements needs one line, not three hundred. */
+const MAX_MOTION_ISSUES = 10
 /** Copy that means "someone will write this later". */
 const PLACEHOLDER_TEXT = [
   /\blorem ipsum\b/i,
@@ -130,6 +142,53 @@ export function interactionProbe(probe: Probe): ContentIssue[] {
   return issues
 }
 
+/** Motion the frame declares, judged rather than measured: the missing
+ *  reduced-motion escape hatch, durations long enough to read as broken, and
+ *  animations that never stop. All three are advisory — motion is a design
+ *  decision, and only the author can say whether it is the right one. */
+function motionIssues(probe: Probe): ContentIssue[] {
+  const issues: ContentIssue[] = []
+  const long: { el: ProbeElement; label: string; duration: number }[] = []
+  const forever = new Set<string>()
+  let moving = 0
+  for (const el of probe.elements) {
+    const motion = elementMotion(el)
+    if (!motion.transitions.length && !motion.animations.length) continue
+    moving += 1
+    for (const transition of motion.transitions) {
+      if (transition.duration > MOTION_LONG_DURATION_MS)
+        long.push({ el, label: `transition ${transition.property}`, duration: transition.duration })
+    }
+    for (const animation of motion.animations) {
+      if (animation.duration > MOTION_LONG_DURATION_MS)
+        long.push({ el, label: `animation ${animation.name}`, duration: animation.duration })
+      if (animation.iterations === 'infinite') forever.add(el.selector)
+    }
+  }
+  if (moving > 0 && !(probe.motion?.reducedMotion ?? false))
+    issues.push({
+      rule: 'motion_no_reduced_motion',
+      severity: 'warning',
+      selector: 'html',
+      detail: `${moving} element${moving === 1 ? '' : 's'} animate or transition and the CSS has no prefers-reduced-motion query — add one that turns the motion off`,
+    })
+  for (const entry of long.slice(0, MAX_MOTION_ISSUES))
+    issues.push({
+      rule: 'motion_long_duration',
+      severity: 'warning',
+      selector: entry.el.selector,
+      detail: `${entry.label} runs for ${Math.round(entry.duration)}ms — past ${MOTION_LONG_DURATION_MS}ms motion reads as broken rather than animated`,
+    })
+  for (const selector of [...forever].slice(0, MAX_MOTION_ISSUES))
+    issues.push({
+      rule: 'motion_infinite_animation',
+      severity: 'warning',
+      selector,
+      detail: 'an animation repeats forever — infinite motion distracts and burns battery; give it an iteration count',
+    })
+  return issues
+}
+
 /** Placeholder copy, stand-in images, images that failed to load, an empty or
  *  untitled page, and text over a background the contrast check cannot read. */
 export function contentProbe(probe: Probe): ContentReport {
@@ -206,6 +265,7 @@ export function contentProbe(probe: Probe): ContentReport {
     })
 
   issues.push(...interactionProbe(probe))
+  issues.push(...motionIssues(probe))
 
   return {
     counts: {

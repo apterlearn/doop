@@ -14,6 +14,7 @@ import type {
   AgentQuestion,
   AgentTask,
   Canvas,
+  Component,
   DesignDecision,
   ElementComment,
   DesignTokens,
@@ -31,6 +32,7 @@ import type {
   RunEvent,
   RunJournal,
   TaskFeedback,
+  UserMemory,
 } from '../../shared/types.ts'
 
 /**
@@ -57,6 +59,8 @@ function canvasColumns(c: Canvas) {
     tokens: c.tokens ?? null,
     breakpoints: c.breakpoints ?? null,
     reviewMode: c.reviewMode ?? false,
+    reviewPolicy: c.reviewPolicy ?? 'off',
+    approvalTools: c.approvalTools ?? null,
     updatedAt: c.updatedAt,
   }
 }
@@ -521,6 +525,92 @@ export function saveReference(canvasId: string, ref: MemoryReference) {
 
 export function deleteReference(id: string) {
   swallow(db.delete(t.memoryReferences).where(eq(t.memoryReferences.id, id)))
+}
+
+/* Components: the canvas's reusable design pieces. Single-shot writes, like
+   references — the frame HTML holds the instances, so there is no projection
+   to keep in step. */
+function componentColumns(c: Component) {
+  return {
+    canvasId: c.canvasId,
+    name: c.name,
+    description: c.description ?? null,
+    html: c.html,
+    width: c.width,
+    height: c.height,
+    props: c.props ?? null,
+    variantOf: c.variantOf ?? null,
+    createdBy: c.createdBy,
+    updatedBy: c.updatedBy,
+    createdAt: c.createdAt,
+    updatedAt: c.updatedAt,
+  }
+}
+
+export function saveComponent(c: Component) {
+  swallow(
+    db
+      .insert(t.components)
+      .values({ id: c.id, ...componentColumns(c) })
+      .onConflictDoUpdate({ target: t.components.id, set: componentColumns(c) }),
+  )
+}
+
+export function deleteComponentRow(id: string) {
+  swallow(db.delete(t.components).where(eq(t.components.id, id)))
+}
+
+export async function loadComponents(): Promise<Component[]> {
+  const rows = await db.select().from(t.components)
+  return rows.map((r) => ({
+    id: r.id,
+    canvasId: r.canvasId,
+    name: r.name,
+    ...(r.description ? { description: r.description } : {}),
+    html: r.html,
+    width: r.width,
+    height: r.height,
+    ...(r.props != null ? { props: r.props } : {}),
+    ...(r.variantOf ? { variantOf: r.variantOf } : {}),
+    createdBy: r.createdBy,
+    updatedBy: r.updatedBy,
+    createdAt: r.createdAt,
+    updatedAt: r.updatedAt,
+  }))
+}
+
+/* Cross-canvas memory: what a user taught doop about their taste. Keyed by
+   user, never by canvas — that is the whole point of it. */
+export function saveUserMemory(row: UserMemory) {
+  swallow(
+    db
+      .insert(t.userMemory)
+      .values({
+        id: row.id,
+        userId: row.userId,
+        kind: row.kind,
+        text: row.text,
+        sourceCanvasId: row.sourceCanvasId ?? null,
+        createdAt: row.createdAt,
+      })
+      .onConflictDoNothing(),
+  )
+}
+
+export function deleteUserMemory(id: string) {
+  swallow(db.delete(t.userMemory).where(eq(t.userMemory.id, id)))
+}
+
+export async function loadUserMemory(): Promise<UserMemory[]> {
+  const rows = await db.select().from(t.userMemory).orderBy(desc(t.userMemory.createdAt))
+  return rows.map((r) => ({
+    id: r.id,
+    userId: r.userId,
+    kind: r.kind === 'brand' || r.kind === 'workflow' ? r.kind : 'preference',
+    text: r.text,
+    ...(r.sourceCanvasId ? { sourceCanvasId: r.sourceCanvasId } : {}),
+    createdAt: r.createdAt,
+  }))
 }
 
 export function saveDecision(canvasId: string, d: DesignDecision) {
@@ -1034,6 +1124,11 @@ export interface Hydrated {
   journals: Map<string, RunJournal[]>
   /** userId -> wants email on agent events */
   notificationPrefs: Map<string, boolean>
+  /** the canvas component library, keyed by canvas — absent on a hydrate
+   *  written before components existed, so callers must tolerate undefined */
+  components?: Map<string, Component[]>
+  /** userId -> cross-canvas memory, newest first */
+  userMemory?: Map<string, UserMemory[]>
 }
 
 const LOG_CAP = 100
@@ -1058,6 +1153,8 @@ export async function hydrate(): Promise<Hydrated> {
     runEventRows,
     journalRows,
     notificationRows,
+    componentRows,
+    userMemoryRows,
   ] = await Promise.all([
     db.select().from(t.canvases),
     db.select().from(t.frames),
@@ -1077,6 +1174,8 @@ export async function hydrate(): Promise<Hydrated> {
     db.select().from(t.runEvents).orderBy(desc(t.runEvents.at)),
     db.select().from(t.runJournals).orderBy(desc(t.runJournals.at)),
     db.select().from(t.notificationPrefs),
+    db.select().from(t.components),
+    db.select().from(t.userMemory).orderBy(desc(t.userMemory.createdAt)),
   ])
 
   const canvases: Canvas[] = canvasRows.map((c) => ({
@@ -1092,6 +1191,8 @@ export async function hydrate(): Promise<Hydrated> {
     ...(c.tokens ? { tokens: c.tokens as DesignTokens } : {}),
     ...(c.breakpoints ? { breakpoints: c.breakpoints as { name: string; min_width: number }[] } : {}),
     ...(c.reviewMode ? { reviewMode: true } : {}),
+    ...(c.reviewPolicy === 'destructive' || c.reviewPolicy === 'all_writes' ? { reviewPolicy: c.reviewPolicy } : {}),
+    ...(c.approvalTools ? { approvalTools: c.approvalTools } : {}),
     createdAt: c.createdAt,
     updatedAt: c.updatedAt,
     frames: [],
@@ -1440,6 +1541,9 @@ export async function hydrate(): Promise<Hydrated> {
       ...(row.ok != null ? { ok: row.ok } : {}),
       ...(row.ms != null ? { ms: row.ms } : {}),
       ...(row.summary != null ? { summary: row.summary } : {}),
+      ...(row.frameId != null ? { frameId: row.frameId } : {}),
+      ...(row.beforeVersionId != null ? { beforeVersionId: row.beforeVersionId } : {}),
+      ...(row.afterVersionId != null ? { afterVersionId: row.afterVersionId } : {}),
     })
     runEvents.set(row.canvasId, list)
   }
@@ -1457,12 +1561,53 @@ export async function hydrate(): Promise<Hydrated> {
       summary: row.summary,
       ...(row.decisions != null ? { decisions: row.decisions } : {}),
       ...(row.frames ? { frames: row.frames } : {}),
+      ...(row.startedAt != null ? { startedAt: row.startedAt } : {}),
+      ...(row.endedAt != null ? { endedAt: row.endedAt } : {}),
+      ...(row.turns != null ? { turns: row.turns } : {}),
+      ...(row.toolCalls != null ? { toolCalls: row.toolCalls } : {}),
+      ...(row.tokens != null ? { tokens: row.tokens } : {}),
+      ...(row.costUsd != null ? { costUsd: row.costUsd } : {}),
       at: row.at,
     })
     journals.set(row.canvasId, list)
   }
 
   const notificationPrefs = new Map<string, boolean>(notificationRows.map((r) => [r.userId, r.agentEmail]))
+
+  const components = new Map<string, Component[]>()
+  for (const row of componentRows) {
+    const list = components.get(row.canvasId) ?? []
+    list.push({
+      id: row.id,
+      canvasId: row.canvasId,
+      name: row.name,
+      ...(row.description ? { description: row.description } : {}),
+      html: row.html,
+      width: row.width,
+      height: row.height,
+      ...(row.props != null ? { props: row.props } : {}),
+      ...(row.variantOf ? { variantOf: row.variantOf } : {}),
+      createdBy: row.createdBy,
+      updatedBy: row.updatedBy,
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+    })
+    components.set(row.canvasId, list)
+  }
+
+  const userMemory = new Map<string, UserMemory[]>()
+  for (const row of userMemoryRows) {
+    const list = userMemory.get(row.userId) ?? []
+    list.push({
+      id: row.id,
+      userId: row.userId,
+      kind: row.kind === 'brand' || row.kind === 'workflow' ? row.kind : 'preference',
+      text: row.text,
+      ...(row.sourceCanvasId ? { sourceCanvasId: row.sourceCanvasId } : {}),
+      createdAt: row.createdAt,
+    })
+    userMemory.set(row.userId, list)
+  }
 
   return {
     canvases,
@@ -1478,6 +1623,8 @@ export async function hydrate(): Promise<Hydrated> {
     runEvents,
     journals,
     notificationPrefs,
+    components,
+    userMemory,
   }
 }
 

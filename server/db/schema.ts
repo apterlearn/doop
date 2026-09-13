@@ -35,6 +35,12 @@ export const canvases = pgTable('canvases', {
   updatedAt: bigint('updated_at', { mode: 'number' }).notNull(),
   /** when on, agent frame writes become frame_proposals instead of landing */
   reviewMode: boolean('review_mode').notNull().default(false),
+  /** 'off' | 'destructive' | 'all_writes'; legacy canvases read as 'off' and
+   *  review_mode=true is honoured as 'all_writes'. Scoped replacement for the
+   *  all-or-nothing boolean above. */
+  reviewPolicy: text('review_policy').notNull().default('off'),
+  /** tool names that always need approval, whatever their annotations say */
+  approvalTools: jsonb('approval_tools').$type<string[]>(),
 })
 
 /** Users invited to collaborate on a canvas (the owner is not listed).
@@ -222,6 +228,8 @@ export const tasks = pgTable(
     handback: text('handback'),
     /** JSON {input, output, cacheRead, cacheWrite, model} for the card's run */
     usage: text('usage'),
+    /** epoch ms before which queuedCards() skips this card — deferred work */
+    scheduledAt: bigint('scheduled_at', { mode: 'number' }),
   },
   (t) => [index('tasks_canvas_idx').on(t.canvasId)],
 )
@@ -635,6 +643,12 @@ export const runEvents = pgTable(
     ok: boolean('ok'),
     ms: integer('ms'),
     summary: text('summary'),
+    /** the frame this step touched, when it wrote one — the replay cursor */
+    frameId: text('frame_id'),
+    /** the frame_versions row the step started from / produced, so step N can
+     *  be diffed against N+1 with diff_frame */
+    beforeVersionId: text('before_version_id'),
+    afterVersionId: text('after_version_id'),
   },
   (t) => [index('run_events_canvas_idx').on(t.canvasId)],
 )
@@ -655,6 +669,14 @@ export const runJournals = pgTable(
      *  started from and produced */
     frames:
       jsonb('frames').$type<{ frameId: string; name: string; beforeVersionId?: string; afterVersionId?: string }[]>(),
+    /** when the run's first turn started and when it stopped */
+    startedAt: bigint('started_at', { mode: 'number' }),
+    endedAt: bigint('ended_at', { mode: 'number' }),
+    /** model turns taken, tool calls made, tokens spent and what they cost */
+    turns: integer('turns'),
+    toolCalls: integer('tool_calls'),
+    tokens: integer('tokens'),
+    costUsd: doublePrecision('cost_usd'),
     at: bigint('at', { mode: 'number' }).notNull(),
   },
   (t) => [index('run_journals_canvas_idx').on(t.canvasId)],
@@ -666,3 +688,87 @@ export const notificationPrefs = pgTable('notification_prefs', {
   agentEmail: boolean('agent_email').notNull().default(false),
   updatedAt: bigint('updated_at', { mode: 'number' }).notNull(),
 })
+
+/** A reusable piece of canvas UI — the component library behind
+ *  insert_component. `html` is the definition document; an instance is an
+ *  element in a frame carrying data-doop-component=<id> (plus
+ *  data-doop-overrides), so the frame HTML stays the only document and
+ *  there is no second store to reconcile. `variantOf` points at the base
+ *  component a variant derives from. */
+export const components = pgTable(
+  'components',
+  {
+    id: text('id').primaryKey(),
+    canvasId: text('canvas_id').notNull(),
+    name: text('name').notNull(),
+    description: text('description'),
+    html: text('html').notNull(),
+    width: doublePrecision('width').notNull(),
+    height: doublePrecision('height').notNull(),
+    /** JSON prop schema the component accepts; null = no declared props */
+    props: jsonb('props'),
+    /** base component id this one is a variant of; null = a root component */
+    variantOf: text('variant_of'),
+    createdBy: text('created_by').notNull(),
+    updatedBy: text('updated_by').notNull(),
+    createdAt: bigint('created_at', { mode: 'number' }).notNull(),
+    updatedAt: bigint('updated_at', { mode: 'number' }).notNull(),
+  },
+  (t) => [index('components_canvas_idx').on(t.canvasId)],
+)
+
+/** What one user has taught doop about their taste, carried across every
+ *  canvas they own (the resident prompt and the MCP guide both read it).
+ *  Capped per user at write time. */
+export const userMemory = pgTable(
+  'user_memory',
+  {
+    id: text('id').primaryKey(),
+    userId: text('user_id').notNull(),
+    /** 'preference' | 'brand' | 'workflow' */
+    kind: text('kind').notNull(),
+    text: text('text').notNull(),
+    /** the canvas the memory was learned on — provenance only, never a scope */
+    sourceCanvasId: text('source_canvas_id'),
+    createdAt: bigint('created_at', { mode: 'number' }).notNull(),
+  },
+  (t) => [index('user_memory_user_idx').on(t.userId)],
+)
+
+/** A resident agent run, persisted so a restart can resume it instead of
+ *  failing every claimed card. The transcript itself lives in run_steps;
+ *  this row is the run's identity and status. */
+export const runs = pgTable(
+  'runs',
+  {
+    id: text('id').primaryKey(),
+    canvasId: text('canvas_id').notNull(),
+    agentName: text('agent_name').notNull(),
+    /** JSON array of the task/card ids the run is working */
+    cardIds: jsonb('card_ids').$type<string[]>(),
+    model: text('model'),
+    /** 'running' | 'done' | 'failed' | 'cancelled' */
+    status: text('status').notNull(),
+    startedAt: bigint('started_at', { mode: 'number' }).notNull(),
+    updatedAt: bigint('updated_at', { mode: 'number' }).notNull(),
+  },
+  (t) => [index('runs_canvas_idx').on(t.canvasId)],
+)
+
+/** One transcript entry of a run, in order — what replayInterruptedRuns
+ *  rehydrates the model loop from. */
+export const runSteps = pgTable(
+  'run_steps',
+  {
+    id: text('id').primaryKey(),
+    runId: text('run_id').notNull(),
+    /** dense 0..n-1 position within the run's transcript */
+    seq: integer('seq').notNull(),
+    /** 'assistant' | 'user' (the tool-result turn) */
+    role: text('role').notNull(),
+    /** the message payload as it was pushed into the loop */
+    payload: jsonb('payload').notNull(),
+    createdAt: bigint('created_at', { mode: 'number' }).notNull(),
+  },
+  (t) => [index('run_steps_run_idx').on(t.runId)],
+)

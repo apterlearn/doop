@@ -1,11 +1,26 @@
+import { useEffect, useState } from 'react'
 import { useStore } from '../lib/store'
+import { timeAgo } from '../lib/time'
 import { AgentIcon } from './AgentIcon'
 import { cn } from '@/lib/utils'
+
+/** How quiet a row must go before the strip says how long: under this a status
+ *  is simply live, and "3s ago" beside it is noise. */
+const SILENT_MS = 30_000
 
 /** Floating strip of live "what I'm working on" statuses (agents post via set_status). */
 export function WorkingNow() {
   const working = useStore((s) => Object.values(s.presences).filter((p) => p.status))
   const layersOpen = useStore((s) => s.layersOpen)
+  /* the silence is only readable if it keeps counting: a stale `lastSeen`
+     would otherwise freeze at the second it arrived and read as live forever.
+     The clock lives in state so render reads a value rather than the time —
+     Date.now() in render is impure and re-renders unpredictably. */
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    const t = window.setInterval(() => setNow(Date.now()), 5000)
+    return () => window.clearInterval(t)
+  }, [])
   if (working.length === 0) return null
   return (
     <div
@@ -29,6 +44,11 @@ export function WorkingNow() {
             {p.kind === 'agent' && <AgentIcon name={p.name} size={12} />} {p.name}
           </span>
           <span className="truncate text-ink-soft">{p.status}</span>
+          {/* a status is not proof of life: a row gone quiet past the window
+              says how long, so "thinking" is distinguishable from "stuck" */}
+          {p.lastSeen !== undefined && now - p.lastSeen > SILENT_MS && (
+            <span className="flex-none font-mono text-[10.5px] text-ink-faint">{timeAgo(p.lastSeen)}</span>
+          )}
         </div>
       ))}
     </div>

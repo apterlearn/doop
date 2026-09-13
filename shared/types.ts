@@ -129,6 +129,55 @@ export interface FrameSummary {
 /** A canvas row on the dashboard list, as MCP reports it. */
 export type CanvasListItem = CanvasMeta & { guidelinesCount: number }
 
+/** A reusable piece of design: the canvas's component library. An instance is
+ *  an element in a frame carrying `data-doop-component="<id>"` (and optional
+ *  `data-doop-overrides`), so the frame HTML stays the only document and there
+ *  is no second store to reconcile. */
+export interface Component {
+  id: string
+  canvasId: string
+  name: string
+  description?: string
+  /** the component's markup, self-contained: what gets inserted on the canvas */
+  html: string
+  width: number
+  height: number
+  /** free-form prop declarations an agent may read to know what it can vary */
+  props?: unknown
+  /** the component this one is a variant of, when it was derived from another */
+  variantOf?: string
+  createdBy: string
+  updatedBy: string
+  createdAt: number
+  updatedAt: number
+}
+
+/** A component as listed — metadata and how widely it is used, never the HTML. */
+export interface ComponentSummary {
+  id: string
+  name: string
+  description?: string
+  width: number
+  height: number
+  variantOf?: string
+  /** frames on this canvas holding at least one instance */
+  instanceCount: number
+  updatedAt: string
+  updatedBy: string
+  htmlBytes: number
+}
+
+/** Something durable an agent learned about this user's taste, kept across
+ *  canvases so a new canvas does not start from zero. */
+export interface UserMemory {
+  id: string
+  userId: string
+  kind: 'preference' | 'brand' | 'workflow'
+  text: string
+  sourceCanvasId?: string
+  createdAt: number
+}
+
 /** The `get_canvas` payload — the canvas picture an agent plans from. */
 export interface CanvasView {
   id: string
@@ -265,7 +314,17 @@ export interface Canvas {
   /** when on, agent frame writes land as pending proposals a human must
    *  accept; unset/false means agent edits land canonically (the default) */
   reviewMode?: boolean
+  /** what an agent write must clear before it lands. `off` (the default) gates
+   *  nothing, `destructive` gates only writes a tool declares destructive plus
+   *  every tool named in `approvalTools`, `all_writes` gates every write.
+   *  `reviewMode` is the older all-or-nothing switch and reads as `all_writes`. */
+  reviewPolicy?: ReviewPolicy
+  /** tool names gated under the `destructive` policy, on top of the tools that
+   *  declare themselves destructive */
+  approvalTools?: string[]
 }
+
+export type ReviewPolicy = 'off' | 'destructive' | 'all_writes'
 
 /* ---- design memory ---- */
 
@@ -346,6 +405,19 @@ export interface FrameProposal {
   y?: number
   width?: number
   height?: number
+  /** how the proposal delivers its change. `replace` (the default) carries the
+   *  whole document in `html`; `patch` carries `edits` applied to the frame's
+   *  document as it stood at `baseUpdatedAt`, so a reviewer can resolve the
+   *  change hunk by hunk. */
+  mode?: 'replace' | 'patch'
+  /** patch mode: the exact replacements to apply, in order */
+  edits?: { old_str: string; new_str: string }[]
+  /** the document the agent read, so a reviewer (and the rebase path) can see
+   *  the change against what it was proposed from. Clamped like any read. */
+  baseHtml?: string
+  /** render diff against `baseHtml`, computed once when the proposal is
+   *  created: the PNG a reviewer looks at, and how much of the frame moved */
+  diff?: { png: string; changed_ratio: number }
   /** frame.updatedAt the agent read before proposing; the stale guard */
   baseUpdatedAt: number
   /** one-line what-and-why, shown in the review list */
@@ -410,6 +482,12 @@ export interface RunEvent {
   ms?: number
   /** one-line result/turn summary (≤200 chars) */
   summary?: string
+  /** the frame this step wrote, when it wrote one */
+  frameId?: string
+  /** the frame version the step started from and the one it produced — what
+   *  makes a step diffable against its predecessor with diff_frame */
+  beforeVersionId?: string
+  afterVersionId?: string
 }
 
 /** What an agent did on one past run — the resident's cross-run memory. */
@@ -427,6 +505,16 @@ export interface RunJournal {
   /** the frames the run changed, each with the version it started from and the
    *  one it produced — the run's revertible change set */
   frames?: { frameId: string; name: string; beforeVersionId?: string; afterVersionId?: string }[]
+  /** when the run's first turn started and when it stopped; both absent on a
+   *  journal written before these were recorded */
+  startedAt?: number
+  endedAt?: number
+  /** model turns taken, tool calls made, tokens spent and the money those
+   *  tokens cost (`null` when no price is known for the model) */
+  turns?: number
+  toolCalls?: number
+  tokens?: number
+  costUsd?: number | null
   at: number
 }
 
@@ -493,6 +581,9 @@ export interface Presence {
   status?: string
   /** for agents: whose token they connected with */
   owner?: string
+  /** when this client last did anything on the canvas. A live connection that
+   *  has gone quiet is how a human tells "thinking" from "stuck". */
+  lastSeen?: number
 }
 
 /** What a connected client is looking at: the frame, the element inside it and
@@ -572,6 +663,9 @@ export interface AgentTask {
   stageSummary?: string
   /** a specialist sent the card back to an earlier stage, with its reason */
   handback?: { fromAgent: string; reason: string; at: number }
+  /** the sweep must not start this card before this time; unset means it is
+   *  due as soon as it reaches the front of the queue */
+  scheduledAt?: number
   /** what the card's run cost, as the provider reported it */
   usage?: TaskUsage
 }
@@ -583,6 +677,10 @@ export interface TaskUsage {
   cacheRead: number
   cacheWrite: number
   model?: string
+  /** what those tokens cost in USD, priced from `model` by modelPrices.ts;
+   *  null (or absent, on usage recorded before prices existed) means the
+   *  model had no known price — no cost, never a guessed one */
+  costUsd?: number | null
 }
 
 export type RepoCardKind = 'sketch' | 'design-system'
@@ -726,6 +824,12 @@ export type ServerMessage =
       questions: AgentQuestion[]
       /** whether agent frame writes must be approved before they land */
       reviewMode: boolean
+      /** what agent writes must clear before they land, and the extra tool
+       *  names gated under the `destructive` policy */
+      reviewPolicy?: ReviewPolicy
+      approvalTools?: string[]
+      /** the canvas component library, as the components panel lists it */
+      components?: ComponentSummary[]
       /** per-agent tool-call timeline, newest first (a bounded recent window) */
       runEvents: RunEvent[]
       /** frames an agent is mid-edit on, so a client joining now sees the holder */
@@ -780,6 +884,12 @@ export type ServerMessage =
   | { type: 'run:event'; event: RunEvent }
   /** review mode was toggled */
   | { type: 'canvas:reviewMode'; reviewMode: boolean; actor: Actor }
+  /** the canvas review policy changed (what agent writes must clear) */
+  | { type: 'canvas:reviewPolicy'; reviewPolicy: ReviewPolicy; approvalTools: string[]; actor: Actor }
+  /** a component was created or updated (component set) or deleted (null) —
+   *  `componentId` is always present so a deletion can be applied without the
+   *  body it no longer has */
+  | { type: 'component'; componentId: string; component: Component | null; actor: Actor }
   /** a frame edit lock was taken, released or expired (holder null = free) */
   | { type: 'frame:lock'; frameId: string; holder: { name: string; color: string; kind: ActorKind } | null }
   /** another client's selection moved (nulls = cleared); sent to the canvas room */

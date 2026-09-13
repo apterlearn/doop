@@ -1,6 +1,6 @@
 import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
-import { ElicitResultSchema } from '@modelcontextprotocol/sdk/types.js'
+import { ElicitResultSchema, InitializedNotificationSchema } from '@modelcontextprotocol/sdk/types.js'
 import type { CallToolResult, ServerNotification, ServerRequest } from '@modelcontextprotocol/sdk/types.js'
 import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js'
 import type { Request, Response } from 'express'
@@ -27,32 +27,44 @@ import { inspectFrame } from './domProbe.ts'
 import { auditFrame, type A11yReport } from './a11y.ts'
 import { diffFrames } from './visualDiff.ts'
 import { cssForTokens, stripTokenStyle } from '../shared/tokens.ts'
-import { lintFrame } from './designLint.ts'
+import { lintFrame, lintProbe, planTokenFixes, type LintRule } from './designLint.ts'
 import { deriveDesignSystem, designSystemMarkdown } from './designSystem.ts'
 import { probeFrame, type Probe } from './domProbe.ts'
 import {
   deleteElement,
   ElementEditError,
+  FRAME_SCRIPT_API,
   getElement,
   getFrameCss,
   insertElement,
+  runFrameScript,
   setFrameCss,
   updateElements,
   type UpdateElementsResult,
 } from './elementEdit.ts'
+import { motionFrame } from './motion.ts'
+import { checkBrandCompliance } from './brand.ts'
+import { generateImage, IMAGE_NOT_CONFIGURED, imageProvider } from './imageGen.ts'
 import { DOOP_GUIDE, guideFor, GUIDE_TOPICS } from './guide.ts'
 import { describeInspiration, INSPIRATION_USAGE_NOTE, searchInspiration } from './inspiration.ts'
 import { ESCAPED_HTML_NOTE, looksEscapedHtml, repairEscapedHtml } from './escapedHtml.ts'
 import { describeSyncFlow, getSyncFlow } from './ingest.ts'
 import * as assets from './assets.ts'
 import { buildZip } from './zip.ts'
-import { IMPORTS_PER_MIN, MAX_FRAME_HTML_BYTES, RENDERS_PER_MIN, SEARCHES_PER_MIN, UPLOADS_PER_MIN } from './limits.ts'
+import {
+  IMAGES_PER_MIN,
+  IMPORTS_PER_MIN,
+  MAX_FRAME_HTML_BYTES,
+  RENDERS_PER_MIN,
+  SEARCHES_PER_MIN,
+  UPLOADS_PER_MIN,
+} from './limits.ts'
 import * as imageSearch from './imageSearch.ts'
 import * as backgrounds from './backgrounds.ts'
 import { viewWebsite } from './website.ts'
 import { createImportedWebpageFrame } from './webpageImport.ts'
 import { discoverSitePages, importPage, normalizeImportUrl, type DiscoveredSite } from './importer.ts'
-import { getJob, recordUnit, startJob } from './jobs.ts'
+import { cancelJob, getJob, jobProgress, recordUnit, startJob, waitForJobs } from './jobs.ts'
 import { websiteAccessErrorMessage } from './websiteAccess.ts'
 import { frameSha, htmlSha, reviewFrame, reviewToRecord } from './review.ts'
 import { AGENT_ROLES, PIPELINE_PRESETS, roleName } from '../shared/agents.ts'
@@ -65,6 +77,8 @@ import { commitFiles, GithubWriteError, readPullRequest } from './githubWrite.ts
 import * as github from './github.ts'
 import { importRepoScreen, type RepoScreenImport } from './githubRecon.ts'
 import { touchClient } from './mcpClients.ts'
+import { TOOL_POLICY, toolEnabled } from './mcpPolicy.ts'
+import { setSampler } from './distill.ts'
 import { capabilities } from './capabilities.ts'
 import * as agentEvents from './agentEvents.ts'
 import * as runLog from './runLog.ts'
@@ -76,10 +90,12 @@ import type {
   AgentTask,
   Canvas,
   CanvasView,
+  Component,
   DesignTokens,
   ElementComment,
   Frame,
   MemoryReference,
+  UserMemory,
   Page,
 } from '../shared/types.ts'
 import { recordToolCall } from './mcpStats.ts'
@@ -494,6 +510,9 @@ const importHits = new Map<string, number[]>()
    browser hostage. */
 const renderHits = new Map<string, number[]>()
 
+/* image generation spends money per result and takes tens of seconds */
+const imageHits = new Map<string, number[]>()
+
 /** True when the render budget allows one more, else the seconds to wait. */
 function renderBudget(key: string): { ok: true } | { ok: false; retryAfter: number } {
   const now = Date.now()
@@ -556,33 +575,43 @@ const opId = z
  * deliberately absent — a retried read has nothing to duplicate, and adding the
  * key to them would put a mutation parameter on tools a client auto-approves.
  */
-const MUTATING_TOOLS: Record<string, true> = {
+export const MUTATING_TOOLS: Record<string, true> = {
   add_comment: true,
   append_frame_html: true,
   apply_ops: true,
   ask_human: true,
   begin_frame_edit: true,
+  cancel_job: true,
   complete_card: true,
   copy_frame: true,
   create_canvas: true,
+  create_card: true,
+  create_component: true,
   create_frame: true,
   create_page: true,
   create_release: true,
   delete_asset: true,
   delete_canvas: true,
+  delete_component: true,
   delete_element: true,
   delete_frame: true,
   delete_page: true,
   delete_release: true,
+  detach_component: true,
   duplicate_canvas: true,
   duplicate_frame: true,
   edit_frame_html: true,
   end_frame_edit: true,
+  extract_design_system: true,
+  fix_frame_tokens: true,
+  generate_image: true,
+  get_feedback: true,
   hand_back: true,
   import_code: true,
   import_repo_screen: true,
   import_site: true,
   import_webpage: true,
+  insert_component: true,
   insert_element: true,
   move_frame: true,
   open_pull_request: true,
@@ -592,15 +621,23 @@ const MUTATING_TOOLS: Record<string, true> = {
   propose_frame_html: true,
   publish_canvas: true,
   ready_for_review: true,
+  rebase_proposal: true,
+  remember: true,
   rename_canvas: true,
   rename_page: true,
   rename_release: true,
   reply_to_comment: true,
   resolve_comment: true,
+  resolve_frame_proposal: true,
+  resolve_frame_proposals: true,
   restore_release: true,
   resume_work: true,
+  retry_card: true,
+  retry_feedback: true,
   revert_frame: true,
   revert_run: true,
+  review_frame: true,
+  run_frame_script: true,
   save_decision: true,
   set_breakpoints: true,
   set_frame_css: true,
@@ -615,10 +652,12 @@ const MUTATING_TOOLS: Record<string, true> = {
   take_card: true,
   undo_last_change: true,
   unpublish_canvas: true,
+  update_component: true,
   update_elements: true,
   update_frame: true,
   update_plan_step: true,
   upload_asset: true,
+  upload_font: true,
   withdraw_proposal: true,
 }
 
@@ -635,18 +674,24 @@ export const TOOL_DOMAINS: Record<string, string> = {
   ask_human: 'board',
   audit_frame: 'verify',
   begin_frame_edit: 'frame',
+  cancel_job: 'web',
+  check_brand_compliance: 'verify',
   complete_card: 'board',
   copy_frame: 'frame',
   create_canvas: 'canvas',
+  create_card: 'board',
+  create_component: 'canvas',
   create_frame: 'frame',
   create_page: 'canvas',
   create_release: 'canvas',
   delete_asset: 'assets',
   delete_canvas: 'canvas',
+  delete_component: 'canvas',
   delete_element: 'element',
   delete_frame: 'frame',
   delete_page: 'canvas',
   delete_release: 'canvas',
+  detach_component: 'element',
   diff_frame: 'verify',
   duplicate_canvas: 'canvas',
   duplicate_frame: 'frame',
@@ -655,12 +700,16 @@ export const TOOL_DOMAINS: Record<string, string> = {
   export_canvas: 'handoff',
   export_frame: 'frame',
   extract_design_system: 'web',
+  fix_frame_tokens: 'verify',
+  frame_script_api: 'element',
+  generate_image: 'assets',
   get_agents: 'discovery',
   get_answers: 'board',
   get_asset: 'assets',
   get_canvas: 'canvas',
   get_capabilities: 'discovery',
   get_comments: 'board',
+  get_component: 'canvas',
   get_element: 'element',
   get_feedback: 'board',
   get_focus: 'board',
@@ -674,17 +723,21 @@ export const TOOL_DOMAINS: Record<string, string> = {
   get_guide: 'discovery',
   get_guidelines: 'canvas',
   get_job: 'web',
+  get_memory: 'discovery',
+  get_motion_context: 'verify',
   get_plan: 'run',
   get_pull_request_review: 'handoff',
   get_reference: 'canvas',
   get_run_changes: 'run',
   get_run_events: 'run',
+  get_token_usage: 'verify',
   get_tokens: 'canvas',
   hand_back: 'handoff',
   import_code: 'handoff',
   import_repo_screen: 'web',
   import_site: 'web',
   import_webpage: 'web',
+  insert_component: 'element',
   insert_element: 'element',
   inspect_frame: 'element',
   lint_frame: 'verify',
@@ -693,6 +746,7 @@ export const TOOL_DOMAINS: Record<string, string> = {
   list_canvases: 'canvas',
   list_cards: 'board',
   list_change_proposals: 'review',
+  list_components: 'canvas',
   list_frames: 'frame',
   list_guidelines: 'canvas',
   list_releases: 'canvas',
@@ -705,17 +759,25 @@ export const TOOL_DOMAINS: Record<string, string> = {
   propose_frame_html: 'review',
   publish_canvas: 'canvas',
   ready_for_review: 'verify',
+  rebase_proposal: 'review',
+  remember: 'discovery',
   rename_canvas: 'canvas',
   rename_page: 'canvas',
   rename_release: 'canvas',
   reply_to_comment: 'board',
   resolve_comment: 'board',
+  resolve_frame_proposal: 'review',
+  resolve_frame_proposals: 'review',
   restore_release: 'canvas',
   resume_work: 'run',
+  retry_card: 'board',
+  retry_feedback: 'board',
   revert_frame: 'frame',
   revert_run: 'run',
   review_frame: 'verify',
+  run_frame_script: 'frame',
   save_decision: 'canvas',
+  search_components: 'canvas',
   search_frames: 'frame',
   search_icons: 'assets',
   search_images: 'assets',
@@ -734,12 +796,15 @@ export const TOOL_DOMAINS: Record<string, string> = {
   take_card: 'board',
   undo_last_change: 'frame',
   unpublish_canvas: 'canvas',
+  update_component: 'canvas',
   update_elements: 'element',
   update_frame: 'frame',
   update_plan_step: 'run',
   upload_asset: 'assets',
+  upload_font: 'assets',
   view_website: 'web',
   wait_for_events: 'board',
+  wait_for_jobs: 'web',
   whoami: 'discovery',
   withdraw_proposal: 'review',
 }
@@ -1080,15 +1145,39 @@ const IDENTITY_TOOLS = new Set([
   'stop_work',
 ])
 
+/** Borrow the connected client's model for the distiller (MCP sampling). On a
+ *  self-hosted instance with no ANTHROPIC_API_KEY, a client that declares the
+ *  `sampling` capability is the only model available, so the canvas can still
+ *  learn from feedback. The client hosts the model and may refuse or be
+ *  offline — the failure surfaces to the distiller's own catch like any other
+ *  model error. */
+async function sampleThrough(server: McpServer, prompt: string, system: string): Promise<string> {
+  const result = await server.server.createMessage({
+    messages: [{ role: 'user', content: { type: 'text', text: prompt } }],
+    maxTokens: 1000,
+    ...(system ? { systemPrompt: system } : {}),
+  })
+  return result.content.type === 'text' ? result.content.text : ''
+}
+
 /** owner is the connecting user's display name (for attribution); ownerId is
  *  their user id — canvases the agent creates or lists are scoped to it, the
- *  same isolation the web UI gets. */
-export function buildMcpServer(owner?: string, ownerId?: string, clientId?: string): McpServer {
+ *  same isolation the web UI gets. `opts.readonly` builds the read-only
+ *  surface: write tools are never registered, so they are absent from
+ *  `tools/list` rather than merely refused. */
+export function buildMcpServer(
+  owner?: string,
+  ownerId?: string,
+  clientId?: string,
+  opts?: { readonly?: boolean },
+): McpServer {
   /* one id per connection: every call this agent makes on a canvas lands on
      the Run tab under the same run, so its session reads as one timeline. The
      HTTP endpoint builds a fresh server for every POST, so this state lives
-     outside it — keyed by the account that authorized the token. */
-  const session = sessionFor(ownerId ?? clientId ?? owner ?? 'anonymous')
+     outside it — keyed by the account AND the connection, because two MCP
+     clients on one account must not inherit each other's canvas or agent name.
+     An anonymous caller (no account, no client id) still shares one session. */
+  const session = sessionFor(ownerId || clientId ? `${ownerId ?? ''}\u0000${clientId ?? ''}` : (owner ?? 'anonymous'))
   const actorFrom = (agent_name?: string) =>
     actions.resolveActor({ name: agent_name, kind: 'agent', owner, ownerId, clientId })
   /* Canvas access for agents mirrors the web UI: the OAuth user's id runs
@@ -1235,6 +1324,21 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
     )
   }
   const server = new McpServer({ name: 'doop-canvas', version: '0.1.0' }, { instructions: INSTRUCTIONS })
+  /* A connected client that declares `sampling` can stand in for the server's
+     own model key: on a self-hosted instance with no ANTHROPIC_API_KEY the
+     canvas still learns from feedback, because the distiller borrows the
+     caller's model. A client without the capability clears any sampler an
+     earlier connection left behind, so distillation falls back to the key
+     alone — today's behaviour. The SDK's ServerOptions.oninitialized is
+     declared but never wired, so the notification is handled directly. */
+  server.server.setNotificationHandler(InitializedNotificationSchema, () => {
+    const sampling = server.server.getClientCapabilities()?.sampling
+    setSampler(sampling ? (prompt, source) => sampleThrough(server, prompt, source) : null)
+    /* A client that cached tools/list from an earlier session keeps offering
+       writes this surface does not have; re-list is how it finds out. A no-op
+       when the policy removed nothing. */
+    if (policyFilteredTools) server.sendToolListChanged()
+  })
 
   /* Every tool call lands here: one place that records outcome and latency for
      the whole surface, so the 43 handlers stay readable. It also keeps each
@@ -1446,12 +1550,27 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
     if (canvasId === undefined) return result
     return withInterrupted(result, canvasId, actorFrom(record.agent_name))
   }
+  /** How many tools the source declares, against `registry.size`: when the
+   *  policy removes some, the surface a client caches is smaller than the
+   *  source, and it is told so once registration finishes. */
+  let attemptedTools = 0
   const tool = ((name: string, config: never, cb: never) => {
+    attemptedTools += 1
     const cfg = config as unknown as {
       inputSchema?: z.ZodRawShape
       description?: string
       annotations?: ToolAnnotations
     }
+    /* A tool the policy removes is never registered, so it cannot appear in
+       tools/list at all — that is what makes the read-only surface a real
+       boundary rather than a hint a client could ignore. */
+    if (
+      !toolEnabled(name, TOOL_POLICY, {
+        readonly: opts?.readonly === true,
+        readOnlyHint: cfg.annotations?.readOnlyHint,
+      })
+    )
+      return undefined as never
     /* The registry keeps the tool's OWN schema, so apply_ops validates a batch
        against exactly what the tool publishes. The schema registered with the
        SDK is loosened instead: `canvas_id` and `agent_name` are declared
@@ -1588,6 +1707,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
       try {
         await progress(extra, 0, `Searching real designs for “${query}”…`)
         const results = await searchInspiration(query, count ?? 4)
+        await progress(extra, 1, `Searched real designs for “${query}”.`)
         if (results.length === 0)
           return text({ ok: true, results: [], note: `No inspiration for "${query}" — try a broader category.` })
         const thumbs = await Promise.all(results.map((r) => imageSearch.fetchThumb(r.thumb_url)))
@@ -2054,6 +2174,75 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
           ? 'Your work, claims and stops are scoped to this account — another account using the same agent name is a different agent here.'
           : 'This connection has no account behind it, so your agent name is the only thing identifying you on a canvas.',
       })
+    },
+  )
+
+  /* ---- cross-canvas memory: what this account taught doop about its taste ---- */
+
+  tool(
+    'get_memory',
+    {
+      annotations: { readOnlyHint: true, destructiveHint: false },
+      title: 'Read your account’s memory',
+      description:
+        'What the connected account has taught Doop about its taste, kept across canvases: preferences, brand rules and working workflows. Read it when starting work on a canvas you have never seen — a new canvas does not start from zero.',
+      inputSchema: { agent_name: agentName.optional() },
+      outputSchema: {
+        memories: z.array(
+          z.object({
+            id: z.string(),
+            kind: z.enum(['preference', 'brand', 'workflow']),
+            text: z.string(),
+            source_canvas_id: z.string().optional(),
+            created_at: z.number(),
+          }),
+        ),
+      },
+    },
+    async () => {
+      /* the memory is the account's, not the agent's: every connection under
+         one account reads and writes the same rows */
+      if (!ownerId) return err('unsupported', 'memory is keyed by account — connect with an account token to use it')
+      return structured({
+        memories: actions.getUserMemory(ownerId).map((m) => ({
+          id: m.id,
+          kind: m.kind,
+          text: m.text,
+          ...(m.sourceCanvasId ? { source_canvas_id: m.sourceCanvasId } : {}),
+          created_at: m.createdAt,
+        })),
+      })
+    },
+  )
+
+  tool(
+    'remember',
+    {
+      annotations: { readOnlyHint: false, destructiveHint: false },
+      title: 'Record a durable preference',
+      description:
+        'Teach Doop something durable about this account that outlives the canvas: a styling preference ("likes generous whitespace"), a brand rule ("never use pure black"), a workflow ("wants mobile-first drafts first"). One fact per call, one or two sentences — not a work log. Read everything back with get_memory.',
+      inputSchema: {
+        kind: z
+          .enum(['preference', 'brand', 'workflow'])
+          .describe('preference = taste, brand = identity rules, workflow = how they like work done'),
+        text: z.string().min(1).max(500).describe('The fact itself, one or two sentences'),
+        canvas_id: z.string().optional().describe('The canvas the fact came from, for provenance'),
+        op_id: opId,
+        agent_name: agentName.optional(),
+      },
+      outputSchema: { ok: z.literal(true), id: z.string() },
+    },
+    async ({ kind, text, canvas_id, op_id }) => {
+      if (!ownerId) return err('unsupported', 'memory is keyed by account — connect with an account token to use it')
+      /* the row rides in a wrapper because replay cannot carry undefined: a
+         factory that returns one is a call that never landed, not a payload */
+      const saved = replay(ownerId, op_id, (): { memory?: UserMemory } => {
+        const row = actions.remember(ownerId, kind, text, canvas_id)
+        return row ? { memory: row } : {}
+      })
+      if (!saved.memory) return err('conflict', 'the same memory already exists')
+      return structured({ ok: true as const, id: saved.memory.id })
     },
   )
 
@@ -2589,6 +2778,568 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
           note: 'Card closed. Set your status to "" (empty) so watchers see you are between tasks.',
         }),
         canvasId,
+        actorFrom(agent_name),
+      )
+    },
+  )
+
+  /* ---- board: agents can queue, retry and re-fire work, not only claim it ---- */
+
+  tool(
+    'create_card',
+    {
+      annotations: { readOnlyHint: false, destructiveHint: false },
+      title: 'Queue a board card',
+      description:
+        'Queue work on this canvas’s board the way a human does: the title is the full brief, an optional pipeline names the roles that should work it in order, target_frame_ids are the frames the card is ABOUT (edit those in place), target_selector points at one element, attachments are reference-image frame ids, and schedule_at (epoch ms) defers the card until then. The card is attributed to the account behind your connection and the resident team can claim it.',
+      inputSchema: {
+        canvas_id: z.string(),
+        title: z
+          .string()
+          .min(1)
+          .max(4000)
+          .describe('The full brief — the agent that claims it reads this and nothing else'),
+        pipeline: z
+          .array(z.string())
+          .max(6)
+          .optional()
+          .describe('Role ids in order (see get_agents); default is the canvas’s single default role'),
+        target_frame_ids: z
+          .array(z.string())
+          .max(4)
+          .optional()
+          .describe('Frames the card is about — the agent edits these in place'),
+        target_selector: z
+          .string()
+          .max(300)
+          .optional()
+          .describe('Element on the target frame the card is about ("fix THIS")'),
+        attachments: z
+          .array(z.string())
+          .max(4)
+          .optional()
+          .describe('Reference-image frame ids — source material the agent must not edit'),
+        schedule_at: z.number().int().optional().describe('Epoch ms before which the sweep must not start this card'),
+        op_id: opId,
+        agent_name: agentName,
+      },
+    },
+    async ({
+      canvas_id,
+      title,
+      pipeline,
+      target_frame_ids,
+      target_selector,
+      attachments,
+      schedule_at,
+      agent_name,
+      op_id,
+    }) => {
+      const actor = actorFrom(agent_name)
+      /* the card rides in a wrapper for the same reason remember's row does:
+         replay cannot carry undefined, and a duplicate title is a real answer */
+      const queued = replay(ownerId ?? '', op_id, (): { card?: AgentTask } => ({
+        card: actions.addQueuedCard(
+          canvas_id,
+          title,
+          actor.name,
+          pipeline,
+          attachments,
+          ownerId,
+          target_frame_ids,
+          target_selector,
+          undefined,
+        ),
+      }))
+      const card = queued.card
+      if (!card) return noCanvas(canvas_id)
+      if (schedule_at !== undefined && schedule_at > Date.now()) {
+        card.scheduledAt = schedule_at
+        persist.saveTask(canvas_id, card)
+      }
+      return withFeedback(
+        structured({
+          ok: true as const,
+          card_id: card.id,
+          title: card.status,
+          pipeline: actions.pipelineOf(card),
+          ...(card.scheduledAt ? { scheduled_at: new Date(card.scheduledAt).toISOString() } : {}),
+          note: 'Queued. list_cards shows it; the resident team claims it on its next sweep (after schedule_at, if set).',
+        }),
+        canvas_id,
+        actor,
+      )
+    },
+  )
+
+  tool(
+    'retry_card',
+    {
+      annotations: { readOnlyHint: false, destructiveHint: true },
+      title: 'Retry a failed card',
+      description:
+        'Re-queue a failed or cancelled board card: its failure clears and the next sweep re-claims it. A retry also lifts a human’s stop on the card. Only failed or cancelled work is retryable — an in-progress or finished card stays where it is.',
+      inputSchema: { card_id: z.string(), agent_name: agentName },
+    },
+    async ({ card_id, agent_name }) => {
+      const canvasId = actions.taskCanvasId(card_id)
+      if (!canvasId) return err('not_found', `no card with id ${card_id}`)
+      if (!canvasFor(canvasId)) return noCanvas(canvasId)
+      arrive(canvasId, agent_name)
+      const card = actions.retryCard(canvasId, card_id, actorFrom(agent_name).name)
+      if (!card) return err('not_found', `no card with id ${card_id}`)
+      if (card.failedAt || card.cancelledAt)
+        return err('conflict', 'the card has not failed or been cancelled — only failed work can be retried')
+      return structured({
+        ok: true as const,
+        card_id: card.id,
+        status: card.status,
+        note: 're-queued — the next sweep claims it',
+      })
+    },
+  )
+
+  tool(
+    'retry_feedback',
+    {
+      annotations: { readOnlyHint: false, destructiveHint: true },
+      title: 'Retry failed human feedback',
+      description:
+        'Re-deliver a piece of human feedback that failed to reach an agent (server restart, agent disconnect). The claim clears and the feedback goes back to whoever it was addressed to. Delivered or completed feedback is not retryable.',
+      inputSchema: { feedback_id: z.string(), agent_name: agentName },
+    },
+    async ({ feedback_id, agent_name }) => {
+      const feedback = actions.findFeedback(feedback_id)
+      if (!feedback) return err('not_found', `no feedback with id ${feedback_id}`)
+      if (!canvasFor(feedback.canvasId)) return noCanvas(feedback.canvasId)
+      arrive(feedback.canvasId, agent_name)
+      const retried = actions.retryTaskFeedback(feedback_id, actorFrom(agent_name).name)
+      if (!retried) return err('not_found', `no feedback with id ${feedback_id}`)
+      if (retried.deliveredAt || retried.completedAt)
+        return err('conflict', 'that feedback was already delivered or completed — only failed feedback can be retried')
+      return structured({ ok: true as const, feedback_id, note: 're-queued for delivery' })
+    },
+  )
+
+  /* ---- component library: reusable pieces an instance marker binds into frames ---- */
+
+  /** The summary shape list_components and search_components publish: metadata
+   *  and usage, never the HTML — the full document is get_component's job. */
+  const componentSummaryShape = {
+    id: z.string(),
+    name: z.string(),
+    description: z.string().optional(),
+    width: z.number(),
+    height: z.number(),
+    variant_of: z.string().optional(),
+    instance_count: z.number(),
+    updated_at: z.string(),
+    updated_by: z.string(),
+    html_bytes: z.number(),
+  }
+  const componentSummary = (
+    component: Component,
+    instances: { frameId: string; canvasId: string; name: string }[],
+  ) => ({
+    id: component.id,
+    name: component.name,
+    ...(component.description ? { description: component.description } : {}),
+    width: component.width,
+    height: component.height,
+    ...(component.variantOf ? { variant_of: component.variantOf } : {}),
+    /* distinct frames on this canvas carrying the marker — componentsUsing is
+       per-frame, so the filter is what keeps a foreign frame out of the count */
+    instance_count: instances.filter((u) => u.canvasId === component.canvasId).length,
+    updated_at: new Date(component.updatedAt).toISOString(),
+    updated_by: component.updatedBy,
+    html_bytes: component.html.length,
+  })
+
+  tool(
+    'list_components',
+    {
+      annotations: { readOnlyHint: true, destructiveHint: false },
+      title: 'List the component library',
+      description:
+        'List the canvas’s reusable components — saved pieces (a nav bar, a pricing card) that can be inserted into any frame with insert_component and updated once for every instance with update_component. Metadata and instance counts only; the markup comes from get_component.',
+      inputSchema: {
+        canvas_id: z.string(),
+        limit: z.number().int().min(1).max(200).default(50).describe('Components to return, default 50, max 200'),
+        offset: z.number().int().min(0).default(0).describe('Rows to skip, for paging'),
+        agent_name: agentName.optional(),
+      },
+      outputSchema: { components: z.array(z.object(componentSummaryShape)), total: z.number(), truncated: z.boolean() },
+    },
+    async ({ canvas_id, limit, offset, agent_name }) => {
+      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      arrive(canvas_id, agent_name)
+      const all = store.listComponents(canvas_id)
+      /* one usage scan for the whole page: componentsUsing is cheap, but the
+         same instance set answers every summary in it */
+      const usage = new Map(all.map((c) => [c.id, actions.componentsUsing(c.id)]))
+      const shown = all.slice(offset, offset + limit)
+      return structured({
+        components: shown.map((c) => componentSummary(c, usage.get(c.id) ?? [])),
+        total: all.length,
+        truncated: offset + shown.length < all.length,
+      })
+    },
+  )
+
+  tool(
+    'search_components',
+    {
+      annotations: { readOnlyHint: true, destructiveHint: false },
+      title: 'Search the component library',
+      description:
+        'Find saved components by name or description — "pricing", "nav", "testimonial". Same summaries as list_components; use it instead of paging the whole library when you know what kind of piece you want.',
+      inputSchema: {
+        canvas_id: z.string(),
+        query: z.string().min(1).max(200).describe('Words from the component’s name or description'),
+        limit: z.number().int().min(1).max(20).default(10).describe('Matches to return, default 10, max 20'),
+        agent_name: agentName.optional(),
+      },
+      outputSchema: {
+        components: z.array(z.object(componentSummaryShape)),
+        total: z.number(),
+        truncated: z.boolean(),
+      },
+    },
+    async ({ canvas_id, query, limit, agent_name }) => {
+      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      arrive(canvas_id, agent_name)
+      const needle = query.trim().toLowerCase()
+      const matches = store
+        .listComponents(canvas_id)
+        .filter((c) => c.name.toLowerCase().includes(needle) || (c.description ?? '').toLowerCase().includes(needle))
+      const shown = matches.slice(0, limit)
+      const usage = new Map(shown.map((c) => [c.id, actions.componentsUsing(c.id)]))
+      return structured({
+        components: shown.map((c) => componentSummary(c, usage.get(c.id) ?? [])),
+        total: matches.length,
+        truncated: matches.length > shown.length,
+      })
+    },
+  )
+
+  tool(
+    'get_component',
+    {
+      annotations: { readOnlyHint: true, destructiveHint: false },
+      title: 'Read one component',
+      description:
+        'Read a component’s full markup and metadata before inserting or editing it. The html is capped at 30,000 characters; html_truncated: true means it was clipped — insert_component uses the stored document either way.',
+      inputSchema: {
+        component_id: z.string().describe('Component id from list_components or search_components'),
+        agent_name: agentName.optional(),
+      },
+    },
+    async ({ component_id, agent_name }) => {
+      const component = store.getComponent(component_id)
+      if (!component || !canvasFor(component.canvasId)) return err('not_found', `no component with id ${component_id}`)
+      if (agent_name) arrive(component.canvasId, agent_name)
+      const clipped = component.html.length > MAX_HTML_READ_CHARS
+      return structured({
+        ...componentSummary(component, actions.componentsUsing(component_id)),
+        canvas_id: component.canvasId,
+        html: clipped ? component.html.slice(0, MAX_HTML_READ_CHARS) : component.html,
+        ...(clipped ? { html_truncated: true as const } : {}),
+        created_by: component.createdBy,
+        created_at: component.createdAt,
+      })
+    },
+  )
+
+  tool(
+    'create_component',
+    {
+      annotations: { readOnlyHint: false, destructiveHint: false },
+      title: 'Save a component',
+      description:
+        'Save a reusable component on this canvas’s library: self-contained markup you will insert into frames (insert_component) and keep in sync across them (update_component propagates). width/height are the component’s natural artboard size in px — defaults to 640x480, the size a new frame gets, so pass the real size when the piece is a card or a band rather than a full page.',
+      inputSchema: {
+        canvas_id: z.string(),
+        name: z.string().min(1).max(200).describe('Library name, e.g. "Pricing card / dark"'),
+        html: z
+          .string()
+          .min(1)
+          .describe(
+            `Self-contained markup for the piece — a fragment is fine. Max ${MAX_FRAME_HTML_BYTES} characters.`,
+          ),
+        description: z
+          .string()
+          .max(1000)
+          .optional()
+          .describe('What it is and when to reach for it — what search_components matches'),
+        props: z
+          .unknown()
+          .optional()
+          .describe('Free-form prop declarations agents may vary per instance, e.g. {"title": "string"}'),
+        variant_of: z.string().optional().describe('Component id this one was derived from'),
+        width: z.number().int().min(1).max(20_000).optional().describe('Natural width in px, default 640'),
+        height: z.number().int().min(1).max(20_000).optional().describe('Natural height in px, default 480'),
+        op_id: opId,
+        agent_name: agentName,
+      },
+    },
+    async ({ canvas_id, name, html, description, props, variant_of, width, height, agent_name, op_id }) => {
+      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      if (tooLarge(html))
+        return err('too_large', `html is ${html.length} characters; the limit is ${MAX_FRAME_HTML_BYTES}.`)
+      /* the wrapper keeps replay type-safe across the undefined return: a
+         failed create is a refusal below, not a payload to remember */
+      const payload = replay(ownerId ?? '', op_id, (): { component?: Component } => ({
+        component:
+          actions.createComponent(
+            canvas_id,
+            {
+              name,
+              html,
+              ...(description ? { description } : {}),
+              ...(props !== undefined ? { props } : {}),
+              ...(variant_of ? { variantOf: variant_of } : {}),
+              ...(width !== undefined ? { width } : {}),
+              ...(height !== undefined ? { height } : {}),
+            },
+            actorFrom(agent_name),
+          ) ?? undefined,
+      }))
+      if (!payload.component) return noCanvas(canvas_id)
+      return withFeedback(
+        structured({
+          ok: true as const,
+          component: { ...componentSummary(payload.component, []), canvas_id: payload.component.canvasId },
+        }),
+        canvas_id,
+        actorFrom(agent_name),
+      )
+    },
+  )
+
+  tool(
+    'update_component',
+    {
+      annotations: { readOnlyHint: false, destructiveHint: false },
+      title: 'Update a component',
+      description:
+        'Edit a saved component once and let the change reach its instances: propagate: true (the default) re-renders every frame that carries the component and reports the frames updated and the ones skipped (with reasons — a locked frame is skipped, not blocked). Rename, re-describe, swap the markup or change its props here.',
+      inputSchema: {
+        component_id: z.string(),
+        name: z.string().min(1).max(200).optional(),
+        description: z.string().max(1000).optional(),
+        html: z.string().min(1).optional().describe(`Full replacement markup. Max ${MAX_FRAME_HTML_BYTES} characters.`),
+        props: z.unknown().optional(),
+        propagate: z
+          .boolean()
+          .optional()
+          .describe('Push the change into every frame carrying an instance (default true)'),
+        op_id: opId,
+        agent_name: agentName,
+      },
+      outputSchema: {
+        ok: z.literal(true),
+        component: z.object(componentSummaryShape),
+        updated: z.array(z.object({ frame_id: z.string(), name: z.string() })),
+        skipped: z.array(z.object({ frame_id: z.string(), name: z.string(), reason: z.string() })),
+      },
+    },
+    async ({ component_id, name, description, html, props, propagate, agent_name, op_id }) => {
+      const outcome = await replayAsync(
+        ownerId ?? '',
+        op_id,
+        async (): Promise<{ result?: NonNullable<ReturnType<typeof actions.updateComponent>> }> => ({
+          result:
+            (await actions.updateComponent(
+              component_id,
+              {
+                ...(name !== undefined ? { name } : {}),
+                ...(description !== undefined ? { description } : {}),
+                ...(html !== undefined ? { html } : {}),
+                ...(props !== undefined ? { props } : {}),
+              },
+              actorFrom(agent_name),
+              { propagate: propagate !== false },
+            )) ?? undefined,
+        }),
+      )
+      if (!outcome.result) return err('not_found', `no component with id ${component_id}`)
+      return withFeedback(
+        structured({
+          ok: true as const,
+          component: componentSummary(outcome.result.component, actions.componentsUsing(component_id)),
+          updated: outcome.result.updated.map((u) => ({ frame_id: u.frameId, name: u.name })),
+          skipped: outcome.result.skipped.map((s) => ({ frame_id: s.frameId, name: s.name, reason: s.reason })),
+        }),
+        outcome.result.component.canvasId,
+        actorFrom(agent_name),
+      )
+    },
+  )
+
+  tool(
+    'delete_component',
+    {
+      annotations: { readOnlyHint: false, destructiveHint: true },
+      title: 'Delete a component',
+      description:
+        'Remove a component from the library (confirm: true). Refused while frames still hold instances — the instances’ markup is left alone either way, it simply stops being bound to a library entry; pass force: true to delete anyway.',
+      inputSchema: {
+        component_id: z.string(),
+        confirm: z.literal(true).describe('Must be true — deleting unbinds every instance'),
+        force: z.boolean().optional().describe('Delete even though frames still hold instances'),
+        op_id: opId,
+        agent_name: agentName,
+      },
+    },
+    async ({ component_id, confirm, force, agent_name }) => {
+      if (confirm !== true)
+        return err('invalid_input', 'deleting a component unbinds its instances — pass confirm: true to go ahead')
+      const component = store.getComponent(component_id)
+      if (!component || !canvasFor(component.canvasId)) return err('not_found', `no component with id ${component_id}`)
+      const using = actions.componentsUsing(component_id).filter((u) => u.canvasId === component.canvasId)
+      if (using.length && !force)
+        return err(
+          'conflict',
+          `${using.length} frame(s) still hold an instance (${using
+            .slice(0, 5)
+            .map((u) => u.name)
+            .join(', ')}${using.length > 5 ? ', …' : ''}) — detach_component them first, or pass force: true`,
+          {
+            instance_frames: using.slice(0, 5).map((u) => ({ frame_id: u.frameId, name: u.name })),
+            count: using.length,
+            force_available: true,
+          },
+        )
+      const outcome = actions.deleteComponent(component_id, actorFrom(agent_name), { force })
+      if (!outcome) return err('not_found', `no component with id ${component_id}`)
+      if (!outcome.deleted) return err('conflict', outcome.reason ?? 'the component still has instances')
+      return text({ ok: true, deleted: component.name })
+    },
+  )
+
+  tool(
+    'insert_component',
+    {
+      annotations: { readOnlyHint: false, destructiveHint: false },
+      title: 'Insert a component instance',
+      description:
+        'Insert a saved component into a frame: a single wrapper element carrying the component marker is placed under parent_selector (append, prepend, or a 0-based child index), with optional per-instance prop overrides. The instance tracks its component — update_component reaches it. Returns the new element’s selector.',
+      inputSchema: {
+        frame_id: z.string(),
+        component_id: z.string().describe('Component id from list_components'),
+        parent_selector: z.string().describe('The element to insert into, e.g. "main" or "#content"'),
+        position: z
+          .union([z.literal('append'), z.literal('prepend'), z.number().int().min(0).max(1000)])
+          .describe('append, prepend, or a 0-based child index'),
+        overrides: z
+          .record(z.string(), z.string())
+          .optional()
+          .describe('Per-instance prop values overriding the component defaults, e.g. {"title": "Spring sale"}'),
+        expected_updated_at: z.string().optional().describe("The frame's updatedAt from when you read it"),
+        takeover: z.boolean().optional().describe('Edit a frame another agent holds the lock on'),
+        agent_name: agentName,
+      },
+      outputSchema: { ok: z.literal(true), frame: z.unknown(), selector: z.string() },
+    },
+    async ({
+      frame_id,
+      component_id,
+      parent_selector,
+      position,
+      overrides,
+      agent_name,
+      expected_updated_at,
+      takeover,
+    }) => {
+      const before = frameFor(frame_id)
+      if (!before) return noFrame(frame_id)
+      const component = store.getComponent(component_id)
+      if (!component || !canvasFor(component.canvasId)) return err('not_found', `no component with id ${component_id}`)
+      if (component.canvasId !== before.canvasId)
+        return err(
+          'forbidden',
+          `component ${component_id} belongs to another canvas — create it there or copy it over first`,
+        )
+      const gated = reviewGate(before.canvasId)
+      if (gated) return gated
+      const stale = staleConflict(before, expected_updated_at)
+      if (stale) return stale
+      takeOver(frame_id, before.canvasId, actorFrom(agent_name), takeover)
+      let frame: Frame | undefined
+      try {
+        frame = (
+          await actions.insertComponent(
+            frame_id,
+            component_id,
+            { parent_selector, position, ...(overrides ? { overrides } : {}) },
+            actorFrom(agent_name),
+          )
+        )?.frame
+      } catch (e) {
+        if (e instanceof actions.ReviewModeError) throw e
+        const conflict = lockConflict(e)
+        if (conflict) return conflict
+        throw e
+      }
+      if (!frame) return noFrame(frame_id)
+      /* the actions layer returns the wrapper's own selector with the frame */
+      const selector = `[data-doop-component="${component_id}"]`
+      return withStatusNudge(
+        withFeedback(
+          structuredWithNudge(
+            { ok: true as const, frame: frameSummary(frame), selector },
+            'Instance placed. Call get_frame_screenshot to see it in place, and pass the same selector to update_elements if it needs a nudge.',
+          ),
+          before.canvasId,
+          actorFrom(agent_name),
+        ),
+        before.canvasId,
+        actorFrom(agent_name),
+      )
+    },
+  )
+
+  tool(
+    'detach_component',
+    {
+      annotations: { readOnlyHint: false, destructiveHint: false },
+      title: 'Detach a component instance',
+      description:
+        'Unbind one component instance from its library entry: the wrapper element and its markup stay in the frame exactly as they are, but the component no longer tracks it — later update_component calls skip this frame. The selector is the wrapper carrying data-doop-component.',
+      inputSchema: {
+        frame_id: z.string(),
+        selector: z.string().describe('The instance wrapper’s selector (from insert_component)'),
+        expected_updated_at: z.string().optional().describe("The frame's updatedAt from when you read it"),
+        takeover: z.boolean().optional().describe('Edit a frame another agent holds the lock on'),
+        agent_name: agentName,
+      },
+      outputSchema: { ok: z.literal(true), frame: z.unknown() },
+    },
+    async ({ frame_id, selector, agent_name, expected_updated_at, takeover }) => {
+      const before = frameFor(frame_id)
+      if (!before) return noFrame(frame_id)
+      const stale = staleConflict(before, expected_updated_at)
+      if (stale) return stale
+      const gated = reviewGate(before.canvasId)
+      if (gated) return gated
+      takeOver(frame_id, before.canvasId, actorFrom(agent_name), takeover)
+      let frame: Frame | undefined
+      try {
+        frame = (await actions.detachComponent(frame_id, selector, actorFrom(agent_name)))?.frame
+      } catch (e) {
+        if (e instanceof actions.ReviewModeError) throw e
+        const conflict = lockConflict(e)
+        if (conflict) return conflict
+        throw e
+      }
+      if (!frame) return noFrame(frame_id)
+      return withStatusNudge(
+        withFeedback(
+          structured({ ok: true as const, frame: frameSummary(frame) }),
+          before.canvasId,
+          actorFrom(agent_name),
+        ),
+        before.canvasId,
         actorFrom(agent_name),
       )
     },
@@ -3509,6 +4260,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
       try {
         await progress(extra, 0, `Rendering “${f.name}” to check it against the canvas tokens…`)
         report = await lintFrame(f, tokens, resolved ? { viewport: resolved } : {})
+        await progress(extra, 0.5, `Comparing “${f.name}” against the canvas tokens…`)
       } catch (e) {
         return err('upstream_failed', e instanceof Error ? e.message : 'could not render this frame for linting')
       }
@@ -3518,6 +4270,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
           ? `${total} value(s) drift off the canvas tokens — read them with get_tokens and use those exact colors, fonts and scales so this frame matches the rest of the canvas.`
           : undefined
         : 'No design tokens on this canvas yet — define them with set_tokens so every frame shares one palette, type and scale.'
+      await progress(extra, 1, `Linted “${f.name}”.`)
       return withFeedback(
         nudge ? structuredWithNudge(report, nudge) : structured(report),
         f.canvasId,
@@ -3581,6 +4334,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
           ...(resolved ? { viewport: resolved } : {}),
           ...(state ? { state } : {}),
         })
+        await progress(extra, 0.5, `Checking “${f.name}” against the accessibility rules…`)
       } catch (e) {
         if (e instanceof StateRenderError) return err(e.code, e.message)
         return err('upstream_failed', e instanceof Error ? e.message : 'could not render this frame for audit')
@@ -3591,6 +4345,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
           : undefined
       const payload = state ? { ...report, state: stateLabel(state) } : report
       const result = nudge ? structuredWithNudge(payload, nudge) : structured(payload)
+      await progress(extra, 1, `Audited “${f.name}”.`)
       return withFeedback(result, f.canvasId, actorFrom(agent_name))
     },
   )
@@ -3701,6 +4456,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
       try {
         await progress(extra, 0, `Rendering both designs to compare them…`)
         diff = await diffFrames(f, other, threshold === undefined ? {} : { threshold })
+        await progress(extra, 0.5, `Measuring the difference against ${label}…`)
       } catch (e) {
         return err('upstream_failed', e instanceof Error ? e.message : 'could not render the frames for comparison')
       }
@@ -3719,6 +4475,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
         against: label,
         diff_image_url: url,
       }
+      await progress(extra, 1, `Compared “${f.name}” against ${label}.`)
       return withFeedback(
         {
           content: [
@@ -3728,6 +4485,206 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
           structuredContent: payload,
         },
         f.canvasId,
+        actorFrom(agent_name),
+      )
+    },
+  )
+
+  /* ---- token usage and repair: read the drift, then write it back ---- */
+
+  tool(
+    'get_token_usage',
+    {
+      annotations: { readOnlyHint: true, destructiveHint: false },
+      title: 'Read a frame’s token usage',
+      description:
+        'Per-element account of which design tokens a rendered frame actually uses, and where it drifts off them: the token (or raw value) behind each element’s color, background, font, radius and spacing, plus the off-token findings the lint reports — value, nearest token, and how far away it is. Scope it with selector to read one subtree. The element list is capped; truncated: true means the report was cut.',
+      inputSchema: {
+        canvas_id: z.string(),
+        frame_id: z.string(),
+        selector: z.string().optional().describe('Scope the report to this element and its descendants'),
+        agent_name: agentName,
+      },
+      outputSchema: {
+        frame_id: z.string(),
+        viewport: z.object({ width: z.number(), height: z.number() }),
+        elements: z.array(
+          z.object({
+            selector: z.string(),
+            tag: z.string(),
+            tokens_used: z.object({
+              color: z.string().optional(),
+              background: z.string().optional(),
+              font: z.string().optional(),
+              radius: z.string().optional(),
+              spacing: z.string().optional(),
+            }),
+            off_token: z.array(
+              z.object({
+                property: z.string(),
+                value: z.string(),
+                nearest_token: z.string().optional(),
+                delta: z.number().optional(),
+              }),
+            ),
+          }),
+        ),
+        truncated: z.boolean(),
+      },
+    },
+    async ({ canvas_id, frame_id, selector, agent_name }) => {
+      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      const f = frameFor(frame_id)
+      if (!f || f.canvasId !== canvas_id) return noFrame(frame_id)
+      arrive(canvas_id, agent_name)
+      const budget = takeRender(agent_name)
+      if (budget) return budget
+      const tokens = canvasFor(canvas_id)?.tokens
+      let probe: Probe
+      try {
+        probe = await probeFrame(f)
+      } catch (e) {
+        return err('upstream_failed', e instanceof Error ? e.message : 'could not render this frame for the token read')
+      }
+      /* the same comparator the lint runs — one definition of "off token", so
+         this read and lint_frame can never disagree about a value */
+      const report = lintProbe(probe, tokens)
+      /* selector scoping follows motionFrame's reading: the element itself and
+         its descendants, named by the probe's own selectors */
+      const scoped = (el: (typeof probe.elements)[number]) =>
+        !selector || el.selector === selector || el.selector.startsWith(`${selector} > `)
+      const visible = probe.elements.filter((el) => !el.attrs.hiddenFromAT && scoped(el))
+      const elements = visible.map((el) => {
+        const violations = report.violations.filter((v) => v.selector === el.selector)
+        return {
+          selector: el.selector,
+          tag: el.tag,
+          tokens_used: {
+            ...(el.style.color ? { color: el.style.color } : {}),
+            ...(el.style.background && el.style.background !== 'rgba(0, 0, 0, 0)'
+              ? { background: el.style.background }
+              : {}),
+            ...(el.style.font ? { font: el.style.font } : {}),
+            ...(el.style.borderRadius && el.style.borderRadius !== '0px' ? { radius: el.style.borderRadius } : {}),
+            ...(el.style.gap && el.style.gap !== 'normal' ? { spacing: el.style.gap } : {}),
+          },
+          off_token: violations.map((v) => ({
+            property: v.property,
+            value: v.value,
+            ...(v.nearest_token ? { nearest_token: v.nearest_token } : {}),
+            ...(v.distance !== undefined ? { delta: v.distance } : {}),
+          })),
+        }
+      })
+      return withFeedback(
+        structured({
+          frame_id,
+          viewport: { width: f.width, height: f.height },
+          elements,
+          truncated: elements.length < probe.elements.length,
+        }),
+        canvas_id,
+        actorFrom(agent_name),
+      )
+    },
+  )
+
+  tool(
+    'fix_frame_tokens',
+    {
+      annotations: { readOnlyHint: false, destructiveHint: false },
+      title: 'Snap a frame back onto its tokens',
+      description:
+        'Fix the values a frame drifts off the canvas tokens: a fresh lint runs, every finding within the fix tolerance is rewritten to its token (var(--color-ink), var(--space-8) — values the render resolves), and the result is applied with the element editor and written through updateFrame. Restrict the pass with only (rule ids from lint_frame); rehearse with dry_run. Each fixed entry names what moved and what it became; each skipped entry names the value a token was not close enough to claim.',
+      inputSchema: {
+        frame_id: z.string(),
+        only: z
+          .array(
+            z.enum(['off_token_color', 'off_token_font', 'off_token_type', 'off_scale_radius', 'off_grid_spacing']),
+          )
+          .optional()
+          .describe('Fix only these rule classes; default fixes everything within tolerance'),
+        expected_updated_at: z.string().optional().describe("The frame's updatedAt from when you read it"),
+        takeover: z.boolean().optional().describe('Edit a frame another agent holds the lock on'),
+        dry_run: z.boolean().optional().describe('Report the planned fixes and write nothing'),
+        agent_name: agentName,
+      },
+      outputSchema: {
+        ok: z.literal(true),
+        frame: z.unknown().optional(),
+        fixed: z.array(z.object({ selector: z.string(), property: z.string(), from: z.string(), to: z.string() })),
+        skipped: z.array(
+          z.object({ selector: z.string(), property: z.string(), value: z.string(), reason: z.string() }),
+        ),
+        dry_run: z.literal(true).optional(),
+        would_apply: z.boolean().optional(),
+        diff: diffShape.optional(),
+        bytes_before: z.number().optional(),
+        bytes_after: z.number().optional(),
+      },
+    },
+    async ({ frame_id, only, expected_updated_at, takeover, dry_run, agent_name }) => {
+      const before = frameFor(frame_id)
+      if (!before) return noFrame(frame_id)
+      const tokens = canvasFor(before.canvasId)?.tokens
+      if (!tokens)
+        return err('unsupported', 'this canvas has no design tokens to fix toward — set them with set_tokens first')
+      const stale = staleConflict(before, expected_updated_at)
+      if (stale) return stale
+      const gated = reviewGate(before.canvasId)
+      if (gated) return gated
+      const budget = takeRender(agent_name)
+      if (budget) return budget
+      arrive(before.canvasId, agent_name)
+      let report
+      try {
+        report = await lintFrame(before, tokens)
+      } catch (e) {
+        return err('upstream_failed', e instanceof Error ? e.message : 'could not render this frame for linting')
+      }
+      const plan = planTokenFixes(report, tokens, only as LintRule[] | undefined)
+      if (plan.fixed.length === 0) return structured({ ok: true as const, fixed: [], skipped: plan.skipped })
+      /* one element edit per fix: the planned `to` is a var() the render
+         resolves, so each rewrite is the exact declaration the lint judged */
+      const edits = plan.fixed.map((fix) => ({ selector: fix.selector, style: { [fix.property]: fix.to } }))
+      if (dry_run) {
+        try {
+          const preview = await updateElements(before, edits)
+          return structured(
+            dryRunPayload(before.html, storedHtml(preview.html), { fixed: plan.fixed, skipped: plan.skipped }),
+          )
+        } catch (e) {
+          if (e instanceof ElementEditError) return err(e.code, e.message)
+          throw e
+        }
+      }
+      takeOver(frame_id, before.canvasId, actorFrom(agent_name), takeover)
+      let outcome: UpdateElementsResult
+      try {
+        outcome = await updateElements(before, edits)
+      } catch (e) {
+        if (e instanceof ElementEditError) return err(e.code, e.message)
+        throw e
+      }
+      let frame: Frame | undefined
+      try {
+        frame = actions.updateFrame(frame_id, { html: outcome.html }, actorFrom(agent_name))
+      } catch (e) {
+        const conflict = lockConflict(e)
+        if (conflict) return conflict
+        throw e
+      }
+      if (!frame) return noFrame(frame_id)
+      return withStatusNudge(
+        withFeedback(
+          structuredWithNudge(
+            { ok: true as const, frame: frameSummary(frame), fixed: plan.fixed, skipped: plan.skipped },
+            'Token fixes applied. Call get_frame_screenshot to see the frame on its tokens.',
+          ),
+          before.canvasId,
+          actorFrom(agent_name),
+        ),
+        before.canvasId,
         actorFrom(agent_name),
       )
     },
@@ -4647,6 +5604,239 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
     },
   )
 
+  /* ---- motion, brand, images, fonts: the senses beyond a screenshot ---- */
+
+  tool(
+    'get_motion_context',
+    {
+      annotations: { readOnlyHint: true, destructiveHint: false },
+      title: 'Read a frame’s motion',
+      description:
+        'What a frame does over time, which no screenshot shows: the keyframes and media queries its stylesheet declares, which elements run transitions or animations and for how long, and whether it honors reduced motion. Scope with selector for one subtree. Use it before judging animation work, or when a frame feels "slow" and you need the numbers.',
+      inputSchema: {
+        frame_id: z.string(),
+        selector: z.string().optional().describe('Scope the report to this element and its descendants'),
+        agent_name: agentName,
+      },
+    },
+    async ({ frame_id, selector, agent_name }) => {
+      const budget = takeRender(agent_name)
+      if (budget) return budget
+      const f = frameFor(frame_id)
+      if (!f) return noFrame(frame_id)
+      arrive(f.canvasId, agent_name)
+      try {
+        const report = await motionFrame(f, { ...(selector ? { selector } : {}) })
+        return withFeedback(structured({ frame_id, ...report }), f.canvasId, actorFrom(agent_name))
+      } catch (e) {
+        return err(
+          'upstream_failed',
+          e instanceof Error ? e.message : 'could not render this frame for the motion read',
+        )
+      }
+    },
+  )
+
+  tool(
+    'check_brand_compliance',
+    {
+      annotations: { readOnlyHint: true, destructiveHint: false },
+      title: 'Check brand rules',
+      description:
+        'Check a rendered frame against the brand rules a style guide declares in its "## Brand rules" section — palette, forbidden colors, licensed fonts, logo presence, minimum contrast. Read get_guidelines first: the section heading and the `- kind: value` lines are the grammar this checks. Verdict pass/fail with per-violation selectors; blocking rules (marked with `blocking: <id>`) report as blocking.',
+      inputSchema: {
+        canvas_id: z.string(),
+        frame_id: z.string(),
+        guideline: z
+          .string()
+          .optional()
+          .describe('Which style guide holds the brand rules; default is the design-system doc, else the first guide'),
+        agent_name: agentName,
+      },
+    },
+    async ({ canvas_id, frame_id, guideline, agent_name }) => {
+      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      const f = frameFor(frame_id)
+      if (!f || f.canvasId !== canvas_id) return noFrame(frame_id)
+      arrive(canvas_id, agent_name)
+      const budget = takeRender(agent_name)
+      if (budget) return budget
+      const docs = store.getGuidelines(canvas_id)
+      const doc = guideline
+        ? docs.find((d) => d.name === guideline.trim().toLowerCase())
+        : (docs.find((d) => d.name === 'design-system') ?? docs[0])
+      if (guideline && !doc)
+        return err(
+          'not_found',
+          docs.length
+            ? `no style guide named “${guideline}” — this canvas has: ${docs.map((d) => d.name).join(', ')}`
+            : 'no style guides on this canvas yet — brand rules live in a guide’s "## Brand rules" section',
+        )
+      if (!doc)
+        return err(
+          'not_found',
+          'no style guides on this canvas yet — brand rules live in a guide’s "## Brand rules" section',
+        )
+      try {
+        const report = await checkBrandCompliance(f, doc.markdown)
+        return withFeedback(structured({ frame_id, guideline: doc.name, ...report }), canvas_id, actorFrom(agent_name))
+      } catch (e) {
+        return err(
+          'upstream_failed',
+          e instanceof Error ? e.message : 'could not render this frame for the brand check',
+        )
+      }
+    },
+  )
+
+  tool(
+    'generate_image',
+    {
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+      title: 'Generate an image',
+      description:
+        'Generate images from a prompt through the configured provider and store them as canvas assets with permanent /a/ URLs ready for <img src>. Real imagery beats placeholder tiles; reference_asset_ids (existing canvas assets) steer composition and style. The provider bill follows the connected account, else the server key. Generation takes tens of seconds per image.',
+      inputSchema: {
+        canvas_id: z.string(),
+        prompt: z
+          .string()
+          .min(1)
+          .max(2000)
+          .describe('Scene-level description of the image, not a label — describe light, subject, mood'),
+        size: z.enum(['1024x1024', '1536x1024', '1024x1536']).describe('Square, landscape or portrait'),
+        count: z.number().int().min(1).max(4).default(1).describe('How many candidates, default 1'),
+        reference_asset_ids: z
+          .array(z.string())
+          .max(3)
+          .optional()
+          .describe('Canvas assets to steer the result (product shot, face, illustration style)'),
+        style: z
+          .string()
+          .max(200)
+          .optional()
+          .describe('A style modifier folded into the prompt, e.g. "flat vector, muted palette"'),
+        op_id: opId,
+        agent_name: agentName,
+      },
+      outputSchema: {
+        ok: z.literal(true),
+        images: z.array(z.object({ url: z.string(), bytes: z.number() })),
+      },
+    },
+    async ({ canvas_id, prompt, size, count, reference_asset_ids, style, agent_name, op_id }) => {
+      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      if (imageProvider() === 'none')
+        return err(
+          'unsupported',
+          `no image provider is configured on this server — ${IMAGE_NOT_CONFIGURED}. Until then, draw with inline SVG/CSS, or search_images for photography.`,
+        )
+      const now = Date.now()
+      const limitKey = ownerId ?? agent_name
+      const hits = (imageHits.get(limitKey) ?? []).filter((t) => now - t < 60_000)
+      if (hits.length >= IMAGES_PER_MIN)
+        return err('rate_limited', `image generation rate limit (${IMAGES_PER_MIN}/min) — wait a minute`)
+      hits.push(now)
+      imageHits.set(limitKey, hits)
+      try {
+        const references: Buffer[] = []
+        for (const id of reference_asset_ids ?? []) {
+          const asset = await assets.getAsset(id)
+          if (!asset) return err('not_found', `no asset with id ${id} — list_assets has the canvas's own`)
+          references.push(asset.buf)
+        }
+        const payload = await replayAsync(ownerId ?? '', op_id, async () => {
+          const generated = await generateImage({
+            prompt,
+            size,
+            count,
+            ...(style ? { style } : {}),
+            referenceImages: references,
+          })
+          const images: { url: string; bytes: number }[] = []
+          for (const { png } of generated) {
+            const asset = await assets.createAsset(png, { canvasId: canvas_id, ownerId, uploadedBy: agent_name })
+            images.push({ url: `${PUBLIC_ORIGIN}/a/${asset.id}.${asset.ext}`, bytes: asset.size })
+          }
+          return { ok: true as const, images }
+        })
+        return withFeedback(
+          textWithNudge(
+            payload,
+            'Embed with <img src> and real alt text; always get_frame_screenshot to see it in place. Do not inline data: URIs — the URLs are permanent.',
+          ),
+          canvas_id,
+          actorFrom(agent_name),
+        )
+      } catch (e) {
+        return err('upstream_failed', e instanceof Error ? e.message : 'image generation failed')
+      }
+    },
+  )
+
+  tool(
+    'upload_font',
+    {
+      annotations: { readOnlyHint: false, destructiveHint: false },
+      title: 'Upload a font',
+      description:
+        "Store a font file (woff2/woff/ttf, max 5 MB) as a canvas asset and get back a ready-to-paste @font-face block plus the permanent /a/ URL — put it in set_frame_css or the frame's own <style> and the family renders on the canvas. Exactly one of source_url (remote file) or data (base64) names where the bytes come from.",
+      inputSchema: {
+        canvas_id: z.string(),
+        source_url: z.string().optional().describe('Public http(s) URL to fetch the font from'),
+        data: z
+          .string()
+          .optional()
+          .describe('The font file as base64 (raw or a data: URL) — last resort for tiny files'),
+        family: z.string().min(1).max(120).describe('The font-family name to declare, e.g. "Inter Tight"'),
+        weight: z.number().int().min(100).max(900).optional().describe('Weight this file carries, e.g. 400'),
+        style: z.enum(['normal', 'italic']).optional().describe('Style this file carries, default normal'),
+        op_id: opId,
+        agent_name: agentName,
+      },
+      outputSchema: {
+        ok: z.literal(true),
+        url: z.string(),
+        font_face: z.string(),
+      },
+    },
+    async ({ canvas_id, source_url, data, family, weight, style, agent_name, op_id }) => {
+      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      const provided = [source_url, data].filter(Boolean).length
+      if (provided !== 1)
+        return err('invalid_input', 'provide exactly one of source_url (remote file) or data (base64)')
+      try {
+        const payload = await replayAsync(ownerId ?? '', op_id, async () => {
+          const buf = data
+            ? Buffer.from(data.replace(/^data:[^,]*;base64,/, ''), 'base64')
+            : await assets.fetchRemote(source_url!)
+          const asset = await assets.createAsset(buf, { canvasId: canvas_id, ownerId, uploadedBy: agent_name })
+          const url = `${PUBLIC_ORIGIN}/a/${asset.id}.${asset.ext}`
+          const src = `url('${url}') format('${asset.ext === 'ttf' ? 'truetype' : asset.ext}')`
+          const font_face = [
+            '@font-face {',
+            `  font-family: '${family}';`,
+            `  src: ${src};`,
+            ...(weight ? [`  font-weight: ${weight};`] : []),
+            ...(style ? [`  font-style: ${style};`] : []),
+            '  font-display: swap;',
+            '}',
+          ].join('\n')
+          return { ok: true as const, url, font_face }
+        })
+        return withFeedback(
+          text({
+            ...payload,
+            usage: `Paste font_face into set_frame_css (or the frame's <style>), then use font-family: '${family}' — the frame renders it once the face is declared.`,
+          }),
+          canvas_id,
+          actorFrom(agent_name),
+        )
+      } catch (e) {
+        return err('upstream_failed', e instanceof Error ? e.message : 'font upload failed')
+      }
+    },
+  )
+
   tool(
     'search_icons',
     {
@@ -4756,6 +5946,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
       try {
         await progress(extra, 0, `Loading ${url}…`)
         const site = await viewWebsite(url)
+        await progress(extra, 1, `Loaded ${site.finalUrl}.`)
         const result = {
           content: [
             { type: 'image' as const, data: site.screenshot.toString('base64'), mimeType: 'image/jpeg' },
@@ -4820,6 +6011,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
           includePreview: true,
         })
         if (!frame) return noCanvas(canvas_id)
+        await progress(extra, 1, `Imported ${normalizedUrl}.`)
 
         /* as_reference: the page is source material, not a frame to keep — pin
            it to Memory and take the frame back off the canvas, so a reference
@@ -4941,6 +6133,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
         await progress(extra, 0, `Rendering ${source} to read its design…`)
         try {
           probe = await probeFrame(frame)
+          await progress(extra, 1, `Read the design of ${source}.`)
         } catch (e) {
           return err('upstream_failed', e instanceof Error ? e.message : 'could not render this frame')
         }
@@ -4972,6 +6165,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
             updatedAt: 0,
             updatedBy: actor.name,
           })
+          await progress(extra, 1, `Captured ${normalizedUrl}.`)
         } catch (e) {
           return err(
             'upstream_failed',
@@ -5166,7 +6360,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
     {
       title: 'Read a background job',
       description:
-        'Read the state of a job started by import_site: status, how many pages are done, and each page’s frame id or the reason it failed. Poll this until status is done or failed.',
+        'Read the state of a job started by import_site: status, how far it has got, and each page’s frame id or the reason it failed. Poll this until status is done or failed — or block on several at once with wait_for_jobs.',
       annotations: { readOnlyHint: true, destructiveHint: false },
       inputSchema: {
         job_id: z.string(),
@@ -5180,6 +6374,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
         status: z.enum(['queued', 'running', 'done', 'failed']),
         total: z.number(),
         completed: z.number(),
+        progress: z.object({ completed: z.number(), total: z.number() }),
         error: z.string().optional(),
         results: z.array(
           z.object({
@@ -5202,8 +6397,112 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
         status: job.status,
         total: job.total,
         completed: job.completed,
+        progress: jobProgress(job_id) ?? { completed: job.completed, total: job.total },
         ...(job.error ? { error: job.error } : {}),
         results: job.results,
+      })
+    },
+  )
+
+  tool(
+    'wait_for_jobs',
+    {
+      annotations: { readOnlyHint: true, destructiveHint: false },
+      title: 'Wait for background jobs',
+      description:
+        'Block until every named job settles (done or failed) or the timeout runs out — whichever first — then read each job’s state in one result instead of polling get_job in a loop. A timed_out job is not failed: call again to keep waiting. Only jobs your account started are visible.',
+      inputSchema: {
+        job_ids: z
+          .array(z.string())
+          .min(1)
+          .max(10)
+          .describe('Job ids from import_site (or another job-returning call)'),
+        timeout_seconds: z.number().min(5).max(120).default(60).describe('How long to block, default 60'),
+        agent_name: agentName.optional(),
+      },
+      outputSchema: {
+        jobs: z.array(
+          z.object({
+            job_id: z.string(),
+            status: z.enum(['queued', 'running', 'done', 'failed', 'not_found']),
+            completed: z.number(),
+            total: z.number(),
+            results: z
+              .array(
+                z.object({
+                  label: z.string(),
+                  ok: z.boolean(),
+                  detail: z.string().optional(),
+                  frameId: z.string().optional(),
+                }),
+              )
+              .optional(),
+          }),
+        ),
+        timed_out: z.boolean(),
+      },
+    },
+    async ({ job_ids, timeout_seconds }) => {
+      const before = new Map(
+        job_ids.map((id) => {
+          const job = getJob(id)
+          return [id, job && (!job.ownerId || !ownerId || job.ownerId === ownerId) ? job.status : undefined]
+        }),
+      )
+      await waitForJobs(
+        job_ids.filter(
+          (id) => before.get(id) !== undefined && before.get(id) !== 'done' && before.get(id) !== 'failed',
+        ),
+        (timeout_seconds ?? 60) * 1000,
+      )
+      const jobs = job_ids.map((id) => {
+        const job = getJob(id)
+        /* owner scoping reads exactly like get_job: a foreign job is no job */
+        const visible = job && (!job.ownerId || !ownerId || job.ownerId === ownerId)
+        return {
+          job_id: id,
+          status: (visible ? job!.status : 'not_found') as 'queued' | 'running' | 'done' | 'failed' | 'not_found',
+          completed: visible ? job!.completed : 0,
+          total: visible ? job!.total : 0,
+          ...(visible && (job!.status === 'done' || job!.status === 'failed') ? { results: job!.results } : {}),
+        }
+      })
+      return structured({
+        jobs,
+        timed_out: jobs.some((j) => j.status === 'queued' || j.status === 'running'),
+      })
+    },
+  )
+
+  tool(
+    'cancel_job',
+    {
+      annotations: { readOnlyHint: false, destructiveHint: true },
+      title: 'Cancel a background job',
+      description:
+        'Ask a running job to stop at its next unit boundary — the pages already captured stay, the rest never start. The worker owns its ending: the job reports done or failed with whatever it finished, so read the result back with get_job.',
+      inputSchema: {
+        job_id: z.string(),
+        agent_name: agentName.optional(),
+      },
+      outputSchema: {
+        ok: z.boolean(),
+        cancelled: z.boolean().optional(),
+        completed: z.number().optional(),
+        total: z.number().optional(),
+      },
+    },
+    async ({ job_id }) => {
+      const job = getJob(job_id)
+      if (!job) return err('not_found', `no job with id ${job_id} — jobs are dropped 30 minutes after they finish`)
+      if (job.ownerId && ownerId && job.ownerId !== ownerId) return err('not_found', `no job with id ${job_id}`)
+      const cancelled = cancelJob(job_id)
+      if (!cancelled) return err('conflict', `job ${job_id} has already finished — nothing to cancel`)
+      return structured({
+        ok: true as const,
+        cancelled: true,
+        completed: cancelled.completed,
+        total: cancelled.total,
       })
     },
   )
@@ -5268,8 +6567,10 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
           ...(clip ? { clip } : {}),
           ...(state ? { state } : {}),
         })
+        await progress(extra, 0.5, `Rendered “${f.name}”; encoding the PNG…`)
         const width = resolved?.width ?? f.width
         const height = resolved?.height ?? f.height
+        await progress(extra, 1, `Captured “${f.name}”.`)
         return withFeedback(
           {
             content: [
@@ -5716,6 +7017,96 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
     },
   )
 
+  /* ---- frame script: the escape hatch for what the element tools cannot say ---- */
+
+  tool(
+    'frame_script_api',
+    {
+      annotations: { readOnlyHint: true, destructiveHint: false },
+      title: 'Read the frame-script surface',
+      description:
+        'The exact API a frame script runs against: the doop global, its methods, and the limits (size, time, forbidden markup, blocked network). Read it before writing your first run_frame_script, or whenever a script failed in a way the API doc explains.',
+      inputSchema: { agent_name: agentName.optional() },
+    },
+    async () => ({ content: [{ type: 'text' as const, text: FRAME_SCRIPT_API }] }),
+  )
+
+  tool(
+    'run_frame_script',
+    {
+      annotations: { readOnlyHint: false, destructiveHint: false },
+      title: 'Run a script in a frame',
+      description:
+        "Run a short script inside a rendered frame to make the one structural change the element tools cannot express — a bulk renumber, every repeated card rewritten. The script sees the live DOM through the doop global (read the surface with frame_script_api) and the frame's new HTML is what gets saved. Nothing else can save the change: this is the write. dry_run returns the diff without writing. Scripts cannot add scripts/iframes or touch the network, and time out after 5 seconds — nothing is saved from a timed-out run.",
+      inputSchema: {
+        frame_id: z.string(),
+        script: z.string().min(1).max(20_000).describe('The script body — JavaScript, async/await allowed'),
+        expected_updated_at: z.string().optional().describe("The frame's updatedAt from when you read it"),
+        takeover: z.boolean().optional().describe('Edit a frame another agent holds the lock on'),
+        dry_run: z.boolean().optional().describe('Return the diff the script would produce and write nothing'),
+        agent_name: agentName,
+      },
+      outputSchema: {
+        ok: z.literal(true).optional(),
+        frame: z.unknown().optional(),
+        dry_run: z.literal(true).optional(),
+        would_apply: z.boolean().optional(),
+        diff: diffShape.optional(),
+        bytes_before: z.number().optional(),
+        bytes_after: z.number().optional(),
+      },
+    },
+    async ({ frame_id, script, expected_updated_at, takeover, dry_run, agent_name }) => {
+      const before = frameFor(frame_id)
+      if (!before) return noFrame(frame_id)
+      const stale = staleConflict(before, expected_updated_at)
+      if (stale) return stale
+      const gated = reviewGate(before.canvasId)
+      if (gated) return gated
+      const budget = takeRender(agent_name)
+      if (budget) return budget
+      arrive(before.canvasId, agent_name)
+      if (dry_run) {
+        try {
+          const preview = await runFrameScript(before, script)
+          return structured(dryRunPayload(before.html, storedHtml(preview.html)))
+        } catch (e) {
+          if (e instanceof ElementEditError) return err(e.code, e.message)
+          throw e
+        }
+      }
+      takeOver(frame_id, before.canvasId, actorFrom(agent_name), takeover)
+      let outcome: { html: string }
+      try {
+        outcome = await runFrameScript(before, script)
+      } catch (e) {
+        if (e instanceof ElementEditError) return err(e.code, e.message)
+        throw e
+      }
+      let frame: Frame | undefined
+      try {
+        frame = actions.updateFrame(frame_id, { html: outcome.html }, actorFrom(agent_name))
+      } catch (e) {
+        const conflict = lockConflict(e)
+        if (conflict) return conflict
+        throw e
+      }
+      if (!frame) return noFrame(frame_id)
+      return withStatusNudge(
+        withFeedback(
+          structuredWithNudge(
+            { ok: true as const, frame: frameSummary(frame) },
+            'Script applied. Call get_frame_screenshot to see the result.',
+          ),
+          before.canvasId,
+          actorFrom(agent_name),
+        ),
+        before.canvasId,
+        actorFrom(agent_name),
+      )
+    },
+  )
+
   tool(
     'update_frame',
     {
@@ -5831,6 +7222,11 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
     'update_elements',
     'insert_element',
     'delete_element',
+    'fix_frame_tokens',
+    'insert_component',
+    'detach_component',
+    'run_frame_script',
+    'update_component',
     'restore_release',
     'publish_canvas',
     'unpublish_canvas',
@@ -6154,8 +7550,12 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
                     'save_decision',
                     'set_status',
                     'update_elements',
-                    'insert_element',
                     'delete_element',
+                    'fix_frame_tokens',
+                    'insert_component',
+                    'detach_component',
+                    'run_frame_script',
+                    'update_component',
                   ])
                   .describe('The tool to run; the remaining fields are that tool’s own arguments'),
               })
@@ -6712,6 +8112,10 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
       })
       const payload = {
         ...caps,
+        /* this server's surface is filtered: read-only mode registers only the
+           tools that declare readOnlyHint, so `tools` above is the honest list
+           and a client can see why writes are missing */
+        readonly: opts?.readonly === true,
         tools,
         resources: RESOURCE_NAMES,
         prompts: PROMPT_NAMES,
@@ -6956,7 +8360,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'wait_for_events',
     {
-      annotations: { readOnlyHint: false, destructiveHint: false },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
       title: 'Wait for human events',
       description:
         'Block until something on this canvas needs you: task feedback, a comment, a stop, an answer to your question, or a new queued card. Pass the cursor from your previous call to only see newer events; an empty cursor means everything pending. Between tasks, call this instead of ending your session — it also keeps your presence alive so the humans see you connected and your claimed card is not swept. Resolves on the first event or on timeout (whichever comes first); a timeout is normal, just call again.',
@@ -7020,25 +8424,92 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
       inputSchema: {
         canvas_id: z.string(),
         frame_id: z.string(),
-        html: z.string().describe(`Full replacement HTML. Max ${MAX_FRAME_HTML_BYTES} characters.`),
+        html: z
+          .string()
+          .describe(`Full replacement HTML (mode "replace", the default). Max ${MAX_FRAME_HTML_BYTES} characters.`),
+        mode: z
+          .enum(['replace', 'patch'])
+          .optional()
+          .describe(
+            'replace = a whole new document (default); patch = targeted edits applied to the frame as you read it, so the reviewer can resolve hunks individually',
+          ),
+        edits: z
+          .array(
+            z.object({
+              old_str: z.string().min(1).max(MAX_FRAME_HTML_BYTES),
+              new_str: z.string().max(MAX_FRAME_HTML_BYTES),
+            }),
+          )
+          .max(20)
+          .optional()
+          .describe(
+            'patch mode: exact find/replace edits, in order — each old_str must occur exactly once in the frame HTML you based this on',
+          ),
         summary: z.string().max(500).describe('One line: what changes and why the reviewer should accept it'),
         expected_updated_at: z.string().optional().describe('The frame updatedAt you based this on (baseUpdatedAt)'),
         agent_name: agentName,
       },
       outputSchema: { ok: z.literal(true), proposal_id: z.string(), status: z.string() },
     },
-    async ({ canvas_id, frame_id, html, summary, expected_updated_at, agent_name }) => {
+    async ({ canvas_id, frame_id, html, mode, edits, summary, expected_updated_at, agent_name }) => {
       const f = frameFor(frame_id)
       if (!f || f.canvasId !== canvas_id || !canvasFor(canvas_id)) return noFrame(frame_id)
+      /* patch mode carries no document, so the size ceiling applies to the
+         replacement text instead — and every old_str is validated exactly the
+         way edit_frame_html validates its replacement, against the base the
+         agent read, before the proposal is worth a reviewer's time */
+      if (mode === 'patch') {
+        if (!edits?.length) return err('invalid_input', 'patch mode requires edits — a list of { old_str, new_str }')
+        if (html)
+          return err('invalid_input', 'patch mode takes edits, not html — omit html or switch to mode "replace"')
+        const baseHtml = expected_updated_at ? undefined : f.html
+        let patched = baseHtml ?? f.html
+        for (const [i, edit] of edits.entries()) {
+          const count = patched.split(edit.old_str).length - 1
+          if (count === 0) return err('invalid_input', `edits[${i}]: old_str not found in the frame HTML`)
+          if (count > 1)
+            return err(
+              'invalid_input',
+              `edits[${i}]: old_str occurs ${count} times — include more surrounding context so it matches exactly once`,
+            )
+          patched = patched.replace(edit.old_str, edit.new_str)
+        }
+        if (tooLarge(patched))
+          return err(
+            'too_large',
+            `the patched document would be ${patched.length} characters; the limit is ${MAX_FRAME_HTML_BYTES}.`,
+          )
+        arrive(canvas_id, agent_name)
+        if (!store.getCanvas(canvas_id)?.reviewMode)
+          return err('unsupported', 'review mode is off on this canvas — write directly with edit_frame_html instead')
+        const base = expected_updated_at ? Date.parse(expected_updated_at) : f.updatedAt
+        const proposal = actions.addFrameProposal(
+          canvas_id,
+          {
+            kind: 'replace_html',
+            frameId: frame_id,
+            mode: 'patch',
+            edits,
+            summary,
+            ...(Number.isFinite(base) ? { baseUpdatedAt: base } : {}),
+          },
+          actorFrom(agent_name),
+        )
+        if (!proposal) return noFrame(frame_id)
+        return structured({ ok: true as const, proposal_id: proposal.id, status: proposal.status })
+      }
       if (tooLarge(html))
         return err('too_large', `html is ${html.length} characters; the limit is ${MAX_FRAME_HTML_BYTES}.`)
-      arrive(canvas_id, agent_name)
-      if (!store.getCanvas(canvas_id)?.reviewMode)
-        return err('unsupported', 'review mode is off on this canvas — write directly with set_frame_html instead')
       const base = expected_updated_at ? Date.parse(expected_updated_at) : f.updatedAt
       const proposal = actions.addFrameProposal(
         canvas_id,
-        { kind: 'replace_html', frameId: frame_id, html, summary, ...(Number.isFinite(base) ? {} : {}) },
+        {
+          kind: 'replace_html',
+          frameId: frame_id,
+          html,
+          summary,
+          ...(Number.isFinite(base) ? { baseUpdatedAt: base } : {}),
+        },
         actorFrom(agent_name),
       )
       if (!proposal) return noFrame(frame_id)
@@ -7132,16 +8603,148 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
       arrive(canvas_id, agent_name)
       const proposals = actions.getFrameProposals(canvas_id, status).map((p) => ({
         proposal_id: p.id,
-        kind: p.kind,
-        ...(p.frameId ? { frame_id: p.frameId } : {}),
-        summary: p.summary,
-        status: p.status,
-        at: new Date(p.at).toISOString(),
-        base_updated_at: new Date(p.baseUpdatedAt).toISOString(),
-        ...(p.resolvedBy ? { resolved_by: p.resolvedBy } : {}),
+        ...(p.html !== undefined ? { diff: { added: p.html.length, removed: 0 } } : {}),
+        ...(p.mode === 'patch' && p.edits?.length
+          ? {
+              changed_regions: p.edits.map((edit, index) => {
+                /* locate each edit's old_str in the base the proposal carries:
+                   the region a reviewer reads before accepting one hunk */
+                const base = p.baseHtml ?? store.getFrame(p.frameId ?? '')?.html ?? ''
+                const at = base.indexOf(edit.old_str)
+                return {
+                  index,
+                  ...(at >= 0
+                    ? {
+                        selector: `${
+                          base
+                            .slice(Math.max(0, at - 400), at)
+                            .match(/<([a-z][a-z0-9]*)\b[^>]*>/gi)
+                            ?.pop() ?? 'frame'
+                        }`,
+                      }
+                    : {}),
+                  kind: 'replace' as const,
+                  before: at >= 0 ? edit.old_str.slice(0, 2000) : '',
+                  after: edit.new_str.slice(0, 2000),
+                }
+              }),
+            }
+          : {}),
         ...(p.resolutionNote ? { resolution_note: p.resolutionNote } : {}),
       }))
       return structured({ proposals })
+    },
+  )
+
+  tool(
+    'resolve_frame_proposal',
+    {
+      annotations: { readOnlyHint: false, destructiveHint: true },
+      title: 'Accept or reject a proposal',
+      description:
+        'Accept or reject a pending frame-change proposal. Without hunks the whole proposal lands or dies; with hunks ({ index, accept }) you resolve a patch proposal change by change and only the accepted hunks reach the frame. A note rides back to the proposing agent; force applies a proposal the stale guard would otherwise refuse.',
+      inputSchema: {
+        canvas_id: z.string(),
+        proposal_id: z.string(),
+        action: z.enum(['accept', 'reject']),
+        hunks: z
+          .array(z.object({ index: z.number().int().min(0), accept: z.boolean() }))
+          .max(50)
+          .optional()
+          .describe('patch mode only: resolve individual edits — accepted hunks apply, the rest are dropped'),
+        note: z.string().max(1000).optional().describe('One line the proposing agent reads with the decision'),
+        force: z.boolean().optional().describe('Accept even though the frame changed since the proposal was made'),
+        agent_name: agentName,
+      },
+    },
+    async ({ canvas_id, proposal_id, action, hunks, note, force, agent_name }) => {
+      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      arrive(canvas_id, agent_name)
+      const proposal = actions.resolveFrameProposal(
+        canvas_id,
+        proposal_id,
+        action === 'accept',
+        actorFrom(agent_name),
+        {
+          ...(note ? { note } : {}),
+          ...(force ? { force: true } : {}),
+          ...(hunks?.length ? { hunks } : {}),
+        },
+      )
+      if (!proposal) return err('not_found', `no pending proposal with id ${proposal_id} on this canvas`)
+      return structured({ ok: true as const, proposal_id, status: proposal.status })
+    },
+  )
+
+  tool(
+    'resolve_frame_proposals',
+    {
+      annotations: { readOnlyHint: false, destructiveHint: true },
+      title: 'Accept or reject several proposals',
+      description:
+        'Resolve up to 50 frame-change proposals in one call — clear a review queue after reading them. Per-id results: a proposal that is gone, already resolved, or not on this canvas is reported at its id and the rest still resolve.',
+      inputSchema: {
+        canvas_id: z.string(),
+        ids: z.array(z.string()).min(1).max(50).describe('Proposal ids to resolve'),
+        action: z.enum(['accept', 'reject']),
+        note: z.string().max(1000).optional().describe('One note applied to every proposal in the batch'),
+        agent_name: agentName,
+      },
+      outputSchema: {
+        results: z.array(
+          z.object({
+            proposal_id: z.string(),
+            ok: z.boolean(),
+            status: z.string().optional(),
+            reason: z.string().optional(),
+          }),
+        ),
+      },
+    },
+    async ({ canvas_id, ids, action, note, agent_name }) => {
+      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      arrive(canvas_id, agent_name)
+      const actor = actorFrom(agent_name)
+      const results = ids.map((id) => {
+        const proposal = actions.resolveFrameProposal(canvas_id, id, action === 'accept', actor, {
+          ...(note ? { note } : {}),
+        })
+        return proposal && proposal.status !== 'pending'
+          ? { proposal_id: id, ok: true as const, status: proposal.status }
+          : { proposal_id: id, ok: false as const, reason: 'no pending proposal with this id on this canvas' }
+      })
+      return structured({ results })
+    },
+  )
+
+  tool(
+    'rebase_proposal',
+    {
+      annotations: { readOnlyHint: false, destructiveHint: false },
+      title: 'Rebase a stale proposal',
+      description:
+        'Re-apply a stale patch-mode proposal onto the frame as it stands now: the edits are re-run against the current HTML, the proposal’s base is refreshed and it goes back to pending for review. Use it when your proposal was marked stale — the alternative is proposing again from scratch. Only patch (edit-based) proposals rebase; a whole-document proposal must be re-proposed.',
+      inputSchema: {
+        proposal_id: z.string(),
+        agent_name: agentName,
+      },
+    },
+    async ({ proposal_id, agent_name }) => {
+      const proposal = actions.findFrameProposal(proposal_id)
+      if (!proposal) return err('not_found', `no proposal with id ${proposal_id}`)
+      /* findFrameProposal scans every canvas's log without naming the canvas;
+         the proposal's own frame (patch mode is always frame-scoped) resolves
+         it, and rebaseProposal re-checks ownership anyway */
+      const canvasId = proposal.frameId ? store.getFrame(proposal.frameId)?.canvasId : undefined
+      if (!canvasId) return err('not_found', `no proposal with id ${proposal_id}`)
+      arrive(canvasId, agent_name)
+      const rebased = actions.rebaseProposal(canvasId, proposal_id, actorFrom(agent_name))
+      if (!rebased)
+        return err(
+          'conflict',
+          'the proposal could not be rebased — only a stale patch-mode proposal can be, and its edits must still match the frame',
+        )
+      return structured({ ok: true as const, proposal_id, status: rebased.status })
     },
   )
 
@@ -7209,7 +8812,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
         blocking: z.array(z.object({ rule: z.string(), selector: z.string(), detail: z.string(), source: z.string() })),
       },
     },
-    async ({ canvas_id, frame_id, device, agent_name }) => {
+    async ({ canvas_id, frame_id, device, agent_name }, extra) => {
       const budget = takeRender(agent_name)
       if (budget) return budget
 
@@ -7221,10 +8824,12 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
          so they are reviewed on top of the device presets rather than instead
          of them — a named width is what makes a finding attributable */
       const breakpoints = canvas.breakpoints ?? []
+      await progress(extra, 0, `Reviewing “${f.name}” across viewports…`)
       const report = await reviewFrame(f, canvas.tokens, {
         ...(device ? { viewports: [VIEWPORTS[device]] } : {}),
         ...(breakpoints.length ? { breakpoints } : {}),
       })
+      await progress(extra, 1, `Reviewed “${f.name}” across ${report.viewports.length} viewport(s).`)
       /* Persist it: a human reading the checks panel usually reads them after
          the agent that produced them is gone, and the delivery gate reads the
          newest stored report rather than trusting a claim. */
@@ -7796,13 +9401,15 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
         summary: z.record(z.string(), z.number()),
       },
     },
-    async ({ canvas_id, frame_id, agent_name }) => {
+    async ({ canvas_id, frame_id, agent_name }, extra) => {
       const f = frameFor(frame_id)
       if (!f || f.canvasId !== canvas_id) return noFrame(frame_id)
       const budget = takeRender(agent_name)
       if (budget) return budget
       arrive(canvas_id, agent_name)
+      await progress(extra, 0, `Checking “${f.name}” across viewports…`)
       const report = await reviewFrame(f, canvasFor(canvas_id)?.tokens)
+      await progress(extra, 1, `Checked “${f.name}” across ${report.viewports.length} viewport(s).`)
       await persist.saveFrameReview(reviewToRecord(report, canvas_id, actorFrom(agent_name).name))
       return withFeedback(
         structured({
@@ -8617,6 +10224,12 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
     },
   )
 
+  /* The policy may have removed tools, so the surface is smaller than the
+     source declares. The endpoint builds a fresh server per POST and this one
+     is not connected yet, so the notification is sent from the initialized
+     handler below — the first moment it can actually reach the client. */
+  const policyFilteredTools = attemptedTools !== registry.size
+
   return server
 }
 
@@ -8757,8 +10370,9 @@ function decodeText(data: Buffer): string | undefined {
   return text.includes('\uFFFD') ? undefined : text
 }
 
-/** Stateless streamable-HTTP MCP endpoint. */
-export async function handleMcpRequest(req: Request, res: Response) {
+/** Stateless streamable-HTTP MCP endpoint. `opts.readonly` builds the
+ *  read-only surface (/mcp/readonly): write tools are never registered there. */
+export async function handleMcpRequest(req: Request, res: Response, opts?: { readonly?: boolean }) {
   if (req.method !== 'POST') {
     res.status(405).json({
       jsonrpc: '2.0',
@@ -8819,7 +10433,7 @@ export async function handleMcpRequest(req: Request, res: Response) {
   /* the OAuth client (not just the user) rides along: presence, activity and
      the clients panel can then tell two agents of one account apart */
   if (session.clientId) touchClient(session.clientId)
-  const server = buildMcpServer(owner, session.userId ?? undefined, session.clientId ?? undefined)
+  const server = buildMcpServer(owner, session.userId ?? undefined, session.clientId ?? undefined, opts)
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined })
   res.on('close', () => {
     /* the client is gone; there is nobody left to report a close failure to */

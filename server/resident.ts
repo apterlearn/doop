@@ -29,6 +29,13 @@ import type { Frame, RunJournal, TaskFeedback } from '../shared/types.ts'
 import { websiteAccessErrorMessage } from './websiteAccess.ts'
 import { executeGuardedBatch } from './guardedBatch.ts'
 import { runRepoCards } from './githubRecon.ts'
+import * as runScheduler from './runScheduler.ts'
+import { costOf } from './modelPrices.ts'
+import { checkBrandCompliance } from './brand.ts'
+import { lintProbe, planTokenFixes, type LintRule } from './designLint.ts'
+import { FRAME_SCRIPT_API, moveElement, runFrameScript, updateElements } from './elementEdit.ts'
+import { motionFrame } from './motion.ts'
+import { probeFrame } from './domProbe.ts'
 
 /**
  * The resident design team: a server-side Claude tool loop, run once per
@@ -90,8 +97,19 @@ export function onFeedback(canvasId: string) {
 }
 
 /** Work every agent that has something waiting, one at a time. Re-checking the
- *  queue between runs is what carries a card into its next pipeline stage. */
+ *  queue between runs is what carries a card into its next pipeline stage.
+ *
+ *  Admission is instance-wide (runScheduler): a canvas holds one slot for the
+ *  whole sweep, because the sweep runs its runs one at a time. A canvas denied
+ *  a slot leaves without touching the queue at all — no claim, no running
+ *  mark, nothing for a human to undo — and its card stays queued for the next
+ *  kick, on the same interval that fires this sweep today. */
 async function sweep(canvasId: string) {
+  const admission = runScheduler.requestRun(canvasId)
+  if (!admission.granted) {
+    console.log(`[resident] deferred canvas=${canvasId} ahead=${admission.ahead}`)
+    return
+  }
   running.add(canvasId)
   /* Requesters with no usable model right now. A run bills one person, so
      without this a requester who cannot pay would be re-picked forever and
@@ -102,7 +120,25 @@ async function sweep(canvasId: string) {
   const idle = new Set<string>()
   try {
     for (let i = 0; i < MAX_SWEEP_RUNS; i++) {
-      const next = actions.pendingWorkAgents(canvasId).find((name) => !idle.has(name))
+      /* A card scheduled for later is not work yet: it must not be claimed,
+         because a claim is visible on the board and would sit there until its
+         time came. The agent whose stage it is is skipped this pass, and the
+         interval that fires this sweep picks it up when it is due. */
+      const now = Date.now()
+      const next = actions
+        .pendingWorkAgents(canvasId)
+        .find(
+          (name) =>
+            !idle.has(name) &&
+            actions
+              .queuedCards(canvasId)
+              .some(
+                (c) =>
+                  (!c.scheduledAt || c.scheduledAt <= now) &&
+                  (actions.pipelineOf(c)[Math.min(c.stage ?? 0, actions.pipelineOf(c).length - 1)] ?? '') ===
+                    (roleByAgentName(name)?.id ?? DEFAULT_ROLE_ID),
+              ),
+        )
       if (!next) break
       const outcome = await runAgent(canvasId, next, stalled)
       if (outcome === 'idle') {
@@ -115,6 +151,9 @@ async function sweep(canvasId: string) {
     }
   } finally {
     running.delete(canvasId)
+    /* the slot goes back with the per-canvas running mark, on every path the
+       sweep exits by — finished, failed or aborted */
+    runScheduler.releaseRun(canvasId)
     /* the sweep owns the controller's lifetime so this check still sees it: a
        stop must not be undone by the re-sweep it just queued. A pause aborts
        the same call but leaves no stop behind, so a human's resume — which is
@@ -188,10 +227,16 @@ interface RunState {
   /** writes filed as proposals instead of landing: on a review-mode canvas
    *  they are the run's deliverable, so they count as a change */
   proposals: number
-}
-
-function deliverableFrameIds(runState: RunState): string[] {
-  return [...runState.mutatedFrames].filter((id) => !runState.sourceFrames.has(id))
+  /** the user the run's memory belongs to: `get_memory` reads their durable
+   *  preferences and `remember` writes them. Undefined on a server-tier run
+   *  with no connected account — memory has no owner to attach to. */
+  userId?: string
+  /** this run's accumulated model cost in USD, summed from each turn's
+   *  provider usage. `null` once the model has no known price: the cost
+   *  budget cannot be evaluated for the run, so it never stops on cost. */
+  costUsd: number | null
+  /** model turns taken and tool calls made — the journal's totals */
+  toolCalls: number
 }
 
 /** The first deliverable frame whose automated review is missing, stale, or
@@ -200,6 +245,9 @@ function deliverableFrameIds(runState: RunState): string[] {
  *  A report is only evidence about the document it was made from, so a frame
  *  edited after its review counts as unreviewed. Without that check, reviewing
  *  early and editing afterwards passed the gate. */
+function deliverableFrameIds(runState: RunState): string[] {
+  return [...runState.mutatedFrames].filter((id) => !runState.sourceFrames.has(id))
+}
 function failedReview(runState: RunState): { frameId: string; detail: string } | undefined {
   for (const id of deliverableFrameIds(runState)) {
     const report = runState.reviewedFrames.get(id)
@@ -229,6 +277,15 @@ function completeHtml(value: unknown): string | undefined {
   const html = value.trim()
   if (html.length < 80 || !/<html(?:\s|>)/i.test(html) || !/<\/html>\s*$/i.test(html)) return undefined
   return html
+}
+
+/** The frame a tool call names, when it names one — the version capture and
+ *  the run-event's frameId key off it. Calls without a frame_id (set_status,
+ *  memory, cards) report no frame. */
+function toolFrame(block: Anthropic.ToolUseBlockParam): string | undefined {
+  const raw = block.input
+  if (raw && typeof raw === 'object' && 'frame_id' in raw && typeof raw.frame_id === 'string') return raw.frame_id
+  return undefined
 }
 
 const REDESIGN_RE =
@@ -309,8 +366,24 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
     return 'no-model'
   }
 
+  /* The same refusal for money: a run that would start on the wrong side of
+     the cost budget must not bill at all, for the reason above. `undefined`
+     means uncapped, so the check is silent without a ceiling — and a model
+     with no known price has no cost to compare against either. */
+  const runCostLimit = runBudget.runCostBudget()
+  if (runCostLimit !== undefined) {
+    const reason =
+      'Cost budget reached — continuing needs a human. Raise DOOP_RUN_COST_BUDGET_USD to let runs go further.'
+    for (const f of actions.takeFeedbackFor(canvasId, role.name, payer)) actions.failTaskFeedback(f.id, reason)
+    for (const c of actions.takeAgentCommentsFor(canvasId, role.name, payer)) actions.failComment(c.id, reason)
+    for (const c of actions.takeQueuedCardsFor(canvasId, role.name, payer)) actions.failCard(canvasId, c.id, reason)
+    stalled.add(payer)
+    return 'no-model'
+  }
+
   /* claim this agent's open work — the UI flips to "picked up" instantly.
      Claiming happens before the try so an agent with nothing to do never
+
      shows up in presence. */
   const claimed = actions.takeFeedbackFor(canvasId, role.name, payer)
   const comments = actions.takeAgentCommentsFor(canvasId, role.name, payer)
@@ -346,6 +419,14 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
   const spentTokens = () => runBudget.tokensUsed(usage) + runBudget.tokensUsed(repoUsage)
   const runBudgetTokens = runBudget.runTokenBudget()
   let budgetReached = false
+  /* the run's money, accumulated per turn from the provider's own report. A
+     model with no known price costs `null` — never a guess — and a run on
+     such a model cannot be evaluated against the cost budget at all, so the
+     cost ceiling is simply out of reach for it (the token budget still
+     applies). */
+  let spentCost: number | null = 0
+  const turnCost = (u: { input: number; output: number; cacheRead: number; cacheWrite: number }) =>
+    costOf({ ...u, model: model.label })
 
   if (repoCards.length > 0) {
     const counted: AgentModel = {
@@ -537,6 +618,17 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
         : '')
 
     const runId = nanoid(8)
+    const runStartedAt = Date.now()
+    /* the durable record opens the moment the id exists: every path below that
+       ends the run closes it again through finishRun, so no run row is left
+       saying `running` unless the process itself died mid-run */
+    runLog.startRun({
+      id: runId,
+      canvasId,
+      agentName: actor.name,
+      cardIds: cards.map((c) => c.id),
+      model: model.label,
+    })
     /* The frames the request names — a card's targets, the frames comments are
        pinned to. Their newest version right now is the "before" the run's
        change set is measured against; a frame the run writes anyway is
@@ -572,6 +664,11 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
       reviewedFrames: new Map(),
       rewriteDrafts: new Map(),
       proposals: 0,
+      /* memory rides on the paying account: a server-tier run has no user to
+         attach a durable preference to */
+      ...(model.userId || payer ? { userId: model.userId ?? payer } : {}),
+      costUsd: 0,
+      toolCalls: 0,
     }
     let refused = false
     let crashed = false
@@ -582,6 +679,7 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
     let verificationNudgeSent = false
     let outputLimitNudgeSent = false
     let reviewNudgeSent = false
+    let costReached = false
     let turnsUsed = 0
     /* feedback that arrived while this run was already working: picked up
        between turns and completed (or failed) with the rest at the end */
@@ -602,6 +700,21 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
             },
           ]
         : []
+      /* the component library and the user's cross-canvas memory: both shape
+         what "right" means for this human before any frame work starts */
+      const libraryBlock: typeof guidelinesBlock = [
+        {
+          text:
+            `# Component library and durable memory\n` +
+            (actions.listComponentSummaries(canvasId).length > 0
+              ? `This canvas has a component library (list_components). REUSE a component with insert_component before authoring equivalent markup by hand — consistent UI beats bespoke HTML. When a section you are writing matches an existing component, insert it (optionally with data-doop-overrides for this instance's text/colors) instead of retyping it. When you originate a pattern likely to be repeated (a card row, a button style, a footer), create_component so later work reuses it. Check the library with list_components/get_component before you write.\n`
+              : `This canvas has no components yet (list_components). When you originate a pattern likely to be repeated (a card row, a button style, a footer), create_component so later work — yours or another agent's — reuses it instead of retyping it.\n`) +
+            (runState.userId
+              ? `You also carry DURABLE MEMORY for this user, across every canvas (get_memory). When the human states a preference that will hold beyond this one request — "always dark mode", "we never use rounded corners", "send us the palette first" — call remember with kind preference (or brand/workflow when it is about their brand identity or how they like to work). Read get_memory before big design decisions: what they told you last canvas still applies.\n`
+              : ''),
+          cache: true,
+        },
+      ]
       const maxTurns = REDESIGN_RE.test(workText) ? MAX_REDESIGN_TURNS : MAX_TURNS
       for (let turn = 0; turn < maxTurns; turn++) {
         /* the human stopped this run: unwind before spending another turn */
@@ -619,6 +732,16 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
         if (spentTokens() >= runBudgetTokens) {
           budgetReached = true
           actions.setAgentStatus(canvasId, actor, 'Budget reached — continuing needs a human')
+          break
+        }
+        /* the same stop for money, checked the same way: at a turn boundary,
+           never mid-tool. A run on an unpriced model has spentCost null — the
+           ceiling cannot be evaluated, so it never fires (the token budget
+           above still applies to it). */
+        if (runCostLimit !== undefined && spentCost !== null && spentCost >= runCostLimit) {
+          budgetReached = true
+          costReached = true
+          actions.setAgentStatus(canvasId, actor, 'Cost budget reached — continuing needs a human')
           break
         }
         const midRun = actions.takeFeedbackFor(canvasId, role.name, payer)
@@ -665,26 +788,27 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
         }
         const res = await model.run({
           maxTokens: 16000,
-          system: [{ text: systemFor(role), cache: true }, ...guidelinesBlock],
+          system: [{ text: systemFor(role), cache: true }, ...guidelinesBlock, ...libraryBlock],
           tools: TOOLS,
           messages,
           signal: abort.signal,
         })
-
         /* the stop can land mid-stream: the aborted request rejects, but a
-           provider that resolves anyway must not cost another turn */
+           provider that resolves anyway must not cost another turn. Without
+           this the resolving turn falls through to the loop's own end and the
+           run closes as `done` instead of stopped — the `finished` branch,
+           which is the one that completes the feedback and resolves the
+           comments the run claimed. */
         if (abort.signal.aborted) {
           cancelled = true
           break
         }
 
-        if (res.stop_reason === 'refusal') {
-          actions.setAgentStatus(canvasId, actor, "Couldn't address that feedback")
-          refused = true
-          break
-        }
-
         messages.push({ role: 'assistant', content: res.content })
+        /* the transcript grows here: persist the step behind the turn, so a
+           restart can replay the conversation instead of failing every card
+           the run had claimed */
+        runLog.appendRunStep(runId, messages.length - 1, 'assistant', messages[messages.length - 1])
         turnsUsed = turn + 1
         usage = {
           input: usage.input + res.usage.input,
@@ -692,6 +816,9 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
           cacheRead: usage.cacheRead + res.usage.cacheRead,
           cacheWrite: usage.cacheWrite + res.usage.cacheWrite,
         }
+        const thisCost = turnCost(res.usage)
+        if (thisCost === null) spentCost = null
+        else if (spentCost !== null) spentCost += thisCost
         runLog.record({
           canvasId,
           runId,
@@ -706,10 +833,20 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
           `[resident] response canvas=${canvasId} turn=${turnsUsed} stop=${res.stop_reason} tools=${toolBlocks.map((block) => block.name).join(',') || 'none'}`,
         )
 
+        /* the provider refused the request outright. Nothing came back to act
+           on and no nudge will change that, so the run ends refused: its cards
+           are failed with a retryable reason instead of being advanced as if
+           the work had been done. */
+        if (res.stop_reason === 'refusal') {
+          actions.setAgentStatus(canvasId, actor, "Couldn't address that feedback")
+          refused = true
+          break
+        }
+
         /* A response can contain a complete tool_use block even when its stop
-         reason is max_tokens. The Messages protocol still requires an
-         immediate tool_result for every emitted tool id, so content blocks —
-         not stop_reason — are authoritative for tool execution. */
+           reason is max_tokens. The Messages protocol still requires an
+           immediate tool_result for every emitted tool id, so content blocks —
+           not stop_reason — are authoritative for tool execution. */
         if (toolBlocks.length > 0) {
           /* Models may emit an import and design mutations in one parallel
              batch. Run imports first and defer every other call to the next
@@ -741,6 +878,10 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
                 )
                 const startedAt = Date.now()
                 const result = await execTool(block, canvasId, actor, runState)
+                /* the tool's own duration, read before the version bookkeeping
+                   below so a persist round-trip is not billed to the tool */
+                const elapsedMs = Date.now() - startedAt
+                runState.toolCalls += 1
                 /* the Run tab's tool timeline: name, duration, outcome and a
                    one-line summary the human can expand */
                 const resultText = Array.isArray(result.content)
@@ -751,6 +892,28 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
                       .trim()
                       .slice(0, 200)
                   : ''
+                /* the version ids this step carries: the frame's version when
+                   the run first wrote it (before) and its newest version now
+                   (after), flushed first so the read is not the pre-write
+                   version still sitting in the debounce. Recorded per write
+                   tool, not per call — a read reports no versions. */
+                const toolFrameId = toolFrame(block)
+                let before: string | undefined
+                let afterVersionId: string | undefined
+                if (toolFrameId && runState.mutatedFrames.has(toolFrameId)) {
+                  before = runState.startVersions.get(toolFrameId)
+                  try {
+                    const frame = store.getFrame(toolFrameId)
+                    if (frame) {
+                      await persist.saveFrame(frame, true)
+                      const [newest] = await persist.listFrameVersions(toolFrameId, 1)
+                      if (newest && newest.id !== before) afterVersionId = newest.id
+                    }
+                  } catch (err) {
+                    /* bookkeeping only — the write already happened */
+                    console.error('[resident] could not read the frame version', err)
+                  }
+                }
                 runLog.record({
                   canvasId,
                   runId,
@@ -758,8 +921,11 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
                   kind: 'tool',
                   name: block.name,
                   ok: !result.is_error,
-                  ms: Date.now() - startedAt,
-                  summary: resultText,
+                  ms: elapsedMs,
+                  ...(resultText ? { summary: resultText } : {}),
+                  ...(toolFrameId ? { frameId: toolFrameId } : {}),
+                  ...(before ? { beforeVersionId: before } : {}),
+                  ...(afterVersionId ? { afterVersionId: afterVersionId } : {}),
                 })
                 if (block.name === 'import_webpage' && result.is_error && !runState.blockedWebsiteAccess) {
                   importFailureInBatch =
@@ -775,6 +941,9 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
             break
           }
           messages.push({ role: 'user', content: results })
+          /* the tool-result turn is the transcript's other half: both sides of
+             every exchange reach the durable record, so a replay is exact */
+          runLog.appendRunStep(runId, messages.length - 1, 'user', messages[messages.length - 1])
           continue
         }
 
@@ -897,13 +1066,12 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
         actions.agentSummary(canvasId, actor, text)
       }
     }
-    /* what the run cost, on every card it served, and against the account's
-       day — a run that stops on its budget is still accounted for */
-    runBudget.recordSpend(accountKey, spentTokens())
     if (usage.input > 0 || usage.output > 0) {
       actions.recordRunUsage(
         cards.map((c) => c.id),
-        { ...usage, model: model.label },
+        /* the run's money, priced from the model table; null when the model
+           has no known price — recorded as absent cost, never a guess */
+        { ...usage, model: model.label, ...(spentCost !== null ? { costUsd: spentCost } : {}) },
       )
     }
     /* cross-run memory: the next run of this role starts knowing what this
@@ -945,7 +1113,7 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
          crash — the journal just records less about it */
       console.error('[resident] could not record the run change set', err)
     }
-    actions.recordRunJournal({
+    const journal: RunJournal = actions.recordRunJournal({
       canvasId,
       agentName: actor.name,
       cardId: cards[0]?.id,
@@ -956,7 +1124,20 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
         guidelines: store.getGuidelines(canvasId).map((d) => d.name),
       }),
       frames: changedFrames,
+      startedAt: runStartedAt,
+      endedAt: Date.now(),
+      turns: turnsUsed,
+      toolCalls: runState.toolCalls,
+      tokens: runBudget.tokensUsed(usage) + runBudget.tokensUsed(repoUsage),
+      costUsd: spentCost,
     })
+    /* the totals the journal entry now carries must reach the database like
+       the entry itself: runLog mirrors the columns persist.ts's saveJournal
+       does not write yet */
+    runLog.mirrorJournal(journal)
+    /* the durable run row closes with how the run actually ended, so a boot
+       can tell a resumable run from a finished one */
+    runLog.finishRun(runId, cancelled ? 'stopped' : finished ? 'done' : 'failed')
     if (finished && !blockedWebsiteAccess && !noMutation && !unverifiedMutation && !failedGate) {
       for (const f of [...claimed, ...pickedUp]) actions.completeTaskFeedback(f.id)
       for (const c of comments) actions.resolveComment(c.id, actor)
@@ -985,8 +1166,9 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
         reason = blockedWebsiteAccess
       } else if (refused) {
         reason = `${role.name} could not take this request. Retry when you are ready.`
-      } else if (crashed) {
-        reason = `${role.name} hit a snag before finishing. Retry when you are ready.`
+      } else if (costReached) {
+        reason =
+          'Cost budget reached — continuing needs a human. Raise DOOP_RUN_COST_BUDGET_USD to let runs go further.'
       } else if (budgetReached) {
         reason = `${role.name} reached this run's token budget (${runBudgetTokens.toLocaleString()}) before finishing. Retry to give it another budget, or raise DOOP_RUN_TOKEN_BUDGET.`
       } else if (exhausted) {
@@ -1018,6 +1200,39 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
     actions.setAgentStatus(canvasId, actor, '')
   }
   return 'ran'
+}
+
+/**
+ * Runs that were live when the process died: their `runs` row still says
+ * `running` and their transcript is in `run_steps`. A run with a persisted
+ * transcript has real work attached — its card is re-queued so the next sweep
+ * takes it again from its pipeline stage (the transcript itself is kept in
+ * run_steps for the Run tab; the loop's kickoff, claim and budget state are
+ * run-scoped and cannot be rebuilt outside runAgent, so a fresh run redoes the
+ * work rather than a half-loop pretending to continue it). A run with no
+ * persisted steps is skipped entirely and left to actions's interrupted-work
+ * failure path at boot.
+ *
+ * Exported for index.ts's boot sequence, which calls it after hydration —
+ * before the first sweep, so a re-queued card and fresh feedback do not race.
+ */
+export async function resumeInterruptedRuns(): Promise<number> {
+  const orphaned = await runLog.interruptedRuns()
+  let retried = 0
+  for (const run of orphaned) {
+    const steps = await runLog.runStepsFor(run.id)
+    /* no transcript, no replay: a run that died before its first turn has
+       nothing of its own to carry forward — the failure path owns its card */
+    if (steps.length === 0) continue
+    const journal = actions.getRunJournalBy(run.canvasId, { runId: run.id })
+    if (!journal || !store.getCanvas(run.canvasId)) continue
+    runLog.finishRun(run.id, 'stopped')
+    if (journal.cardId) {
+      const card = actions.retryCard(run.canvasId, journal.cardId, 'server restart')
+      if (card) retried += 1
+    }
+  }
+  return retried
 }
 
 const TOOLS: Anthropic.Tool[] = [
@@ -1391,6 +1606,251 @@ const TOOLS: Anthropic.Tool[] = [
         reason: { type: 'string', maxLength: 500 },
       },
       required: ['card_id', 'to_agent', 'reason'],
+    },
+  },
+  {
+    name: 'move_element',
+    description:
+      "Move one element under a different parent inside a frame's rendered document — the node itself moves, keeping its identity (data-doop-key, anchored comments) that delete + insert would destroy. The selector and the parent must each match exactly one element.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        frame_id: { type: 'string' },
+        selector: { type: 'string', description: 'The element to move — must match exactly one' },
+        parent_selector: { type: 'string', description: 'The new parent — must match exactly one' },
+        position: {
+          description: "'append' (last child), 'prepend' (first child) or a 0-based child index",
+          anyOf: [{ type: 'string', enum: ['append', 'prepend'] }, { type: 'number' }],
+        },
+      },
+      required: ['frame_id', 'selector', 'parent_selector', 'position'],
+    },
+  },
+  {
+    name: 'refactor_frames',
+    description:
+      'Apply one exact find/replace across several frames of this canvas in one call — a rename, a class swap, a shared snippet change. Exact-match semantics per frame: a frame where "find" occurs zero or more than one time is reported skipped, never half-applied.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        find: { type: 'string', description: 'Exact text to replace — must occur exactly once per frame' },
+        replace: { type: 'string' },
+        frame_ids: {
+          type: 'array',
+          items: { type: 'string' },
+          maxItems: 50,
+          description: 'Frames to touch; omitted means every frame on the canvas',
+        },
+        dry_run: { type: 'boolean', description: 'Report which frames would change without writing' },
+      },
+      required: ['find', 'replace'],
+    },
+  },
+  {
+    name: 'run_frame_script',
+    description: FRAME_SCRIPT_API,
+    input_schema: {
+      type: 'object',
+      properties: {
+        frame_id: { type: 'string' },
+        script: { type: 'string', description: 'JavaScript run inside the rendered frame; at most 20,000 characters' },
+      },
+      required: ['frame_id', 'script'],
+    },
+  },
+  {
+    name: 'fix_frame_tokens',
+    description:
+      "Rewrite a frame's off-token values to the nearest canvas token (var(--…)) in one call — the write-back half of review_frame's token lint. Values with no token within tolerance are reported skipped, never guessed.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        frame_id: { type: 'string' },
+        only: {
+          type: 'array',
+          items: {
+            type: 'string',
+            enum: ['off_token_color', 'off_token_font', 'off_token_type', 'off_scale_radius', 'off_grid_spacing'],
+          },
+          description: 'Restrict to these lint rules; omitted means all of them',
+        },
+      },
+      required: ['frame_id'],
+    },
+  },
+  {
+    name: 'get_token_usage',
+    description:
+      "Read which design tokens a frame's elements use and which values have drifted off-token, per element: the property, the offending value and the token it should be (--color-ink, --space-8). Use it to see exactly what to fix before calling fix_frame_tokens.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        frame_id: { type: 'string' },
+      },
+      required: ['frame_id'],
+    },
+  },
+  {
+    name: 'get_motion_context',
+    description:
+      'Read what a frame does over time: its @keyframes, media queries, the transitions and animations its elements actually run, and whether prefers-reduced-motion is honoured. A screenshot cannot see any of this.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        frame_id: { type: 'string' },
+        selector: { type: 'string', description: 'Scope the element lists to one element and its descendants' },
+      },
+      required: ['frame_id'],
+    },
+  },
+  {
+    name: 'check_brand_compliance',
+    description:
+      "Check a rendered frame against the brand rules a guideline declares in a '## Brand rules' section — palette membership, forbidden colors, font families, logo requirements, minimum contrast. Returns pass/fail with a violation per rule.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        frame_id: { type: 'string' },
+        guideline: { type: 'string', description: 'Guideline doc name; omitted means every guideline on the canvas' },
+        selector: { type: 'string', description: 'Scope the check to one element and its descendants' },
+      },
+      required: ['frame_id'],
+    },
+  },
+  {
+    name: 'list_components',
+    description:
+      "List this canvas's component library — name, size, instance count, HTML bytes. Reuse one with insert_component before authoring equivalent markup by hand.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Case-insensitive filter on name and description' },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'get_component',
+    description:
+      'Read one component in full: its definition HTML (clamped at 30,000 characters), size, props and where it is used. Component ids come from list_components.',
+    input_schema: {
+      type: 'object',
+      properties: { component_id: { type: 'string' } },
+      required: ['component_id'],
+    },
+  },
+  {
+    name: 'create_component',
+    description:
+      "Add a reusable component to this canvas's library from a self-contained HTML document. Later work inserts instances of it instead of retyping the markup; update_component with propagate rewrites every existing instance.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', maxLength: 200 },
+        html: { type: 'string', description: 'Self-contained HTML document — the component definition' },
+        description: { type: 'string', maxLength: 1000 },
+        props: { type: 'object', description: 'Free-form prop declarations an instance may override' },
+        variant_of: { type: 'string', description: 'Base component id this one is a variant of' },
+      },
+      required: ['name', 'html'],
+    },
+  },
+  {
+    name: 'update_component',
+    description:
+      "Edit a component's definition (html, name, description, props). With propagate (the default) every frame holding an instance is rewritten to match; frames locked or drifted are reported skipped, never force-overwritten.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        component_id: { type: 'string' },
+        name: { type: 'string', maxLength: 200 },
+        description: { type: 'string', maxLength: 1000 },
+        html: { type: 'string' },
+        props: { type: 'object' },
+        propagate: { type: 'boolean', description: 'Rewrite existing instances too; default true' },
+      },
+      required: ['component_id'],
+    },
+  },
+  {
+    name: 'insert_component',
+    description:
+      'Place a component instance into a frame — the instance element carries the component id, so later propagate calls update it. Returns the selector of the inserted element.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        frame_id: { type: 'string' },
+        component_id: { type: 'string' },
+        parent_selector: { type: 'string', description: 'Where to place it — must match exactly one element' },
+        position: {
+          description: "'append' (last child), 'prepend' (first child) or a 0-based child index",
+          anyOf: [{ type: 'string', enum: ['append', 'prepend'] }, { type: 'number' }],
+        },
+        overrides: { type: 'object', description: 'data-doop-overrides JSON: per-instance text/colors' },
+      },
+      required: ['frame_id', 'component_id', 'parent_selector', 'position'],
+    },
+  },
+  {
+    name: 'detach_component',
+    description:
+      'Unbind a component instance: the marker attributes go away and the markup becomes plain HTML that no longer follows the component. The frame is untouched otherwise.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        frame_id: { type: 'string' },
+        selector: { type: 'string', description: 'The instance element — the selector insert_component returned' },
+      },
+      required: ['frame_id', 'selector'],
+    },
+  },
+  {
+    name: 'get_memory',
+    description:
+      'Read your durable memory for the account behind this run — preferences, brand rules and workflow notes the human taught you on this or any canvas. Read it before big design decisions.',
+    input_schema: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'remember',
+    description:
+      'Save one durable preference for this user, carried across every canvas. Only what will hold beyond this request — never one-off content notes. Keep it under 500 characters.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        kind: { type: 'string', enum: ['preference', 'brand', 'workflow'] },
+        text: { type: 'string', maxLength: 500 },
+      },
+      required: ['kind', 'text'],
+    },
+  },
+  {
+    name: 'create_card',
+    description:
+      'Queue a board card — work for another agent of the resident team (yours or a pipeline you name). Use it when you discover work outside your specialty: hand the job over instead of fixing it outside your lane. Attributed to your requester.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        title: { type: 'string', maxLength: 4000, description: 'The work request, as you would word it to a teammate' },
+        pipeline: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Role ids, in order; default is the generalist',
+        },
+        target_frame_ids: { type: 'array', items: { type: 'string' }, maxItems: 4 },
+        target_selector: { type: 'string' },
+        attachments: { type: 'array', items: { type: 'string' }, maxItems: 4, description: 'Reference frame ids' },
+      },
+      required: ['title'],
+    },
+  },
+  {
+    name: 'retry_card',
+    description:
+      "Re-queue one of this canvas's failed cards so an agent takes it again. Use it when the failure was transient and the card is still the right work.",
+    input_schema: {
+      type: 'object',
+      properties: { card_id: { type: 'string' } },
+      required: ['card_id'],
     },
   },
 ]
@@ -2035,6 +2495,439 @@ async function execTool(
         if (!card) return fail(`no open card with id ${raw.card_id}`)
         if (!card.handback) return fail(`"${raw.to_agent}" is not a stage of this card's pipeline`)
         return ok(`handed back to ${raw.to_agent}`)
+      }
+      case 'move_element': {
+        const f = store.getFrame(input.frame_id)
+        if (!f || f.canvasId !== canvasId) return fail('frame not found on this canvas')
+        const raw = block.input as { selector?: string; parent_selector?: string; position?: unknown }
+        if (typeof raw.selector !== 'string' || !raw.selector) return fail('selector must be a non-empty string')
+        if (typeof raw.parent_selector !== 'string' || !raw.parent_selector)
+          return fail('parent_selector must be a non-empty string')
+        const position = raw.position === 'append' || raw.position === 'prepend' ? raw.position : Number(raw.position)
+        if (position !== 'append' && position !== 'prepend' && !Number.isInteger(position))
+          return fail("position must be 'append', 'prepend' or a 0-based child index")
+        const { html } = await moveElement(f, {
+          selector: raw.selector,
+          parent_selector: raw.parent_selector,
+          position,
+        })
+        const diverted = reviewDiverted({
+          kind: 'replace_html',
+          frameId: input.frame_id,
+          html,
+          summary: `move “${raw.selector}” in “${f.name}”`,
+        })
+        if (diverted) return diverted
+        const heldForMove = await lockForWrite(input.frame_id)
+        if (heldForMove) return fail(heldForMove)
+        actions.updateFrame(input.frame_id, { html }, actor)
+        runState.mutatedFrames.add(input.frame_id)
+        runState.verifiedFrames.delete(input.frame_id)
+        return ok(`moved “${raw.selector}” under “${raw.parent_selector}” — verify with screenshot_frame`)
+      }
+      case 'refactor_frames': {
+        const raw = block.input as { find?: string; replace?: string; frame_ids?: unknown; dry_run?: boolean }
+        if (typeof raw.find !== 'string' || !raw.find) return fail('find must be a non-empty exact HTML string')
+        if (typeof raw.replace !== 'string') return fail('replace must be an HTML string')
+        const canvas = store.getCanvas(canvasId)
+        const wanted = Array.isArray(raw.frame_ids)
+          ? (raw.frame_ids as string[]).slice(0, 50)
+          : (canvas?.frames ?? []).map((f) => f.id)
+        const changed: { frame_id: string; name: string; matches: number }[] = []
+        const skipped: { frame_id: string; name: string; reason: string }[] = []
+        for (const frameId of wanted) {
+          const f = store.getFrame(frameId)
+          if (!f || f.canvasId !== canvasId) {
+            skipped.push({ frame_id: frameId, name: frameId, reason: 'frame not found on this canvas' })
+            continue
+          }
+          const count = f.html.split(raw.find).length - 1
+          if (count === 0) {
+            skipped.push({ frame_id: f.id, name: f.name, reason: '"find" text not found' })
+            continue
+          }
+          if (count > 1) {
+            skipped.push({
+              frame_id: f.id,
+              name: f.name,
+              reason: `"find" text occurs ${count} times — include more context`,
+            })
+            continue
+          }
+          const nextHtml = f.html.replace(raw.find, raw.replace)
+          if (raw.dry_run) {
+            changed.push({ frame_id: f.id, name: f.name, matches: count })
+            continue
+          }
+          const diverted = reviewDiverted({
+            kind: 'replace_html',
+            frameId: f.id,
+            html: nextHtml,
+            summary: `refactor “${f.name}”`,
+          })
+          if (diverted) {
+            skipped.push({ frame_id: f.id, name: f.name, reason: 'review mode — filed as a proposal instead' })
+            continue
+          }
+          const heldForRefactor = await lockForWrite(f.id)
+          if (heldForRefactor) {
+            skipped.push({ frame_id: f.id, name: f.name, reason: heldForRefactor })
+            continue
+          }
+          actions.updateFrame(f.id, { html: nextHtml }, actor)
+          runState.mutatedFrames.add(f.id)
+          runState.verifiedFrames.delete(f.id)
+          changed.push({ frame_id: f.id, name: f.name, matches: count })
+        }
+        const head = raw.dry_run ? 'dry run — nothing written. ' : ''
+        return ok(
+          `${head}${changed.length} frame(s) would change: ${
+            changed.map((c) => `${c.frame_id} ("${c.name}")`).join(', ') || 'none'
+          }` +
+            (skipped.length
+              ? `\nSkipped: ${skipped.map((s) => `${s.frame_id} ("${s.name}") — ${s.reason}`).join('; ')}`
+              : ''),
+        )
+      }
+      case 'run_frame_script': {
+        const f = store.getFrame(input.frame_id)
+        if (!f || f.canvasId !== canvasId) return fail('frame not found on this canvas')
+        const raw = block.input as { script?: unknown }
+        if (typeof raw.script !== 'string' || !raw.script.trim()) return fail('script must be a non-empty string')
+        const { html } = await runFrameScript(f, raw.script)
+        const diverted = reviewDiverted({
+          kind: 'replace_html',
+          frameId: input.frame_id,
+          html,
+          summary: `scripted edit of “${f.name}”`,
+        })
+        if (diverted) return diverted
+        const heldForScript = await lockForWrite(input.frame_id)
+        if (heldForScript) return fail(heldForScript)
+        actions.updateFrame(input.frame_id, { html }, actor)
+        runState.mutatedFrames.add(input.frame_id)
+        runState.verifiedFrames.delete(input.frame_id)
+        return ok(`script applied — the frame is revealing to viewers now; verify with screenshot_frame`)
+      }
+      case 'fix_frame_tokens': {
+        const f = store.getFrame(input.frame_id)
+        if (!f || f.canvasId !== canvasId) return fail('frame not found on this canvas')
+        const tokens = store.getCanvas(canvasId)?.tokens
+        if (!tokens) return fail('this canvas has no design tokens to fix toward — set_tokens first')
+        const raw = block.input as { only?: unknown }
+        const only = Array.isArray(raw.only) ? (raw.only as LintRule[]) : undefined
+        const report = lintProbe(await probeFrame(f), tokens)
+        const { fixed, skipped } = planTokenFixes(report, tokens, only)
+        if (fixed.length === 0)
+          return ok(
+            `nothing to fix${
+              skipped.length
+                ? ` — ${skipped.length} value(s) had no token within tolerance: ${skipped
+                    .map((s) => `${s.selector} ${s.property}=${s.value} (${s.reason})`)
+                    .join('; ')}`
+                : ''
+            }`,
+          )
+        /* one batched page load applies every fix as an inline style — the
+           same path the element editor writes through, so generated rules and
+           <style> text are never rewritten blind */
+        const { html } = await updateElements(
+          f,
+          fixed.map((fix) => ({ selector: fix.selector, style: { [fix.property]: fix.to } })),
+        )
+        const diverted = reviewDiverted({
+          kind: 'replace_html',
+          frameId: input.frame_id,
+          html,
+          summary: `token fixes in “${f.name}”`,
+        })
+        if (diverted) return diverted
+        const heldForTokens = await lockForWrite(input.frame_id)
+        if (heldForTokens) return fail(heldForTokens)
+        actions.updateFrame(input.frame_id, { html }, actor)
+        runState.mutatedFrames.add(input.frame_id)
+        runState.verifiedFrames.delete(input.frame_id)
+        return ok(
+          `fixed ${fixed.length} value(s): ${fixed
+            .map((fix) => `${fix.selector} ${fix.property} ${fix.from} → ${fix.to}`)
+            .join('; ')}` +
+            (skipped.length
+              ? `\nSkipped (no token within tolerance): ${skipped
+                  .map((s) => `${s.selector} ${s.property}=${s.value}`)
+                  .join('; ')}.`
+              : '') +
+            ` — verify with screenshot_frame`,
+        )
+      }
+      case 'get_token_usage': {
+        const f = store.getFrame(input.frame_id)
+        if (!f || f.canvasId !== canvasId) return fail('frame not found on this canvas')
+        const tokens = store.getCanvas(canvasId)?.tokens
+        if (!tokens) return fail('this canvas has no design tokens — get_token_usage needs a token set to read against')
+        const report = lintProbe(await probeFrame(f), tokens)
+        const byElement = new Map<string, { tag?: string; off_token: Record<string, unknown>[] }>()
+        for (const v of report.violations) {
+          const entry = byElement.get(v.selector) ?? { off_token: [] }
+          entry.off_token.push({
+            property: v.property,
+            value: v.value,
+            nearest_token: v.nearest_token,
+            delta: v.distance,
+          })
+          byElement.set(v.selector, entry)
+        }
+        return ok(
+          JSON.stringify({
+            frame_id: f.id,
+            tokens_present: report.tokens_present,
+            checked_elements: report.checked_elements,
+            elements: [...byElement.entries()].map(([selector, entry]) => ({
+              selector,
+              ...(entry.tag ? { tag: entry.tag } : {}),
+              off_token: entry.off_token,
+            })),
+          }),
+        )
+      }
+      case 'get_motion_context': {
+        const f = store.getFrame(input.frame_id)
+        if (!f || f.canvasId !== canvasId) return fail('frame not found on this canvas')
+        const raw = block.input as { selector?: string }
+        const report = await motionFrame(f, typeof raw.selector === 'string' ? { selector: raw.selector } : {})
+        return ok(JSON.stringify(report))
+      }
+      case 'check_brand_compliance': {
+        const f = store.getFrame(input.frame_id)
+        if (!f || f.canvasId !== canvasId) return fail('frame not found on this canvas')
+        const raw = block.input as { guideline?: string; selector?: string }
+        const docs = store.getGuidelines(canvasId)
+        const markdown = raw.guideline
+          ? docs.find((d) => d.name === raw.guideline || d.title === raw.guideline)?.markdown
+          : docs.map((d) => d.markdown).join('\n\n')
+        if (raw.guideline && !markdown) {
+          const names = docs.map((d) => d.name).join(', ')
+          return fail(
+            names
+              ? `no guideline named "${raw.guideline}" — this canvas has: ${names}`
+              : 'this canvas has no guidelines',
+          )
+        }
+        const report = await checkBrandCompliance(
+          f,
+          markdown ?? '',
+          typeof raw.selector === 'string' ? { selector: raw.selector } : {},
+        )
+        if (report.rules === 0)
+          return ok('no brand rules declared — add a "## Brand rules" section to a guideline doc (set_guidelines)')
+        return ok(JSON.stringify(report))
+      }
+      case 'list_components': {
+        const raw = block.input as { query?: string }
+        const query = typeof raw.query === 'string' ? raw.query.trim().toLowerCase() : ''
+        const all = actions.listComponentSummaries(canvasId)
+        const rows = query
+          ? all.filter(
+              (c) => c.name.toLowerCase().includes(query) || (c.description ?? '').toLowerCase().includes(query),
+            )
+          : all
+        if (rows.length === 0) return ok('no components on this canvas yet — create_component to add one')
+        return ok(
+          rows
+            .map(
+              (c) =>
+                `- ${c.id} "${c.name}" ${Math.round(c.width)}x${Math.round(c.height)}, ${c.htmlBytes} bytes, used in ${c.instanceCount} frame(s)${c.variantOf ? ` (variant of ${c.variantOf})` : ''}${c.description ? ` — ${c.description}` : ''}`,
+            )
+            .join('\n'),
+        )
+      }
+      case 'get_component': {
+        const raw = block.input as { component_id?: string }
+        if (!raw.component_id) return fail('get_component requires component_id')
+        const c = store.getComponent(raw.component_id)
+        if (!c || c.canvasId !== canvasId) return fail(`no component with id ${raw.component_id} on this canvas`)
+        const using = await actions.componentsUsing(c.id)
+        return ok(
+          JSON.stringify({
+            id: c.id,
+            name: c.name,
+            description: c.description,
+            width: c.width,
+            height: c.height,
+            props: c.props,
+            variant_of: c.variantOf,
+            used_in: using.map((u) => u.frameId),
+            html_truncated: c.html.length > MAX_HTML_READ_CHARS || undefined,
+            html: c.html.slice(0, MAX_HTML_READ_CHARS),
+          }),
+        )
+      }
+      case 'create_component': {
+        const raw = block.input as {
+          name?: string
+          html?: string
+          description?: string
+          props?: unknown
+          variant_of?: string
+        }
+        const name = typeof raw.name === 'string' ? raw.name.trim().slice(0, 200) : ''
+        if (!name) return fail('create_component requires a name')
+        const html = completeHtml(raw.html)
+        if (!html) return fail('create_component requires a complete non-empty HTML document ending in </html>')
+        const c = actions.createComponent(
+          canvasId,
+          {
+            name,
+            html,
+            ...(raw.description ? { description: String(raw.description).slice(0, 1000) } : {}),
+            ...(raw.props !== undefined ? { props: raw.props } : {}),
+            ...(raw.variant_of ? { variant_of: raw.variant_of } : {}),
+          },
+          actor,
+        )
+        if (!c) return fail('canvas not found')
+        return ok(`created component ${c.id} "${c.name}" — insert_component places instances of it in frames`)
+      }
+      case 'update_component': {
+        const raw = block.input as {
+          component_id?: string
+          name?: string
+          description?: string
+          html?: string
+          props?: unknown
+          propagate?: boolean
+        }
+        if (!raw.component_id) return fail('update_component requires component_id')
+        const html = raw.html === undefined ? undefined : completeHtml(raw.html)
+        if (raw.html !== undefined && !html) return fail('html must be a complete HTML document ending in </html>')
+        const outcome = await actions.updateComponent(
+          raw.component_id,
+          {
+            ...(raw.name !== undefined ? { name: String(raw.name).slice(0, 200) } : {}),
+            ...(raw.description !== undefined ? { description: String(raw.description).slice(0, 1000) } : {}),
+            ...(html !== undefined ? { html } : {}),
+            ...(raw.props !== undefined ? { props: raw.props } : {}),
+          },
+          actor,
+          { propagate: raw.propagate !== false },
+        )
+        if (!outcome) return fail(`no component with id ${raw.component_id} on this canvas`)
+        return ok(
+          `updated ${outcome.component.id} "${outcome.component.name}"` +
+            (outcome.updated.length
+              ? ` — propagated to ${outcome.updated.map((u) => `${u.frameId} ("${u.name}")`).join(', ')}`
+              : '') +
+            (outcome.skipped.length
+              ? `\nSkipped instances: ${outcome.skipped.map((s) => `${s.frameId} ("${s.name}") — ${s.reason}`).join('; ')}`
+              : ''),
+        )
+      }
+      case 'insert_component': {
+        const f = store.getFrame(input.frame_id)
+        if (!f || f.canvasId !== canvasId) return fail('frame not found on this canvas')
+        const raw = block.input as {
+          component_id?: string
+          parent_selector?: string
+          position?: unknown
+          overrides?: unknown
+        }
+        if (!raw.component_id) return fail('insert_component requires component_id')
+        if (typeof raw.parent_selector !== 'string' || !raw.parent_selector)
+          return fail('parent_selector must be a non-empty string')
+        const position = raw.position === 'append' || raw.position === 'prepend' ? raw.position : Number(raw.position)
+        if (position !== 'append' && position !== 'prepend' && !Number.isInteger(position))
+          return fail("position must be 'append', 'prepend' or a 0-based child index")
+        /* the actions layer renders the frame to place the instance, so the
+           review gate is checked there: on a review-mode canvas the write
+           throws and surfaces as the tool error it is */
+        const placed = await actions.insertComponent(
+          input.frame_id,
+          raw.component_id,
+          {
+            parent_selector: raw.parent_selector,
+            position,
+            ...(raw.overrides !== undefined ? { overrides: raw.overrides as Record<string, string> } : {}),
+          },
+          actor,
+        )
+        if (!placed) return fail(`no component with id ${raw.component_id} on this canvas`)
+        runState.mutatedFrames.add(input.frame_id)
+        runState.verifiedFrames.delete(input.frame_id)
+        return ok(
+          `inserted "${placed.frame.name}" component ${raw.component_id} — the instance element is ${placed.selector}; verify with screenshot_frame`,
+        )
+      }
+      case 'detach_component': {
+        const f = store.getFrame(input.frame_id)
+        if (!f || f.canvasId !== canvasId) return fail('frame not found on this canvas')
+        const raw = block.input as { selector?: string }
+        if (typeof raw.selector !== 'string' || !raw.selector) return fail('selector must be a non-empty string')
+        const heldForDetach = await lockForWrite(input.frame_id)
+        if (heldForDetach) return fail(heldForDetach)
+        /* the actions layer renders the frame to unwrap the instance, so the
+           review gate is checked there (see insert_component) */
+        const detached = await actions.detachComponent(input.frame_id, raw.selector, actor)
+        if (!detached) return fail(`no component instance matches "${raw.selector}" in ${input.frame_id}`)
+        runState.mutatedFrames.add(input.frame_id)
+        runState.verifiedFrames.delete(input.frame_id)
+        return ok(`detached ${raw.selector} from "${detached.frame.name}" — it is plain HTML now`)
+      }
+      case 'get_memory': {
+        if (!runState.userId) return fail('this run has no connected account, so there is no memory to read')
+        const memories = actions.getUserMemory(runState.userId)
+        if (memories.length === 0) return ok('no memory yet — remember saves a durable preference for this user')
+        return ok(
+          memories
+            .map((m) => `- [${m.kind}] ${m.text}${m.sourceCanvasId ? ` (learned on canvas ${m.sourceCanvasId})` : ''}`)
+            .join('\n'),
+        )
+      }
+      case 'remember': {
+        const raw = block.input as { kind?: string; text?: string }
+        if (!runState.userId) return fail('this run has no connected account, so there is nowhere to save a memory')
+        const kind = raw.kind === 'brand' || raw.kind === 'workflow' ? raw.kind : 'preference'
+        const text = typeof raw.text === 'string' ? raw.text.trim().slice(0, 500) : ''
+        if (!text) return fail('remember requires text — the preference in one line')
+        const saved = actions.remember(runState.userId, kind, text, canvasId)
+        return saved
+          ? ok(`saved (${kind}): "${saved.text}" — you will carry this across canvases`)
+          : fail('could not save the memory')
+      }
+      case 'create_card': {
+        const raw = block.input as {
+          title?: string
+          pipeline?: unknown
+          target_frame_ids?: unknown
+          target_selector?: unknown
+          attachments?: unknown
+        }
+        const title = typeof raw.title === 'string' ? raw.title.trim().slice(0, 4000) : ''
+        if (!title) return fail('create_card requires a title — the work request for the teammate')
+        /* attributed to the run's payer, so the card bills the same person this
+           run does and nextWorkPayer keeps its ordering */
+        const card = actions.addQueuedCard(
+          canvasId,
+          title,
+          actor.name,
+          raw.pipeline,
+          raw.attachments,
+          runState.userId,
+          raw.target_frame_ids,
+          raw.target_selector,
+        )
+        if (!card) return fail('could not queue the card')
+        return ok(
+          `queued card ${card.id} for ${actions
+            .pipelineOf(card)
+            .map((r) => roleName(r))
+            .join(' → ')} — a teammate picks it up on the next sweep`,
+        )
+      }
+      case 'retry_card': {
+        const raw = block.input as { card_id?: string }
+        if (!raw.card_id) return fail('retry_card requires card_id')
+        const card = actions.retryCard(canvasId, raw.card_id, actor.name)
+        if (!card) return fail(`no failed card with id ${raw.card_id} on this canvas`)
+        return ok(`card ${card.id} re-queued — it enters the sweep again on the next pass`)
       }
       default:
         return fail(`unknown tool ${block.name}`)

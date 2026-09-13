@@ -5,8 +5,9 @@ import { nanoid } from 'nanoid'
  *
  * A multi-page site import takes tens of seconds per page. Blocking a tool
  * call for that is what makes an agent time out mid-capture, so the call
- * returns a job id and the work continues; the agent polls `get_job`. Jobs are
- * in-process and deliberately short-lived: a restart drops them, and a dropped
+ * returns a job id and the work continues; the agent polls `get_job` or parks
+ * on `waitForJobs` until the work settles. Jobs are in-process and
+ * deliberately short-lived: a restart drops them, and a dropped
  * job is recoverable by running the import again, which is the honest trade for
  * not persisting a queue nobody asked for.
  */
@@ -27,6 +28,10 @@ export interface Job {
   /** per-unit results, filled as the job runs */
   results: { label: string; ok: boolean; detail?: string; frameId?: string }[]
   error?: string
+  /** set by cancelJob: the worker notices at its next unit boundary and stops.
+   *  The module never sets a terminal state from the flag itself, so the work
+   *  still owns how the job ends. */
+  cancelled?: boolean
   startedAt: number
   finishedAt?: number
 }
@@ -101,6 +106,29 @@ export function jobSettled(id: string): Promise<Job | undefined> {
   return Promise.resolve(job)
 }
 
+/**
+ * Resolve once every id has settled, or when `timeoutMs` runs out — whichever
+ * comes first. An unknown or already-terminal id is settled on arrival, so a
+ * caller that lost a job id still gets an answer instead of a stall. Waits on
+ * the same promises `jobSettled` hands out, so nothing polls and no second
+ * registry exists. Never rejects: a job's failure is its status, not the
+ * waiter's error.
+ */
+export function waitForJobs(ids: string[], timeoutMs: number): Promise<void> {
+  const unique = [...new Set(ids)]
+  if (unique.length === 0) return Promise.resolve()
+  return new Promise<void>((resolve) => {
+    /* the deadline must not hold the process open when every job settles early */
+    const timer = setTimeout(resolve, Math.max(0, timeoutMs))
+    timer.unref?.()
+    const settledAll = () => {
+      clearTimeout(timer)
+      resolve()
+    }
+    void Promise.all(unique.map((id) => jobSettled(id))).then(settledAll, settledAll)
+  })
+}
+
 /** Record one finished unit. */
 export function recordUnit(
   id: string,
@@ -112,6 +140,26 @@ export function recordUnit(
   job.status = 'running'
   job.results.push(result)
   job.completed += 1
+  return job
+}
+
+/** The counters a caller polls for "how far did it get". */
+export function jobProgress(id: string): { completed: number; total: number } | undefined {
+  const job = jobs.get(id)
+  return job ? { completed: job.completed, total: job.total } : undefined
+}
+
+/**
+ * Ask a job to stop. The flag alone changes nothing: the worker loop checks it
+ * at its next unit boundary and calls `finishJob` itself, so the work decides
+ * how far it got and the job keeps whatever units it already recorded. A job
+ * that already ended is returned untouched — cancelling is not a way to rewrite
+ * history — and an unknown id is undefined.
+ */
+export function cancelJob(id: string): Job | undefined {
+  const job = jobs.get(id)
+  if (!job) return undefined
+  if (job.status !== 'done' && job.status !== 'failed') job.cancelled = true
   return job
 }
 
