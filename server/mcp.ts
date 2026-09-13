@@ -11,7 +11,7 @@ import { z } from 'zod'
 import { store } from './store.ts'
 import * as persist from './db/persist.ts'
 import * as actions from './actions.ts'
-import { canAccessCanvas } from './access.ts'
+import { canAccessCanvas, hasDurableCanvasAccess } from './access.ts'
 import { auth, getUserName, isBanned, PUBLIC_ORIGIN } from './auth.ts'
 import { capture, captureThrottled } from './analytics.ts'
 import {
@@ -561,13 +561,18 @@ const MUTATING_TOOLS: Record<string, true> = {
   ask_human: true,
   begin_frame_edit: true,
   complete_card: true,
+  copy_frame: true,
   create_canvas: true,
   create_frame: true,
   create_page: true,
   create_release: true,
+  delete_asset: true,
+  delete_canvas: true,
   delete_element: true,
   delete_frame: true,
   delete_page: true,
+  delete_release: true,
+  duplicate_canvas: true,
   duplicate_frame: true,
   edit_frame_html: true,
   end_frame_edit: true,
@@ -584,7 +589,9 @@ const MUTATING_TOOLS: Record<string, true> = {
   propose_frame_html: true,
   publish_canvas: true,
   ready_for_review: true,
+  rename_canvas: true,
   rename_page: true,
+  rename_release: true,
   reply_to_comment: true,
   resolve_comment: true,
   restore_release: true,
@@ -596,7 +603,9 @@ const MUTATING_TOOLS: Record<string, true> = {
   set_frame_css: true,
   set_frame_html: true,
   set_guidelines: true,
+  set_link_access: true,
   set_plan: true,
+  set_review_mode: true,
   set_status: true,
   set_tokens: true,
   stop_work: true,
@@ -608,6 +617,142 @@ const MUTATING_TOOLS: Record<string, true> = {
   update_plan_step: true,
   upload_asset: true,
   withdraw_proposal: true,
+}
+
+/**
+ * What each tool is FOR, so get_capabilities can answer "what can I do here"
+ * without an agent reading 100 descriptions. One entry per registered tool —
+ * a name missing from this map would read as "other" in the catalog, which is
+ * why a test asserts the map covers the registry exactly.
+ */
+export const TOOL_DOMAINS: Record<string, string> = {
+  add_comment: 'board',
+  append_frame_html: 'frame',
+  apply_ops: 'canvas',
+  ask_human: 'board',
+  audit_frame: 'verify',
+  begin_frame_edit: 'frame',
+  complete_card: 'board',
+  copy_frame: 'frame',
+  create_canvas: 'canvas',
+  create_frame: 'frame',
+  create_page: 'canvas',
+  create_release: 'canvas',
+  delete_asset: 'assets',
+  delete_canvas: 'canvas',
+  delete_element: 'element',
+  delete_frame: 'frame',
+  delete_page: 'canvas',
+  delete_release: 'canvas',
+  diff_frame: 'verify',
+  duplicate_canvas: 'canvas',
+  duplicate_frame: 'frame',
+  edit_frame_html: 'frame',
+  end_frame_edit: 'frame',
+  export_canvas: 'handoff',
+  export_frame: 'frame',
+  extract_design_system: 'web',
+  get_agents: 'discovery',
+  get_answers: 'board',
+  get_asset: 'assets',
+  get_canvas: 'canvas',
+  get_capabilities: 'discovery',
+  get_comments: 'board',
+  get_element: 'element',
+  get_feedback: 'board',
+  get_focus: 'board',
+  get_frame: 'frame',
+  get_frame_content: 'frame',
+  get_frame_css: 'frame',
+  get_frame_history: 'frame',
+  get_frame_html: 'frame',
+  get_frame_screenshot: 'frame',
+  get_frame_version: 'frame',
+  get_guide: 'discovery',
+  get_guidelines: 'canvas',
+  get_job: 'web',
+  get_plan: 'run',
+  get_pull_request_review: 'handoff',
+  get_reference: 'canvas',
+  get_run_changes: 'run',
+  get_run_events: 'run',
+  get_tokens: 'canvas',
+  hand_back: 'handoff',
+  import_code: 'handoff',
+  import_site: 'web',
+  import_webpage: 'web',
+  insert_element: 'element',
+  inspect_frame: 'element',
+  lint_frame: 'verify',
+  list_assets: 'assets',
+  list_backgrounds: 'assets',
+  list_canvases: 'canvas',
+  list_cards: 'board',
+  list_change_proposals: 'review',
+  list_frames: 'frame',
+  list_guidelines: 'canvas',
+  list_releases: 'canvas',
+  move_frame: 'frame',
+  open_pull_request: 'handoff',
+  pause_work: 'run',
+  propose_frame_create: 'review',
+  propose_frame_delete: 'review',
+  propose_frame_html: 'review',
+  publish_canvas: 'canvas',
+  ready_for_review: 'verify',
+  rename_canvas: 'canvas',
+  rename_page: 'canvas',
+  rename_release: 'canvas',
+  reply_to_comment: 'board',
+  resolve_comment: 'board',
+  restore_release: 'canvas',
+  resume_work: 'run',
+  revert_frame: 'frame',
+  revert_run: 'run',
+  review_frame: 'verify',
+  save_decision: 'canvas',
+  search_frames: 'frame',
+  search_icons: 'assets',
+  search_images: 'assets',
+  search_inspiration: 'web',
+  search_logos: 'assets',
+  set_breakpoints: 'canvas',
+  set_frame_css: 'frame',
+  set_frame_html: 'frame',
+  set_guidelines: 'canvas',
+  set_link_access: 'canvas',
+  set_plan: 'run',
+  set_review_mode: 'canvas',
+  set_status: 'board',
+  set_tokens: 'canvas',
+  stop_work: 'run',
+  take_card: 'board',
+  undo_last_change: 'frame',
+  unpublish_canvas: 'canvas',
+  update_elements: 'element',
+  update_frame: 'frame',
+  update_plan_step: 'run',
+  upload_asset: 'assets',
+  view_website: 'web',
+  wait_for_events: 'board',
+  whoami: 'discovery',
+  withdraw_proposal: 'review',
+}
+
+/** The resources and prompts this server registers, by name — reported by
+ *  get_capabilities so a client knows what it can attach before it reads the
+ *  guide. The resource names are the registrations; a template expands to one
+ *  entry per canvas on the wire. */
+const RESOURCE_NAMES = ['doop-guide', 'doop-canvas', 'doop-canvas-tokens']
+const PROMPT_NAMES = ['design_review', 'redesign_from_url', 'handoff_to_code']
+
+/** The one-line gist of a tool for the catalog: its first sentence, capped —
+ *  the full description is what the tool call itself returns. */
+function toolSummary(description: string): string {
+  const flat = description.replace(/\s+/g, ' ').trim()
+  const stop = flat.indexOf('. ')
+  const first = stop === -1 ? flat : flat.slice(0, stop + 1)
+  return first.length > 200 ? `${first.slice(0, 197)}…` : first
 }
 
 /**
@@ -682,9 +827,15 @@ const guidelineSummaryShape = {
   updatedBy: z.string().optional(),
 }
 
-/** `breakpoints` is reported by get_canvas and the canvas resource; the local
- *  extension keeps the shared CanvasView type untouched. */
-type CanvasViewWithBreakpoints = CanvasView & { breakpoints?: { name: string; min_width: number }[] }
+/** `breakpoints`, `review_mode` and `link_access` are reported by get_canvas and
+ *  the canvas resource; the local extension keeps the shared CanvasView type
+ *  untouched. The policy pair is what tells an agent how its writes will land
+ *  and who else can reach the canvas before it writes. */
+type CanvasViewWithBreakpoints = CanvasView & {
+  breakpoints?: { name: string; min_width: number }[]
+  review_mode?: boolean
+  link_access?: 'edit' | 'none'
+}
 
 const canvasViewShape = {
   id: z.string(),
@@ -700,6 +851,8 @@ const canvasViewShape = {
   flow: z.array(z.string()).optional(),
   breakpoints: z.array(z.object({ name: z.string(), min_width: z.number() })).optional(),
   tokens_present: z.boolean(),
+  review_mode: z.boolean().optional(),
+  link_access: z.enum(['edit', 'none']).optional(),
   note: z.string().optional(),
 }
 
@@ -992,6 +1145,20 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
     return payload ? err(payload.error.code, payload.error.message) : undefined
   }
 
+  /* Canvas policy and the canvas itself belong to the owner alone — the same
+     rule the REST routes enforce (server/index.ts: the owner check on
+     linkAccess, review-mode, publish and delete). Collaborators may rename
+     pages and edit frames; who can reach the canvas, whether agent writes need
+     approval, and whether it exists at all are the owner's decisions. A caller
+     with no account id is nobody's owner, so an ownerless canvas matches no
+     one — exactly like publishCanvas's `!actor.id ||` guard. */
+  const ownerOnly = (c: Canvas, what: string) =>
+    ownerId !== undefined && c.ownerId === ownerId
+      ? undefined
+      : err('forbidden', `only the owner can ${what} — this canvas belongs to another account`, {
+          hint: 'ask the owner, or copy the design into your own canvas with duplicate_canvas',
+        })
+
   /**
    * Frames this agent designed that are not currently verified: it wrote them
    * (they carry its name as the last writer), and the newest stored review does
@@ -1077,9 +1244,21 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
      intercepted here). */
   type RegisterTool = McpServer['registerTool']
   type ToolHandler = (args: never, extra: never) => Promise<CallToolResult>
+  /** The hints a tool declares to the client. Every tool carries
+   *  `readOnlyHint` and `destructiveHint`; the other two are optional. */
+  interface ToolAnnotations {
+    readOnlyHint?: boolean
+    destructiveHint?: boolean
+    idempotentHint?: boolean
+    openWorldHint?: boolean
+  }
   interface RegisteredTool {
     inputSchema: z.ZodRawShape
     run: ToolHandler
+    /* kept so get_capabilities can describe the surface from the registrations
+       themselves rather than from a second, hand-maintained list */
+    description: string
+    annotations?: ToolAnnotations
   }
   const registry = new Map<string, RegisteredTool>()
   /** The canvas a call is about, from its own args: canvas_id, else the frame
@@ -1263,7 +1442,11 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
     return withInterrupted(result, canvasId, actorFrom(record.agent_name))
   }
   const tool = ((name: string, config: never, cb: never) => {
-    const cfg = config as unknown as { inputSchema?: z.ZodRawShape }
+    const cfg = config as unknown as {
+      inputSchema?: z.ZodRawShape
+      description?: string
+      annotations?: ToolAnnotations
+    }
     /* The registry keeps the tool's OWN schema, so apply_ops validates a batch
        against exactly what the tool publishes. The schema registered with the
        SDK is loosened instead: `canvas_id` and `agent_name` are declared
@@ -1283,7 +1466,12 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
       const field = registered[key]
       if (field instanceof z.ZodString) registered[key] = field.optional()
     }
-    registry.set(name, { inputSchema: declared, run: cb as unknown as ToolHandler })
+    registry.set(name, {
+      inputSchema: declared,
+      run: cb as unknown as ToolHandler,
+      description: cfg.description ?? '',
+      annotations: cfg.annotations,
+    })
     return server.registerTool(
       name as never,
       { ...(config as object), inputSchema: registered } as never,
@@ -1351,6 +1539,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'get_guide',
     {
+      annotations: { readOnlyHint: true, destructiveHint: false },
       description:
         'Read the Doop agent guide: mandatory review checkpoints, the streaming workflow, frame sizing, design-quality doctrine, and multiplayer etiquette. Call with topic "doop-instructions" ONCE before using other Doop tools; call again if a long conversation may have compressed earlier context. Use the other topics ("streaming", "review", "images", "redesign") to re-load just one section after a compaction instead of the whole guide.',
       inputSchema: {
@@ -1371,6 +1560,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'search_inspiration',
     {
+      annotations: { readOnlyHint: true, destructiveHint: false },
       title: 'Search design inspiration',
       description:
         'Search a curated gallery of real, well-designed live websites by category and SEE thumbnails of each, with pre-distilled style facts (one-line mood north star, named palette, fonts). Call it FIRST when writing a design brief — it is the required inspiration step, especially for landing pages: query the page archetype plus the register you want ("law firm landing page, editorial", "dark fintech dashboard"), not just the product noun. Study the thumbnails, pick the ONE exemplar that fits the brief best and follow it — do not blend several — and name it in the brief. Do not embed these screenshots in a frame.',
@@ -1420,6 +1610,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'list_canvases',
     {
+      annotations: { readOnlyHint: true, destructiveHint: false },
       description:
         "List the connected user's design canvases with their ids, names and frame counts, newest first. Paged — follow has_more instead of assuming the list is complete.",
       inputSchema: {
@@ -1449,6 +1640,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'create_canvas',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       description: 'Create a new design canvas. Returns the canvas id, which is part of the shareable URL (/c/<id>).',
       inputSchema: {
         name: z.string().max(200).describe('Canvas name'),
@@ -1472,6 +1664,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'get_canvas',
     {
+      annotations: { readOnlyHint: true, destructiveHint: false },
       description:
         'Get a canvas: its name, its ordered pages, and every frame with position, size and metadata (not the HTML — use get_frame for that). Use this to see the current layout before adding or editing frames. Pass your agent_name so any human feedback waiting for you is delivered with the result.',
       inputSchema: {
@@ -1565,6 +1758,11 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
         ...(flow.length ? { flow } : {}),
         ...(c.breakpoints?.length ? { breakpoints: c.breakpoints } : {}),
         tokens_present: !!c.tokens,
+        /* the canvas's policy, so an agent knows how its writes will land
+           (review mode) and who else can reach the canvas (link access)
+           before it writes anything */
+        review_mode: !!c.reviewMode,
+        link_access: c.linkAccess ?? 'none',
         ...(notes.length ? { note: notes.join(' ') } : {}),
       }
       return withFeedback(structured(view), canvas_id, agent_name ? actorFrom(agent_name) : undefined)
@@ -1576,7 +1774,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
     {
       description:
         "Page through a canvas's frames without pulling their HTML: id, name, page, position, size, who last touched each one and when, plus a public image_url. Use it when get_canvas reported frames_truncated, or to poll a busy canvas for what changed since you last looked (updated_since).",
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false },
       inputSchema: {
         canvas_id: z.string(),
         page: z.string().optional().describe('Only frames on this page (name or id, from get_canvas)'),
@@ -1630,6 +1828,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'list_guidelines',
     {
+      annotations: { readOnlyHint: true, destructiveHint: false },
       description:
         "List a canvas's style guides (named markdown guidelines — brand rules, style recipes) with one-line summaries. Fetch the full text of the relevant ones with get_guidelines before designing. Pass agent_name: it is how human feedback reaches you — a call without it never receives the notes people leave for you.",
       inputSchema: { canvas_id: z.string(), agent_name: agentName },
@@ -1667,6 +1866,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'get_guidelines',
     {
+      annotations: { readOnlyHint: true, destructiveHint: false },
       description:
         "Read one of the canvas's style guides in full: the style rules (palettes, fonts, layout recipes, asset URLs) every frame must follow. If get_canvas listed style guides, read the relevant ones with this BEFORE creating or restyling frames. Pass agent_name: it is how human feedback reaches you — a call without it never receives the notes people leave for you.",
       inputSchema: {
@@ -1708,6 +1908,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'set_guidelines',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       description:
         "Create, replace or delete a named style guide on a canvas (markdown, max 24,000 chars; empty string deletes). Write rules other designers and agents can execute directly: palette hexes, font <link>s, ready-to-paste <style> blocks, logo asset URLs (upload files with upload_asset first and reference the returned URLs), layout recipes, do/don't lists.",
       inputSchema: {
@@ -1750,6 +1951,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'get_reference',
     {
+      annotations: { readOnlyHint: true, destructiveHint: false },
       description:
         'Read a pinned style reference in full: the HTML of a design a human marked as an exemplar ("more designs like this"). References are listed by get_canvas. Match its palette, typography and spacing when designing on this canvas — it is the ground truth for the canvas\'s style. Pass agent_name: it is how human feedback reaches you — a call without it never receives the notes people leave for you.',
       inputSchema: {
@@ -1788,6 +1990,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'save_decision',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       description:
         'Record a design decision your human made while talking to YOU — style feedback you carried out ("rounder corners", "less purple, more white and blue", "stop using italic serif"). Doop\'s UI feedback is captured automatically, but you are the only one who hears your own conversation, so report it with this tool AFTER you have addressed it. It lands in the canvas\'s Memory; recurring preferences become suggested style rules. Record design taste only — not one-off content edits like typo fixes or copy changes.',
       inputSchema: {
@@ -1827,7 +2030,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
       title: 'Who am I on this server',
       description:
         'The identity your tool calls run as: the account behind the connection, the agent name you are posting under, and what that means for your work. Agent names are free text — two accounts can both call themselves the same thing — so this is how you tell which identity is yours when a canvas shows a name you did not expect.',
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false },
       inputSchema: { agent_name: agentName.optional() },
       outputSchema: {
         account: z.string().optional(),
@@ -1855,7 +2058,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
       title: 'List agents and pipelines',
       description:
         'The resident design team this canvas can be worked by, and who is live on it right now: the roles with what each one is for, the ready-made pipelines (an ordered list of role ids), and every agent currently present on the canvas. Use it to address work to a specific agent, or to see whether the agent you expected is actually connected before you hand something back.',
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false },
       inputSchema: { canvas_id: z.string(), agent_name: agentName.optional() },
       outputSchema: {
         roles: z.array(z.object({ id: z.string(), name: z.string(), blurb: z.string() })),
@@ -1900,6 +2103,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'set_status',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       description:
         'Broadcast a one-line status of what you are working on right now — everyone viewing the canvas sees it live next to your name (e.g. "Sketching a mobile onboarding flow", "Fixing contrast on the pricing table"). Set it when you START a task, update it whenever your focus shifts to something new, and clear it with an empty string when you are done. Keep it under ~80 characters, present tense, specific.',
       inputSchema: {
@@ -1934,7 +2138,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
       title: 'Stop agent work',
       description:
         "Stop an agent's work on a canvas — for when a run is going wrong: a redesign that drifted from the brief, work on the wrong frame, or an agent looping. Pass target_agent to stop another agent (the name you see on the canvas), or omit it to stop yourself: its live stream closes and its board card is marked stopped instead of failed, so a human can retry it. Pass card_id instead to stop just that one board card — the agent's other cards and its tool calls keep running. Frames already written stay on the canvas and are yours to edit. Use this instead of deleting a frame out from under a working agent.",
-      annotations: { destructiveHint: true },
+      annotations: { readOnlyHint: false, destructiveHint: true },
       inputSchema: {
         canvas_id: z.string(),
         agent_name: agentName,
@@ -2021,7 +2225,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
     {
       description:
         'Read element-pinned comments and replies on a canvas, newest first, including author, text, frame, CSS selector, HTML snippet, parentId thread links, and claim/failure/resolution metadata. Includes resolved comments by default so complete conversations remain readable; set include_resolved to false for unresolved comments only. Returns the retained comment history (up to 100 entries per canvas), not an archive; paged, so follow has_more. Reading does not claim feedback or comments, or mark them resolved. To answer or close a comment, use reply_to_comment and resolve_comment.',
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false },
       inputSchema: {
         canvas_id: z.string(),
         frame_id: z.string().optional().describe('Only comments on this frame; it must belong to the canvas.'),
@@ -2064,7 +2268,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
       title: 'Pin a comment to an element',
       description:
         "Leave a note pinned to one element inside a frame — use it to record what you changed and why, or to ask a human a question about a specific element. selector is a CSS selector for the element: get one from inspect_frame's elements[].selector, or from an existing comment. Pass snippet (the element's outerHTML excerpt) when you have it so the pin still makes sense if the element moves. Humans see this as a pin on the canvas.",
-      annotations: { readOnlyHint: false },
+      annotations: { readOnlyHint: false, destructiveHint: false },
       inputSchema: {
         frame_id: z.string(),
         selector: z.string().max(2000).describe('CSS selector of the element to pin to'),
@@ -2105,7 +2309,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
       title: 'Reply in a comment thread',
       description:
         "Reply inside an existing element-comment thread. The reply inherits the thread's element anchor, so it stays pinned to the same thing the conversation is about. Use this to answer a human's question on your work, or to record what you did about their note. Resolve the thread with resolve_comment once the note is addressed.",
-      annotations: { readOnlyHint: false },
+      annotations: { readOnlyHint: false, destructiveHint: false },
       inputSchema: {
         comment_id: z.string(),
         text: z.string().max(10_000).describe('The reply text'),
@@ -2133,7 +2337,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
       title: 'Resolve a comment thread',
       description:
         'Mark an element-comment thread as resolved — do this once the note it carries has actually been addressed in the design. Resolving a root comment closes its whole thread. Humans can see who resolved it; nothing is deleted, and the conversation stays readable with get_comments.',
-      annotations: { readOnlyHint: false },
+      annotations: { readOnlyHint: false, destructiveHint: true },
       inputSchema: { comment_id: z.string(), agent_name: agentName },
     },
     async ({ comment_id, agent_name }) => {
@@ -2153,6 +2357,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'get_feedback',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       description:
         'Fetch and claim any open human feedback requests on a canvas. Feedback normally arrives automatically inside your other tool results, so you rarely need this — use it when you are specifically checking for feedback, e.g. an agent whose job is to poll the canvas every few minutes and address whatever humans have requested. Claiming assigns the requests to you: address each one, then review with get_frame_screenshot.',
       inputSchema: { canvas_id: z.string(), agent_name: agentName },
@@ -2183,7 +2388,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
       title: 'See what the humans are looking at',
       description:
         'What every connected human on this canvas is looking at right now: the frame, the element selector and the page, with how recently each moved. Use it when a human says "fix this" or "this one" — it is how you find out which element they mean. An empty humans array means nobody is connected, not an error.',
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false },
       inputSchema: { canvas_id: z.string(), agent_name: agentName.optional() },
       outputSchema: {
         humans: z.array(
@@ -2233,7 +2438,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
       title: 'List board cards',
       description:
         "Open board cards on this canvas — work humans have queued for agents. Each card's text is the full prompt. Call take_card to claim one and work it, or get going on the queue. Structured import cards (GitHub recon) are handled by the resident team and never listed here.",
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false },
       inputSchema: {
         canvas_id: z.string(),
         agent_name: agentName.optional(),
@@ -2269,6 +2474,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'take_card',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       title: 'Claim a board card',
       description:
         'Claim an open board card so you can work on it: the card moves to "in progress" under your name and the result carries the full brief. Reference-image attachments arrive as images in the result — they are source material; do not edit or delete those frames. target_frames are the frames the card is ABOUT: edit them in place. When done, call complete_card.',
@@ -2341,6 +2547,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'complete_card',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       title: 'Complete a board card',
       description:
         'Mark a board card you claimed with take_card as done — it moves to the board\'s "done" column and everyone sees you finished. Pass summary for a one-line closing note in the activity feed. Only call this on a card you claimed; a card you cannot finish stays in progress until a human stops or retries it.',
@@ -2385,6 +2592,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'create_frame',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       description:
         'Create a new frame on a canvas with an HTML design. A frame is a rectangular artboard that renders a full HTML document (inline <style> and <script> allowed, no external network access needed). If x/y are omitted the frame is auto-placed to the right of existing frames. Everyone viewing the canvas sees it appear live.',
       inputSchema: {
@@ -2450,6 +2658,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'create_page',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       description:
         'Create a new page on a canvas. Pages are ordered sub-canvases that group frames — use them to build multi-screen flows, one page per screen. The page is appended at the end and starts empty.',
       inputSchema: {
@@ -2491,6 +2700,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'rename_page',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       description:
         'Rename a page. Pass the page id from get_canvas; the new name is trimmed and capped at 80 characters.',
       inputSchema: {
@@ -2524,6 +2734,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'delete_page',
     {
+      annotations: { readOnlyHint: false, destructiveHint: true },
       description:
         'Deletes the page AND every frame on it. The canvas keeps ≥1 page — deleting the last one is refused. Rescue frames you still need with move_frame first.',
       inputSchema: { page_id: z.string(), agent_name: agentName.optional() },
@@ -2557,6 +2768,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'move_frame',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       description:
         'Move a frame to another page of its canvas (page by id or exact name — get_canvas lists both), optionally repositioning it with x/y in the same call. Use this to arrange screens across a multi-page flow.',
       inputSchema: {
@@ -2607,6 +2819,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'duplicate_frame',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       description:
         'Duplicate a frame: a full copy (same size and HTML) lands 40px below-right of the original, on the same page. Override the name and/or x/y to place it yourself.',
       inputSchema: {
@@ -2647,8 +2860,92 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   )
 
   tool(
+    'copy_frame',
+    {
+      title: 'Copy a frame to another canvas',
+      description:
+        'Copy a frame (same size and HTML) onto ANOTHER canvas. The copy becomes an ordinary frame there — the original is untouched. Pass page (id or exact name) and x/y to place it.',
+      annotations: { readOnlyHint: false, destructiveHint: false },
+      inputSchema: {
+        frame_id: z.string(),
+        to_canvas_id: z.string().describe('The canvas the copy lands on — must be accessible to this account'),
+        name: z.string().max(200).optional().describe('Title for the copy. Defaults to "<original> copy"'),
+        page: z
+          .string()
+          .optional()
+          .describe('Target page ON THE DESTINATION canvas (id or exact name). Defaults to its first page.'),
+        x: z.number().min(-1_000_000).max(1_000_000).optional(),
+        y: z.number().min(-1_000_000).max(1_000_000).optional(),
+        agent_name: agentName.optional(),
+      },
+    },
+    async ({ frame_id, to_canvas_id, name, page, x, y, agent_name }) => {
+      const source = frameFor(frame_id)
+      if (!source) return noFrame(frame_id)
+      const target = canvasFor(to_canvas_id)
+      if (!target) return noCanvas(to_canvas_id)
+      arrive(to_canvas_id, agent_name)
+      /* the write lands on the destination, so the destination's policy is what
+         governs it — a copy into a review-mode canvas is a proposal, not a
+         direct write, and must be refused the same way any other write is */
+      const gated = reviewGate(to_canvas_id)
+      if (gated) return gated
+      /* the page is resolved against the DESTINATION canvas: the source's page
+         ids and names mean nothing there */
+      let pageId: string | undefined
+      if (page !== undefined) {
+        const resolved = resolvePage(to_canvas_id, page)
+        if (resolved.error !== undefined) return err('invalid_input', resolved.error)
+        pageId = resolved.page.id
+      }
+      const actor = actorFrom(agent_name)
+      const frame = actions.createFrame(
+        to_canvas_id,
+        {
+          name: name ?? `${source.name} copy`,
+          x: x ?? source.x + 40,
+          y: y ?? source.y + 40,
+          width: source.width,
+          height: source.height,
+          html: source.html,
+          ...(pageId ? { pageId } : {}),
+        },
+        actor,
+      )
+      if (!frame) return err('not_found', `could not copy the frame onto canvas ${to_canvas_id}`)
+      /* No reconcileAssetRefs here: it rebuilds the WHOLE asset_refs table from
+         the frame set it is given (db.delete(t.assetRefs) first), so passing
+         one canvas's frames would erase every other canvas's refs. The copy's
+         refs are maintained the same way every other frame's are —
+         store.createFrame → persist.saveFrame → syncAssetRefs. */
+      return withGuidelinesNudge(
+        withStatusNudge(
+          withFeedback(
+            text({
+              ok: true,
+              frame: frameSummary(
+                frame,
+                target.pages?.find((p) => p.id === frame.pageId),
+              ),
+              copied_to: to_canvas_id,
+              note: 'The copy is an ordinary frame on the destination canvas — the original is unchanged.',
+            }),
+            to_canvas_id,
+            actor,
+          ),
+          to_canvas_id,
+          actor,
+        ),
+        to_canvas_id,
+        actor,
+      )
+    },
+  )
+
+  tool(
     'get_frame',
     {
+      annotations: { readOnlyHint: true, destructiveHint: false },
       description:
         'Get a frame including its full HTML content. Pass agent_name: it is how human feedback reaches you — a call without it never receives the notes people leave for you. On a large or imported frame prefer get_frame_html (a bounded slice or a query) and inspect_frame (the rendered result) over pulling the whole document.',
       inputSchema: { frame_id: z.string(), agent_name: agentName },
@@ -2688,7 +2985,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
     {
       description:
         "List the saved versions of a frame, newest first — every durable write is snapshotted, so this is how you see what a frame looked like before an edit (yours or anyone else's) and pick a version to restore. Returns metadata only, never the HTML: read one version's document with get_frame_version, restore it with revert_frame.",
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false },
       inputSchema: {
         frame_id: z.string(),
         limit: z.number().int().min(1).max(50).default(20).describe('Versions to return, default 20, max 50'),
@@ -2734,7 +3031,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
     {
       description:
         'Read one saved version of a frame in full, including its HTML — the document to compare against or to restore with revert_frame. Get version ids from get_frame_history.',
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false },
       inputSchema: { version_id: z.string(), agent_name: agentName.optional() },
       outputSchema: {
         id: z.string(),
@@ -2769,6 +3066,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'revert_frame',
     {
+      annotations: { readOnlyHint: false, destructiveHint: true },
       description:
         'Restore a frame to a version from get_frame_history. The restore is an ordinary edit — everyone sees it land live, it is logged, and it becomes a new version itself, so a revert is never a dead end. Use this instead of rebuilding a frame that was better before: an agent that made it worse, or a redesign you want to undo.',
       inputSchema: {
@@ -2827,6 +3125,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'undo_last_change',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       description:
         'Undo your own last change to a frame — the one-tool "that was a mistake, put it back". It reverts the frame to the state before your last write, using the same version history revert_frame uses, so the undo is itself an ordinary edit: it lands live, it is logged, and it can be undone in turn. Pass frame_id to undo one frame; omit it to undo every frame you changed on this canvas in the last 30 minutes. Refuses when someone else has changed the frame since your write — their work is never discarded by an undo aimed at yours.',
       inputSchema: {
@@ -2968,6 +3267,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'begin_frame_edit',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       description:
         "Claim a frame so no other agent writes to it while you work: other agents' writes to that frame fail with a conflict naming you until you release it with end_frame_edit, your run stops, or the lock expires. Use it when two agents share a canvas and you are about to make a series of edits to one frame. Locks are cooperative — a human or an agent that passes takeover: true can still write.",
       inputSchema: {
@@ -3004,6 +3304,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'end_frame_edit',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       description:
         'Release a frame you claimed with begin_frame_edit so other agents can write to it again. Call it as soon as you are done with the frame rather than waiting for the lock to expire.',
       inputSchema: { frame_id: z.string(), agent_name: agentName },
@@ -3023,7 +3324,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
       title: 'Read the canvas design tokens',
       description:
         "The canvas's design tokens — the named colors, fonts, spacing scale and radii every frame on it should use — plus the ready-to-paste :root block. Read this BEFORE designing on an existing canvas: reusing its tokens is what makes a new frame look like it belongs. Returns null tokens when the canvas has none yet, in which case set them with set_tokens before you start.",
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false },
       inputSchema: { canvas_id: z.string(), agent_name: agentName.optional() },
       outputSchema: {
         tokens: tokensShape.nullable(),
@@ -3048,6 +3349,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'set_tokens',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       title: 'Define the canvas design tokens',
       description:
         "Define or update the canvas's design tokens: named colors, display/body/mono fonts, a px spacing scale and radii. Do this early on a new canvas — every later frame should use these values, and lint_frame checks that they do. merge: true folds the values into the existing set instead of replacing it. Returns the stored tokens and the :root block to paste into a frame.",
@@ -3120,6 +3422,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'set_breakpoints',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       title: 'Declare the canvas responsive breakpoints',
       description:
         "Declare the widths this canvas designs for, by name (e.g. [{ name: 'mobile', min_width: 390 }, { name: 'desktop', min_width: 1280 }]). review_frame then renders every frame at each one in addition to the device presets and labels its findings with the breakpoint name, so verification matches the widths the design targets. Order is normalised ascending by min_width; an empty list clears them.",
@@ -3180,7 +3483,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
       title: 'Lint a frame against the design tokens',
       description:
         "Check the RENDERED frame for values that drift off the canvas's design tokens: colors that are not one of them, fonts outside the token set, and radii or spacing off the declared scales. Each violation names the selector, the value found, and the token it should have used. Run it after building a frame so the canvas stays coherent instead of accumulating near-miss shades and one-off paddings. With no tokens set it reports tokens_present: false rather than inventing a scale.",
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false },
       inputSchema: {
         frame_id: z.string(),
         device: deviceName,
@@ -3224,7 +3527,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
       title: 'Audit a frame’s accessibility',
       description:
         'Check the RENDERED frame against the accessibility rules a design review is responsible for: text contrast (WCAG ratios, computed from the real composited background), image alt text, heading order, focus order and tabindex, tap-target sizes, landmarks, form labels and the document language. Each issue names the CSS selector to fix. Run it before calling a design done — contrast in particular is the checkpoint the review workflow asks you to judge, and this measures it instead of guessing. Pass device/viewport to audit the layout at a phone or tablet width.',
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false },
       inputSchema: {
         frame_id: z.string(),
         device: deviceName,
@@ -3293,7 +3596,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
       title: 'Compare a frame against another render',
       description:
         "Measure how far a frame's CURRENT render is from another one, and see WHERE: a magenta-marked image plus the changed-pixel ratio. Compare against a previous version (get_frame_history), a pinned reference, another frame, or a live URL. Use it to confirm a fix actually landed, to check a redesign against the source it came from, or to match a pinned exemplar. identical: true means the two renders are the same design.",
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false },
       inputSchema: {
         frame_id: z.string(),
         against: z
@@ -3431,7 +3734,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
       title: 'Inspect a rendered frame',
       description:
         "Inspect the RENDERED page instead of its source: a compact semantic element outline with each element's CSS selector, the visible text, geometry, and the computed colors, typography, radii, shadows and CSS variables actually in effect. Use this instead of get_frame on large or imported frames — it is a fraction of the size and shows what the design really looks like. Pair it with get_frame_screenshot for layout.",
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false },
       inputSchema: {
         frame_id: z.string(),
         device: deviceName,
@@ -3466,7 +3769,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
       title: 'Read a bounded slice of a frame’s HTML',
       description:
         "Read a bounded portion of a frame's source HTML before a targeted edit. Use query for small snippets around matching text, or offset/limit to page through the source. Prefer this over get_frame whenever the frame may be large — get_frame returns the whole document, which is the most common way to run out of context mid-design.",
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false },
       inputSchema: {
         frame_id: z.string(),
         query: z
@@ -3499,6 +3802,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'set_frame_html',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       description:
         'Replace the HTML design of a frame in one shot. The change renders live for everyone viewing the canvas. For new or heavily reworked designs, prefer append_frame_html so viewers can watch the design stream in.',
       inputSchema: {
@@ -3564,6 +3868,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'set_frame_css',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       title: 'Write the frame stylesheet',
       description:
         "Write the frame's own stylesheet (a <style data-doop-css> block in its head): the only place responsive rules (@media), interaction states (:hover/:focus/:active) and motion (transition/@keyframes) can live. Inline styles cannot express any of those, so a frame that needs them needs this. Replaces the whole block each call — read it first with get_frame_css if you are adding to it. @import is refused: a frame must not fetch anything external.",
@@ -3654,7 +3959,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
       title: 'Read the frame stylesheet',
       description:
         "Read back the frame's own stylesheet (the <style data-doop-css> block), or an empty string when it has none. Read it before set_frame_css if you are adding to what is already there — set_frame_css replaces the whole block.",
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false },
       inputSchema: { frame_id: z.string(), agent_name: agentName.optional() },
       outputSchema: { css: z.string() },
     },
@@ -3683,7 +3988,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
       title: 'Search across the canvas frames',
       description:
         'Find which frames on a canvas mention something: a literal, case-insensitive substring matched against every frame name and its HTML, newest-updated first, with a few short snippets around each hit. Use it on a big canvas to answer "where is the pricing table" or "which frames use the old brand name" without reading frames one at a time.',
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false },
       inputSchema: {
         canvas_id: z.string(),
         query: z.string().min(1).max(500).describe('Literal text to find (case-insensitive)'),
@@ -3743,6 +4048,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'export_frame',
     {
+      annotations: { readOnlyHint: true, destructiveHint: false },
       title: 'Export a frame — image or code',
       description:
         "Hand a frame to the world outside Doop. format: 'png'/'jpg' returns public image URLs rendering the CURRENT design (download one and upload it to a CMS media library, social post or og:image — it re-renders when the frame changes). format: 'html' returns the frame's stored document verbatim. format: 'react' converts the RENDERED frame into a self-contained React component plus its stylesheet, with the canvas tokens as a :root block — use it when a human asks for the code behind a design.",
@@ -3863,9 +4169,10 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'export_canvas',
     {
+      annotations: { readOnlyHint: true, destructiveHint: false },
       title: 'Export a whole canvas',
       description:
-        "Hand a canvas to a human's machine in one piece. format: 'manifest' returns the frame list with file names and the canvas tokens. format: 'html' returns one self-contained document containing every frame, with each frame's stylesheet scoped to it (frames that style html/body or use :root are noted, since that cannot be scoped perfectly). format: 'zip' returns the same document plus every frame's original HTML as an archive, base64-encoded so you can write it to disk and unzip it.",
+        "Hand a canvas to a human's machine in one piece. format: 'manifest' returns the frame list with file names and the canvas tokens. format: 'html' returns one self-contained document containing every frame, with each frame's stylesheet scoped to it (frames that style html/body or use :root are noted, since that cannot be scoped perfectly). format: 'zip' returns the same document plus every frame's original HTML as a ZIP archive: it is stored and you get back zip_url, a public download link — fetch that (no auth needed) instead of carrying the bytes through your context. Pass inline: true only when you cannot fetch a URL and need archive_base64 in the result.",
       inputSchema: {
         canvas_id: z.string(),
         page: z.string().optional().describe('Only frames on this page (name or id, from get_canvas)'),
@@ -3875,6 +4182,10 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
           .describe(
             'default manifest; "tokens" returns the design tokens as JSON + plain CSS + a Tailwind v4 @theme block',
           ),
+        inline: z
+          .boolean()
+          .optional()
+          .describe('zip only: return archive_base64 in the result instead of zip_url (default false)'),
         agent_name: agentName.optional(),
       },
       outputSchema: {
@@ -3889,12 +4200,13 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
         tailwind_css: z.string().optional(),
         design_md: z.string().optional(),
         html: z.string().optional(),
+        zip_url: z.string().optional(),
         archive_base64: z.string().optional(),
         bytes: z.number().optional(),
         notes: z.array(z.string()),
       },
     },
-    async ({ canvas_id, page, format, agent_name }) => {
+    async ({ canvas_id, page, format, agent_name, inline }) => {
       const c = canvasFor(canvas_id)
       if (!c) return noCanvas(canvas_id)
       if (agent_name) arrive(canvas_id, agent_name)
@@ -4061,37 +4373,77 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
           time: f.updatedAt,
         })),
       ])
-      return structured({
-        format: 'zip',
-        ...base,
-        filename: `${base.filename}.zip`,
-        archive_base64: archive.toString('base64'),
-        bytes: archive.length,
-        notes: [
-          ...notes,
-          ...(bundledPaths.length
-            ? [`${bundledPaths.length} asset(s) bundled under assets/ and the references rewritten to match.`]
-            : []),
-          ...(missingAssets.length
-            ? [
-                `${missingAssets.length} asset id(s) could not be read and are missing from the archive: ${missingAssets.join(', ')}`,
-              ]
-            : []),
-          ...(externalInExport.length
-            ? [
-                `${externalInExport.length} third-party URL(s) stay external: ${externalInExport.slice(0, 5).join(', ')}`,
-              ]
-            : []),
-          ...(bundle.fontsCss ? ['fonts.css carries the frames’ @font-face rules and linked stylesheets.'] : []),
-          'archive_base64 is a ZIP file: decode it and write it to disk, then unzip.',
-        ],
-      })
+      const exportNotes = [
+        ...notes,
+        ...(bundledPaths.length
+          ? [`${bundledPaths.length} asset(s) bundled under assets/ and the references rewritten to match.`]
+          : []),
+        ...(missingAssets.length
+          ? [
+              `${missingAssets.length} asset id(s) could not be read and are missing from the archive: ${missingAssets.join(', ')}`,
+            ]
+          : []),
+        ...(externalInExport.length
+          ? [`${externalInExport.length} third-party URL(s) stay external: ${externalInExport.slice(0, 5).join(', ')}`]
+          : []),
+        ...(bundle.fontsCss ? ['fonts.css carries the frames’ @font-face rules and linked stylesheets.'] : []),
+      ]
+      const filename = `${base.filename}.zip`
+      /* The archive is the largest payload this surface can emit, and inlined
+         base64 puts all of it in the agent's context. It is stored through the
+         asset store instead and handed back as a public URL, which is also what
+         the /a/<id>.<ext> route already serves. `inline: true` keeps the old
+         shape for a client that cannot fetch a URL. */
+      if (inline) {
+        return structured({
+          format: 'zip',
+          ...base,
+          filename,
+          archive_base64: archive.toString('base64'),
+          bytes: archive.length,
+          notes: [...exportNotes, 'archive_base64 is a ZIP file: decode it and write it to disk, then unzip.'],
+        })
+      }
+      try {
+        const asset = await assets.createAsset(archive, {
+          canvasId: canvas_id,
+          ownerId,
+          uploadedBy: actorFrom(agent_name).name,
+        })
+        return structured({
+          format: 'zip',
+          ...base,
+          filename,
+          zip_url: `${PUBLIC_ORIGIN}/a/${asset.id}.${asset.ext}`,
+          bytes: archive.length,
+          notes: [
+            ...exportNotes,
+            'zip_url serves the archive from this server with no auth — fetch it and unzip; the bytes are not in this result.',
+          ],
+        })
+      } catch (e) {
+        /* an archive over the asset ceiling (or a storage failure) must not cost
+           the caller its export: fall back to the inline form and say why */
+        return structured({
+          format: 'zip',
+          ...base,
+          filename,
+          archive_base64: archive.toString('base64'),
+          bytes: archive.length,
+          notes: [
+            ...exportNotes,
+            `the archive could not be stored for download (${e instanceof Error ? e.message : 'storage failed'}), so it is returned inline.`,
+            'archive_base64 is a ZIP file: decode it and write it to disk, then unzip.',
+          ],
+        })
+      }
     },
   )
 
   tool(
     'upload_asset',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       title: 'Upload an image asset',
       description:
         'Upload an image (png/jpg/webp/gif/svg, max 5 MB) and get back a permanent public URL to reference in frame HTML (<img src>, CSS background) — use this instead of inlining data: URIs. Pick ONE input by where the file lives: (1) remote — pass source_url and the server fetches it; (2) LOCAL FILE — pass local_file=true to receive a one-time upload URL and a ready-to-run curl command, run it in your shell, and the curl response JSON contains the permanent url. (3) data — base64, LAST RESORT for tiny files (under ~100 KB) when you cannot run shell commands; larger base64 payloads are slow and corrupt easily.',
@@ -4173,6 +4525,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'search_images',
     {
+      annotations: { readOnlyHint: true, destructiveHint: false },
       title: 'Search stock photos',
       description:
         'Search free stock photography (Pexels) and get back candidate photos WITH visual thumbnails — look at them and pick the one that fits the frame\'s mood, palette and crop. Use concrete, scene-level queries ("team collaborating loft office", not "business"). Embed the returned image_url directly in frame HTML (hotlinking is fine and license-safe), or pass it to upload_asset source_url for a permanent copy on this origin. Always write a real alt text.',
@@ -4234,6 +4587,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'list_backgrounds',
     {
+      annotations: { readOnlyHint: true, destructiveHint: false },
       title: 'List backgrounds',
       description:
         'Browse a curated library of premium backgrounds for hero sections, section bands and bento tiles — soft glows, grainy meshes, aurora ribbons, neon, painterly landscapes — as a page of thumbnails you look at, each with palette hexes and a ready-to-paste CSS line that includes a legibility scrim. Reach for it when a hero or full-bleed section wants atmosphere, depth or a focal glow; a quiet typographic design can stay flat, but a default two-stop gradient is rarely right. Filter by tone (light/dark — match your copy color), slot and style; an optional query ("warm sunset", "dark teal") only reorders. Then decide like a designer: does one of these genuinely fit the frame\'s style and palette? If yes, use it and put the copy in its text_zone. If not, call again with a different filter, or draw the background yourself.',
@@ -4291,6 +4645,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'search_icons',
     {
+      annotations: { readOnlyHint: true, destructiveHint: false },
       title: 'Search icons',
       description:
         'Search 200,000+ open-source UI icons (Iconify: Material, Lucide, Tabler, Phosphor, …) and get hotlinkable SVG URLs for frame HTML. Search one concept per call ("shopping cart", "arrow right") — multi-concept queries return nothing; call once per icon. Results are semantically named ids — pick by name. For company/brand logos use search_logos instead.',
@@ -4320,6 +4675,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'search_logos',
     {
+      annotations: { readOnlyHint: true, destructiveHint: false },
       title: 'Search company logos',
       description:
         'Find a company\'s logo by brand name or domain — returns the company\'s real mark as a hotlinkable URL (a thumbnail is included when possible so you can confirm the brand), plus open-source vector marks (SVG) for well-known brands. One company per call — for a logo wall, call once per brand. The exact domain ("acme.io") resolves far more reliably than a name ("Acme"). Use for customer-logo walls, "works with" integration rows, testimonial cards, press bars. Mind each result\'s size guidance: favicon-sourced logos are small rasters — never scale them up.',
@@ -4379,7 +4735,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
       title: 'View a website',
       description:
         'Read-only inspection of a public web page: acquires its current HTML and returns a locally rendered desktop screenshot plus visible text without changing the canvas. Use it to study real copy, structure and branding. When the page should appear on the canvas as an editable source frame, use import_webpage instead.',
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true },
       inputSchema: {
         url: z.string().describe('The page URL — a bare domain like "acme.io" is loaded over https'),
         agent_name: agentName,
@@ -4652,7 +5008,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
       title: 'Read a frame as structured content',
       description:
         'Read what a frame SAYS, separately from how it looks: title and meta description, the heading outline with selectors, sections with their text, nav links, calls to action with hrefs, form fields with their labels, and images with their alt text and real pixel size. Use this on an imported page or an existing frame before rewriting its copy, and to check that a design has real content rather than placeholders.',
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false },
       inputSchema: {
         canvas_id: z.string(),
         frame_id: z.string(),
@@ -4806,7 +5162,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
       title: 'Read a background job',
       description:
         'Read the state of a job started by import_site: status, how many pages are done, and each page’s frame id or the reason it failed. Poll this until status is done or failed.',
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false },
       inputSchema: {
         job_id: z.string(),
         /* reading a job is canvas-free and attributes nothing, so the name is
@@ -4850,6 +5206,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'get_frame_screenshot',
     {
+      annotations: { readOnlyHint: true, destructiveHint: false },
       description:
         'Render a frame and return a PNG screenshot of it — this is how you SEE your design. Always review your work with this after creating or updating a frame, then fix what looks wrong (spacing, overflow, contrast, alignment) and check again. Iterate until it actually looks good, not just until the HTML seems right.',
       inputSchema: {
@@ -4931,6 +5288,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'append_frame_html',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       description:
         'Stream a design into a frame section by section — every chunk renders for viewers the moment it arrives, so they watch the design build up live. Prefer this over set_frame_html when creating or reworking a whole design. Send the HTML in document order, ONE complete section per call (head+styles first, then the hero, then each following section), roughly 1–4 KB per chunk. Set start=true on the FIRST chunk (replaces any existing content and shows a live "designing…" badge) and done=true on the LAST chunk. End chunks at element boundaries — partial HTML is healed, but a complete section paints cleanly.',
       inputSchema: {
@@ -4998,6 +5356,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'edit_frame_html',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       description:
         'Make a targeted edit to a frame: exact find-and-replace in its HTML. Use this for small tweaks (copy, a color, spacing, one element) instead of resending the whole document — the change morphs into the rendered frame in place. old_str must appear EXACTLY ONCE in the current HTML (call get_frame first if unsure); include enough surrounding context to make it unique.',
       inputSchema: {
@@ -5094,7 +5453,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
         computed: z.record(z.string(), z.unknown()),
         outerHTML: z.string(),
       },
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false },
     },
     async ({ canvas_id, frame_id, selector, full_text, agent_name }) => {
       const frame = frameFor(frame_id)
@@ -5113,6 +5472,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'update_elements',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       title: 'Set properties on elements',
       description:
         'Change elements of a frame by property instead of by text: set CSS declarations, set or remove attributes, or replace an element’s text. One call applies up to 20 edits in ONE render, so a multi-element change costs one screenshot’s worth of budget and lands atomically — if any selector does not resolve, nothing is changed. This is the right tool for "make every card’s heading 20px" or "give this button the accent background"; use edit_frame_html only for markup that has no element-level equivalent. The write is versioned and respects locks and review mode.',
@@ -5244,6 +5604,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'insert_element',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       title: 'Insert markup into an element',
       description:
         'Insert HTML as a child of an existing element, at the start, the end, or a child index. The inserted markup may not contain <script>, <iframe>, <object>, <embed>, <link>, <meta> or on* handlers. Returns the new element’s own selector so you can immediately style it with update_elements.',
@@ -5302,6 +5663,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'delete_element',
     {
+      annotations: { readOnlyHint: false, destructiveHint: true },
       title: 'Delete an element',
       description:
         'Remove an element and its subtree from a frame. Refuses <html> and <body>: rewrite the frame instead. Use get_element first to be sure the selector hits the element you mean.',
@@ -5352,6 +5714,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'update_frame',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       description: 'Update frame metadata: rename it or move/resize it on the canvas.',
       inputSchema: {
         frame_id: z.string(),
@@ -5392,6 +5755,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'delete_frame',
     {
+      annotations: { readOnlyHint: false, destructiveHint: true },
       description: 'Delete a frame from its canvas.',
       inputSchema: {
         frame_id: z.string(),
@@ -5677,6 +6041,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'set_plan',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       title: 'Publish your plan for this canvas',
       description:
         'Record the steps you intend to work through, in order, so the human watching can see the plan and a later session (or a compacted context) can pick up where you left off. Use it when a task needs more than about three frames or ten tool calls. Re-publishing keeps the progress of steps whose text is unchanged, and marks new or changed steps pending again.',
@@ -5710,6 +6075,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'update_plan_step',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       title: 'Move a step of your plan',
       description:
         'Mark a plan step active when you start it, done when it is finished, blocked when you cannot continue. Update as you go — that is what makes the plan useful to the human watching and to a session that resumes later. An optional note records what you learned or what is blocking you.',
@@ -5743,7 +6109,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
       title: 'Read the plans on this canvas',
       description:
         'Every plan published on this canvas, newest first — your own and any other agent working here. Call it after a context compaction, or when you join a canvas another agent is already working on, to see what has been done and what is next.',
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false },
       inputSchema: {
         canvas_id: z.string(),
         agent_name: agentName.optional(),
@@ -5761,7 +6127,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
     'apply_ops',
     {
       title: 'Apply several edits in one call',
-      annotations: { readOnlyHint: false },
+      annotations: { readOnlyHint: false, destructiveHint: false },
       description:
         'Run a sequence of Doop edits in one round trip: create frames, write their HTML, position them, comment, update status. Each op is `{ op: "<tool name>", ...that tool\'s arguments }` — the same fields the named tool takes (see its own schema). Use this to lay out a multi-frame flow, or to apply a review pass across several frames, instead of paying a round trip per call. Ops run in array order; with atomic: false (the default) a failing op is reported at its index and the rest still run, while atomic: true validates every op first and applies nothing if any would fail — and if an op still fails while applying (another agent took a lock in between), the batch stops and the ops that landed are rolled back from a pre-image taken before the first one: the error reports `rolled_back`, `restored` and how many ops landed before it. Appended comments, decisions and status lines cannot be taken back, and are named in `not_rolled_back`. With dry_run: true nothing is written at all: every op is validated, each op that can diff its own write returns `diff`, `bytes_before` and `bytes_after`, and the rest report that they cleared pre-flight.',
       inputSchema: {
@@ -6151,6 +6517,8 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
         })),
         ...(c.breakpoints?.length ? { breakpoints: c.breakpoints } : {}),
         tokens_present: !!c.tokens,
+        review_mode: !!c.reviewMode,
+        link_access: c.linkAccess ?? 'none',
       }
       return { contents: [{ uri: uri.href, mimeType: 'application/json', text: JSON.stringify(view, null, 2) }] }
     },
@@ -6311,17 +6679,48 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'get_capabilities',
     {
+      annotations: { readOnlyHint: true, destructiveHint: false },
       title: 'Get server capabilities',
       description:
-        'Which optional integrations are actually configured on this server (screenshot renderer, image/icon/logo search, website capture, model accounts for the resident agent, GitHub), plus the current size and rate limits. Call it ONCE before planning asset-heavy, import-heavy or export-heavy work: it is how you know a feature is available instead of discovering a failure mid-task.',
+        'Which optional integrations are actually configured on this server (screenshot renderer, image/icon/logo search, website capture, model accounts for the resident agent, GitHub), plus the current size and rate limits. It also catalogues the surface itself: every registered tool with its domain and its read-only/destructive/idempotent flags, and the resources and prompts this server exposes. Call it ONCE before planning asset-heavy, import-heavy or export-heavy work: it is how you know a feature is available instead of discovering a failure mid-task.',
       inputSchema: {},
       outputSchema: { capabilities: z.record(z.unknown()) },
     },
     async () => {
-      const caps = capabilities()
+      const caps = await capabilities()
+      /* The catalog is derived from the registry the wrapper fills, so it
+         cannot drift from the tools actually registered. `read_only` and
+         `destructive` are the annotations the tool itself published — the same
+         hints a client sees in tools/list — and `domain` is the taxonomy above. */
+      const tools = [...registry.entries()].map(([name, entry]) => {
+        const readOnly = entry.annotations?.readOnlyHint === true
+        return {
+          name,
+          domain: TOOL_DOMAINS[name] ?? 'other',
+          read_only: readOnly,
+          destructive: entry.annotations?.destructiveHint === true,
+          /* retryable without harm: a read, a tool the wrapper replays by
+             op_id, or one that declares itself idempotent */
+          idempotent: readOnly || entry.annotations?.idempotentHint === true || MUTATING_TOOLS[name] === true,
+          summary: toolSummary(entry.description),
+        }
+      })
+      const payload = {
+        ...caps,
+        tools,
+        resources: RESOURCE_NAMES,
+        prompts: PROMPT_NAMES,
+        /* `with_read_only` is the coverage of the annotation contract: how many
+           tools DECLARE readOnlyHint (true or false). A client reads it to know
+           whether it can trust the flags above for auto-approval. */
+        annotations_coverage: {
+          with_read_only: [...registry.values()].filter((e) => e.annotations?.readOnlyHint !== undefined).length,
+          total: registry.size,
+        },
+      }
       return {
-        content: [{ type: 'text' as const, text: JSON.stringify(caps, null, 2) }],
-        structuredContent: { capabilities: caps },
+        content: [{ type: 'text' as const, text: JSON.stringify(payload, null, 2) }],
+        structuredContent: { capabilities: payload },
       }
     },
   )
@@ -6331,6 +6730,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'ask_human',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       title: 'Ask the human a question',
       description:
         'Ask the humans on this canvas a question and WAIT for the answer (up to the wait_seconds you pass). Use it when a request is genuinely ambiguous or implies a destructive choice you cannot settle from the canvas — which palette direction, whether replacing a whole frame is intended, whether to delete something. Pass choices (2–6 short options) when the answer is one of a few directions: the client asks with those options, and the canvas shows them as buttons. When your client supports questions in its own UI the user is asked there and you get the answer directly (status "answered", via "elicitation"); otherwise the question appears live on the canvas and in the Review panel for the humans in the room. Either way the exchange is recorded on the canvas. If the wait expires you get status "open" plus the question id — carry on with your best judgement and check get_answers later, and do not ask the same question twice. Do not use it for information the canvas already answers.',
@@ -6521,6 +6921,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'get_answers',
     {
+      annotations: { readOnlyHint: true, destructiveHint: false },
       title: 'Check for answers to your questions',
       description:
         'Check whether humans answered your ask_human questions. Returns every question you asked on this canvas with its current status and answer. Cheap to poll; use it after a wait expired with status "open".',
@@ -6550,6 +6951,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'wait_for_events',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       title: 'Wait for human events',
       description:
         'Block until something on this canvas needs you: task feedback, a comment, a stop, an answer to your question, or a new queued card. Pass the cursor from your previous call to only see newer events; an empty cursor means everything pending. Between tasks, call this instead of ending your session — it also keeps your presence alive so the humans see you connected and your claimed card is not swept. Resolves on the first event or on timeout (whichever comes first); a timeout is normal, just call again.',
@@ -6606,6 +7008,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'propose_frame_html',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       title: 'Propose new frame HTML for review',
       description:
         'Propose a full replacement design for a frame WITHOUT touching the canvas. Use it when the canvas is in review mode (direct writes fail with "review mode"); the proposal appears in the human Review panel with a side-by-side render, and lands on the canvas the moment a human accepts. Include a clear summary: it is the first thing the reviewer reads. If the frame changes before your proposal is reviewed, it is marked stale and you will see it in list_change_proposals.',
@@ -6641,6 +7044,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'propose_frame_create',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       title: 'Propose a new frame for review',
       description:
         'Propose creating a new frame without touching the canvas — the review-mode counterpart of create_frame. It appears in the human Review panel with a render of the proposed design and lands when a human accepts.',
@@ -6677,6 +7081,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'propose_frame_delete',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       title: 'Propose deleting a frame',
       description:
         'Propose deleting a frame without touching the canvas — the review-mode counterpart of delete_frame. The human sees what would go away and decides.',
@@ -6707,6 +7112,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'list_change_proposals',
     {
+      annotations: { readOnlyHint: true, destructiveHint: false },
       title: 'List your change proposals',
       description:
         'List the frame-change proposals on this canvas and their status — pending, accepted, rejected, withdrawn, or stale (the frame moved on after you proposed). Read it after a review to learn what the human decided.',
@@ -6737,6 +7143,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'withdraw_proposal',
     {
+      annotations: { readOnlyHint: false, destructiveHint: true },
       title: 'Withdraw a pending proposal',
       description:
         'Withdraw your own pending frame-change proposal (for example when you notice a better approach before the human reviews it). Accepted, rejected or already-resolved proposals cannot be withdrawn.',
@@ -6766,6 +7173,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'review_frame',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       title: 'Review a frame across viewports',
       description:
         'The full quality gate in one call: design-token lint, accessibility audit, and layout analysis (overflow, clipping, overlap, truncation) at mobile, tablet and desktop widths in a single render batch. A canvas that declares breakpoints is reviewed at those widths too, and every viewport in the result is reported by its label. Call it on every frame you touched before you report the work done — it is what "I checked my work" means here. summary.errors and summary.critical are the counts that must be zero; warnings are judgement calls.',
@@ -6836,6 +7244,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'import_code',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       title: 'Import HTML as a frame',
       description:
         'Turn an HTML document (or fragment) into a frame on this canvas — the counterpart of export_frame. Use it to bring a design from a developer, a generated page, or a previous export back into the canvas where it renders live and can be edited like any frame. Scripts and inline event handlers are stripped; visuals and inline styles survive. If the canvas is in review mode the import becomes a proposal.',
@@ -6924,6 +7333,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'list_assets',
     {
+      annotations: { readOnlyHint: true, destructiveHint: false },
       title: 'List canvas assets',
       description:
         'List the image assets this canvas already has (uploads and anything its frames reference), newest first, with their public /a/ URLs. Check here before uploading the same image again — reuse keeps the design consistent and the canvas light.',
@@ -6963,6 +7373,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'get_asset',
     {
+      annotations: { readOnlyHint: true, destructiveHint: false },
       title: 'View a canvas asset',
       description:
         'Look at one asset of this canvas: image assets come back as an image you can actually see (the same way get_frame_screenshot shows a frame), with their public /a/ URL. Use it to check what an uploaded logo or photo looks like before placing it.',
@@ -6994,11 +7405,55 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
     },
   )
 
+  tool(
+    'delete_asset',
+    {
+      title: 'Delete a canvas asset',
+      description:
+        "Permanently remove an uploaded asset (confirm: true). Refused while any frame's HTML still points at it; pass force: true to delete anyway and see which frames would break.",
+      annotations: { readOnlyHint: false, destructiveHint: true },
+      inputSchema: {
+        canvas_id: z.string(),
+        asset_id: z.string().describe('Asset id from list_assets'),
+        confirm: z.literal(true).describe('Must be true — the bytes cannot be recovered'),
+        force: z.boolean().optional().describe('Delete even though frames still reference it'),
+        agent_name: agentName,
+      },
+      outputSchema: {
+        ok: z.literal(true),
+        deleted: z.string(),
+        referenced_by: z.array(z.string()),
+      },
+    },
+    async ({ canvas_id, asset_id, confirm, force, agent_name }) => {
+      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      arrive(canvas_id, agent_name)
+      if (confirm !== true)
+        return err('invalid_input', 'deleting an asset is irreversible — pass confirm: true to go ahead')
+      const asset = await assets.getCanvasAsset(canvas_id, asset_id)
+      if (!asset) return err('not_found', `no asset with id ${asset_id} on this canvas`)
+      /* HTML is the ground truth for what references an asset, so this reads
+         the frames rather than the asset_refs projection */
+      const referencing = await assets.framesReferencingAsset(canvas_id, asset_id)
+      if (referencing.length && !force)
+        return err(
+          'conflict',
+          `${referencing.length} frame(s) still reference this asset (${referencing.slice(0, 5).join(', ')}${referencing.length > 5 ? ', …' : ''}) — replace or remove those images first, or pass force: true to delete it anyway`,
+          { referenced_by: referencing.slice(0, 5), count: referencing.length, force_available: true },
+        )
+      const removed = await assets.deleteAsset(asset_id)
+      if (!removed) return err('not_found', `no asset with id ${asset_id} on this canvas`)
+      actions.logActivity(canvas_id, actorFrom(agent_name), `deleted asset ${asset_id}`)
+      return structured({ ok: true as const, deleted: asset_id, referenced_by: referencing.slice(0, 5) })
+    },
+  )
+
   /* ---- open_pull_request: the repo handoff ---- */
 
   tool(
     'open_pull_request',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       title: 'Open a pull request with the canvas design',
       description:
         'Hand the design to a developer: write the exported frames (design/<frame-name>.html, tokens.css, README) to a branch in a connected GitHub repo and open a pull request. Requires a GitHub connection with contents:write and pull_requests:write. Check get_capabilities first — github is "none" when no connection is configured.',
@@ -7061,6 +7516,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'get_pull_request_review',
     {
+      annotations: { readOnlyHint: true, destructiveHint: false },
       title: 'Read the review on a handoff pull request',
       description:
         'Read what a reviewer said on a pull request this canvas opened: the conversation, the inline comments (with the file and line they are attached to) and the review verdicts. A comment on design/<frame>.html comes back with the frame_id it belongs to, so you can act on it with get_element / update_elements / edit_frame_html. Read-only; needs a GitHub connection for the repo.',
@@ -7139,6 +7595,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'ready_for_review',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       title: 'Check a frame and record the result',
       description:
         'Run the full quality gate on a frame — token conformance, accessibility, layout and content checks at mobile, tablet and desktop widths — and RECORD the result against the exact document it checked. Call this on every frame you changed before complete_card or hand_back: those refuse a delivery whose frames you changed and did not verify. Returns verdict "pass" or "fail" with the blocking findings and their selectors. Fix them and call it again; a report is only valid for the document it was made from, so any later edit means checking again.',
@@ -7193,6 +7650,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'create_release',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       title: 'Freeze the canvas as a release',
       description:
         'Snapshot every frame as it is right now and return a public, permanent preview URL (/p/<canvas>/<release>). Frames keep changing afterwards, so a handoff needs a frozen artifact: send this URL to a client, attach it to a pull request (open_pull_request accepts release_id) or point a listing at it. The snapshot is stored whole — later edits, renames and deletions on the canvas never change it. Restoring it later is possible with restore_release.',
@@ -7249,6 +7707,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'list_releases',
     {
+      annotations: { readOnlyHint: true, destructiveHint: false },
       title: 'List the canvas’s releases',
       description:
         'Every frozen release of this canvas, newest first, with the public preview URL for each. Use it to find a release id for restore_release or to send the current one to a human.',
@@ -7285,8 +7744,80 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   )
 
   tool(
+    'rename_release',
+    {
+      title: 'Rename a release',
+      description:
+        'Relabel a frozen release (owner-only) — the label a handoff URL is listed under. Only the name moves: the snapshot, its frames and its tokens stay exactly as stored, so a link already sent out keeps serving the same design.',
+      annotations: { readOnlyHint: false, destructiveHint: false },
+      inputSchema: {
+        canvas_id: z.string(),
+        release_id: z.string().describe('Release id from list_releases'),
+        name: z.string().min(1).max(80).describe('New label, e.g. "v2 — pricing review"'),
+        agent_name: agentName,
+      },
+      outputSchema: { ok: z.literal(true), name: z.string() },
+    },
+    async ({ canvas_id, release_id, name, agent_name }) => {
+      const c = canvasFor(canvas_id)
+      if (!c) return noCanvas(canvas_id)
+      arrive(canvas_id, agent_name)
+      const denied = ownerOnly(c, 'rename a release')
+      if (denied) return denied
+      const release = await persist.getRelease(release_id)
+      if (!release || release.canvasId !== canvas_id) return err('not_found', `no release ${release_id} on this canvas`)
+      const trimmed = name.trim()
+      if (!trimmed) return err('invalid_input', 'the release name cannot be empty')
+      await persist.renameRelease(release_id, trimmed)
+      actions.logActivity(canvas_id, actorFrom(agent_name), `renamed release “${release.name}” to “${trimmed}”`)
+      return structured({ ok: true as const, name: trimmed })
+    },
+  )
+
+  tool(
+    'delete_release',
+    {
+      title: 'Delete a release',
+      description:
+        'Permanently delete a frozen release and its snapshot (owner-only, confirm: true). A release the gallery listing is pinned to cannot be deleted — unpublish_canvas first.',
+      annotations: { readOnlyHint: false, destructiveHint: true },
+      inputSchema: {
+        canvas_id: z.string(),
+        release_id: z.string().describe('Release id from list_releases'),
+        confirm: z.literal(true).describe('Must be true — the snapshot cannot be recovered'),
+        agent_name: agentName,
+      },
+      outputSchema: { ok: z.literal(true), deleted: z.string() },
+    },
+    async ({ canvas_id, release_id, confirm, agent_name }) => {
+      const c = canvasFor(canvas_id)
+      if (!c) return noCanvas(canvas_id)
+      arrive(canvas_id, agent_name)
+      const denied = ownerOnly(c, 'delete a release')
+      if (denied) return denied
+      if (confirm !== true)
+        return err('invalid_input', 'deleting a release is irreversible — pass confirm: true to go ahead')
+      const release = await persist.getRelease(release_id)
+      if (!release || release.canvasId !== canvas_id) return err('not_found', `no release ${release_id} on this canvas`)
+      /* the listing's preview and the copies it hands out come from the pinned
+         release, so deleting it would leave a gallery entry with nothing to
+         show. Refuse and name the way out rather than silently unpinning. */
+      if (c.publishedReleaseId === release_id)
+        return err(
+          'conflict',
+          `release “${release.name}” is the snapshot this canvas is listed with in the gallery — call unpublish_canvas first (or re-publish without release_id)`,
+          { release_id, published: true },
+        )
+      await persist.deleteRelease(release_id)
+      actions.logActivity(canvas_id, actorFrom(agent_name), `deleted release “${release.name}”`)
+      return structured({ ok: true as const, deleted: release.name })
+    },
+  )
+
+  tool(
     'restore_release',
     {
+      annotations: { readOnlyHint: false, destructiveHint: true },
       title: 'Put a release’s frames back on the canvas',
       description:
         'Write a release’s frames back onto the live canvas, as ordinary edits: each frame is written through the same path as any other edit, so the restore is logged, streamed to the room and reversible frame by frame with get_frame_history + revert_frame. Frames that no longer exist are recreated; frames added after the release are left alone.',
@@ -7371,6 +7902,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'publish_canvas',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       title: 'List the canvas in the community gallery',
       description:
         'Publish this canvas to the Doop community gallery with a short description and a shelf. Owner-only. The gallery hands out previews and copies — never the source canvas or a seat in its room. Pass release_id to publish the frozen snapshot instead of the live frames.',
@@ -7412,6 +7944,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'unpublish_canvas',
     {
+      annotations: { readOnlyHint: false, destructiveHint: true },
       title: 'Take the canvas out of the gallery',
       description: 'Remove this canvas from the community gallery. Owner-only.',
       inputSchema: { canvas_id: z.string(), agent_name: agentName },
@@ -7427,9 +7960,183 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
     },
   )
 
+  /* ---- canvas lifecycle ----
+     Agents could create canvases but never rename, configure, copy or remove
+     them, so anything past "make a new one" needed a human in the web UI.
+     These are the same operations the REST routes perform, with the same
+     authorization: the policy toggles and the destructive pair are the owner's
+     alone, and a copy may only be taken by someone with durable access (the
+     owner or an invited member) — a share-link visitor must not be able to
+     lift a canvas into their own account. */
+
+  tool(
+    'rename_canvas',
+    {
+      title: 'Rename a canvas',
+      description:
+        'Rename this canvas (owner-only). The new name is what list_canvases, the dashboard and the share sheet show; the canvas id and URL do not change.',
+      annotations: { readOnlyHint: false, destructiveHint: false },
+      inputSchema: {
+        canvas_id: z.string(),
+        name: z.string().min(1).max(80).describe('New canvas name'),
+        agent_name: agentName,
+      },
+      outputSchema: { ok: z.literal(true), name: z.string() },
+    },
+    async ({ canvas_id, name, agent_name }) => {
+      const c = canvasFor(canvas_id)
+      if (!c) return noCanvas(canvas_id)
+      arrive(canvas_id, agent_name)
+      const denied = ownerOnly(c, 'rename a canvas')
+      if (denied) return denied
+      const trimmed = name.trim()
+      if (!trimmed) return err('invalid_input', 'the canvas name cannot be empty')
+      const renamed = actions.renameCanvas(canvas_id, trimmed, actorFrom(agent_name))
+      if (!renamed) return noCanvas(canvas_id)
+      return structured({ ok: true as const, name: renamed.name })
+    },
+  )
+
+  tool(
+    'duplicate_canvas',
+    {
+      title: 'Copy a canvas into your account',
+      description:
+        'Copy this canvas — frames, pages, guides and references — into a new private canvas owned by you. Owner and invited members only: a share-link visitor cannot lift a canvas.',
+      annotations: { readOnlyHint: false, destructiveHint: false },
+      inputSchema: {
+        canvas_id: z.string(),
+        name: z.string().min(1).max(200).optional().describe('Name for the copy. Defaults to "<source> copy"'),
+        agent_name: agentName,
+      },
+      outputSchema: { ok: z.literal(true), canvas: z.object(canvasListItemShape) },
+    },
+    async ({ canvas_id, name, agent_name }) => {
+      const c = canvasFor(canvas_id)
+      if (!c) return noCanvas(canvas_id)
+      arrive(canvas_id, agent_name)
+      /* durable access, not plain access: the REST duplicate route uses
+         hasDurableCanvasAccess for exactly this reason — a copy outlives the
+         visit, so a link-edit visitor must not be able to take one */
+      if (!ownerId || !hasDurableCanvasAccess(ownerId, c))
+        return err('forbidden', 'only the canvas owner or an invited member can copy a canvas', {
+          hint: 'ask the owner to invite you, or design into your own canvas instead',
+        })
+      const copy = await store.duplicateCanvas(
+        c.id,
+        ownerId,
+        owner ?? ownerId,
+        name?.trim() ? { name: name.trim() } : {},
+      )
+      if (!copy) return noCanvas(canvas_id)
+      const previewFrame = copy.frames.length
+        ? copy.frames.reduce((a, b) => (b.updatedAt > a.updatedAt ? b : a))
+        : undefined
+      return structured({
+        ok: true as const,
+        canvas: {
+          id: copy.id,
+          name: copy.name,
+          ownerId: copy.ownerId,
+          createdAt: copy.createdAt,
+          updatedAt: copy.updatedAt,
+          frameCount: copy.frames.length,
+          ...(previewFrame ? { previewFrameId: previewFrame.id } : {}),
+          guidelinesCount: copy.guidelines?.length ?? 0,
+        },
+      })
+    },
+  )
+
+  tool(
+    'set_review_mode',
+    {
+      title: 'Require approval for agent writes',
+      description:
+        'Turn review mode on or off (owner-only). While it is on, agent frame writes do not land: they become proposals a human accepts, and direct writes are refused. Turn it off to let agents write canonically again.',
+      annotations: { readOnlyHint: false, destructiveHint: false },
+      inputSchema: {
+        canvas_id: z.string(),
+        on: z.boolean().describe('true = agent writes need human approval'),
+        agent_name: agentName,
+      },
+      outputSchema: { ok: z.literal(true), review_mode: z.boolean() },
+    },
+    async ({ canvas_id, on, agent_name }) => {
+      const c = canvasFor(canvas_id)
+      if (!c) return noCanvas(canvas_id)
+      arrive(canvas_id, agent_name)
+      const denied = ownerOnly(c, 'change review mode')
+      if (denied) return denied
+      actions.setCanvasReviewMode(canvas_id, on, actorFrom(agent_name))
+      return structured({ ok: true as const, review_mode: on })
+    },
+  )
+
+  tool(
+    'set_link_access',
+    {
+      title: 'Set what the share link grants',
+      description:
+        'Set the canvas\'s share-link policy (owner-only). "edit" lets anyone holding the link open and edit the canvas; "none" makes it private to the owner and invited members. Invited members keep access either way.',
+      annotations: { readOnlyHint: false, destructiveHint: false },
+      inputSchema: {
+        canvas_id: z.string(),
+        mode: z.enum(['none', 'edit']).describe('"edit" = anyone with the link collaborates, "none" = private'),
+        agent_name: agentName,
+      },
+      outputSchema: { ok: z.literal(true), link_access: z.enum(['edit', 'none']) },
+    },
+    async ({ canvas_id, mode, agent_name }) => {
+      const c = canvasFor(canvas_id)
+      if (!c) return noCanvas(canvas_id)
+      arrive(canvas_id, agent_name)
+      const denied = ownerOnly(c, 'change link access')
+      if (denied) return denied
+      if (!store.setLinkAccess(canvas_id, mode)) return noCanvas(canvas_id)
+      /* no canvas:linkAccess wire message exists, so the activity feed is where
+         this lands for everyone watching — a policy change is worth a line */
+      actions.logActivity(
+        canvas_id,
+        actorFrom(agent_name),
+        mode === 'edit' ? 'turned on the share link — anyone with it can edit' : 'turned off the share link',
+      )
+      return structured({ ok: true as const, link_access: mode })
+    },
+  )
+
+  tool(
+    'delete_canvas',
+    {
+      title: 'Delete a canvas',
+      description:
+        'Permanently delete this canvas with its frames, pages, guides, references, cards and comments (owner-only). Irreversible: pass confirm: true. Take a release first (create_release) if you may need the design again.',
+      annotations: { readOnlyHint: false, destructiveHint: true },
+      inputSchema: {
+        canvas_id: z.string(),
+        confirm: z.literal(true).describe('Must be true — the deletion cannot be undone'),
+        agent_name: agentName,
+      },
+      outputSchema: { ok: z.literal(true), deleted: z.string() },
+    },
+    async ({ canvas_id, confirm, agent_name }) => {
+      const c = canvasFor(canvas_id)
+      if (!c) return noCanvas(canvas_id)
+      arrive(canvas_id, agent_name)
+      const denied = ownerOnly(c, 'delete a canvas')
+      if (denied) return denied
+      if (confirm !== true)
+        return err('invalid_input', 'deleting a canvas is irreversible — pass confirm: true to go ahead')
+      const name = c.name
+      if (!actions.deleteCanvas(canvas_id)) return noCanvas(canvas_id)
+      return structured({ ok: true as const, deleted: name })
+    },
+  )
+
   tool(
     'hand_back',
     {
+      annotations: { readOnlyHint: false, destructiveHint: false },
       title: 'Hand a card back to an earlier specialist',
       description:
         'Give a board card back to an agent with the specialty it needs (e.g. the copywriter or the layout specialist) instead of fixing it outside your lane. The reason is shown to the human and to the receiving agent. Only roles that are part of the card pipeline can receive it.',
@@ -7474,7 +8181,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
       title: 'What a run changed',
       description:
         "A run's change set: the frames it touched, each with the version it started from and the one it produced, plus the run's summary and the decisions it recorded. Pick the run with run_id (from get_run_events) or card_id (from list_cards). Empty frames means the run recorded no frame changes. Undo the whole set with revert_run.",
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false },
       inputSchema: {
         canvas_id: z.string(),
         run_id: z.string().optional().describe('A run id from get_run_events or get_run_changes'),
@@ -7528,7 +8235,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
       title: 'Read a run’s timeline',
       description:
         'The run timeline, newest first: one entry per model turn, tool call, status line, error and stop, with its agent, outcome and duration. Filter to one run with run_id, or read the canvas’s whole recent history. Page with cursor: pass the previous next_offset back as cursor.',
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false },
       inputSchema: {
         canvas_id: z.string(),
         run_id: z.string().optional().describe('Only this run’s events'),

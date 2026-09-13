@@ -59,8 +59,9 @@ vi.mock('../server/db/persist.ts', () => ({
 const OWNER_ID = 'export-owner'
 const CANVAS_ID = 'c-export'
 
-/* export_canvas stores nothing, but the export_frame image branch needs a
-   working asset/database layer; boot the real one as the server does. */
+/* The export's manifest/html/tokens forms store nothing, but the zip form
+   stores its archive and the export_frame image branch needs a working
+   asset/database layer; boot the real one as the server does. */
 const dataRoot = mkdtempSync(path.join(tmpdir(), 'doop-code-export-'))
 
 beforeAll(async () => {
@@ -336,6 +337,10 @@ describe.skipIf(!findBrowserPath())('code handoff over real renders', () => {
       const zip = await callTool(client, 'export_canvas', {
         canvas_id: canvasId,
         format: 'zip',
+        /* this test is about what is INSIDE the archive; the default form
+           hands back a zip_url instead of the bytes (mcpCapabilities.test.ts
+           covers that), so ask for the inline archive to unzip it here */
+        inline: true,
         agent_name: 'Claude',
       })
       expect(zip.isError).toBeFalsy()

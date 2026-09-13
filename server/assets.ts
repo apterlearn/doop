@@ -23,6 +23,10 @@ const MIME_EXT = {
   'image/webp': 'webp',
   'image/gif': 'gif',
   'image/svg+xml': 'svg',
+  /* not an image, but the same store serves it: export_canvas's zip is
+     archived here so the tool can hand back a URL instead of a base64 blob
+     the agent would have to carry in context. */
+  'application/zip': 'zip',
 } as const
 
 type AssetMime = keyof typeof MIME_EXT
@@ -34,6 +38,9 @@ function sniffMime(buf: Buffer): AssetMime | undefined {
   if (buf.length >= 6 && buf.toString('latin1', 0, 4) === 'GIF8') return 'image/gif'
   if (buf.length >= 12 && buf.toString('latin1', 0, 4) === 'RIFF' && buf.toString('latin1', 8, 12) === 'WEBP')
     return 'image/webp'
+  /* zip local-file / end-of-central-directory / spanned signatures */
+  if (buf.length >= 4 && buf[0] === 0x50 && buf[1] === 0x4b && (buf[2] === 3 || buf[2] === 5 || buf[2] === 7))
+    return 'application/zip'
   const head = buf.toString('utf8', 0, Math.min(buf.length, 1500)).trimStart()
   if (head.startsWith('<svg') || (head.startsWith('<?xml') && head.includes('<svg'))) return 'image/svg+xml'
   return undefined
@@ -106,7 +113,7 @@ export async function createAsset(
   if (buf.length > MAX_ASSET_BYTES)
     throw new Error(`file is ${(buf.length / 1024 / 1024).toFixed(1)} MB — the limit is 5 MB`)
   const mime = sniffMime(buf)
-  if (!mime) throw new Error('unsupported file type — png, jpg, webp, gif and svg are accepted')
+  if (!mime) throw new Error('unsupported file type — png, jpg, webp, gif, svg and zip are accepted')
   const ext = MIME_EXT[mime]
   const id = nanoid(10)
   /* object first, row second: an orphaned object is swept later, but a row
