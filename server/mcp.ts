@@ -62,6 +62,8 @@ import { COMMUNITY_CATEGORIES } from '../shared/types.ts'
 import { sanitizeImportedHtml } from './sanitizeHtml.ts'
 import { agentsMd, designMd, rewriteAssetUrls, specMd, tailwindThemeCss, tokensDtcg, tokensJson } from './codeExport.ts'
 import { commitFiles, GithubWriteError, readPullRequest } from './githubWrite.ts'
+import * as github from './github.ts'
+import { importRepoScreen, type RepoScreenImport } from './githubRecon.ts'
 import { touchClient } from './mcpClients.ts'
 import { capabilities } from './capabilities.ts'
 import * as agentEvents from './agentEvents.ts'
@@ -578,6 +580,7 @@ const MUTATING_TOOLS: Record<string, true> = {
   end_frame_edit: true,
   hand_back: true,
   import_code: true,
+  import_repo_screen: true,
   import_site: true,
   import_webpage: true,
   insert_element: true,
@@ -679,6 +682,7 @@ export const TOOL_DOMAINS: Record<string, string> = {
   get_tokens: 'canvas',
   hand_back: 'handoff',
   import_code: 'handoff',
+  import_repo_screen: 'web',
   import_site: 'web',
   import_webpage: 'web',
   insert_element: 'element',
@@ -692,6 +696,7 @@ export const TOOL_DOMAINS: Record<string, string> = {
   list_frames: 'frame',
   list_guidelines: 'canvas',
   list_releases: 'canvas',
+  list_repo_screens: 'web',
   move_frame: 'frame',
   open_pull_request: 'handoff',
   pause_work: 'run',
@@ -7587,6 +7592,176 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
         if (e instanceof GithubWriteError) return err(e.code, e.message)
         return err(codeFor(e), e instanceof Error ? e.message : 'could not read the pull request')
       }
+    },
+  )
+
+  /* ---- repo recon: what a connected repository holds, and importing one of
+     its screens as a frame. The same connection model as open_pull_request:
+     canvas-scoped, so a call can never spend another canvas's credential. */
+
+  const repoConnection = async (canvasId: string, repo: string) => {
+    const wanted = repo
+      .trim()
+      .replace(/^https?:\/\/github\.com\//i, '')
+      .replace(/\.git$/, '')
+    const connections = await github.listConnections(canvasId)
+    return connections.find(
+      (conn) => conn.repo.toLowerCase() === wanted.toLowerCase() && !!(conn.token || conn.installationId),
+    )
+  }
+
+  tool(
+    'list_repo_screens',
+    {
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true },
+      title: 'List a repository’s screens',
+      description:
+        'List the screens Doop found in a connected GitHub repository — page routes, component and story files, and static HTML — each with the source file it comes from. Call it before import_repo_screen to pick what to bring onto the canvas.',
+      inputSchema: {
+        canvas_id: z.string(),
+        repo: z.string().describe('owner/name'),
+        agent_name: agentName.optional(),
+      },
+      outputSchema: {
+        repo: z.string(),
+        framework: z.string().nullable(),
+        truncated: z.boolean(),
+        screens: z.array(
+          z.object({
+            route: z.string(),
+            file: z.string(),
+            kind: z.string(),
+            title: z.string(),
+            dynamic: z.boolean(),
+          }),
+        ),
+      },
+    },
+    async ({ canvas_id, repo, agent_name }) => {
+      const c = canvasFor(canvas_id)
+      if (!c) return noCanvas(canvas_id)
+      arrive(canvas_id, agent_name)
+      const conn = await repoConnection(canvas_id, repo)
+      if (!conn)
+        return err(
+          'unsupported',
+          `no GitHub connection for ${repo} on this canvas — connect the repository first, the same prerequisite open_pull_request has. get_capabilities reports github: "none" when no connection exists at all.`,
+        )
+      try {
+        const manifest = await github.analyzeConnection(conn)
+        return structured({
+          repo: conn.repo,
+          framework: manifest.framework,
+          truncated: manifest.truncated,
+          screens: manifest.screens.map((screen) => ({
+            route: screen.route,
+            file: screen.sourcePath,
+            kind: screen.kind,
+            title: screen.title,
+            dynamic: screen.dynamic,
+          })),
+        })
+      } catch (e) {
+        return err('upstream_failed', e instanceof Error ? e.message : `could not read ${conn.repo}`)
+      }
+    },
+  )
+
+  tool(
+    'import_repo_screen',
+    {
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+      title: 'Import a repository screen',
+      description:
+        'Bring one screen of a connected GitHub repository onto this canvas as a frame, marked doop-github-screen so it stays traceable to its route and source file. A static HTML screen lands the repo HTML verbatim; a screen that exists only as code comes back as its source to design from — design it, then call again with html to land the frame.',
+      inputSchema: {
+        canvas_id: z.string(),
+        repo: z.string().describe('owner/name'),
+        route: z
+          .string()
+          .optional()
+          .describe('Screen route from list_repo_screens, e.g. "/pricing" — exactly one of route / file'),
+        file: z.string().optional().describe('Source file path from list_repo_screens — exactly one of route / file'),
+        html: z
+          .string()
+          .optional()
+          .describe(
+            'For a screen that exists only as code: the complete document you designed from its source (a final <!-- doop-height: N --> comment sizes the frame)',
+          ),
+        agent_name: agentName,
+      },
+      outputSchema: {
+        ok: z.literal(true),
+        screen: z.object({ route: z.string(), file: z.string(), kind: z.string(), title: z.string() }),
+        frame: z.object(frameSummaryShape).nullable(),
+        source: z.array(z.object({ path: z.string(), text: z.string() })).optional(),
+        note: z.string().optional(),
+      },
+    },
+    async ({ canvas_id, repo, route, file, html, agent_name }) => {
+      const c = canvasFor(canvas_id)
+      if (!c) return noCanvas(canvas_id)
+      arrive(canvas_id, agent_name)
+      if ((route === undefined) === (file === undefined))
+        return err(
+          'invalid_input',
+          'pass exactly one of route or file — list_repo_screens returns both for every screen',
+        )
+      const conn = await repoConnection(canvas_id, repo)
+      if (!conn)
+        return err(
+          'unsupported',
+          `no GitHub connection for ${repo} on this canvas — connect the repository first, the same prerequisite open_pull_request has. get_capabilities reports github: "none" when no connection exists at all.`,
+        )
+      let manifest: github.RepoManifest
+      try {
+        manifest = await github.analyzeConnection(conn)
+      } catch (e) {
+        return err('upstream_failed', e instanceof Error ? e.message : `could not read ${conn.repo}`)
+      }
+      const screen = manifest.screens.find((s) => (route !== undefined ? s.route === route : s.sourcePath === file))
+      if (!screen)
+        return err(
+          'not_found',
+          `no screen "${route ?? file}" in ${conn.repo} — call list_repo_screens for its routes and files`,
+        )
+      /* A code screen with no document yet lands nothing, so review mode does
+         not gate the read that makes designing it possible. */
+      if (screen.source !== 'static' && html === undefined) {
+        const outcome = await importRepoScreen(canvas_id, conn, screen, actorFrom(agent_name))
+        if (outcome.kind !== 'source' || !outcome.files.length)
+          return err('upstream_failed', `no readable source for ${screen.sourcePath} in ${conn.repo}`)
+        return structured({
+          ok: true as const,
+          screen: { route: screen.route, file: screen.sourcePath, kind: screen.kind, title: screen.title },
+          frame: null,
+          source: outcome.files,
+          note: `This screen exists only as code (${screen.sourcePath}). Design a complete self-contained document from the source above — the same brief the import's own sketch lane gives its model — then call import_repo_screen again with the same route/file and html to land it with the import marker.`,
+        })
+      }
+      const gated = reviewGate(canvas_id)
+      if (gated) return gated
+      let outcome: RepoScreenImport
+      try {
+        outcome = await importRepoScreen(canvas_id, conn, screen, actorFrom(agent_name), html)
+      } catch (e) {
+        /* with html supplied only the document parse can fail; otherwise the
+           repository read did */
+        return err(
+          html !== undefined ? 'invalid_input' : 'upstream_failed',
+          e instanceof Error ? e.message : 'the import failed',
+        )
+      }
+      if (outcome.kind !== 'frame') return err('upstream_failed', 'the screen produced no frame')
+      return withFeedback(
+        structured({
+          ok: true as const,
+          screen: { route: screen.route, file: screen.sourcePath, kind: screen.kind, title: screen.title },
+          frame: frameSummary(outcome.frame),
+        }),
+        canvas_id,
+        actorFrom(agent_name),
+      )
     },
   )
 

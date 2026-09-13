@@ -573,6 +573,65 @@ function placeRepoFrame(
   return frame
 }
 
+/** What an out-of-band screen import produced: the landed frame, or — for a
+ *  screen that exists only as code, when no document was supplied — the
+ *  bounded source closure to design one from. */
+export type RepoScreenImport =
+  { kind: 'frame'; frame: Frame } | { kind: 'source'; files: { path: string; text: string }[] }
+
+/**
+ * Land one screen as a frame outside the card lane, through exactly the
+ * placement, wrapper and marker the resident sketch lane uses. A static screen
+ * lands its repo HTML verbatim; a screen that exists only as code needs a
+ * document from the caller — the resident lane's model designs it, and over
+ * MCP the calling agent is that designer — so without one this hands back the
+ * source closure to design from rather than inventing a document.
+ */
+export async function importRepoScreen(
+  canvasId: string,
+  conn: GithubConnection,
+  screen: RepoScreenRef,
+  actor: Actor,
+  designed?: string,
+): Promise<RepoScreenImport> {
+  if (designed !== undefined) {
+    let document: { html: string; height: number }
+    try {
+      document = extractHtml([{ type: 'text', text: designed }])
+    } catch {
+      throw new Error(
+        'the html carries no renderable document — send a complete document, or a fragment that starts with a tag',
+      )
+    }
+    return {
+      kind: 'frame',
+      frame: placeRepoFrame(
+        canvasId,
+        conn,
+        screen,
+        wrapGeneratedHtml(document.html, conn, screen),
+        isCompact(screen) ? COMPONENT_W : PAGE_W,
+        document.height,
+        actor,
+      ),
+    }
+  }
+  if (screen.source === 'static')
+    return {
+      kind: 'frame',
+      frame: placeRepoFrame(
+        canvasId,
+        conn,
+        screen,
+        wrapRepoHtml(await fetchRepoFile(conn, screen.sourcePath), conn, screen),
+        PAGE_W,
+        STATIC_H,
+        actor,
+      ),
+    }
+  return { kind: 'source', files: await collectClosure(conn, screen, await fetchTreePaths(conn)) }
+}
+
 /** One screen, source to frame. Repo HTML lands as-is; code is designed by
  *  the model, rendered, reviewed once by the model, and fixed. */
 async function sketchScreen(
