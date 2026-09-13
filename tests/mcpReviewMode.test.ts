@@ -184,6 +184,79 @@ describe('review mode', () => {
     expect(store.getFrame(frame.id)?.html).toContain('human edit')
   })
 
+  it('rejecting with a note carries it back through list_change_proposals', async () => {
+    actions.setCanvasReviewMode(
+      canvas.id,
+      true,
+      actions.resolveActor({ name: 'owner', kind: 'user', ownerId: OWNER_ID }),
+    )
+    const { client, close } = await connect()
+    const proposed = await callTool(client, 'propose_frame_html', {
+      canvas_id: canvas.id,
+      frame_id: frame.id,
+      html: '<html><body><p>too loud</p></body></html>',
+      summary: 'swap the hero copy',
+      agent_name: 'ux lead',
+    })
+    const { proposal_id: proposalId } = proposed.parsed as { proposal_id: string }
+
+    const rejected = actions.resolveFrameProposal(
+      canvas.id,
+      proposalId,
+      false,
+      actions.resolveActor({ name: 'owner', kind: 'user', ownerId: OWNER_ID }),
+      { note: 'too busy — keep the quiet hero' },
+    )
+    expect(rejected?.status).toBe('rejected')
+    expect(rejected?.resolutionNote).toBe('too busy — keep the quiet hero')
+
+    const listed = await callTool(client, 'list_change_proposals', {
+      canvas_id: canvas.id,
+      status: 'rejected',
+      agent_name: 'ux lead',
+    })
+    const { proposals } = listed.parsed as {
+      proposals: { proposal_id: string; resolution_note?: string; base_updated_at?: string }[]
+    }
+    const row = proposals.find((p) => p.proposal_id === proposalId)!
+    expect(row.resolution_note).toBe('too busy — keep the quiet hero')
+    expect(typeof row.base_updated_at).toBe('string')
+    /* the rejection really did not land the html */
+    expect(store.getFrame(frame.id)?.html).toContain('<h1>Hi</h1>')
+    await close()
+  })
+
+  it('force-accepting a stale proposal lands the html and marks it accepted', async () => {
+    actions.setCanvasReviewMode(
+      canvas.id,
+      true,
+      actions.resolveActor({ name: 'owner', kind: 'user', ownerId: OWNER_ID }),
+    )
+    const { client, close } = await connect()
+    const proposed = await callTool(client, 'propose_frame_html', {
+      canvas_id: canvas.id,
+      frame_id: frame.id,
+      html: '<html><body><p>forced</p></body></html>',
+      summary: 'refresh hero',
+      agent_name: 'ux lead',
+    })
+    const { proposal_id: proposalId } = proposed.parsed as { proposal_id: string }
+    await close()
+
+    /* the frame moves on while the proposal is pending */
+    store.updateFrame(frame.id, { html: '<html><body><p>human edit</p></body></html>' }, 'alice')
+
+    const accepted = actions.resolveFrameProposal(
+      canvas.id,
+      proposalId,
+      true,
+      actions.resolveActor({ name: 'owner', kind: 'user', ownerId: OWNER_ID }),
+      { force: true },
+    )
+    expect(accepted?.status).toBe('accepted')
+    expect(store.getFrame(frame.id)?.html).toContain('forced')
+  })
+
   it('review mode off: propose tools are refused', async () => {
     const { client, close } = await connect()
     const res = await callTool(client, 'propose_frame_html', {

@@ -418,6 +418,9 @@ export interface RunJournal {
   canvasId: string
   agentName: string
   cardId?: string
+  /** the run's own id in the run timeline (runLog) — how a run is resolved
+   *  back to the frames it changed */
+  runId?: string
   summary: string
   /** JSON string of what the run touched (frames, guides read) */
   decisions?: string
@@ -428,7 +431,16 @@ export interface RunJournal {
 }
 
 /** What wakes an agent parked in wait_for_events / ask_human. */
-export type AgentEventKind = 'feedback' | 'comment' | 'stop' | 'question_answer' | 'frame_proposal' | 'card'
+export type AgentEventKind =
+  | 'feedback'
+  | 'comment'
+  | 'stop'
+  | 'question_answer'
+  | 'frame_proposal'
+  | 'card'
+  /** a human wrote to a frame an agent had just written — the agent must
+   *  re-read it before its next write lands on a base it never saw */
+  | 'frame_edited'
 
 /** A buffered event an agent receives from a long-poll call. `targetAgent`
  *  scopes it to one agent; unset means every agent on the canvas may see it. */

@@ -578,6 +578,7 @@ const MUTATING_TOOLS: Record<string, true> = {
   insert_element: true,
   move_frame: true,
   open_pull_request: true,
+  pause_work: true,
   propose_frame_create: true,
   propose_frame_delete: true,
   propose_frame_html: true,
@@ -587,7 +588,9 @@ const MUTATING_TOOLS: Record<string, true> = {
   reply_to_comment: true,
   resolve_comment: true,
   restore_release: true,
+  resume_work: true,
   revert_frame: true,
+  revert_run: true,
   save_decision: true,
   set_breakpoints: true,
   set_frame_css: true,
@@ -1928,8 +1931,9 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
   tool(
     'stop_work',
     {
+      title: 'Stop agent work',
       description:
-        "Stop an agent's work on a canvas — for when a run is going wrong: a redesign that drifted from the brief, work on the wrong frame, or an agent looping. Pass target_agent to stop another agent (the name you see on the canvas), or omit it to stop yourself. Its live stream closes and its board card is marked stopped instead of failed, so a human can retry it. Frames already written stay on the canvas and are yours to edit. Use this instead of deleting a frame out from under a working agent.",
+        "Stop an agent's work on a canvas — for when a run is going wrong: a redesign that drifted from the brief, work on the wrong frame, or an agent looping. Pass target_agent to stop another agent (the name you see on the canvas), or omit it to stop yourself: its live stream closes and its board card is marked stopped instead of failed, so a human can retry it. Pass card_id instead to stop just that one board card — the agent's other cards and its tool calls keep running. Frames already written stay on the canvas and are yours to edit. Use this instead of deleting a frame out from under a working agent.",
       annotations: { destructiveHint: true },
       inputSchema: {
         canvas_id: z.string(),
@@ -1938,11 +1942,36 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
           .string()
           .optional()
           .describe('The agent to stop, as named on the canvas. Omit to stop your own run.'),
+        card_id: z
+          .string()
+          .optional()
+          .describe(
+            'Stop only this board card, leaving the agent’s other cards and calls running. Takes precedence over target_agent.',
+          ),
       },
     },
-    async ({ canvas_id, agent_name, target_agent }) => {
+    async ({ canvas_id, agent_name, target_agent, card_id }) => {
       const c = canvasFor(canvas_id)
       if (!c) return noCanvas(canvas_id)
+      /* Card scope: one card goes to cancelled, nothing else changes — no
+         agent-level stop, so the agent keeps its other cards and its next call
+         is not refused. */
+      if (card_id !== undefined) {
+        const card = actions.getTasks(canvas_id).find((t) => t.id === card_id)
+        if (!card) return err('not_found', `no card with id ${card_id} on this canvas`)
+        if (!card.queuedBy) return err('invalid_input', `${card_id} is not a board card — pass an id from list_cards`)
+        const stopped = actions.cancelCard(canvas_id, card_id, actorFrom(agent_name).name)
+        if (!stopped || stopped.cancelledAt === undefined)
+          return err('invalid_input', 'that card is already finished or stopped')
+        return text({
+          ok: true,
+          stopped_card: card_id,
+          ...(card.agentName ? { agent: card.agentName } : {}),
+          note: card.agentName
+            ? `${card.agentName} is stopped on this card only — its other cards and tool calls keep running. A human can retry this card from the board.`
+            : 'Stopped. No agent had claimed this card, so nothing else changed.',
+        })
+      }
       /* ?? keeps an empty string: a blank target must not fall back to
          agent_name or worse, abort whatever run happens to be live */
       const target = (target_agent ?? agent_name).trim()
@@ -6304,7 +6333,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
     {
       title: 'Ask the human a question',
       description:
-        'Ask the humans on this canvas a question and WAIT for the answer (up to the wait_seconds you pass). Use it when a request is genuinely ambiguous or implies a destructive choice you cannot settle from the canvas — which palette direction, whether replacing a whole frame is intended, whether to delete something. When your client supports questions in its own UI the user is asked there and you get the answer directly (status "answered", via "elicitation"); otherwise the question appears live on the canvas and in the Review panel for the humans in the room. Either way the exchange is recorded on the canvas. If the wait expires you get status "open" plus the question id — carry on with your best judgement and check get_answers later, and do not ask the same question twice. Do not use it for information the canvas already answers.',
+        'Ask the humans on this canvas a question and WAIT for the answer (up to the wait_seconds you pass). Use it when a request is genuinely ambiguous or implies a destructive choice you cannot settle from the canvas — which palette direction, whether replacing a whole frame is intended, whether to delete something. Pass choices (2–6 short options) when the answer is one of a few directions: the client asks with those options, and the canvas shows them as buttons. When your client supports questions in its own UI the user is asked there and you get the answer directly (status "answered", via "elicitation"); otherwise the question appears live on the canvas and in the Review panel for the humans in the room. Either way the exchange is recorded on the canvas. If the wait expires you get status "open" plus the question id — carry on with your best judgement and check get_answers later, and do not ask the same question twice. Do not use it for information the canvas already answers.',
       inputSchema: {
         canvas_id: z.string(),
         text: z
@@ -6312,6 +6341,19 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
           .min(1)
           .max(2000)
           .describe('The question. One clear ask; options inlined ("A or B?") if you have them.'),
+        choices: z
+          .array(z.string().min(1).max(120))
+          .min(2)
+          .max(6)
+          .optional()
+          .describe(
+            '2–6 offered answers, each 1–120 chars. The human picks one (or several with multi) instead of typing free text; set allow_other to also accept a typed answer.',
+          ),
+        multi: z.boolean().optional().describe('The human may pick more than one choice (default: one)'),
+        allow_other: z
+          .boolean()
+          .optional()
+          .describe('Also accept an answer that is not one of the choices (default: only the choices)'),
         frame_id: z.string().optional().describe('Pin the question to a frame'),
         selector: z.string().optional().describe('Element selector the question is about, from inspect_frame'),
         stable_key: z
@@ -6328,11 +6370,19 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
         agent_name: agentName,
       },
     },
-    async ({ canvas_id, text, frame_id, selector, stable_key, wait_seconds, agent_name }, extra: ToolExtra) => {
+    async (
+      { canvas_id, text, choices, multi, allow_other, frame_id, selector, stable_key, wait_seconds, agent_name },
+      extra: ToolExtra,
+    ) => {
       const c = canvasFor(canvas_id)
       if (!c) return noCanvas(canvas_id)
       arrive(canvas_id, agent_name)
       const waitMs = Math.max(0, wait_seconds ?? 60) * 1000
+      /* A choice question is only a choice question with real options: a
+         one-entry list (or an empty one) is the free-text ask it already was. */
+      const offered = (choices ?? []).map((c) => c.trim()).filter(Boolean)
+      const useChoices = offered.length >= 2
+      const isMulti = useChoices && !!multi
       /* The client in front of the agent can answer directly, in its own UI —
          no canvas question, no polling. When it cannot, the canvas question
          below is the fallback: the humans in the room are the other half of
@@ -6348,12 +6398,20 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
                 requestedSchema: {
                   type: 'object',
                   properties: {
-                    answer: {
-                      type: 'string',
-                      title: 'Your answer',
-                      description: 'Answer for the agent. It continues with this as soon as you submit.',
-                      maxLength: 2000,
-                    },
+                    answer: useChoices
+                      ? {
+                          title: 'Your answer',
+                          description: 'Answer for the agent. It continues with this as soon as you submit.',
+                          ...(isMulti
+                            ? { type: 'array', items: { type: 'string', enum: offered } }
+                            : { type: 'string', enum: offered }),
+                        }
+                      : {
+                          type: 'string',
+                          title: 'Your answer',
+                          description: 'Answer for the agent. It continues with this as soon as you submit.',
+                          maxLength: 2000,
+                        },
                   },
                   required: ['answer'],
                 },
@@ -6363,8 +6421,23 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
             { timeout: waitMs },
           )
           const answerValue = (elicited.content as { answer?: unknown } | undefined)?.answer
-          const answer = typeof answerValue === 'string' ? answerValue.trim() : ''
-          if (elicited.action === 'accept' && answer) {
+          const answer = Array.isArray(answerValue)
+            ? answerValue
+                .filter((v): v is string => typeof v === 'string')
+                .map((v) => v.trim())
+                .filter(Boolean)
+                .join(', ')
+            : typeof answerValue === 'string'
+              ? answerValue.trim()
+              : ''
+          if (
+            elicited.action === 'accept' &&
+            answer &&
+            /* a client that ignored the enum does not get to settle a choice
+               question with something that was never on offer — fall through
+               to the canvas, where the choices are enforced */
+            (!useChoices || allow_other || actions.matchesChoices(answer, offered, isMulti))
+          ) {
             /* recorded on the canvas too: the humans who were not in front of
                the client still see the question and what settled it */
             const recorded = actions.recordElicitedAnswer(
@@ -6372,6 +6445,9 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
               {
                 text,
                 answer,
+                ...(useChoices ? { choices: offered } : {}),
+                ...(isMulti ? { multi: true } : {}),
+                ...(useChoices && allow_other ? { allowOther: true } : {}),
                 ...(frame_id ? { frameId: frame_id } : {}),
                 ...(selector ? { selector } : {}),
                 ...(stable_key ? { stableKey: stable_key } : {}),
@@ -6396,6 +6472,9 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
         canvas_id,
         {
           text,
+          ...(useChoices ? { choices: offered } : {}),
+          ...(isMulti ? { multi: true } : {}),
+          ...(useChoices && allow_other ? { allowOther: true } : {}),
           ...(frame_id ? { frameId: frame_id } : {}),
           ...(selector ? { selector } : {}),
           ...(stable_key ? { stableKey: stable_key } : {}),
@@ -6432,6 +6511,8 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
       return structured({
         question_id: question.id,
         status: 'open' as const,
+        ...(question.choices?.length ? { choices: question.choices } : {}),
+        ...(question.multi ? { multi: true } : {}),
         hint: 'Nobody answered yet. Continue with your best judgement; check get_answers later for this question_id.',
       })
     },
@@ -6456,6 +6537,8 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
         question_id: q.id,
         status: q.status,
         text: q.text,
+        ...(q.choices?.length ? { choices: q.choices } : {}),
+        ...(q.multi ? { multi: true } : {}),
         ...(q.answer ? { answer: q.answer, answered_by: q.answeredBy } : {}),
       }))
       return structured({ questions: summary })
@@ -6643,7 +6726,9 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
         summary: p.summary,
         status: p.status,
         at: new Date(p.at).toISOString(),
+        base_updated_at: new Date(p.baseUpdatedAt).toISOString(),
         ...(p.resolvedBy ? { resolved_by: p.resolvedBy } : {}),
+        ...(p.resolutionNote ? { resolution_note: p.resolutionNote } : {}),
       }))
       return structured({ proposals })
     },
@@ -7370,6 +7455,283 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
           `"${to_agent}" is not a stage of this card's pipeline — check the card's pipeline in get_canvas or list your roles with get_agents`,
         )
       return structured({ ok: true as const, stage: card.stage ?? 0 })
+    },
+  )
+
+  /* ---- run lifecycle: what a run changed, its timeline, and the run undo ---- */
+
+  /* The run timeline ring holds 500 events per canvas; one read of the whole
+     ring is what makes the cursor a plain offset, with no server-side state. */
+  const RUN_EVENT_SCAN = 500
+  /* A journal is written at teardown, after the run's own writes. A frame
+     updated later than the journal by more than this is someone else's work,
+     and a revert must not discard it. */
+  const REVERT_RUN_GRACE_MS = 5_000
+
+  tool(
+    'get_run_changes',
+    {
+      title: 'What a run changed',
+      description:
+        "A run's change set: the frames it touched, each with the version it started from and the one it produced, plus the run's summary and the decisions it recorded. Pick the run with run_id (from get_run_events) or card_id (from list_cards). Empty frames means the run recorded no frame changes. Undo the whole set with revert_run.",
+      annotations: { readOnlyHint: true },
+      inputSchema: {
+        canvas_id: z.string(),
+        run_id: z.string().optional().describe('A run id from get_run_events or get_run_changes'),
+        card_id: z.string().optional().describe('A board card id from list_cards — resolves the run that worked it'),
+        agent_name: agentName.optional(),
+      },
+    },
+    async ({ canvas_id, run_id, card_id, agent_name }) => {
+      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      if (!run_id && !card_id) return err('invalid_input', 'pass run_id or card_id to pick the run')
+      if (agent_name) arrive(canvas_id, agent_name)
+      const journal = actions.getRunJournalBy(canvas_id, {
+        ...(run_id ? { runId: run_id } : {}),
+        ...(card_id ? { cardId: card_id } : {}),
+      })
+      if (!journal)
+        return err(
+          'not_found',
+          `no run journal for ${run_id ? `run ${run_id}` : `card ${card_id}`} on this canvas — read the timeline with get_run_events`,
+        )
+      /* the decisions blob is a JSON string the resident wrote: hand it back
+         parsed when it is valid JSON, so a reader does not have to parse it */
+      let decisions: unknown
+      if (journal.decisions !== undefined) {
+        try {
+          decisions = JSON.parse(journal.decisions)
+        } catch {
+          decisions = journal.decisions
+        }
+      }
+      const journalRunId = journal.runId ?? journal.id
+      return structured({
+        run_id: journalRunId,
+        ...(journal.cardId ? { card_id: journal.cardId } : {}),
+        agent: journal.agentName,
+        summary: journal.summary,
+        frames: (journal.frames ?? []).map((entry) => ({
+          frame_id: entry.frameId,
+          name: entry.name,
+          ...(entry.beforeVersionId ? { before_version_id: entry.beforeVersionId } : {}),
+          ...(entry.afterVersionId ? { after_version_id: entry.afterVersionId } : {}),
+        })),
+        ...(decisions !== undefined ? { decisions } : {}),
+      })
+    },
+  )
+
+  tool(
+    'get_run_events',
+    {
+      title: 'Read a run’s timeline',
+      description:
+        'The run timeline, newest first: one entry per model turn, tool call, status line, error and stop, with its agent, outcome and duration. Filter to one run with run_id, or read the canvas’s whole recent history. Page with cursor: pass the previous next_offset back as cursor.',
+      annotations: { readOnlyHint: true },
+      inputSchema: {
+        canvas_id: z.string(),
+        run_id: z.string().optional().describe('Only this run’s events'),
+        cursor: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe('Offset into the newest-first list — a previous call’s next_offset'),
+        limit: z.number().int().min(1).max(200).default(100),
+        agent_name: agentName.optional(),
+      },
+    },
+    async ({ canvas_id, run_id, cursor, limit, agent_name }) => {
+      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      if (agent_name) arrive(canvas_id, agent_name)
+      const all = runLog.getRunEvents(canvas_id, { ...(run_id ? { runId: run_id } : {}), limit: RUN_EVENT_SCAN })
+      const start = Math.min(cursor ?? 0, all.length)
+      const events = all.slice(start, start + limit)
+      const next = start + events.length
+      return structured({
+        events: events.map((event) => ({
+          id: event.id,
+          runId: event.runId,
+          agentName: event.agentName,
+          at: event.at,
+          kind: event.kind,
+          ...(event.name ? { name: event.name } : {}),
+          ...(event.ok !== undefined ? { ok: event.ok } : {}),
+          ...(event.ms !== undefined ? { ms: event.ms } : {}),
+          ...(event.summary ? { summary: event.summary } : {}),
+        })),
+        total_shown: events.length,
+        has_more: next < all.length,
+        ...(next < all.length ? { next_offset: next } : {}),
+      })
+    },
+  )
+
+  tool(
+    'revert_run',
+    {
+      title: 'Undo everything a run changed',
+      description:
+        'Put every frame a run changed back to the version it started from — the run-level undo, for a redesign that went wrong. Read the change set with get_run_changes first. A frame someone else has edited since the run, or deleted since, is skipped and reported instead of being clobbered.',
+      annotations: { readOnlyHint: false, destructiveHint: true },
+      inputSchema: {
+        canvas_id: z.string(),
+        run_id: z.string().describe('The run to undo, from get_run_changes or get_run_events'),
+        agent_name: agentName,
+      },
+    },
+    async ({ canvas_id, run_id, agent_name }) => {
+      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      const gated = reviewGate(canvas_id)
+      if (gated) return gated
+      const journal = actions.getRunJournalBy(canvas_id, { runId: run_id })
+      if (!journal) return err('not_found', `no run journal for ${run_id} on this canvas`)
+      const actor = actorFrom(agent_name)
+      const entries = journal.frames ?? []
+      if (entries.length === 0)
+        return withFeedback(
+          structured({ reverted: [], skipped: [], note: 'this run recorded no frame changes' }),
+          canvas_id,
+          actor,
+        )
+      const reverted: string[] = []
+      const skipped: { frame_id: string; reason: string }[] = []
+      for (const entry of entries) {
+        if (!entry.beforeVersionId) {
+          skipped.push({ frame_id: entry.frameId, reason: 'no starting version was recorded for this frame' })
+          continue
+        }
+        const frame = store.getFrame(entry.frameId)
+        if (!frame || frame.canvasId !== canvas_id) {
+          skipped.push({ frame_id: entry.frameId, reason: 'the frame no longer exists' })
+          continue
+        }
+        if (frame.updatedAt > journal.at + REVERT_RUN_GRACE_MS) {
+          skipped.push({
+            frame_id: entry.frameId,
+            reason: `changed after the run by ${frame.updatedBy} — reverting would discard that work`,
+          })
+          continue
+        }
+        try {
+          const restored = await actions.revertFrame(entry.frameId, entry.beforeVersionId, actor)
+          if (!restored) {
+            skipped.push({ frame_id: entry.frameId, reason: 'the recorded version is no longer stored' })
+            continue
+          }
+          reverted.push(entry.frameId)
+        } catch (e) {
+          const conflict = lockConflict(e)
+          if (!conflict) throw e
+          skipped.push({
+            frame_id: entry.frameId,
+            reason: `still locked by another agent — ${conflict.content[0]?.text}`,
+          })
+        }
+      }
+      return withFeedback(
+        structured({
+          reverted,
+          skipped,
+          note: reverted.length
+            ? `${reverted.length} frame(s) restored to their pre-run version.`
+            : 'nothing was reverted — see skipped for why.',
+        }),
+        canvas_id,
+        actor,
+      )
+    },
+  )
+
+  /* Pausing acts on another account's agent only for the canvas owner and its
+     members — the same rule stop_work applies, since an agent name is typed by
+     the caller and two accounts can both be running a "Claude". */
+  const foreignAgentRefusal = (c: Canvas, canvasId: string, target: string) => {
+    const targetOwners = new Set(
+      actions
+        .getTasks(canvasId)
+        .filter((t) => t.agentName === target && !t.endedAt && !t.cancelledAt && t.ownerId !== undefined)
+        .map((t) => t.ownerId as string),
+    )
+    const foreign = [...targetOwners].some((id) => id !== ownerId)
+    const privileged = ownerId !== undefined && (c.ownerId === ownerId || (c.memberIds ?? []).includes(ownerId))
+    if (!foreign || privileged) return undefined
+    return err('forbidden', `${target} belongs to another account — only the canvas owner or a member can pause it`, {
+      target_agent: target,
+      hint: 'pause your own agent, or ask the canvas owner to pause that one',
+    })
+  }
+
+  tool(
+    'pause_work',
+    {
+      title: 'Pause an agent’s run',
+      description:
+        "Pause an agent's live run without losing its card: the model call aborts, its frame locks are released, and the card goes back to the queue paused instead of failed — resume_work re-claims it, and the run's journal carries the context forward. Pass target_agent to pause another agent (the name you see on the canvas), or omit it to pause yourself.",
+      annotations: { readOnlyHint: false, destructiveHint: false },
+      inputSchema: {
+        canvas_id: z.string(),
+        agent_name: agentName,
+        target_agent: z
+          .string()
+          .optional()
+          .describe('The agent to pause, as named on the canvas. Omit to pause your own run.'),
+      },
+    },
+    async ({ canvas_id, agent_name, target_agent }) => {
+      const c = canvasFor(canvas_id)
+      if (!c) return noCanvas(canvas_id)
+      const target = (target_agent ?? agent_name).trim()
+      if (!target)
+        return err('invalid_input', 'target_agent is empty — name the agent to pause, or omit it to pause yourself')
+      const denied = foreignAgentRefusal(c, canvas_id, target)
+      if (denied) return denied
+      const paused = actions.pauseAgentWork(canvas_id, target, actorFrom(agent_name).name)
+      return structured({
+        ok: paused > 0,
+        paused_agent: target,
+        cards_paused: paused,
+        note:
+          paused > 0
+            ? `${target} was paused. Its card stays open and paused — resume_work re-claims it, and the run's journal carries the context forward.`
+            : `${target} had no live card on this canvas to pause.`,
+      })
+    },
+  )
+
+  tool(
+    'resume_work',
+    {
+      title: 'Resume a paused card',
+      description:
+        "Resume a card a human (or pause_work) paused: the pause clears and the canvas's resident sweep re-fires, so the card is claimed again. Continuity is journal-based — the interrupted message transcript is not replayed, the run's journal and plan are what survive.",
+      annotations: { readOnlyHint: false, destructiveHint: false },
+      inputSchema: {
+        canvas_id: z.string(),
+        card_id: z.string().describe('The paused card, from list_cards'),
+        agent_name: agentName,
+      },
+    },
+    async ({ canvas_id, card_id, agent_name }) => {
+      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      if (actions.taskCanvasId(card_id) !== canvas_id)
+        return err('not_found', `no card with id ${card_id} on this canvas`)
+      const before = actions.getTasks(canvas_id).find((t) => t.id === card_id)
+      if (!before) return err('not_found', `no card with id ${card_id} on this canvas`)
+      const wasPaused = before.pausedAt !== undefined
+      const card = actions.resumeCard(canvas_id, card_id, actorFrom(agent_name).name)
+      if (!card) return err('not_found', `no card with id ${card_id} on this canvas`)
+      return structured({
+        ok: true as const,
+        card_id: card.id,
+        resumed: wasPaused,
+        status: card.status,
+        stage: card.stage ?? 0,
+        note: wasPaused
+          ? 'the card is queued again — the next sweep claims it'
+          : 'the card was not paused; nothing changed',
+      })
     },
   )
 

@@ -47,6 +47,10 @@ vi.mock('../server/db/persist.ts', () => ({
  *  transport rather than only the loop around it. */
 const turns: { signal?: AbortSignal }[] = []
 
+/** The flattened text of every request's messages, so a test can read what a
+ *  resumed run was told. */
+const prompts: string[] = []
+
 /* Holds the run inside its model call, so a stop can be landed while a turn is
    genuinely in flight. */
 let turnGate: { promise: Promise<void>; release: () => void } | null = null
@@ -57,10 +61,25 @@ vi.mock('../server/agentModel.ts', () => ({
     provider: 'anthropic',
     label: 'test model',
     userId: 'user-1',
-    run: async (req: { signal?: AbortSignal }) => {
+    run: async (req: { signal?: AbortSignal; messages: { role: string; content: unknown }[] }) => {
       turns.push({ signal: req.signal })
+      prompts.push(
+        req.messages
+          .map((m) =>
+            typeof m.content === 'string'
+              ? m.content
+              : (m.content as { type: string; text?: string }[])
+                  .map((b) => (b.type === 'text' ? (b.text ?? '') : ''))
+                  .join(' '),
+          )
+          .join('\n'),
+      )
       if (turnGate) await turnGate.promise
-      return { content: [{ type: 'text' as const, text: 'done' }], stop_reason: 'end_turn' }
+      return {
+        content: [{ type: 'text' as const, text: 'done' }],
+        stop_reason: 'end_turn',
+        usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0 },
+      }
     },
   }),
 }))
@@ -92,6 +111,7 @@ function terminal() {
 
 beforeEach(() => {
   turns.length = 0
+  prompts.length = 0
   turnGate = null
   /* the real canceller: without it a stop cannot reach the in-flight call */
   actions.wire(
@@ -150,5 +170,73 @@ describe('a stopped resident run', () => {
     const card = actions.getTasks(CANVAS).find((t) => t.id === cardId)!
     expect(card.cancelledAt).toBeGreaterThan(0)
     expect(card.failedAt).toBeUndefined()
+  })
+})
+
+describe('a paused resident run', () => {
+  it('aborts the run without failing the card, and the resume re-runs with why it paused', async () => {
+    turnGate = deferred()
+    resident.onFeedback(CANVAS)
+    await vi.waitFor(() => expect(turns.length).toBeGreaterThan(0))
+
+    expect(actions.pauseAgentWork(CANVAS, AGENT, 'alice')).toBe(1)
+    turnGate.release()
+    turnGate = null
+    /* the pause journal, then the aborted run's own journal: the run has
+       unwound and its card is still open */
+    await vi.waitFor(() => expect(actions.getRunJournals(CANVAS, AGENT).length).toBe(2))
+
+    const card = actions.getTasks(CANVAS).find((t) => t.id === cardId)!
+    expect(card.pausedAt).toBeGreaterThan(0)
+    expect(card.failedAt).toBeUndefined()
+    expect(card.cancelledAt).toBeUndefined()
+    /* back in the queue, unclaimed: the resume is one click */
+    expect(card.agentName).toBe('')
+    expect(actions.getRunJournals(CANVAS, AGENT)[0]!.summary).toBe('paused by alice: Make a hero')
+
+    const callsBefore = turns.length
+    actions.resumeCard(CANVAS, cardId, 'alice')
+    await vi.waitFor(() => expect(turns.length).toBeGreaterThan(callsBefore))
+
+    /* the resumed run is a fresh kickoff, so the journal is what tells it why
+       it stopped — otherwise the agent redoes work the human paused */
+    expect(prompts.at(-1)).toContain('paused by alice')
+    expect(prompts.at(-1)).toContain('Make a hero')
+  })
+})
+
+describe('journals across a restart', () => {
+  it('reads back the runs a previous process recorded', async () => {
+    /* what boot does: the rows the database held become the in-memory log the
+       next kickoff and revert_run read */
+    actions.hydrateLogs({
+      tasks: new Map(),
+      feedback: new Map(),
+      comments: new Map(),
+      activity: new Map(),
+      decisions: new Map(),
+      proposals: new Map(),
+      journals: new Map([
+        [
+          CANVAS,
+          [
+            {
+              id: 'j-1',
+              canvasId: CANVAS,
+              agentName: AGENT,
+              runId: 'run-before-restart',
+              summary: 'paused by alice: Make a hero',
+              frames: [{ frameId: 'f-1', name: 'Hero', beforeVersionId: 'v-1', afterVersionId: 'v-2' }],
+              at: 1,
+            },
+          ],
+        ],
+      ]),
+    })
+
+    expect(actions.getRunJournals(CANVAS, AGENT).map((j) => j.summary)).toEqual(['paused by alice: Make a hero'])
+    expect(actions.getRunJournalBy(CANVAS, { runId: 'run-before-restart' })?.frames).toEqual([
+      { frameId: 'f-1', name: 'Hero', beforeVersionId: 'v-1', afterVersionId: 'v-2' },
+    ])
   })
 })

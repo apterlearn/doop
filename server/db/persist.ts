@@ -593,6 +593,7 @@ export function saveFrameProposal(canvasId: string, p: FrameProposal) {
     status: p.status,
     resolvedBy: p.resolvedBy ?? null,
     resolvedAt: p.resolvedAt ?? null,
+    resolutionNote: p.resolutionNote ?? null,
   }
   swallow(
     db
@@ -600,7 +601,12 @@ export function saveFrameProposal(canvasId: string, p: FrameProposal) {
       .values(row)
       .onConflictDoUpdate({
         target: t.frameProposals.id,
-        set: { status: row.status, resolvedBy: row.resolvedBy, resolvedAt: row.resolvedAt },
+        set: {
+          status: row.status,
+          resolvedBy: row.resolvedBy,
+          resolvedAt: row.resolvedAt,
+          resolutionNote: row.resolutionNote,
+        },
       }),
   )
 }
@@ -617,6 +623,9 @@ export function saveQuestion(q: AgentQuestion) {
     selector: q.selector ?? null,
     stableKey: q.stableKey ?? null,
     text: q.text,
+    choices: q.choices ?? null,
+    multi: q.multi ?? null,
+    allowOther: q.allowOther ?? null,
     at: q.at,
     status: q.status,
     answer: q.answer ?? null,
@@ -659,8 +668,10 @@ export function saveJournal(j: RunJournal) {
       canvasId: j.canvasId,
       agentName: j.agentName,
       cardId: j.cardId ?? null,
+      runId: j.runId ?? null,
       summary: j.summary,
       decisions: j.decisions ?? null,
+      frames: j.frames ?? null,
       at: j.at,
     }),
   )
@@ -1381,6 +1392,7 @@ export async function hydrate(): Promise<Hydrated> {
       status: row.status as FrameProposal['status'],
       ...(row.resolvedBy != null ? { resolvedBy: row.resolvedBy } : {}),
       ...(row.resolvedAt != null ? { resolvedAt: row.resolvedAt } : {}),
+      ...(row.resolutionNote != null ? { resolutionNote: row.resolutionNote } : {}),
     })
     frameProposals.set(row.canvasId, list)
   }
@@ -1400,6 +1412,9 @@ export async function hydrate(): Promise<Hydrated> {
       ...(row.selector != null ? { selector: row.selector } : {}),
       ...(row.stableKey != null ? { stableKey: row.stableKey } : {}),
       text: row.text,
+      ...(row.choices?.length ? { choices: row.choices } : {}),
+      ...(row.multi != null ? { multi: row.multi } : {}),
+      ...(row.allowOther != null ? { allowOther: row.allowOther } : {}),
       at: row.at,
       status: row.status as AgentQuestion['status'],
       ...(row.answer != null ? { answer: row.answer } : {}),
@@ -1438,8 +1453,10 @@ export async function hydrate(): Promise<Hydrated> {
       canvasId: row.canvasId,
       agentName: row.agentName,
       ...(row.cardId != null ? { cardId: row.cardId } : {}),
+      ...(row.runId != null ? { runId: row.runId } : {}),
       summary: row.summary,
       ...(row.decisions != null ? { decisions: row.decisions } : {}),
+      ...(row.frames ? { frames: row.frames } : {}),
       at: row.at,
     })
     journals.set(row.canvasId, list)

@@ -147,6 +147,9 @@ export function hydrateLogs(data: {
   proposals: Map<string, MemoryProposal[]>
   /** canvasId -> agentName -> plan */
   plans?: Map<string, Map<string, AgentPlan>>
+  /** canvasId -> journals, newest first — the resident's cross-run memory,
+   *  which the next kickoff and revert_run read after a restart */
+  journals?: Map<string, RunJournal[]>
 }) {
   for (const [canvasId, list] of data.tasks) taskLog.set(canvasId, list)
   for (const [canvasId, list] of data.feedback) feedbackLog.set(canvasId, list)
@@ -155,10 +158,12 @@ export function hydrateLogs(data: {
   for (const [canvasId, list] of data.decisions) decisionLog.set(canvasId, list)
   for (const [canvasId, list] of data.proposals) proposalLog.set(canvasId, list)
   for (const [canvasId, byAgent] of data.plans ?? []) planLog.set(canvasId, byAgent)
+  for (const [canvasId, list] of data.journals ?? []) journalLog.set(canvasId, list)
   /* A stop is per-canvas session state like the task log: a canvas whose logs
      were just re-read has no stop outstanding against it. */
   for (const canvasId of data.tasks.keys()) cancellations.delete(canvasId)
   interruptedStreams.clear()
+  frameEditNotices.clear()
   failInterruptedWork()
 }
 
@@ -664,16 +669,37 @@ export function findQuestion(questionId: string): AgentQuestion | undefined {
   return undefined
 }
 
+/** The choices a question may offer: at least two, at most six, each trimmed
+ *  to the length the Review panel renders. Fewer than two is not a choice —
+ *  the question stays the free-text ask it would have been anyway. */
+function normalizeChoices(raw: string[] | undefined): string[] {
+  const offered = (raw ?? [])
+    .map((c) => c.trim().slice(0, 120))
+    .filter(Boolean)
+    .slice(0, 6)
+  return offered.length >= 2 ? offered : []
+}
+
 /** An agent asked a human a blocking question (ask_human). It surfaces live
  *  on the canvas and in the Review tab; the answer rides back through the
  *  event bus into the agent's parked wait. */
 export function askQuestion(
   canvasId: string,
-  input: { text: string; frameId?: string; selector?: string; stableKey?: string; waitSeconds?: number },
+  input: {
+    text: string
+    frameId?: string
+    selector?: string
+    stableKey?: string
+    waitSeconds?: number
+    choices?: string[]
+    multi?: boolean
+    allowOther?: boolean
+  },
   actor: Actor,
 ): AgentQuestion | undefined {
   const text = input.text.trim().slice(0, 2000)
   if (!text || !store.getCanvas(canvasId)) return undefined
+  const choices = normalizeChoices(input.choices)
   const question: AgentQuestion = {
     id: nanoid(8),
     canvasId,
@@ -684,6 +710,9 @@ export function askQuestion(
     ...(input.frameId ? { frameId: input.frameId } : {}),
     ...(input.selector ? { selector: input.selector } : {}),
     ...(input.stableKey ? { stableKey: input.stableKey } : {}),
+    ...(choices.length ? { choices } : {}),
+    ...(choices.length && input.multi ? { multi: true } : {}),
+    ...(choices.length && input.allowOther ? { allowOther: true } : {}),
     text,
     at: Date.now(),
     status: 'open',
@@ -705,6 +734,34 @@ export function askQuestion(
   return question
 }
 
+/** An answer that is not one of the choices the asker offered. Nothing is
+ *  recorded: the question stays open, so the human can answer it properly. */
+export class InvalidAnswerError extends Error {
+  readonly choices: string[]
+  constructor(choices: string[], multi: boolean) {
+    super(
+      `that answer is not one of this question's choices — answer with ${
+        multi ? 'one or more of' : 'one of'
+      }: ${choices.join(', ')}`,
+    )
+    this.name = 'InvalidAnswerError'
+    this.choices = choices
+  }
+}
+
+/** Whether an answer satisfies the choices an asker offered. A single-choice
+ *  question takes exactly one offered value; a multi-choice one takes one or
+ *  more, comma-separated — the shape the Review panel submits. */
+export function matchesChoices(answer: string, choices: string[], multi: boolean): boolean {
+  const given = multi
+    ? answer
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+    : [answer.trim()]
+  return given.length > 0 && given.every((value) => choices.includes(value))
+}
+
 export function answerQuestion(
   canvasId: string,
   questionId: string,
@@ -715,6 +772,8 @@ export function answerQuestion(
   if (!question || question.status !== 'open') return question
   const clean = answer.trim().slice(0, 2000)
   if (!clean) return question
+  if (question.choices?.length && !question.allowOther && !matchesChoices(clean, question.choices, !!question.multi))
+    throw new InvalidAnswerError(question.choices, !!question.multi)
   question.status = 'answered'
   question.answer = clean
   question.answeredBy = actor.name
@@ -736,13 +795,23 @@ export function answerQuestion(
  *  it to later agents, and nobody is emailed about a question that is settled. */
 export function recordElicitedAnswer(
   canvasId: string,
-  input: { text: string; answer: string; frameId?: string; selector?: string; stableKey?: string },
+  input: {
+    text: string
+    answer: string
+    frameId?: string
+    selector?: string
+    stableKey?: string
+    choices?: string[]
+    multi?: boolean
+    allowOther?: boolean
+  },
   agent: Actor,
   answeredBy: Actor,
 ): AgentQuestion | undefined {
   const text = input.text.trim().slice(0, 2000)
   const answer = input.answer.trim().slice(0, 2000)
   if (!text || !answer || !store.getCanvas(canvasId)) return undefined
+  const choices = normalizeChoices(input.choices)
   const question: AgentQuestion = {
     id: nanoid(8),
     canvasId,
@@ -753,6 +822,9 @@ export function recordElicitedAnswer(
     ...(input.frameId ? { frameId: input.frameId } : {}),
     ...(input.selector ? { selector: input.selector } : {}),
     ...(input.stableKey ? { stableKey: input.stableKey } : {}),
+    ...(choices.length ? { choices } : {}),
+    ...(choices.length && input.multi ? { multi: true } : {}),
+    ...(choices.length && input.allowOther ? { allowOther: true } : {}),
     text,
     at: Date.now(),
     status: 'answered',
@@ -1129,6 +1201,19 @@ export function wasStopped(canvasId: string, agentName: string, ownerId?: string
   return record.ownerId === ownerId
 }
 
+/** True while a stop is outstanding for any agent on this canvas.
+ *
+ *  The sweep's teardown uses it to tell a stop from a pause: both abort the
+ *  in-flight model call, but a stop must not be undone by the re-sweep it just
+ *  queued, while a pause followed by a resume is exactly the re-sweep a human
+ *  asked for. */
+export function anyStopOutstanding(canvasId: string): boolean {
+  const byName = cancellations.get(canvasId)
+  if (!byName) return false
+  for (const name of [...byName.keys()]) if (wasStopped(canvasId, name)) return true
+  return false
+}
+
 /** Clear the record when a fresh run claims work, so a stop cannot leak into a
  *  later, unrelated session under the same agent name. Called by the resident
  *  runner right after it claims (server/resident.ts). */
@@ -1185,6 +1270,34 @@ export function cancelAgentWork(canvasId: string, agentName: string, by: string,
     logActivity(canvasId, resolveActor({ name: by, kind: 'user' }), `stopped ${agentName}`)
   }
   return stopped
+}
+
+/** Stop ONE board card, leaving the agent's other work alone. Unlike
+ *  cancelAgentWork this records no agent-level stop, so the agent keeps its
+ *  other cards and its next call is not refused. The card is cancelled, not
+ *  failed: a human can retry it from the board. */
+export function cancelCard(canvasId: string, cardId: string, by: string): AgentTask | undefined {
+  const card = (taskLog.get(canvasId) ?? []).find((t) => t.id === cardId && t.queuedBy)
+  if (!card || card.endedAt || card.cancelledAt) return card
+  card.cancelledAt = Date.now()
+  card.cancelledBy = by
+  persist.saveTask(canvasId, card)
+  broadcast(canvasId, { type: 'task', task: card })
+  /* Only the agent holding the card is told: a stop event with no target
+     wakes every parked agent on the canvas, and an unclaimed card has no one
+     to tell — the board broadcast is the whole story there. */
+  if (card.agentName)
+    agentEvents.push(canvasId, {
+      kind: 'stop',
+      targetAgent: card.agentName,
+      data: { taskId: card.id, stoppedBy: by },
+    })
+  logActivity(
+    canvasId,
+    resolveActor({ name: by, kind: 'user' }),
+    `stopped a card${card.agentName ? ` for ${card.agentName}` : ''}`,
+  )
+  return card
 }
 
 /** Take a card off the board entirely — what the ✕ means. Distinct from
@@ -1569,6 +1682,77 @@ export function takeInterruptedStreams(canvasId: string, agentName: string, owne
   return out
 }
 
+/** A human write to a frame an agent had just written. The agent is told on
+ *  its next turn: it has been working from a base that no longer exists, so
+ *  the write it is about to make would undo the human's edit. */
+interface FrameEditNotice {
+  frameId: string
+  frameName: string
+  canvasId: string
+  /** the human who wrote */
+  by: string
+  /** the agent whose write the human landed on top of */
+  agentName: string
+  at: number
+}
+
+/** frameId -> the notice, until the agent that wrote the frame is told. */
+const frameEditNotices = new Map<string, FrameEditNotice>()
+
+/** Same lifetime rule as an interrupted stream: a notice is about a state
+ *  change, not a standing fact, so an agent that never comes back must not be
+ *  handed an edit from an hour ago on its next session. */
+const FRAME_EDIT_TTL_MS = 15 * 60_000
+
+/** How recently an agent must have written a frame for a human's write to
+ *  count as landing on top of its work. Past this the human is simply working,
+ *  and every agent that ever touched the frame would be nudged forever. */
+const FRAME_EDIT_WINDOW_MS = 10 * 60_000
+
+/** A human wrote a frame an agent holds or just wrote: wake that agent, and
+ *  leave a notice for the ones a turn loop is driving (they are told between
+ *  turns, not through the event bus). */
+function noticeFrameEdited(
+  frame: { id: string; name: string; canvasId: string },
+  prev: { updatedBy: string; updatedAt: number },
+  by: string,
+): void {
+  const holder = frameLocks.heldBy(frame.id, by)
+  const recent = Date.now() - prev.updatedAt <= FRAME_EDIT_WINDOW_MS
+  const agentName = holder?.agentName ?? (prev.updatedBy !== by && recent ? prev.updatedBy : undefined)
+  if (!agentName) return
+  frameEditNotices.set(frame.id, {
+    frameId: frame.id,
+    frameName: frame.name,
+    canvasId: frame.canvasId,
+    by,
+    agentName,
+    at: Date.now(),
+  })
+  agentEvents.push(frame.canvasId, {
+    kind: 'frame_edited',
+    targetAgent: agentName,
+    data: { frameId: frame.id, name: frame.name },
+  })
+}
+
+/** The human edits this agent has not been told about yet, cleared as they are
+ *  read — one notice per frame, however many writes landed on it. */
+export function takeFrameEditNotices(canvasId: string, agentName: string): FrameEditNotice[] {
+  const now = Date.now()
+  const out: FrameEditNotice[] = []
+  for (const [frameId, record] of frameEditNotices) {
+    if (now - record.at > FRAME_EDIT_TTL_MS) {
+      frameEditNotices.delete(frameId)
+      continue
+    }
+    if (record.canvasId !== canvasId || record.agentName !== agentName) continue
+    frameEditNotices.delete(frameId)
+    out.push(record)
+  }
+  return out
+}
+
 interface RevealState {
   actor: Actor
   /** how many chars of the frame's html are currently revealed to viewers */
@@ -1785,6 +1969,11 @@ export function updateFrame(
   if (patch.html !== undefined) patch = { ...patch, html: stripTokenStyle(repairEscapedHtml(patch.html)) }
   const prevName = before.name
   const prevHtml = before.html
+  /* the store mutates the frame in place, so who last wrote it — the thing
+     that decides whether a human's edit landed on an agent's work — has to be
+     read before the write, not after */
+  const prevWriter = before.updatedBy
+  const prevUpdatedAt = before.updatedAt
   const frame = store.updateFrame(frameId, patch, actor.name)!
 
   const htmlChanged = patch.html !== undefined && patch.html !== prevHtml
@@ -1842,6 +2031,11 @@ export function updateFrame(
     } else if (patch.name !== undefined && patch.name !== prevName) {
       logActivity(frame.canvasId, actor, `renamed “${prevName}” to “${frame.name}”`, frame.id)
     }
+    /* the human's write lands on an agent's work: that agent's next write would
+       undo it unless it re-reads the frame first */
+    if (actor.kind === 'user') {
+      noticeFrameEdited(frame, { updatedBy: prevWriter, updatedAt: prevUpdatedAt }, actor.name)
+    }
   }
 
   touch(frame.canvasId, actor, frame.id)
@@ -1884,6 +2078,9 @@ export function deleteCanvas(canvasId: string): boolean {
   cancellations.delete(canvasId)
   for (const [frameId, record] of interruptedStreams) {
     if (record.canvasId === canvasId) interruptedStreams.delete(frameId)
+  }
+  for (const [frameId, record] of frameEditNotices) {
+    if (record.canvasId === canvasId) frameEditNotices.delete(frameId)
   }
   return true
 }
@@ -2447,41 +2644,50 @@ export function addFrameProposal(
 }
 
 /** A human accepted or rejected a proposal. Accepting after the frame moved
- *  again marks it stale instead of overwriting the newer design. */
+ *  again marks it stale instead of overwriting the newer design — unless the
+ *  reviewer passed `force`, which applies it anyway. A reject may carry a note
+ *  saying why, which the agent reads back through list_change_proposals. */
 export function resolveFrameProposal(
   canvasId: string,
   proposalId: string,
   accept: boolean,
   actor: Actor,
+  opts?: { note?: string; force?: boolean },
 ): FrameProposal | undefined {
   const proposal = (frameProposalLog.get(canvasId) ?? []).find((p) => p.id === proposalId)
   if (!proposal || proposal.status !== 'pending') return proposal
   if (accept) {
     const frame = proposal.frameId ? store.getFrame(proposal.frameId) : undefined
-    if (frame && frame.updatedAt !== proposal.baseUpdatedAt) {
+    /* the frame moved on since the agent read it: without an explicit
+       "apply anyway" this is a stale decision, not an overwrite */
+    if (frame && frame.updatedAt !== proposal.baseUpdatedAt && !opts?.force) {
       proposal.status = 'stale'
-    } else if (proposal.kind === 'replace_html' && frame) {
-      updateFrame(frame.id, { html: proposal.html ?? frame.html }, actor)
-    } else if (proposal.kind === 'delete_frame' && frame) {
-      deleteFrame(frame.id, actor)
-    } else if (proposal.kind === 'create_frame') {
-      createFrame(
-        canvasId,
-        {
-          name: proposal.name ?? 'Proposed frame',
-          html: proposal.html,
-          ...(proposal.x !== undefined ? { x: proposal.x } : {}),
-          ...(proposal.y !== undefined ? { y: proposal.y } : {}),
-          ...(proposal.width !== undefined ? { width: proposal.width } : {}),
-          ...(proposal.height !== undefined ? { height: proposal.height } : {}),
-        },
-        actor,
-      )
+    } else {
+      if (proposal.kind === 'replace_html' && frame) {
+        updateFrame(frame.id, { html: proposal.html ?? frame.html }, actor)
+      } else if (proposal.kind === 'delete_frame' && frame) {
+        deleteFrame(frame.id, actor)
+      } else if (proposal.kind === 'create_frame') {
+        createFrame(
+          canvasId,
+          {
+            name: proposal.name ?? 'Proposed frame',
+            html: proposal.html,
+            ...(proposal.x !== undefined ? { x: proposal.x } : {}),
+            ...(proposal.y !== undefined ? { y: proposal.y } : {}),
+            ...(proposal.width !== undefined ? { width: proposal.width } : {}),
+            ...(proposal.height !== undefined ? { height: proposal.height } : {}),
+          },
+          actor,
+        )
+      }
+      proposal.status = 'accepted'
     }
-    proposal.status = proposal.status === 'stale' ? 'stale' : 'accepted'
   } else {
     proposal.status = 'rejected'
   }
+  const note = opts?.note?.trim().slice(0, 1000)
+  if (note) proposal.resolutionNote = note
   proposal.resolvedBy = actor.name
   proposal.resolvedAt = Date.now()
   persist.saveFrameProposal(canvasId, proposal)
@@ -2489,7 +2695,11 @@ export function resolveFrameProposal(
   agentEvents.push(canvasId, {
     kind: 'frame_proposal',
     targetAgent: proposal.agentName,
-    data: { proposalId: proposal.id, status: proposal.status },
+    data: {
+      proposalId: proposal.id,
+      status: proposal.status,
+      ...(proposal.resolutionNote ? { note: proposal.resolutionNote } : {}),
+    },
   })
   logActivity(canvasId, actor, `${accept ? 'accepted' : 'rejected'} ${proposal.agentName}’s proposal`)
   return proposal
@@ -2538,9 +2748,13 @@ export function proposeInsteadOfWrite(
 export function pauseAgentWork(canvasId: string, agentName: string, by: string): number {
   const now = Date.now()
   let paused = 0
+  /* the card the journal names: the resume re-runs from a fresh kickoff, and
+     the journal is the only thing that tells it why it stopped */
+  let first: AgentTask | undefined
   for (const t of taskLog.get(canvasId) ?? []) {
     if (t.agentName !== agentName || !t.queuedBy) continue
     if (t.endedAt || t.cancelledAt || t.pausedAt || t.failedAt) continue
+    first ??= t
     t.pausedAt = now
     t.pausedBy = by
     /* the card goes back into the queue (stage kept, claim dropped) so a
@@ -2555,6 +2769,14 @@ export function pauseAgentWork(canvasId: string, agentName: string, by: string):
     releaseLocksForAgent(canvasId, agentName)
     cancel(canvasId)
     logActivity(canvasId, resolveActor({ name: by, kind: 'user' }), `paused ${agentName}`)
+    /* continuity for the resumed run: the message transcript is not
+       checkpointed, so the journal plus the plan are what survive */
+    recordRunJournal({
+      canvasId,
+      agentName,
+      ...(first ? { cardId: first.id } : {}),
+      summary: `paused by ${by}: ${first?.status ?? `${paused} open task(s) stopped`}`,
+    })
   }
   return paused
 }
@@ -2680,20 +2902,34 @@ export async function revertFrame(frameId: string, versionId: string, actor: Act
 /** Cross-run memory: what an agent did on its last runs of this canvas. */
 const journalLog = new Map<string, RunJournal[]>() // canvasId -> newest first
 
+/** How many frames of a run's change set a journal keeps. The journal is read
+ *  by the next kickoff and by revert_run, not audited — the newest frames are
+ *  the ones still worth reverting. */
+const MAX_JOURNAL_FRAMES = 20
+
 export function recordRunJournal(input: {
   canvasId: string
   agentName: string
   cardId?: string
+  runId?: string
   summary: string
   decisions?: string
+  frames?: RunJournal['frames']
 }): void {
+  /* newest first, one entry per frame: a run that wrote the same frame five
+     times changed one frame, and the change set is what it touched */
+  const frames = (input.frames ?? [])
+    .filter((f, i, all) => all.findIndex((x) => x.frameId === f.frameId) === i)
+    .slice(0, MAX_JOURNAL_FRAMES)
   const entry: RunJournal = {
     id: nanoid(8),
     canvasId: input.canvasId,
     agentName: input.agentName,
     ...(input.cardId ? { cardId: input.cardId } : {}),
+    ...(input.runId ? { runId: input.runId } : {}),
     summary: input.summary.slice(0, 800),
     ...(input.decisions ? { decisions: input.decisions } : {}),
+    ...(frames.length ? { frames } : {}),
     at: Date.now(),
   }
   const list = journalLog.get(input.canvasId) ?? []
@@ -2709,4 +2945,19 @@ export function getRunJournals(canvasId: string, agentName: string, limit = 3): 
     .filter((j) => j.agentName === agentName)
     .slice(0, limit)
     .reverse()
+}
+
+/** One journal, by the run it recorded or the card it worked — the read behind
+ *  get_run_changes and revert_run. The log is newest first, so the most recent
+ *  match wins. A journal written before the run id was stored on it carries
+ *  only its own id, which is why a run id matches that too. */
+export function getRunJournalBy(canvasId: string, query: { runId?: string; cardId?: string }): RunJournal | undefined {
+  const list = journalLog.get(canvasId) ?? []
+  if (query.runId) {
+    const wanted = query.runId
+    const byRun = list.find((j) => j.runId === wanted || j.id === wanted)
+    if (byRun) return byRun
+  }
+  if (query.cardId) return list.find((j) => j.cardId === query.cardId)
+  return undefined
 }

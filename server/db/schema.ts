@@ -586,6 +586,8 @@ export const frameProposals = pgTable(
     status: text('status').notNull(),
     resolvedBy: text('resolved_by'),
     resolvedAt: bigint('resolved_at', { mode: 'number' }),
+    /** the reviewer's note, on a reject (why) or an accept (what they changed) */
+    resolutionNote: text('resolution_note'),
   },
   (t) => [index('frame_proposals_canvas_idx').on(t.canvasId)],
 )
@@ -605,6 +607,10 @@ export const agentQuestions = pgTable(
     /** content key of the element the question is about, like comments */
     stableKey: text('stable_key'),
     text: text('text').notNull(),
+    /** offered answers when the asker framed a choice; null = free text */
+    choices: jsonb('choices').$type<string[]>(),
+    multi: boolean('multi'),
+    allowOther: boolean('allow_other'),
     at: bigint('at', { mode: 'number' }).notNull(),
     status: text('status').notNull(),
     answer: text('answer'),
@@ -641,8 +647,14 @@ export const runJournals = pgTable(
     canvasId: text('canvas_id').notNull(),
     agentName: text('agent_name').notNull(),
     cardId: text('card_id'),
+    /** the run's id in the run timeline (runLog) */
+    runId: text('run_id'),
     summary: text('summary').notNull(),
     decisions: text('decisions'),
+    /** the run's revertible change set: frame, name, and the versions it
+     *  started from and produced */
+    frames:
+      jsonb('frames').$type<{ frameId: string; name: string; beforeVersionId?: string; afterVersionId?: string }[]>(),
     at: bigint('at', { mode: 'number' }).notNull(),
   },
   (t) => [index('run_journals_canvas_idx').on(t.canvasId)],

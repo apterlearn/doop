@@ -187,3 +187,62 @@ describe('feedback that lands mid-run', () => {
     expect(runs[0]![0]!.some((m) => m.text.includes('Make the headline bigger'))).toBe(true)
   })
 })
+
+describe('a human editing a frame a resident run just wrote', () => {
+  it('reaches the next turn, so the next write builds on the human’s edit', async () => {
+    /* the agent's own write: what makes the human's edit land on top of its
+       work rather than on a frame nobody was working in */
+    const frame = actions.createFrame(
+      CANVAS,
+      { name: 'Hero', html: '<h1>agent version</h1>' },
+      actions.resolveActor({ name: AGENT, kind: 'agent' }),
+    )!
+
+    injectOnTurn = () => {
+      actions.updateFrame(
+        frame.id,
+        { html: '<h1>human version</h1>' },
+        actions.resolveActor({ name: 'alice', kind: 'user' }),
+      )
+    }
+
+    resident.onFeedback(CANVAS)
+    await vi.waitFor(() => expect(terminalCard()).toBeTruthy())
+
+    const secondTurn = runs[0]![1]!
+    const carrier = secondTurn.find((m) => m.text.includes('A human edited frame "Hero"'))
+    expect(carrier).toBeDefined()
+    expect(carrier!.text).toContain('re-read it before your next write')
+    /* roles still alternate: the notice rode with the tool results */
+    for (let i = 1; i < secondTurn.length; i += 1) {
+      expect(secondTurn[i]!.role).not.toBe(secondTurn[i - 1]!.role)
+    }
+    /* told once: the notice is a state change, not a standing fact */
+    expect(actions.takeFrameEditNotices(CANVAS, AGENT)).toEqual([])
+  })
+
+  it('says nothing when the human is editing their own frame', async () => {
+    /* no agent ever wrote this frame, so no agent is working from a stale
+       base — nudging every agent on the canvas for every human edit would be
+       noise, and the run is not interrupted */
+    const frame = actions.createFrame(
+      CANVAS,
+      { name: 'Human work', html: '<h1>human version</h1>' },
+      actions.resolveActor({ name: 'alice', kind: 'user' }),
+    )!
+
+    injectOnTurn = () => {
+      actions.updateFrame(
+        frame.id,
+        { html: '<h1>human version 2</h1>' },
+        actions.resolveActor({ name: 'alice', kind: 'user' }),
+      )
+    }
+
+    resident.onFeedback(CANVAS)
+    await vi.waitFor(() => expect(terminalCard()).toBeTruthy())
+
+    expect(runs[0]!.flat().some((m) => m.text.includes('A human edited frame'))).toBe(false)
+    expect(actions.takeFrameEditNotices(CANVAS, AGENT)).toEqual([])
+  })
+})

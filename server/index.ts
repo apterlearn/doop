@@ -1377,14 +1377,18 @@ app.get('/api/canvases/:id/frame-proposals', (req, res) => {
   res.json(actions.getFrameProposals(req.params.id, status))
 })
 
-/** Accept or reject a proposal — any collaborator with canvas access may. */
+/** Accept or reject a proposal — any collaborator with canvas access may.
+ *  `note` rides back to the agent; `force` applies a proposal the stale guard
+ *  would otherwise refuse. */
 app.post('/api/canvases/:id/frame-proposals/:pid', (req, res) => {
   if (!requireCanvas(req, res, req.params.id)) return
+  const note = typeof req.body?.note === 'string' ? req.body.note : undefined
   const proposal = actions.resolveFrameProposal(
     req.params.id,
     req.params.pid,
     !!req.body?.accept,
     resolveActorFromReq(req),
+    { ...(note ? { note } : {}), ...(req.body?.force ? { force: true } : {}) },
   )
   if (!proposal) return res.status(404).json({ error: 'proposal not found' })
   res.json(proposal)
@@ -1414,12 +1418,20 @@ app.get('/api/canvases/:id/plans', (req, res) => {
 
 app.post('/api/canvases/:id/questions/:qid', (req, res) => {
   if (!requireCanvas(req, res, req.params.id)) return
-  const question = actions.answerQuestion(
-    req.params.id,
-    req.params.qid,
-    String(req.body?.answer ?? ''),
-    resolveActorFromReq(req),
-  )
+  let question: AgentQuestion | undefined
+  try {
+    question = actions.answerQuestion(
+      req.params.id,
+      req.params.qid,
+      String(req.body?.answer ?? ''),
+      resolveActorFromReq(req),
+    )
+  } catch (e) {
+    /* the answer was not one of the choices the asker offered: nothing is
+       recorded, and the question stays open for a valid answer */
+    if (e instanceof actions.InvalidAnswerError) return res.status(400).json({ error: e.message, choices: e.choices })
+    throw e
+  }
   if (!question) return res.status(404).json({ error: 'question not found' })
   res.json(question)
 })

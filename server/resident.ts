@@ -25,7 +25,7 @@ import { viewWebsite, referencedUrls } from './website.ts'
 import { createImportedWebpageFrame, findImportedWebpageFrame } from './webpageImport.ts'
 import { DESIGN_BRIEF, DESIGN_QUALITY } from './guide.ts'
 import { describeInspiration, INSPIRATION_USAGE_NOTE, searchInspiration } from './inspiration.ts'
-import type { Frame, TaskFeedback } from '../shared/types.ts'
+import type { Frame, RunJournal, TaskFeedback } from '../shared/types.ts'
 import { websiteAccessErrorMessage } from './websiteAccess.ts'
 import { executeGuardedBatch } from './guardedBatch.ts'
 import { runRepoCards } from './githubRecon.ts'
@@ -58,6 +58,9 @@ const MAX_SWEEP_RUNS = 24
 const LARGE_HTML_CHARS = 60_000
 const MAX_REWRITE_CHUNK_CHARS = 12_000
 const MAX_REWRITE_CHARS = 100_000
+/* how many frames of a run's change set the journal keeps, newest first — the
+   journal is read by the next kickoff and by revert_run, not audited */
+const MAX_JOURNAL_FRAMES = 20
 
 /* the tools the resident loop below actually registers — the shared feedback
    wording names them, and naming the MCP surface's instead would send the
@@ -113,10 +116,12 @@ async function sweep(canvasId: string) {
   } finally {
     running.delete(canvasId)
     /* the sweep owns the controller's lifetime so this check still sees it: a
-       stop must not be undone by the re-sweep it just queued */
-    const wasStopped = cancels.get(canvasId)?.signal.aborted ?? false
+       stop must not be undone by the re-sweep it just queued. A pause aborts
+       the same call but leaves no stop behind, so a human's resume — which is
+       what queued the re-sweep — is honoured instead of swallowed. */
+    const stopped = actions.anyStopOutstanding(canvasId)
     cancels.delete(canvasId)
-    if (queued.delete(canvasId) && !wasStopped) onFeedback(canvasId)
+    if (queued.delete(canvasId) && !stopped) onFeedback(canvasId)
   }
 }
 
@@ -169,6 +174,13 @@ interface RunState {
   sourceFrames: Set<string>
   verificationFrames: Set<string>
   verifiedFrames: Set<string>
+  /** frames this run has taken the edit lock on — acquired before the first
+   *  write to a frame, released wholesale by the run teardown */
+  lockedFrames: Set<string>
+  /** frameId -> the version the frame was at before this run wrote it: the
+   *  "before" half of the run's change set. Card targets are resolved at run
+   *  start; a frame the run writes anyway is captured at its first write. */
+  startVersions: Map<string, string>
   rewriteDrafts: Map<string, string>
   blockedWebsiteAccess?: string
   /** review_frame output per deliverable frame — the automated quality gate */
@@ -525,6 +537,24 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
         : '')
 
     const runId = nanoid(8)
+    /* The frames the request names — a card's targets, the frames comments are
+       pinned to. Their newest version right now is the "before" the run's
+       change set is measured against; a frame the run writes anyway is
+       captured at its first write instead (see execTool's lockForWrite). */
+    const startVersions = new Map<string, string>()
+    try {
+      for (const frameId of new Set([
+        ...cards.flatMap((c) => c.targetFrameIds ?? []),
+        ...comments.map((c) => c.frameId),
+      ])) {
+        const [newest] = await persist.listFrameVersions(frameId, 1)
+        if (newest) startVersions.set(frameId, newest.id)
+      }
+    } catch (err) {
+      /* the change set is bookkeeping for the next kickoff and revert_run: a
+         read that fails must not take the run — or the card it claimed — down */
+      console.error('[resident] could not resolve pre-run frame versions', err)
+    }
     console.log(
       `[resident] run start canvas=${canvasId} agent=${role.name} model=${model.label}${model.userId ? ` on=${model.userId}` : ''} feedback=${claimed.length} comments=${comments.length} cards=${cards.length}`,
     )
@@ -537,6 +567,8 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
       sourceFrames: new Set(),
       verificationFrames: new Set(),
       verifiedFrames: new Set(),
+      lockedFrames: new Set(),
+      startVersions,
       reviewedFrames: new Map(),
       rewriteDrafts: new Map(),
       proposals: 0,
@@ -612,6 +644,24 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
             ),
           )
           actions.setAgentStatus(canvasId, actor, 'Picking up human feedback')
+        }
+        /* A human wrote a frame this run had just written. Their edit is the
+           canvas's state now: told here, between turns, so the next write
+           builds on it instead of restoring the version the agent had. */
+        const edited = actions.takeFrameEditNotices(canvasId, role.name)
+        if (edited.length > 0) {
+          injectFeedback(
+            messages,
+            `HUMAN EDITS — frames this run had written, changed by a human while you were working:\n` +
+              edited
+                .map(
+                  (e) =>
+                    `- A human edited frame "${e.frameName}" while you were working — re-read it before your next write.`,
+                )
+                .join('\n') +
+              `\nBuild on what is in those frames now. Never restore your earlier version over a human's change.`,
+          )
+          actions.setAgentStatus(canvasId, actor, 'Re-reading frames a human changed')
         }
         const res = await model.run({
           maxTokens: 16000,
@@ -871,15 +921,41 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
       }
       return ''
     })()
+    /* The run's change set: what each frame it wrote started at, and what it
+       left behind. The last writes of a run may still be inside the frame
+       write debounce, so flush them first — otherwise the "after" version
+       read back is the one the run started from. */
+    const changedFrames: NonNullable<RunJournal['frames']> = []
+    try {
+      for (const frameId of [...runState.mutatedFrames].reverse().slice(0, MAX_JOURNAL_FRAMES)) {
+        const frame = store.getFrame(frameId)
+        if (!frame) continue
+        persist.saveFrame(frame, true)
+        const [newest] = await persist.listFrameVersions(frameId, 1)
+        const before = runState.startVersions.get(frameId)
+        changedFrames.push({
+          frameId,
+          name: frame.name,
+          ...(before ? { beforeVersionId: before } : {}),
+          ...(newest ? { afterVersionId: newest.id } : {}),
+        })
+      }
+    } catch (err) {
+      /* a change set that cannot be read must not turn a finished run into a
+         crash — the journal just records less about it */
+      console.error('[resident] could not record the run change set', err)
+    }
     actions.recordRunJournal({
       canvasId,
       agentName: actor.name,
       cardId: cards[0]?.id,
+      runId,
       summary: runSummaryText || `${role.name} run ended without a summary`,
       decisions: JSON.stringify({
         frames: [...runState.mutatedFrames],
         guidelines: store.getGuidelines(canvasId).map((d) => d.name),
       }),
+      frames: changedFrames,
     })
     if (finished && !blockedWebsiteAccess && !noMutation && !unverifiedMutation && !failedGate) {
       for (const f of [...claimed, ...pickedUp]) actions.completeTaskFeedback(f.id)
@@ -925,7 +1001,13 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
       }
       for (const f of [...claimed, ...pickedUp]) actions.failTaskFeedback(f.id, reason)
       for (const c of comments) actions.failComment(c.id, reason)
-      for (const c of cards) actions.failCard(canvasId, c.id, reason)
+      /* a card a human paused while this run was live is not a failure: the
+         pause already put it back in the queue, and failing it would hide the
+         pause behind a snag and block the resume */
+      for (const c of cards) {
+        if (c.pausedAt) continue
+        actions.failCard(canvasId, c.id, reason)
+      }
     }
   } finally {
     clearInterval(heartbeat)
@@ -1365,6 +1447,32 @@ async function execTool(
     tool_use_id: block.id,
     content,
   })
+  /* Every write this run makes takes the frame's edit lock first — the same
+     claim an external agent makes with begin_frame_edit. A second agent's
+     write is then a conflict it can read instead of a silent clobber, and the
+     room sees who is editing. One acquisition per frame per run; the run's
+     teardown releases them all. The version the frame is at when the run first
+     writes it is the "before" half of the change set, for a frame the card did
+     not name. Returns the refusal to hand the model, or undefined to proceed. */
+  const lockForWrite = async (frameId: string): Promise<string | undefined> => {
+    if (!runState.lockedFrames.has(frameId)) {
+      const lock = actions.acquireFrameLock(frameId, actor)
+      if ('heldBy' in lock) {
+        return `frame is being edited by ${lock.heldBy.agentName} until ${new Date(lock.heldBy.expiresAt).toISOString()} — work on another frame and come back to this one`
+      }
+      runState.lockedFrames.add(frameId)
+      if (!runState.startVersions.has(frameId)) {
+        try {
+          const [newest] = await persist.listFrameVersions(frameId, 1)
+          if (newest) runState.startVersions.set(frameId, newest.id)
+        } catch (err) {
+          /* bookkeeping only — the write itself must still go through */
+          console.error('[resident] could not read the frame version', err)
+        }
+      }
+    }
+    return undefined
+  }
   /* Review mode: the canvas rejects agent writes, so a design change becomes a
      proposal a human accepts — the same contract the MCP surface follows. The
      model is told plainly that nothing landed, so it does not believe the
@@ -1422,6 +1530,7 @@ async function execTool(
           actor,
         )
         if (!f) return fail('canvas not found')
+        await lockForWrite(f.id)
         runState.mutatedFrames.add(f.id)
         runState.verifiedFrames.delete(f.id)
         return ok(
@@ -1439,6 +1548,8 @@ async function execTool(
           if (typeof v === 'number' && Number.isFinite(v)) patch[key] = Math.round(v)
         }
         if (Object.keys(patch).length === 0) return fail('provide at least one of: name, x, y, width, height')
+        const heldForUpdate = await lockForWrite(input.frame_id)
+        if (heldForUpdate) return fail(heldForUpdate)
         const updated = actions.updateFrame(input.frame_id, patch, actor)
         if (!updated) return fail('could not update the frame')
         runState.mutatedFrames.add(input.frame_id)
@@ -1477,6 +1588,8 @@ async function execTool(
           summary: `edit “${f.name}”`,
         })
         if (diverted) return diverted
+        const heldForEdit = await lockForWrite(input.frame_id)
+        if (heldForEdit) return fail(heldForEdit)
         actions.updateFrame(input.frame_id, { html: nextHtml }, actor)
         runState.mutatedFrames.add(input.frame_id)
         runState.verifiedFrames.delete(input.frame_id)
@@ -1503,6 +1616,8 @@ async function execTool(
           summary: `redesign “${f.name}”`,
         })
         if (diverted) return diverted
+        const heldForSet = await lockForWrite(input.frame_id)
+        if (heldForSet) return fail(heldForSet)
         actions.updateFrame(input.frame_id, { html }, actor)
         runState.mutatedFrames.add(input.frame_id)
         runState.verifiedFrames.delete(input.frame_id)
@@ -1529,6 +1644,8 @@ async function execTool(
         if (draft.length > MAX_REWRITE_CHARS) {
           return fail(`rewrite draft exceeds the ${MAX_REWRITE_CHARS}-character safety limit`)
         }
+        const heldForAppend = await lockForWrite(input.frame_id)
+        if (heldForAppend) return fail(heldForAppend)
         runState.rewriteDrafts.set(input.frame_id, draft)
         return ok(`appended ${raw.chunk.length} characters; draft is now ${draft.length} characters`)
       }
@@ -1550,6 +1667,8 @@ async function execTool(
           runState.rewriteDrafts.delete(input.frame_id)
           return diverted
         }
+        const heldForCommit = await lockForWrite(input.frame_id)
+        if (heldForCommit) return fail(heldForCommit)
         actions.updateFrame(input.frame_id, { html }, actor)
         runState.rewriteDrafts.delete(input.frame_id)
         runState.mutatedFrames.add(input.frame_id)
@@ -1720,6 +1839,7 @@ async function execTool(
 
         const { frame: f } = await createImportedWebpageFrame({ canvasId, url: requestedUrl, actor })
         if (!f) return fail('canvas not found')
+        await lockForWrite(f.id)
         runState.mutatedFrames.add(f.id)
         if (raw.as_reference) runState.sourceFrames.add(f.id)
         else runState.sourceFrames.delete(f.id)
@@ -1921,8 +2041,13 @@ async function execTool(
     }
   } catch (e) {
     /* another agent holds the frame: report it like any tool error so the
-       model can move to another frame instead of dying on the run */
-    if (e instanceof frameLocks.FrameLockedError) return fail(e.message)
+       model can move to another frame instead of dying on the run. Forget our
+       claim on it too, so a later write tries to take the lock again rather
+       than assuming it is still ours. */
+    if (e instanceof frameLocks.FrameLockedError) {
+      runState.lockedFrames.delete(input.frame_id)
+      return fail(e.message)
+    }
     /* Review mode reached through a path that cannot be diverted into a
        proposal (frame metadata, guides, decisions): report it as the tool
        error it is, so the model stops rather than retrying. */

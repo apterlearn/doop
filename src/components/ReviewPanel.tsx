@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { AgentQuestion, FrameProposal } from '../../shared/types'
 import { useStore } from '../lib/store'
-import { api } from '../lib/api'
+import { api, ApiError } from '../lib/api'
 import { authClient } from '../lib/auth'
 import { timeAgo } from '../lib/time'
 import { useHtmlPreview } from '../lib/useHtmlPreview'
@@ -64,30 +64,30 @@ export function ReviewPanel() {
   const [toggling, setToggling] = useState(false)
 
   /* the ws init payload may predate this panel opening; a human who came here
-     to review wants the current pending list, not the one the socket carried */
+     to review wants the current list, not the one the socket carried. Stale
+     proposals come too — they need the "apply anyway" decision. */
   useEffect(() => {
     if (!canvasId) return
-    void api
-      .frameProposals(canvasId, 'pending')
-      .then((list) => {
-        for (const p of list) useStore.getState().upsertFrameProposal(p)
+    void Promise.all([api.frameProposals(canvasId, 'pending'), api.frameProposals(canvasId, 'stale')])
+      .then(([pendingList, staleList]) => {
+        for (const p of [...pendingList, ...staleList]) useStore.getState().upsertFrameProposal(p)
       })
       .catch(console.error)
   }, [canvasId])
 
-  const pending = useMemo(() => proposals.filter((p) => p.status === 'pending'), [proposals])
+  const awaiting = useMemo(() => proposals.filter((p) => p.status === 'pending' || p.status === 'stale'), [proposals])
   const open = useMemo(() => questions.filter((q) => q.status === 'open'), [questions])
   /* one card per frame (or per proposed new frame), the agent's latest change on top */
   const groups = useMemo(() => {
     const byKey = new Map<string, FrameProposal[]>()
-    for (const p of pending) {
+    for (const p of awaiting) {
       const key = p.frameId ?? p.id
       const list = byKey.get(key) ?? []
       list.push(p)
       byKey.set(key, list)
     }
     return [...byKey.entries()]
-  }, [pending])
+  }, [awaiting])
 
   if (!canvasId) return null
 
@@ -124,7 +124,7 @@ export function ReviewPanel() {
         </Button>
       </div>
 
-      {open.length === 0 && pending.length === 0 && (
+      {open.length === 0 && awaiting.length === 0 && (
         <div className="px-4 py-6 text-center text-[13px] text-ink-faint">
           {reviewMode
             ? 'Nothing waiting for review. Agent changes land here for your decision.'
@@ -162,20 +162,45 @@ export function ReviewPanel() {
 }
 
 /** One open question with its answer box: the agent is parked in ask_human
- *  until this lands (or its wait times out). */
+ *  until this lands (or its wait times out). A question that offered choices
+ *  renders them as buttons — one to pick, or several when it is multi-select —
+ *  with a free-text "Other" field when the asker allowed one. */
 function QuestionRow({ canvasId, question }: { canvasId: string; question: AgentQuestion }) {
+  const choices = question.choices ?? []
+  const [picked, setPicked] = useState<string[]>([])
   const [answer, setAnswer] = useState('')
+  const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
   const frameName = useStore((s) => s.canvas?.frames.find((f) => f.id === question.frameId)?.name)
+  /* picks win over a typed answer: a choice question's answer is the choice */
+  const text = choices.length ? picked.join(', ') : answer.trim()
+
+  function pick(choice: string) {
+    setError('')
+    setPicked((prev) =>
+      question.multi
+        ? prev.includes(choice)
+          ? prev.filter((c) => c !== choice)
+          : [...prev, choice]
+        : prev.includes(choice)
+          ? []
+          : [choice],
+    )
+  }
 
   function submit() {
-    const text = answer.trim()
     if (!text) return
     setBusy(true)
+    setError('')
     api
       .answerQuestion(canvasId, question.id, text)
-      .then(() => setAnswer(''))
-      .catch(console.error)
+      .then(() => {
+        setAnswer('')
+        setPicked([])
+      })
+      .catch((e) =>
+        setError(e instanceof ApiError && e.body.error ? String(e.body.error) : 'Could not send that answer.'),
+      )
       .finally(() => setBusy(false))
   }
 
@@ -189,29 +214,48 @@ function QuestionRow({ canvasId, question }: { canvasId: string; question: Agent
       <div className="mt-1.5 text-[11.5px] text-ink-faint">
         {frameName ? `${frameName} · ` : ''}
         {timeAgo(question.at)}
+        {question.multi ? ' · pick any number' : ''}
       </div>
-      <Field label="Your answer" className="mt-2.5">
-        <Textarea
-          className="min-h-[52px] text-[13px]"
-          value={answer}
-          placeholder="The agent is waiting for this…"
-          onChange={(e) => setAnswer(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' && !e.shiftKey) {
-              e.preventDefault()
-              submit()
-            }
-          }}
-        />
-      </Field>
+      {choices.length > 0 && (
+        <div className="mt-2.5 flex flex-wrap gap-1.5">
+          {choices.map((choice) => (
+            <Button
+              key={choice}
+              variant={picked.includes(choice) ? 'primary' : 'ghost'}
+              size="sm"
+              className="text-[11.5px]"
+              disabled={busy}
+              onClick={() => pick(choice)}
+            >
+              {choice}
+            </Button>
+          ))}
+        </div>
+      )}
+      {choices.length === 0 || question.allowOther ? (
+        <Field label={choices.length ? 'Other' : 'Your answer'} className="mt-2.5">
+          <Textarea
+            className="min-h-[52px] text-[13px]"
+            value={answer}
+            placeholder={choices.length ? 'Something else — the agent is waiting…' : 'The agent is waiting for this…'}
+            onChange={(e) => {
+              setAnswer(e.target.value)
+              /* typing an answer means you mean it: drop any picked choice */
+              if (e.target.value) setPicked([])
+              setError('')
+            }}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault()
+                submit()
+              }
+            }}
+          />
+        </Field>
+      ) : null}
+      {error && <div className="mt-2 text-[11.5px] text-accent-ink">{error}</div>}
       <div className="mt-2.5 flex justify-end">
-        <Button
-          variant="primary"
-          size="sm"
-          className="text-[11.5px]"
-          disabled={!answer.trim() || busy}
-          onClick={submit}
-        >
+        <Button variant="primary" size="sm" className="text-[11.5px]" disabled={!text || busy} onClick={submit}>
           Answer
         </Button>
       </div>
@@ -221,19 +265,32 @@ function QuestionRow({ canvasId, question }: { canvasId: string; question: Agent
 
 /** One proposed change: the frame as it is beside the frame as proposed, with
  *  the accept/reject decision. Accepting applies it; the frame having changed
- *  since the agent read it marks the proposal stale instead of overwriting. */
+ *  since the agent read it marks the proposal stale instead of overwriting —
+ *  a stale row is still here so the reviewer can apply it anyway. A reject can
+ *  carry a note the agent reads back. */
 function ProposalCard({ canvasId, proposal }: { canvasId: string; proposal: FrameProposal }) {
   const frame = useStore((s) => s.canvas?.frames.find((f) => f.id === proposal.frameId))
   const width = proposal.width ?? frame?.width ?? 640
   const height = proposal.height ?? frame?.height ?? 480
   const proposed = useHtmlPreview(proposal.html, width, height)
   const [busy, setBusy] = useState(false)
+  const [note, setNote] = useState('')
+  const [rejecting, setRejecting] = useState(false)
+  const stale = proposal.status === 'stale'
   const ratio = Math.max(0.2, width / Math.max(1, height))
 
-  function resolve(accept: boolean) {
+  function resolve(accept: boolean, force = false) {
     setBusy(true)
+    const trimmed = note.trim()
     api
-      .resolveFrameProposal(canvasId, proposal.id, accept)
+      .resolveFrameProposal(canvasId, proposal.id, accept, {
+        ...(!accept && trimmed ? { note: trimmed } : {}),
+        ...(force ? { force: true } : {}),
+      })
+      .then(() => {
+        setRejecting(false)
+        setNote('')
+      })
       .catch(console.error)
       .finally(() => setBusy(false))
   }
@@ -251,8 +308,15 @@ function ProposalCard({ canvasId, proposal }: { canvasId: string; proposal: Fram
         <span className="font-mono text-[10.5px] text-ink-faint">
           {kindLabel[proposal.kind]} · {timeAgo(proposal.at)}
         </span>
+        {stale && <Badge tone="banned">stale</Badge>}
       </div>
       <p className="mt-1.5 text-[13px] font-semibold leading-[1.45] text-ink">{proposal.summary}</p>
+      {stale && (
+        <p className="mt-1 text-[11.5px] leading-[1.45] text-ink-soft">
+          The frame changed after {proposal.agentName} read it, so accepting would overwrite that newer work. Apply it
+          anyway only if you know that is what you want.
+        </p>
+      )}
       <div className="mt-2.5 grid grid-cols-2 gap-2.5">
         {proposal.kind === 'create_frame' ? (
           <Thumb label="now" ratio={ratio} />
@@ -276,13 +340,66 @@ function ProposalCard({ canvasId, proposal }: { canvasId: string; proposal: Fram
           <Thumb label="proposed" ratio={ratio} src={proposed} loading={!proposed} />
         )}
       </div>
+      {rejecting && (
+        <Field label="Why? (optional — the agent reads this)" className="mt-2.5">
+          <Textarea
+            className="min-h-[44px] text-[12.5px]"
+            value={note}
+            placeholder="Too busy, wrong direction, keep the old hero…"
+            onChange={(e) => setNote(e.target.value)}
+          />
+        </Field>
+      )}
       <div className="mt-2.5 flex justify-end gap-2">
-        <Button variant="ghost" size="sm" className="text-[11.5px]" disabled={busy} onClick={() => resolve(false)}>
-          Reject
-        </Button>
-        <Button variant="primary" size="sm" className="text-[11.5px]" disabled={busy} onClick={() => resolve(true)}>
-          Accept
-        </Button>
+        {rejecting ? (
+          <>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="text-[11.5px]"
+              disabled={busy}
+              onClick={() => setRejecting(false)}
+            >
+              Cancel
+            </Button>
+            <Button variant="danger" size="sm" className="text-[11.5px]" disabled={busy} onClick={() => resolve(false)}>
+              {note.trim() ? 'Reject with note' : 'Reject'}
+            </Button>
+          </>
+        ) : (
+          <>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="text-[11.5px]"
+              disabled={busy}
+              onClick={() => setRejecting(true)}
+            >
+              Reject
+            </Button>
+            {stale ? (
+              <Button
+                variant="primary"
+                size="sm"
+                className="text-[11.5px]"
+                disabled={busy}
+                onClick={() => resolve(true, true)}
+              >
+                Apply anyway
+              </Button>
+            ) : (
+              <Button
+                variant="primary"
+                size="sm"
+                className="text-[11.5px]"
+                disabled={busy}
+                onClick={() => resolve(true)}
+              >
+                Accept
+              </Button>
+            )}
+          </>
+        )}
       </div>
     </div>
   )

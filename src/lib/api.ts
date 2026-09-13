@@ -284,7 +284,7 @@ export const api = {
    *  ready_for_review, for when a reviewer does not want to wait for an agent */
   runFrameReviews: (frameId: string) =>
     req<FrameReview & { current: boolean }>(`/api/frames/${frameId}/reviews`, { method: 'POST' }),
-  frameProposals: (canvasId: string, status?: 'pending') =>
+  frameProposals: (canvasId: string, status?: FrameProposal['status']) =>
     req<FrameProposal[]>(`/api/canvases/${canvasId}/frame-proposals${status ? `?status=${status}` : ''}`),
   /* the canvas design tokens, as the Tokens panel edits them */
   setTokens: (canvasId: string, tokens: DesignTokens | null) =>
@@ -292,10 +292,21 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify({ tokens }),
     }),
-  resolveFrameProposal: (canvasId: string, proposalId: string, accept: boolean) =>
+  /* a reject may carry a note the agent reads back; force applies a proposal
+     the stale guard would otherwise refuse */
+  resolveFrameProposal: (
+    canvasId: string,
+    proposalId: string,
+    accept: boolean,
+    opts?: { note?: string; force?: boolean },
+  ) =>
     req<FrameProposal>(`/api/canvases/${canvasId}/frame-proposals/${proposalId}`, {
       method: 'POST',
-      body: JSON.stringify({ accept }),
+      body: JSON.stringify({
+        accept,
+        ...(opts?.note ? { note: opts.note } : {}),
+        ...(opts?.force ? { force: true } : {}),
+      }),
     }),
   /* the answer reaches a waiting agent inside its ask_human call */
   answerQuestion: (canvasId: string, questionId: string, answer: string) =>

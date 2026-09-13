@@ -23,12 +23,49 @@ vi.mock('../server/db/persist.ts', () => ({
 const actions = await import('../server/actions.ts')
 const { store } = await import('../server/store.ts')
 const { DEFAULT_ROLE_ID, roleName } = await import('../shared/agents.ts')
+const { buildMcpServer } = await import('../server/mcp.ts')
+const { Client } = await import('@modelcontextprotocol/sdk/client/index.js')
+const { InMemoryTransport } = await import('@modelcontextprotocol/sdk/inMemory.js')
 
 const AGENT = roleName(DEFAULT_ROLE_ID)
 
 /* hydrateLogs only overwrites the canvases it is given, so each case works on
    its own canvas — a shared one would carry the previous case's card over. */
 let CANVAS = ''
+
+/** The MCP surface, so the stop latch that gates every tool call is exercised
+ *  for real rather than inferred from actions.wasStopped. */
+async function connectMcp() {
+  const server = buildMcpServer('alice', 'alice')
+  const client = new Client({ name: 'doop-stop-test', version: '1.0.0' })
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
+  await server.connect(serverTransport)
+  await client.connect(clientTransport)
+  return {
+    client,
+    close: async () => {
+      await client.close()
+      await server.close()
+    },
+  }
+}
+
+async function callTool(client: InstanceType<typeof Client>, name: string, args: Record<string, unknown>) {
+  const result = (await client.callTool({ name, arguments: args })) as unknown as {
+    content?: Array<{ type: string; text?: string }>
+    isError?: boolean
+  }
+  const raw = result.content?.find((b) => b.type === 'text')?.text ?? ''
+  /* a tool payload is JSON when it is machine-readable and prose when it is a
+     plain text() result — both are returned, unparsed text included */
+  let parsed: { error?: { code?: string; message?: string }; [k: string]: unknown } = {}
+  try {
+    parsed = JSON.parse(raw) as typeof parsed
+  } catch {
+    /* plain text */
+  }
+  return { parsed, raw, isError: result.isError }
+}
 
 function claimedCard() {
   const card = actions.addQueuedCard(CANVAS, 'Make a hero', 'alice', undefined, undefined, 'alice')!
@@ -102,6 +139,34 @@ describe('stopping agent work', () => {
     expect(card(queued.id).stage).toBe(0)
   })
 
+  it('stops one card without stopping the agent', () => {
+    const first = claimedCard()
+    /* queued after the claim, so it is still waiting for an agent */
+    const second = actions.addQueuedCard(CANVAS, 'Make a footer', 'alice', undefined, undefined, 'alice')!
+
+    const stopped = actions.cancelCard(CANVAS, first.id, 'alice')
+
+    expect(stopped?.cancelledAt).toBeGreaterThan(0)
+    expect(stopped?.cancelledBy).toBe('alice')
+    expect(stopped?.failedAt).toBeUndefined()
+    /* the other card is untouched, and still claimable */
+    expect(card(second.id).cancelledAt).toBeUndefined()
+    expect(actions.takeQueuedCardsFor(CANVAS, AGENT, 'alice').map((c) => c.id)).toEqual([second.id])
+    /* and no agent-level stop: the agent keeps its other work and its calls */
+    expect(actions.wasStopped(CANVAS, AGENT)).toBe(false)
+  })
+
+  it('does not re-cancel a card that already finished', () => {
+    const queued = claimedCard()
+    actions.completeCard(CANVAS, queued.id)
+
+    const stopped = actions.cancelCard(CANVAS, queued.id, 'alice')
+
+    expect(stopped?.cancelledAt).toBeUndefined()
+    expect(card(queued.id).endedAt).toBeGreaterThan(0)
+    expect(actions.wasStopped(CANVAS, AGENT)).toBe(false)
+  })
+
   it('stops a card an agent abandoned without attributing it to a person', () => {
     const queued = claimedCard()
 
@@ -164,5 +229,50 @@ describe('stopping agent work', () => {
 
     expect(actions.wasStopped(CANVAS, AGENT)).toBe(true)
     expect(actions.getTasks(CANVAS).some((t) => t.id === queued.id)).toBe(false)
+  })
+
+  it('stop_work with a card_id leaves the agent free to keep calling tools', async () => {
+    const first = claimedCard()
+    const second = actions.addQueuedCard(CANVAS, 'Make a footer', 'alice', undefined, undefined, 'alice')!
+    const { client, close } = await connectMcp()
+    try {
+      const stopped = await callTool(client, 'stop_work', {
+        canvas_id: CANVAS,
+        card_id: first.id,
+        agent_name: AGENT,
+      })
+      expect(stopped.isError).toBeFalsy()
+      expect(card(first.id).cancelledAt).toBeGreaterThan(0)
+      /* the second card is untouched and still waiting to be claimed */
+      expect(card(second.id).cancelledAt).toBeUndefined()
+      expect(actions.takeQueuedCardsFor(CANVAS, AGENT, 'alice').map((c) => c.id)).toEqual([second.id])
+
+      /* no agent-level latch: the agent's next call runs */
+      const next = await callTool(client, 'set_status', {
+        canvas_id: CANVAS,
+        status: 'Still working',
+        agent_name: AGENT,
+      })
+      expect(next.isError).toBeFalsy()
+    } finally {
+      await close()
+    }
+  })
+
+  it('stop_work with a card_id refuses an unknown card', async () => {
+    const { client, close } = await connectMcp()
+    try {
+      const res = await callTool(client, 'stop_work', {
+        canvas_id: CANVAS,
+        card_id: 'nope',
+        agent_name: AGENT,
+      })
+      expect(res.isError).toBe(true)
+      expect(res.parsed.error?.code).toBe('not_found')
+      /* and the agent-level path is untouched: no stop was recorded */
+      expect(actions.wasStopped(CANVAS, AGENT)).toBe(false)
+    } finally {
+      await close()
+    }
   })
 })

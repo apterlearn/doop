@@ -169,6 +169,13 @@
       "when": 1789294732476,
       "tag": "0023_misty_clea",
       "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1789299987336,
+      "tag": "0024_talented_harry_osborn",
+      "breakpoints": true
     }
   ]
 }
