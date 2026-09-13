@@ -1,6 +1,6 @@
 import type { Frame } from '../shared/types.ts'
 import { ELEMENT_KEY_SRC, ELEMENT_PATH_SRC } from '../shared/selector.ts'
-import { loadFramePage } from './screenshot.ts'
+import { loadFramePage, type InteractionState } from './screenshot.ts'
 
 /**
  * The rendered-DOM probe.
@@ -213,9 +213,12 @@ export interface Probe {
  *  viewport override is what makes the same design checkable at a phone width. */
 export async function probeFrame(
   frame: Frame,
-  opts: { viewport?: { width: number; height: number } } = {},
+  opts: { viewport?: { width: number; height: number }; state?: InteractionState } = {},
 ): Promise<Probe> {
-  const loaded = await loadFramePage(frame, opts.viewport ? { viewport: opts.viewport } : {})
+  const loaded = await loadFramePage(frame, {
+    ...(opts.viewport ? { viewport: opts.viewport } : {}),
+    ...(opts.state ? { state: opts.state } : {}),
+  })
   const { page } = loaded
   try {
     /* tsx/esbuild annotates nested functions with __name; page.evaluate

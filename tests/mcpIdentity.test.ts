@@ -346,6 +346,45 @@ describe('sticky session context', () => {
     }
   })
 
+  it('reports the session’s substitutions on a replayed write too', async () => {
+    const a = await connect('Alice', OWNER_ID)
+    try {
+      /* point the session at the canvas and a name first */
+      await callTool(a.client, 'get_canvas', { canvas_id: CANVAS_ID, agent_name: 'Claude' })
+
+      /* the write names neither: the session supplies both, and the result says
+         which it used */
+      const first = await callTool(a.client, 'set_plan', {
+        steps: [{ id: 's1', text: 'Sketch the hero' }],
+        op_id: 'identity-replay-1',
+      })
+      expect(first.isError).toBeFalsy()
+      expect(first.structured.used_active_context).toEqual({ canvas_id: CANVAS_ID, from: 'session' })
+      expect(first.text).not.toContain('idempotent_replay')
+
+      /* the replay answers from the record and still reports the substitution —
+         a retry that said less than the call it replays would hide it exactly
+         where it is easiest to miss. It reports it ONCE: the notices appended to
+         a result are not part of the record it replays. */
+      const retry = await callTool(a.client, 'set_plan', {
+        steps: [{ id: 's2', text: 'Something else entirely' }],
+        op_id: 'identity-replay-1',
+      })
+      expect(retry.isError).toBeFalsy()
+      expect(retry.text).toContain('idempotent_replay')
+      expect(retry.structured.used_active_context).toEqual({ canvas_id: CANVAS_ID, from: 'session' })
+      expect(retry.structured.used_agent_name).toBe(true)
+      expect(retry.text).toContain(`using canvas ${CANVAS_ID} from this session`)
+      expect(retry.text.match(/using canvas/g)).toHaveLength(1)
+      /* it really was the record: the payload is the first call's, and the plan
+         the handler would have written second never landed */
+      expect(retry.raw).toBe(first.raw)
+      expect(actions.getPlan(CANVAS_ID, 'Claude')?.steps.map((step) => step.id)).toEqual(['s1'])
+    } finally {
+      await a.close()
+    }
+  })
+
   it('lets an explicit canvas_id win, and records it for the next call', async () => {
     const other = store.createCanvas('Second canvas', OWNER_ID)
     const a = await connect('Alice', OWNER_ID)

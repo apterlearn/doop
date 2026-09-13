@@ -14,11 +14,19 @@ import * as actions from './actions.ts'
 import { canAccessCanvas } from './access.ts'
 import { auth, getUserName, isBanned, PUBLIC_ORIGIN } from './auth.ts'
 import { capture, captureThrottled } from './analytics.ts'
-import { MAX_HTML_READ_CHARS, readFrameHtml, renderFrame, VIEWPORTS } from './screenshot.ts'
+import {
+  MAX_HTML_READ_CHARS,
+  readFrameHtml,
+  renderFrame,
+  StateRenderError,
+  VIEWPORTS,
+  type InteractionState,
+} from './screenshot.ts'
+import { htmlDiff } from './htmlDiff.ts'
 import { inspectFrame } from './domProbe.ts'
 import { auditFrame, type A11yReport } from './a11y.ts'
 import { diffFrames } from './visualDiff.ts'
-import { cssForTokens } from '../shared/tokens.ts'
+import { cssForTokens, stripTokenStyle } from '../shared/tokens.ts'
 import { lintFrame } from './designLint.ts'
 import { deriveDesignSystem, designSystemMarkdown } from './designSystem.ts'
 import { probeFrame, type Probe } from './domProbe.ts'
@@ -34,7 +42,7 @@ import {
 } from './elementEdit.ts'
 import { DOOP_GUIDE, guideFor, GUIDE_TOPICS } from './guide.ts'
 import { describeInspiration, INSPIRATION_USAGE_NOTE, searchInspiration } from './inspiration.ts'
-import { ESCAPED_HTML_NOTE, looksEscapedHtml } from './escapedHtml.ts'
+import { ESCAPED_HTML_NOTE, looksEscapedHtml, repairEscapedHtml } from './escapedHtml.ts'
 import { describeSyncFlow, getSyncFlow } from './ingest.ts'
 import * as assets from './assets.ts'
 import { buildZip } from './zip.ts'
@@ -60,7 +68,7 @@ import * as agentEvents from './agentEvents.ts'
 import * as runLog from './runLog.ts'
 import { codeFor, err, mcpErrorPayload, ResourceError, type McpErrorPayload } from './mcpErrors.ts'
 import * as frameLocks from './frameLocks.ts'
-import { replay, replayAsync } from './opIds.ts'
+import { recall, remember, replay, replayAsync } from './opIds.ts'
 import { htmlBundle, htmlToReact } from './codeExport.ts'
 import type {
   AgentTask,
@@ -131,6 +139,34 @@ function textWithNudge(data: unknown, nudge: string) {
       { type: 'text' as const, text: JSON.stringify(data, null, 2) },
       { type: 'text' as const, text: nudge },
     ],
+  }
+}
+
+/** The document a frame write actually stores: `actions.updateFrame` repairs
+ *  escaped markup and strips the render-time token block, so a dry run diffs
+ *  what would land, not the raw argument. */
+function storedHtml(html: string): string {
+  return stripTokenStyle(repairEscapedHtml(html))
+}
+
+/** How a render names the interaction state it was measured in. */
+function stateLabel(state: InteractionState): string {
+  return `${state.pseudo} on ${state.selector}`
+}
+
+/**
+ * A write tool's `dry_run` answer: what would change and by how much, with
+ * nothing written. No version is snapshotted, no lock is taken and no viewer
+ * is told — the diff is the whole point of the call.
+ */
+function dryRunPayload(before: string, after: string, extra: Record<string, unknown> = {}) {
+  return {
+    dry_run: true as const,
+    would_apply: before !== after,
+    diff: htmlDiff(before, after),
+    bytes_before: before.length,
+    bytes_after: after.length,
+    ...extra,
   }
 }
 
@@ -482,13 +518,112 @@ const viewportOverride = z
   .optional()
   .describe('Explicit viewport, overriding device and the frame size')
 
+/** Force a pseudo-class on one element before rendering: the design a human
+ *  only sees while interacting with it. */
+const interactionState = z
+  .object({
+    selector: z.string().describe('CSS selector for the element to render in this state'),
+    pseudo: z.enum(['hover', 'focus', 'active']),
+  })
+  .optional()
+  .describe(
+    'Render this element in this interaction state instead of its resting state — the only way to see a :hover/:focus/:active rule',
+  )
+
+/** The shape of a dry run's diff, published so a client can read it typed. */
+const diffShape = z.object({
+  hunks: z.array(z.object({ a_start: z.number(), b_start: z.number(), lines: z.array(z.string()) })),
+  added: z.number(),
+  removed: z.number(),
+})
+
 const opId = z
   .string()
   .max(120)
   .optional()
   .describe(
-    'Idempotency key: a retry of the same call with the same op_id returns the original result instead of creating a second one. Use a fresh value per intended create.',
+    'Idempotency key: a retry of the same call with the same op_id returns the original result instead of running again. Accepted by every tool that changes state (all the writes and creates); use a fresh value per intended operation.',
   )
+
+/**
+ * Every tool that changes state, and therefore takes an `op_id`.
+ *
+ * Declared as a list rather than derived from annotations so it is one
+ * reviewable definition: the wrapper injects the key into exactly these tools,
+ * and a tool missing from it is a tool an agent cannot safely retry. Reads are
+ * deliberately absent — a retried read has nothing to duplicate, and adding the
+ * key to them would put a mutation parameter on tools a client auto-approves.
+ */
+const MUTATING_TOOLS: Record<string, true> = {
+  add_comment: true,
+  append_frame_html: true,
+  apply_ops: true,
+  ask_human: true,
+  begin_frame_edit: true,
+  complete_card: true,
+  create_canvas: true,
+  create_frame: true,
+  create_page: true,
+  create_release: true,
+  delete_element: true,
+  delete_frame: true,
+  delete_page: true,
+  duplicate_frame: true,
+  edit_frame_html: true,
+  end_frame_edit: true,
+  hand_back: true,
+  import_code: true,
+  import_site: true,
+  import_webpage: true,
+  insert_element: true,
+  move_frame: true,
+  open_pull_request: true,
+  propose_frame_create: true,
+  propose_frame_delete: true,
+  propose_frame_html: true,
+  publish_canvas: true,
+  ready_for_review: true,
+  rename_page: true,
+  reply_to_comment: true,
+  resolve_comment: true,
+  restore_release: true,
+  revert_frame: true,
+  save_decision: true,
+  set_breakpoints: true,
+  set_frame_css: true,
+  set_frame_html: true,
+  set_guidelines: true,
+  set_plan: true,
+  set_status: true,
+  set_tokens: true,
+  stop_work: true,
+  take_card: true,
+  undo_last_change: true,
+  unpublish_canvas: true,
+  update_elements: true,
+  update_frame: true,
+  update_plan_step: true,
+  upload_asset: true,
+  withdraw_proposal: true,
+}
+
+/**
+ * The tools that already own their `op_id`, and therefore keep it: they have
+ * carried the key since before the wrapper did, and they mint their payloads
+ * mid-flow (upload_asset's single-use upload URL, import_code's review-mode
+ * proposal), so replaying beside them would be two mechanisms for one key.
+ * The wrapper leaves these to their own `replay`/`replayAsync` and covers every
+ * other mutating tool.
+ */
+const SELF_REPLAY_TOOLS: Record<string, true> = {
+  add_comment: true,
+  create_canvas: true,
+  create_frame: true,
+  create_page: true,
+  import_code: true,
+  open_pull_request: true,
+  upload_asset: true,
+}
 
 const agentName = z
   .string()
@@ -1042,6 +1177,26 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
     return withSessionContext(out, used)
   }
 
+  /** The caller's idempotency key for a tool the wrapper replays, or undefined
+   *  when the call carries none — or when the tool owns its key already (see
+   *  SELF_REPLAY_TOOLS). */
+  const opIdOf = (name: string, args: unknown): string | undefined => {
+    if (SELF_REPLAY_TOOLS[name]) return undefined
+    if (!args || typeof args !== 'object') return undefined
+    const record = args as Record<string, unknown>
+    /* A dry run changes nothing, so it has nothing to replay — and it must never
+       answer a later real call's key with a preview. */
+    if (record.dry_run === true) return undefined
+    const value = record.op_id
+    return typeof value === 'string' && value !== '' ? value : undefined
+  }
+
+  /** Records are keyed per account AND per tool: an `op_id` names one intended
+   *  operation, and the same string on another tool is another operation.
+   *  Sharing one key space would let a create replay a write's result — and
+   *  silently skip creating. */
+  const opIdOwner = (toolName: string) => `${toolName}\u0000${ownerId ?? ''}`
+
   const stoppedResult = (args: unknown): CallToolResult | undefined => {
     if (!args || typeof args !== 'object') return undefined
     const record = args as Record<string, unknown>
@@ -1116,6 +1271,10 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
        nor a session canvas still fails in the handler with `not_found`. */
     const declared = cfg.inputSchema ?? {}
     const registered: z.ZodRawShape = { ...declared }
+    /* Every state-changing tool takes the same idempotency key, declared here
+       once so no tool can forget it — a write an agent cannot safely retry is
+       a write it must re-read the canvas to check. */
+    if (MUTATING_TOOLS[name] && !('op_id' in registered)) registered.op_id = opId
     /* `agent_name` stays required where the identity IS the call */
     for (const key of IDENTITY_TOOLS.has(name) ? (['canvas_id'] as const) : (['canvas_id', 'agent_name'] as const)) {
       const field = registered[key]
@@ -1140,10 +1299,30 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
           recordRunEvent(name, args, false, Date.now() - started, 'refused: a required argument was missing')
           return missing
         }
+        /* A retried write must not land twice. The key is the account plus the
+           caller's OWN op_id — never a field the session filled in — so a retry
+           that omits the canvas or the name still finds its record. The replay
+           is post-processed like the call it replays: the session's
+           substitutions are reported again rather than baked into the record.
+           It runs after the stop check, so a stopped agent is refused whether
+           or not the call is a retry. */
+        const opKey = opIdOf(name, args)
+        if (opKey) {
+          const replayed = recall(opIdOwner(name), opKey)
+          if (replayed) {
+            replayed.content.push({ type: 'text' as const, text: JSON.stringify({ idempotent_replay: true }) })
+            recordToolCall(name, true, Date.now() - started)
+            recordRunEvent(name, args, true, Date.now() - started, 'idempotent replay')
+            return contextNotices(args, interruptedResult(args, replayed), used, declared)
+          }
+        }
         try {
           const result = await (cb as unknown as ToolHandler)(args, extra)
           recordToolCall(name, !result?.isError, Date.now() - started)
           recordRunEvent(name, args, !result?.isError, Date.now() - started, resultSummary(result))
+          /* only a result that landed is remembered: a refused write's key
+             stays free, so the retry of a failure still runs */
+          if (opKey && result && !result.isError) remember(opIdOwner(name), opKey, result)
           return contextNotices(args, interruptedResult(args, result), used, declared)
         } catch (e) {
           /* Review mode is enforced in the mutation layer, so it catches every
@@ -3021,6 +3200,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
         frame_id: z.string(),
         device: deviceName,
         viewport: viewportOverride,
+        state: interactionState,
         width: z
           .number()
           .int()
@@ -3046,9 +3226,11 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
         ),
         checked_elements: z.number(),
         viewport: z.object({ width: z.number(), height: z.number() }),
+        /** the interaction state the audit was measured in, when one was asked for */
+        state: z.string().optional(),
       },
     },
-    async ({ frame_id, device, viewport, width, agent_name }, extra) => {
+    async ({ frame_id, device, viewport, state, width, agent_name }, extra) => {
       const budget = takeRender(agent_name)
       if (budget) return budget
       const f = frameFor(frame_id)
@@ -3058,15 +3240,20 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
       let report: A11yReport
       try {
         await progress(extra, 0, `Rendering “${f.name}” for the audit…`)
-        report = await auditFrame(f, resolved ? { viewport: resolved } : {})
+        report = await auditFrame(f, {
+          ...(resolved ? { viewport: resolved } : {}),
+          ...(state ? { state } : {}),
+        })
       } catch (e) {
+        if (e instanceof StateRenderError) return err(e.code, e.message)
         return err('upstream_failed', e instanceof Error ? e.message : 'could not render this frame for audit')
       }
       const nudge =
         report.counts.critical > 0
           ? `${report.counts.critical} critical issue(s) — the review checkpoints require contrast you can defend. Fix these in the frame HTML and run audit_frame again.`
           : undefined
-      const result = nudge ? structuredWithNudge(report, nudge) : structured(report)
+      const payload = state ? { ...report, state: stateLabel(state) } : report
+      const result = nudge ? structuredWithNudge(payload, nudge) : structured(payload)
       return withFeedback(result, f.canvasId, actorFrom(agent_name))
     },
   )
@@ -3297,10 +3484,16 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
           .optional()
           .describe("The frame's updatedAt from when you read it — refuses the write if someone else changed it since"),
         takeover: z.boolean().optional().describe('Overwrite even if another agent holds the frame lock'),
+        dry_run: z
+          .boolean()
+          .optional()
+          .describe(
+            'Return the diff this write would produce and change nothing — no version, no broadcast, no lock. Use it to check a large rewrite before sending it.',
+          ),
         agent_name: agentName,
       },
     },
-    async ({ frame_id, html, agent_name, expected_updated_at, takeover }) => {
+    async ({ frame_id, html, agent_name, expected_updated_at, takeover, dry_run }) => {
       const before = frameFor(frame_id)
       if (!before) return noFrame(frame_id)
       const gated = reviewGate(before.canvasId)
@@ -3312,6 +3505,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
         )
       const stale = staleConflict(before, expected_updated_at)
       if (stale) return stale
+      if (dry_run) return structured(dryRunPayload(before.html, storedHtml(html)))
       takeOver(frame_id, before.canvasId, actorFrom(agent_name), takeover)
       let frame: Frame | undefined
       try {
@@ -3357,11 +3551,26 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
           .optional()
           .describe("The frame's updatedAt from when you read it — refuses the write if someone else changed it since"),
         takeover: z.boolean().optional().describe('Overwrite even if another agent holds the frame lock'),
+        dry_run: z
+          .boolean()
+          .optional()
+          .describe(
+            'Return the diff this stylesheet would produce and change nothing — no version, no broadcast, no lock',
+          ),
         agent_name: agentName,
       },
-      outputSchema: { ok: z.literal(true), frame: z.unknown(), css_bytes: z.number() },
+      outputSchema: {
+        ok: z.literal(true).optional(),
+        frame: z.unknown().optional(),
+        css_bytes: z.number(),
+        dry_run: z.literal(true).optional(),
+        would_apply: z.boolean().optional(),
+        diff: diffShape.optional(),
+        bytes_before: z.number().optional(),
+        bytes_after: z.number().optional(),
+      },
     },
-    async ({ frame_id, css, agent_name, expected_updated_at, takeover }) => {
+    async ({ frame_id, css, agent_name, expected_updated_at, takeover, dry_run }) => {
       const before = frameFor(frame_id)
       if (!before) return noFrame(frame_id)
       const gated = reviewGate(before.canvasId)
@@ -3370,6 +3579,17 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
       if (stale) return stale
       const budget = takeRender(agent_name)
       if (budget) return budget
+      /* the stylesheet is written into a rendered document, so a dry run still
+         renders — it just never hands the result to a write */
+      if (dry_run) {
+        try {
+          const preview = await setFrameCss(before, css)
+          return structured(dryRunPayload(before.html, storedHtml(preview.html), { css_bytes: css.length }))
+        } catch (e) {
+          if (e instanceof ElementEditError) return err(e.code, e.message)
+          throw e
+        }
+      }
       takeOver(frame_id, before.canvasId, actorFrom(agent_name), takeover)
       let outcome: { html: string }
       try {
@@ -4621,6 +4841,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
             'Render at this width instead of the frame’s own — a breakpoint that is not a named device. Ignored when device or viewport is set.',
           ),
         full_page: z.boolean().optional().describe('Capture the whole document height, not just the viewport'),
+        state: interactionState,
         clip: z
           .object({
             x: z.number(),
@@ -4633,7 +4854,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
         agent_name: agentName,
       },
     },
-    async ({ frame_id, scale, device, viewport, full_page, clip, width: renderWidth, agent_name }, extra) => {
+    async ({ frame_id, scale, device, viewport, full_page, state, clip, width: renderWidth, agent_name }, extra) => {
       const budget = takeRender(agent_name)
       if (budget) return budget
       const f = frameFor(frame_id)
@@ -4654,6 +4875,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
           ...(resolved ? { viewport: resolved } : {}),
           ...(full_page ? { fullPage: true } : {}),
           ...(clip ? { clip } : {}),
+          ...(state ? { state } : {}),
         })
         const width = resolved?.width ?? f.width
         const height = resolved?.height ?? f.height
@@ -4663,7 +4885,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
               { type: 'image' as const, data: png.toString('base64'), mimeType: 'image/png' },
               {
                 type: 'text' as const,
-                text: `Screenshot of “${f.name}” (${width}×${height}@${scale ?? 1}x${full_page ? ', full page' : ''}${clip ? `, clip ${clip.x},${clip.y} ${clip.width}×${clip.height}` : ''}, html ${f.html.length} bytes)`,
+                text: `Screenshot of “${f.name}” (${width}×${height}@${scale ?? 1}x${full_page ? ', full page' : ''}${clip ? `, clip ${clip.x},${clip.y} ${clip.width}×${clip.height}` : ''}${state ? `, ${stateLabel(state)}` : ''}, html ${f.html.length} bytes)`,
               },
             ],
           },
@@ -4671,6 +4893,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
           actorFrom(agent_name),
         )
       } catch (e) {
+        if (e instanceof StateRenderError) return err(e.code, e.message)
         return err('upstream_failed', `screenshot failed: ${e instanceof Error ? e.message : String(e)}`)
       }
     },
@@ -4762,15 +4985,27 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
             "The frame's updatedAt from your last read — send it and a frame that changed under you is refused",
           ),
         takeover: z.boolean().optional().describe('Edit a frame another agent holds the lock on'),
+        dry_run: z
+          .boolean()
+          .optional()
+          .describe(
+            'Return the diff this replacement would produce and change nothing. Reports found: false (with the match count) when old_str does not occur exactly once.',
+          ),
         agent_name: agentName,
       },
     },
-    async ({ frame_id, old_str, new_str, expected_updated_at, agent_name, takeover }) => {
+    async ({ frame_id, old_str, new_str, expected_updated_at, agent_name, takeover, dry_run }) => {
       const f = frameFor(frame_id)
       if (!f) return noFrame(frame_id)
       const stale = staleConflict(f, expected_updated_at)
       if (stale) return stale
       const count = f.html.split(old_str).length - 1
+      if (dry_run) {
+        /* a rehearsal answers "would this land", so a find that is not exactly
+           one match is a false would_apply rather than a thrown refusal */
+        const after = count === 1 ? storedHtml(f.html.replace(old_str, new_str)) : f.html
+        return structured(dryRunPayload(f.html, after, { found: count === 1, matches: count }))
+      }
       if (count === 0)
         return err('invalid_input', 'old_str not found in the frame HTML. Call get_frame to see the current content.')
       if (count > 1)
@@ -4891,16 +5126,27 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
           .optional()
           .describe("The frame's updatedAt from when you read it — refuses the write if someone else changed it since"),
         takeover: z.boolean().optional().describe('Edit a frame another agent holds the lock on'),
+        dry_run: z
+          .boolean()
+          .optional()
+          .describe(
+            'Run the same render and report the diff (plus applied/ambiguous) without writing. Still spends one render.',
+          ),
         agent_name: agentName,
       },
       outputSchema: {
-        ok: z.literal(true),
-        frame: z.unknown(),
+        ok: z.literal(true).optional(),
+        frame: z.unknown().optional(),
         applied: z.number(),
         ambiguous: z.array(z.string()),
+        dry_run: z.literal(true).optional(),
+        would_apply: z.boolean().optional(),
+        diff: diffShape.optional(),
+        bytes_before: z.number().optional(),
+        bytes_after: z.number().optional(),
       },
     },
-    async ({ canvas_id, frame_id, edits, agent_name, expected_updated_at, takeover }) => {
+    async ({ canvas_id, frame_id, edits, agent_name, expected_updated_at, takeover, dry_run }) => {
       const before = frameFor(frame_id)
       if (!before || before.canvasId !== canvas_id) return noFrame(frame_id)
       const gated = reviewGate(canvas_id)
@@ -4909,6 +5155,23 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
       if (stale) return stale
       const budget = takeRender(agent_name)
       if (budget) return budget
+      /* `updateElements` transforms a document and hands the HTML back — only
+         `actions.updateFrame` stores it, so a dry run is the same call minus
+         the write */
+      if (dry_run) {
+        try {
+          const preview = await updateElements(before, edits)
+          return structured(
+            dryRunPayload(before.html, storedHtml(preview.html), {
+              applied: preview.applied,
+              ambiguous: preview.ambiguous,
+            }),
+          )
+        } catch (e) {
+          if (e instanceof ElementEditError) return err(e.code, e.message)
+          throw e
+        }
+      }
       takeOver(frame_id, canvas_id, actorFrom(agent_name), takeover)
       let outcome: UpdateElementsResult
       try {
@@ -5110,16 +5373,28 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
             "The frame's updatedAt from when you read it — refuses the delete if someone else changed it since",
           ),
         takeover: z.boolean().optional().describe('Delete a frame another agent holds the frame lock'),
+        dry_run: z
+          .boolean()
+          .optional()
+          .describe('Report what the delete would remove and delete nothing — the frame and its versions survive'),
         agent_name: agentName,
       },
     },
-    async ({ frame_id, agent_name, expected_updated_at, takeover }) => {
+    async ({ frame_id, agent_name, expected_updated_at, takeover, dry_run }) => {
       const before = frameFor(frame_id)
       if (!before) return noFrame(frame_id)
       const gated = reviewGate(before.canvasId)
       if (gated) return gated
       const stale = staleConflict(before, expected_updated_at)
       if (stale) return stale
+      if (dry_run)
+        return structured({
+          dry_run: true as const,
+          would_apply: true,
+          frame: frameSummary(before),
+          bytes_before: before.html.length,
+          bytes_after: 0,
+        })
       takeOver(frame_id, before.canvasId, actorFrom(agent_name), takeover)
       let frame: Frame | undefined
       try {
@@ -5162,6 +5437,153 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
     'publish_canvas',
     'unpublish_canvas',
   ])
+
+  /* Ops whose effect is a line in a log a human may already have read — a
+     comment, a decision, a status. A failed batch cannot take those back, so it
+     names them in `not_rolled_back` instead of pretending it undid them. Every
+     other batchable op changes canvas content, which the pre-image restores. */
+  const APPEND_ONLY_OPS: Record<string, true> = { add_comment: true, save_decision: true, set_status: true }
+
+  /** One frame as a rollback needs it: the fields a batch op can write, plus
+   *  the page it sits on. */
+  interface FramePreImage {
+    name: string
+    x: number
+    y: number
+    width: number
+    height: number
+    html: string
+    pageId?: string
+  }
+
+  /** The canvas before a batch runs: the frames its ops name, the guideline
+   *  docs, the tokens, and the id sets that tell a rollback what the batch
+   *  created. Taken for atomic and best-effort batches alike, so both modes
+   *  read the same picture of "before". */
+  interface CanvasPreImage {
+    frames: Map<string, FramePreImage>
+    frameIds: Set<string>
+    pageIds: Set<string>
+    tokens: DesignTokens | undefined
+    /** `title: ''` is "this doc had no display name" — the store clears a
+     *  title only when it is given an empty one, so the pre-image keeps the
+     *  difference between absent and empty. */
+    guidelines: { name: string; title: string; markdown: string }[]
+  }
+
+  function snapshotCanvas(canvasId: string, prepared: { args: Record<string, unknown> }[]): CanvasPreImage {
+    const canvas = store.getCanvas(canvasId)!
+    const frames = new Map<string, FramePreImage>()
+    for (const entry of prepared) {
+      const id = entry.args.frame_id
+      if (typeof id !== 'string' || frames.has(id)) continue
+      const frame = store.getFrame(id)
+      /* an op naming a frame outside this canvas is refused before it runs, so
+         it is not part of what a rollback has to put back */
+      if (!frame || frame.canvasId !== canvasId) continue
+      frames.set(id, {
+        name: frame.name,
+        x: frame.x,
+        y: frame.y,
+        width: frame.width,
+        height: frame.height,
+        html: frame.html,
+        ...(frame.pageId !== undefined ? { pageId: frame.pageId } : {}),
+      })
+    }
+    return {
+      frames,
+      frameIds: new Set(canvas.frames.map((f) => f.id)),
+      pageIds: new Set((canvas.pages ?? []).map((p) => p.id)),
+      tokens: canvas.tokens,
+      guidelines: store.getGuidelines(canvasId).map((d) => ({
+        name: d.name,
+        title: d.title ?? '',
+        markdown: d.markdown,
+      })),
+    }
+  }
+
+  /** Put the canvas back as the pre-image has it, through the actions layer so
+   *  the room sees the same broadcasts a normal edit produces. Content only:
+   *  appended comments, decisions and status lines are `not_rolled_back`.
+   *  Throws when a step fails, so the caller can report that instead of
+   *  claiming a rollback that did not happen. */
+  function restoreCanvas(
+    canvasId: string,
+    before: CanvasPreImage,
+    actor: Actor,
+  ): { restored: string[]; recreated: { name: string; from: string; to: string }[] } {
+    const canvas = store.getCanvas(canvasId)
+    if (!canvas) throw new Error(`canvas ${canvasId} is gone`)
+    const restored: string[] = []
+    /* A frame the batch deleted comes back through createFrame, which mints a
+       new id — the old one went with the frame. Named here so the caller is
+       not left looking for an id that no longer exists. */
+    const recreated: { name: string; from: string; to: string }[] = []
+
+    /* frames the batch created did not exist before it ran: take them out. The
+       batch locked whatever it wrote, so the lock goes first — a restore runs
+       as the caller, and the batch's ops may have run as another agent. */
+    for (const frame of [...canvas.frames]) {
+      if (before.frameIds.has(frame.id)) continue
+      actions.releaseAllFrameLocks(frame.id)
+      if (actions.deleteFrame(frame.id, actor)) restored.push(frame.id)
+    }
+
+    for (const [id, was] of before.frames) {
+      const now = store.getFrame(id)
+      if (!now) {
+        const back = actions.createFrame(canvasId, { ...was }, actor)
+        if (back) {
+          restored.push(back.id)
+          recreated.push({ name: was.name, from: id, to: back.id })
+        }
+        continue
+      }
+      const patch: Partial<Pick<Frame, 'name' | 'x' | 'y' | 'width' | 'height' | 'html'>> = {}
+      if (now.name !== was.name) patch.name = was.name
+      if (now.x !== was.x) patch.x = was.x
+      if (now.y !== was.y) patch.y = was.y
+      if (now.width !== was.width) patch.width = was.width
+      if (now.height !== was.height) patch.height = was.height
+      if (now.html !== was.html) patch.html = was.html
+      const moved = was.pageId !== undefined && now.pageId !== was.pageId
+      if (Object.keys(patch).length === 0 && !moved) continue
+      /* A batch op takes the frame lock as it writes, so undoing the write has
+         to take the lock back too — otherwise the restore is refused by the
+         very lock the batch left behind. */
+      actions.releaseAllFrameLocks(id)
+      if (Object.keys(patch).length > 0) actions.updateFrame(id, patch, actor)
+      if (moved) actions.moveFrameToPage(id, was.pageId!, actor)
+      restored.push(id)
+    }
+
+    /* pages the batch created — no batchable op makes one today, but the
+       pre-image knows the difference either way */
+    for (const page of [...(canvas.pages ?? [])]) {
+      if (before.pageIds.has(page.id)) continue
+      if (actions.deletePage(page.id, actor)) restored.push(page.id)
+    }
+
+    for (const was of before.guidelines) {
+      const now = store.getGuidelines(canvasId).find((d) => d.name === was.name)
+      if (now && now.markdown === was.markdown && (now.title ?? '') === was.title) continue
+      actions.setGuideline(canvasId, was.name, was.markdown, actor, undefined, was.title)
+      restored.push(was.name)
+    }
+    for (const now of [...store.getGuidelines(canvasId)]) {
+      if (before.guidelines.some((d) => d.name === now.name)) continue
+      actions.setGuideline(canvasId, now.name, '', actor)
+      restored.push(now.name)
+    }
+
+    if (JSON.stringify(canvas.tokens) !== JSON.stringify(before.tokens)) {
+      actions.setTokens(canvasId, before.tokens, actor)
+      restored.push('tokens')
+    }
+    return { restored, recreated }
+  }
 
   /**
    * Everything that can be known to make a batch op fail WITHOUT applying it:
@@ -5310,8 +5732,9 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
     'apply_ops',
     {
       title: 'Apply several edits in one call',
+      annotations: { readOnlyHint: false },
       description:
-        'Run a sequence of Doop edits in one round trip: create frames, write their HTML, position them, comment, update status. Each op is `{ op: "<tool name>", ...that tool\'s arguments }` — the same fields the named tool takes (see its own schema). Use this to lay out a multi-frame flow, or to apply a review pass across several frames, instead of paying a round trip per call. Ops run in array order; with atomic: false (the default) a failing op is reported at its index and the rest still run, while atomic: true validates every op first and applies nothing if any would fail — if an op still fails while applying (another agent took a lock in between), the batch stops and the error says how many ops landed before it.',
+        'Run a sequence of Doop edits in one round trip: create frames, write their HTML, position them, comment, update status. Each op is `{ op: "<tool name>", ...that tool\'s arguments }` — the same fields the named tool takes (see its own schema). Use this to lay out a multi-frame flow, or to apply a review pass across several frames, instead of paying a round trip per call. Ops run in array order; with atomic: false (the default) a failing op is reported at its index and the rest still run, while atomic: true validates every op first and applies nothing if any would fail — and if an op still fails while applying (another agent took a lock in between), the batch stops and the ops that landed are rolled back from a pre-image taken before the first one: the error reports `rolled_back`, `restored` and how many ops landed before it. Appended comments, decisions and status lines cannot be taken back, and are named in `not_rolled_back`. With dry_run: true nothing is written at all: every op is validated, each op that can diff its own write returns `diff`, `bytes_before` and `bytes_after`, and the rest report that they cleared pre-flight.',
       inputSchema: {
         canvas_id: z.string(),
         ops: z
@@ -5345,6 +5768,10 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
           .boolean()
           .optional()
           .describe('Validate every op before applying any (default false: apply what you can, report what failed)'),
+        dry_run: z
+          .boolean()
+          .optional()
+          .describe('Validate every op and report the diff each would produce, writing nothing'),
         agent_name: agentName,
       },
       outputSchema: {
@@ -5355,14 +5782,26 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
             ok: z.boolean(),
             result: z.unknown().optional(),
             error: z.unknown().optional(),
+            would_apply: z.boolean().optional(),
+            diff: diffShape.optional(),
+            bytes_before: z.number().optional(),
+            bytes_after: z.number().optional(),
           }),
         ),
         applied: z.number(),
         failed: z.number(),
         stopped_at: z.number().optional(),
+        applied_before_failure: z.number().optional(),
+        not_rolled_back: z.array(z.number()).optional(),
+        rolled_back: z.literal(true).optional(),
+        restored: z.array(z.string()).optional(),
+        recreated: z.array(z.object({ name: z.string(), from: z.string(), to: z.string() })).optional(),
+        rollback_failed: z.string().optional(),
+        dry_run: z.literal(true).optional(),
+        would_apply: z.number().optional(),
       },
     },
-    async ({ canvas_id, ops, atomic, agent_name }, extra) => {
+    async ({ canvas_id, ops, atomic, dry_run, agent_name }, extra) => {
       const c = canvasFor(canvas_id)
       if (!c) return noCanvas(canvas_id)
       const actor = actorFrom(agent_name)
@@ -5414,6 +5853,71 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
         prepared.push({ index, op, args: parsed.data as Record<string, unknown> })
       }
 
+      /* A dry run answers the same question a batch answers — would this land?
+         — and writes nothing. Every op is validated; the ops that can diff
+         their own write are asked for one, and the rest report that they
+         cleared pre-flight. No lock is taken, nothing is broadcast, and no
+         frame's updatedAt moves. */
+      if (dry_run) {
+        const previews: {
+          index: number
+          op: string
+          ok: boolean
+          would_apply: boolean
+          error?: unknown
+          diff?: unknown
+          bytes_before?: number
+          bytes_after?: number
+        }[] = []
+        for (const entry of prepared) {
+          if (entry.error) {
+            previews.push({ index: entry.index, op: entry.op, ok: false, would_apply: false, error: entry.error })
+            continue
+          }
+          const blocked = preflightOp(entry.op, entry.args, actor)
+          if (blocked) {
+            previews.push({ index: entry.index, op: entry.op, ok: false, would_apply: false, error: blocked.error })
+            continue
+          }
+          /* Only the tools that can diff a write they did not make carry the
+             numbers; the rest passed pre-flight, which is all a batch can know
+             without running them. */
+          if (!('dry_run' in registry.get(entry.op)!.inputSchema)) {
+            previews.push({ index: entry.index, op: entry.op, ok: true, would_apply: true })
+            continue
+          }
+          const outcome = await registry.get(entry.op)!.run({ ...entry.args, dry_run: true } as never, extra as never)
+          const textBlocks = (outcome.content as { type: string; text?: string }[]).filter((b) => b.type === 'text')
+          if (outcome.isError) {
+            previews.push({
+              index: entry.index,
+              op: entry.op,
+              ok: false,
+              would_apply: false,
+              error: parseToolError(textBlocks[0]?.text),
+            })
+            continue
+          }
+          const preview = (outcome.structuredContent ?? {}) as Record<string, unknown>
+          previews.push({
+            index: entry.index,
+            op: entry.op,
+            ok: true,
+            would_apply: preview.would_apply === true,
+            ...(preview.diff !== undefined ? { diff: preview.diff } : {}),
+            ...(typeof preview.bytes_before === 'number' ? { bytes_before: preview.bytes_before } : {}),
+            ...(typeof preview.bytes_after === 'number' ? { bytes_after: preview.bytes_after } : {}),
+          })
+        }
+        return structured({
+          results: previews,
+          applied: 0,
+          failed: previews.filter((preview) => !preview.ok).length,
+          dry_run: true as const,
+          would_apply: previews.filter((preview) => preview.would_apply).length,
+        })
+      }
+
       if (atomic) {
         const first = prepared.find((entry) => entry.error !== undefined)
         if (first) {
@@ -5440,6 +5944,10 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
         error?: unknown
       }[] = []
       const nudges: string[] = []
+      /* What a rollback needs, taken before the first op runs: an atomic batch
+         that dies mid-apply is put back from this, and the id sets tell it
+         which frames and pages the batch created. */
+      const before = snapshotCanvas(canvas_id, prepared)
       for (const entry of prepared) {
         if (entry.error) {
           results.push({ index: entry.index, op: entry.op, ok: false, error: entry.error })
@@ -5456,16 +5964,47 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
         if (outcome.isError) {
           const failure = parseToolError(textBlocks[0]?.text)
           if (atomic) {
-            /* pre-flight cannot see a lock another agent takes in between, so
-               a batch can still fail while applying: say what landed instead of
-               reporting a half-applied batch as a success */
+            /* Pre-flight cannot see a lock another agent takes in between, so a
+               batch can still fail while applying. The ops that landed are put
+               back from the pre-image; the error says what was restored, or —
+               when the restore itself failed — that, instead of claiming a
+               rollback that did not happen. */
+            const landed = results.filter((result) => result.ok)
+            const appendOnly = landed.filter((result) => APPEND_ONLY_OPS[result.op]).map((result) => result.index)
+            /* `err` spreads `extra` over the payload, so the inner error's own
+               `message` would replace the prose composed here — it is the one
+               field left out, because "failed while applying, rolled back" is
+               the part the caller cannot get anywhere else. */
+            const { message: innerMessage, ...failureFields } = failure.error
+            const context = {
+              ...failureFields,
+              stopped_at: entry.index,
+              applied_before_failure: landed.length,
+              ...(appendOnly.length ? { not_rolled_back: appendOnly } : {}),
+            }
+            const what = `op ${entry.index} (${entry.op}) failed while applying: ${innerMessage}`
+            let rollback: { restored: string[]; recreated: { name: string; from: string; to: string }[] }
+            try {
+              rollback = restoreCanvas(canvas_id, before, actor)
+            } catch (e) {
+              return err(failure.error.code, what, {
+                ...context,
+                rollback_failed: e instanceof Error ? e.message : 'the rollback failed',
+              })
+            }
+            const back = rollback.recreated.length
+              ? ` Frame${rollback.recreated.length === 1 ? '' : 's'} ${rollback.recreated
+                  .map((f) => `“${f.name}” came back as ${f.to} (a deleted frame cannot keep its id)`)
+                  .join('; ')}.`
+              : ''
             return err(
               failure.error.code,
-              `op ${entry.index} (${entry.op}) failed while applying: ${failure.error.message}`,
+              `${what}. Rolled back ${landed.length} op(s): the canvas is as it was before the batch.${back}`,
               {
-                ...failure.error,
-                stopped_at: entry.index,
-                applied_before_failure: results.filter((result) => result.ok).length,
+                ...context,
+                rolled_back: true,
+                restored: rollback.restored,
+                ...(rollback.recreated.length ? { recreated: rollback.recreated } : {}),
               },
             )
           }
@@ -5484,10 +6023,20 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientId?: stri
         })
       }
 
+      const firstFailure = results.findIndex((result) => !result.ok)
       const payload = {
         results,
         applied: results.filter((r) => r.ok).length,
         failed: results.filter((r) => !r.ok).length,
+        /* A best-effort batch undoes nothing by design, so a failure reports
+           what landed instead: how far the batch got, and the ops a later
+           cleanup cannot take back (comments, decisions, status). */
+        ...(firstFailure === -1
+          ? {}
+          : {
+              applied_before_failure: results.slice(0, firstFailure).filter((r) => r.ok).length,
+              not_rolled_back: results.filter((r) => r.ok && APPEND_ONLY_OPS[r.op]).map((r) => r.index),
+            }),
       }
       const summary = `${payload.applied} of ${results.length} op(s) applied${payload.failed ? `, ${payload.failed} failed — see the results array for the index and reason` : ''}`
       return withFeedback(

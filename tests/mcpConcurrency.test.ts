@@ -5,6 +5,7 @@ import * as actions from '../server/actions.ts'
 import { buildMcpServer } from '../server/mcp.ts'
 import { store } from '../server/store.ts'
 import * as frameLocks from '../server/frameLocks.ts'
+import { clearOpIds } from '../server/opIds.ts'
 import type { Canvas } from '../shared/types.ts'
 
 /* Optimistic concurrency: `expected_updated_at` is the caller's assertion that
@@ -71,8 +72,11 @@ async function connect() {
 
 async function callTool(client: Client, name: string, args: Record<string, unknown>) {
   const result = (await client.callTool({ name, arguments: args })) as unknown as CallResult
-  const raw = result.content.find((block) => block.type === 'text')?.text ?? ''
-  return { parsed: JSON.parse(raw) as Record<string, never>, raw, isError: result.isError }
+  const texts = result.content.filter((block) => block.type === 'text').map((block) => block.text ?? '')
+  const raw = texts[0] ?? ''
+  /* every text block, payload first: the steering the wrapper appends (feedback,
+     session substitutions, the replay notice) rides after the payload */
+  return { parsed: JSON.parse(raw) as Record<string, never>, raw, text: texts.join('\n'), isError: result.isError }
 }
 
 function seedCanvas(): Canvas {
@@ -107,6 +111,7 @@ function seedCanvas(): Canvas {
 beforeEach(() => {
   vi.restoreAllMocks()
   frameLocks.clearLocks()
+  clearOpIds()
   actions.wire(
     () => {},
     () => {},
@@ -211,6 +216,94 @@ describe('optimistic concurrency on frame writes', () => {
       expect(bad.isError).toBe(true)
       expect(bad.parsed.error).toMatchObject({ code: 'invalid_input' })
       expect(store.getFrame(FRAME_ID)!.html).toBe('<h1>original</h1>')
+    } finally {
+      await close()
+    }
+  })
+})
+
+/* Idempotency: a dropped connection leaves the caller unable to tell whether a
+   write landed, and the retry it sends must not land a second time. The key is
+   the caller's `op_id`; the wrapper replays the recorded result instead of
+   running the handler again. */
+describe('idempotent retries', () => {
+  it('replays a repeated op_id instead of writing twice', async () => {
+    const { client, close } = await connect()
+    try {
+      const first = await callTool(client, 'set_frame_html', {
+        frame_id: FRAME_ID,
+        html: '<h1>first</h1>',
+        op_id: 'html-1',
+        agent_name: 'Claude',
+      })
+      expect(first.isError).toBeFalsy()
+      expect(first.text).not.toContain('idempotent_replay')
+      const written = store.getFrame(FRAME_ID)!
+
+      /* the retry carries different html under the same key: the record is what
+         answers it, so the frame is exactly as the first call left it */
+      const retry = await callTool(client, 'set_frame_html', {
+        frame_id: FRAME_ID,
+        html: '<h1>second</h1>',
+        op_id: 'html-1',
+        agent_name: 'Claude',
+      })
+      expect(retry.isError).toBeFalsy()
+      expect(retry.text).toContain('idempotent_replay')
+      expect(retry.raw).toBe(first.raw)
+      const after = store.getFrame(FRAME_ID)!
+      expect(after.html).toBe('<h1>first</h1>')
+      expect(after.updatedAt).toBe(written.updatedAt)
+    } finally {
+      await close()
+    }
+  })
+
+  it('leaves the key of a failed call free, so the retry still runs', async () => {
+    const { client, close } = await connect()
+    try {
+      const failed = await callTool(client, 'set_frame_html', {
+        frame_id: 'f-does-not-exist',
+        html: '<h1>x</h1>',
+        op_id: 'html-retry',
+        agent_name: 'Claude',
+      })
+      expect(failed.isError).toBe(true)
+      expect(failed.parsed.error).toMatchObject({ code: 'not_found' })
+
+      /* nothing landed, so the id must still be usable for the real write */
+      const retried = await callTool(client, 'set_frame_html', {
+        frame_id: FRAME_ID,
+        html: '<h1>landed</h1>',
+        op_id: 'html-retry',
+        agent_name: 'Claude',
+      })
+      expect(retried.isError).toBeFalsy()
+      expect(retried.text).not.toContain('idempotent_replay')
+      expect(store.getFrame(FRAME_ID)!.html).toBe('<h1>landed</h1>')
+    } finally {
+      await close()
+    }
+  })
+
+  it('treats a different op_id as a new write', async () => {
+    const { client, close } = await connect()
+    try {
+      await callTool(client, 'set_frame_html', {
+        frame_id: FRAME_ID,
+        html: '<h1>one</h1>',
+        op_id: 'html-a',
+        agent_name: 'Claude',
+      })
+      const second = await callTool(client, 'set_frame_html', {
+        frame_id: FRAME_ID,
+        html: '<h1>two</h1>',
+        op_id: 'html-b',
+        agent_name: 'Claude',
+      })
+      expect(second.isError).toBeFalsy()
+      expect(second.text).not.toContain('idempotent_replay')
+      expect(store.getFrame(FRAME_ID)!.html).toBe('<h1>two</h1>')
     } finally {
       await close()
     }

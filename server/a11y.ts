@@ -1,5 +1,6 @@
 import type { Frame } from '../shared/types.ts'
 import { probeFrame, type Probe, type ProbeElement } from './domProbe.ts'
+import type { InteractionState } from './screenshot.ts'
 
 /**
  * Accessibility audit of a rendered frame.
@@ -278,7 +279,7 @@ export function auditProbe(probe: Probe): A11yReport {
 
 export async function auditFrame(
   frame: Frame,
-  opts: { viewport?: { width: number; height: number } } = {},
+  opts: { viewport?: { width: number; height: number }; state?: InteractionState } = {},
 ): Promise<A11yReport> {
   return auditProbe(await probeFrame(frame, opts))
 }

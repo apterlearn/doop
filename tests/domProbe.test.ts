@@ -336,4 +336,58 @@ describe.skipIf(!findBrowserPath())('probeFrame over a real render', () => {
       await close()
     }
   }, 30_000)
+
+  it('renders an interaction state the frame only shows while hovered', async () => {
+    const frame = seedFrame(
+      page(
+        '<style>.btn{display:block;width:120px;height:40px;background:#ffffff}.btn:hover{background:#ff0000}</style><button class="btn">Buy</button>',
+      ),
+    )
+    const { client, close } = await connect()
+    const shot = async (args: Record<string, unknown>) => {
+      const result = (await client.callTool({
+        name: 'get_frame_screenshot',
+        arguments: { frame_id: frame.id, agent_name: 'Claude', ...args },
+      })) as unknown as { content: Array<{ type: string; data?: string; text?: string }>; isError?: boolean }
+      return result
+    }
+    try {
+      const resting = await shot({})
+      const hovered = await shot({ state: { selector: '.btn', pseudo: 'hover' } })
+      expect(hovered.isError).toBeFalsy()
+      /* the forced state is the frame's own :hover rule, not an injected style:
+         the button's own pixels are red in one render and white in the other.
+         `stats()` reads its input and ignores pipeline operations, so the crop
+         is materialised before measuring it. */
+      const buttonMean = async (result: typeof resting) => {
+        const png = Buffer.from(result.content.find((block) => block.type === 'image')!.data!, 'base64')
+        const cropped = await sharp(png).extract({ left: 6, top: 6, width: 20, height: 8 }).png().toBuffer()
+        return (await sharp(cropped).stats()).channels.map((channel) => channel.mean)
+      }
+      const restingMean = await buttonMean(resting)
+      const hoveredMean = await buttonMean(hovered)
+      expect(restingMean[0]).toBeGreaterThan(240)
+      expect(hoveredMean[0]).toBeGreaterThan(200)
+      expect(hoveredMean[1]).toBeLessThan(60)
+      expect(hoveredMean[2]).toBeLessThan(60)
+      expect(hovered.content.some((block) => block.text?.includes('hover on .btn'))).toBe(true)
+
+      /* a selector that matches nothing is a typed refusal, not a blank image */
+      const missing = await shot({ state: { selector: '.nope', pseudo: 'hover' } })
+      expect(missing.isError).toBe(true)
+      expect(missing.content.some((block) => block.text?.includes('no element matches'))).toBe(true)
+
+      /* audit_frame takes the same state, so a contrast problem that exists
+         only while hovered is measurable instead of guessed at */
+      const audit = await callTool(client, 'audit_frame', {
+        frame_id: frame.id,
+        state: { selector: '.btn', pseudo: 'hover' },
+        agent_name: 'Claude',
+      })
+      expect(audit.isError).toBeFalsy()
+      expect(audit.parsed.state).toBe('hover on .btn')
+    } finally {
+      await close()
+    }
+  }, 30_000)
 })

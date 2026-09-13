@@ -10,7 +10,9 @@ import type { Canvas, Frame } from '../shared/types.ts'
 
 /* Batching: one call, several edits, each reported at its own index. The
    failures below are the ones an agent actually hits — a frame that is not
-   there, another agent's lock, an oversized document. */
+   there, another agent's lock, an oversized document. An atomic batch that
+   dies while applying is rolled back from its pre-image, so a failure never
+   leaves half a flow on the canvas. */
 
 vi.mock('../server/db/persist.ts', () => ({
   getUserEmail: async () => undefined,
@@ -78,6 +80,36 @@ interface OpResult {
   ok: boolean
   result?: unknown
   error?: { error?: { code: string; message: string } }
+}
+
+interface RollbackError {
+  code: string
+  message: string
+  stopped_at?: number
+  applied_before_failure?: number
+  rolled_back?: boolean
+  restored?: string[]
+  recreated?: { name: string; from: string; to: string }[]
+  not_rolled_back?: number[]
+  rollback_failed?: string
+}
+
+interface FrameRead {
+  id: string
+  name: string
+  x: number
+  y: number
+  width: number
+  height: number
+  html: string
+  updatedAt: string
+}
+
+/** The frame as an agent reads it, so the comparisons below are of the canvas
+ *  an agent sees rather than of the store's internals. */
+async function readFrame(client: Client, frameId: string): Promise<FrameRead> {
+  const { parsed } = await callTool(client, 'get_frame', { frame_id: frameId, agent_name: 'Claude' })
+  return parsed as unknown as FrameRead
 }
 
 async function callTool(client: Client, name: string, args: Record<string, unknown>) {
@@ -290,6 +322,231 @@ describe('apply_ops', () => {
       const results = parsed.results as unknown as OpResult[]
       expect(results[0]!.error!.error!.code).toBe('invalid_input')
       expect(results[0]!.error!.error!.message).toContain('somewhere-else')
+    } finally {
+      await close()
+    }
+  })
+
+  it('rolls the batch back when an op fails on a lock taken while applying', async () => {
+    const { client, close } = await connect()
+    try {
+      const before = await readFrame(client, FRAME_ID)
+      /* a real token set, so the comparison below is of something the rollback
+         could have clobbered rather than of two nulls */
+      actions.setTokens(
+        CANVAS_ID,
+        { colors: { ink: '#111110' }, updatedAt: 0, updatedBy: 'alice' },
+        actions.resolveActor({ name: 'alice', kind: 'user' }),
+      )
+      const beforeTokens = (await callTool(client, 'get_tokens', { canvas_id: CANVAS_ID })).parsed.tokens
+      expect(beforeTokens).toBeTruthy()
+      const { parsed, isError } = await callTool(client, 'apply_ops', {
+        canvas_id: CANVAS_ID,
+        atomic: true,
+        agent_name: 'Claude',
+        ops: [
+          /* op 0 takes the frame lock as it writes — takeover is the batchable
+             way to do that — running as AgentA */
+          {
+            op: 'set_frame_html',
+            frame_id: FRAME_ID,
+            html: '<h1>AgentA was here</h1>',
+            takeover: true,
+            agent_name: 'AgentA',
+          },
+          /* op 1 runs as Claude, so AgentA's lock refuses it. Pre-flight ran
+             before either op applied and could not see a lock that did not
+             exist yet. */
+          { op: 'update_frame', frame_id: FRAME_ID, name: 'Claude was here', agent_name: 'Claude' },
+        ],
+      })
+      expect(isError).toBe(true)
+      const failure = parsed.error as unknown as RollbackError
+      expect(failure).toMatchObject({
+        code: 'conflict',
+        stopped_at: 1,
+        applied_before_failure: 1,
+        rolled_back: true,
+      })
+      expect(failure.restored).toContain(FRAME_ID)
+      /* the frame is what the agent read before the batch — op 0 included */
+      const after = await readFrame(client, FRAME_ID)
+      expect(after.html).toBe(before.html)
+      expect(after.name).toBe(before.name)
+      expect(after.x).toBe(before.x)
+      expect(after.y).toBe(before.y)
+      expect(after.width).toBe(before.width)
+      expect(after.height).toBe(before.height)
+      expect((await callTool(client, 'get_tokens', { canvas_id: CANVAS_ID })).parsed.tokens).toEqual(beforeTokens)
+      /* the lock the rolled-back op took went with it: the frame is free again */
+      expect(frameLocks.activeLocks()).toHaveLength(0)
+    } finally {
+      await close()
+    }
+  })
+
+  it('takes back a frame it created and a guide it wrote when a later op fails', async () => {
+    const { client, close } = await connect()
+    try {
+      const before = await readFrame(client, FRAME_ID)
+      /* a doc the batch will overwrite, so the rollback has to put its words
+         back — not just delete what the batch added */
+      actions.setGuideline(
+        CANVAS_ID,
+        'tone',
+        'Original tone rules',
+        actions.resolveActor({ name: 'alice', kind: 'user' }),
+      )
+      const { parsed, isError } = await callTool(client, 'apply_ops', {
+        canvas_id: CANVAS_ID,
+        atomic: true,
+        agent_name: 'Claude',
+        ops: [
+          { op: 'create_frame', name: 'Step 1', html: '<p>one</p>', agent_name: 'Claude' },
+          { op: 'set_guidelines', name: 'hero-rules', markdown: '# Hero rules', agent_name: 'Claude' },
+          {
+            op: 'set_guidelines',
+            name: 'tone',
+            markdown: 'Rewritten tone rules',
+            title: 'Tone of voice',
+            agent_name: 'Claude',
+          },
+          { op: 'set_frame_html', frame_id: FRAME_ID, html: '<h1>rewritten</h1>', agent_name: 'Claude' },
+          /* this op read the frame before op 3 rewrote it, so it fails while
+             applying — pre-flight read the same frame before that rewrite */
+          {
+            op: 'update_frame',
+            frame_id: FRAME_ID,
+            name: 'Never',
+            expected_updated_at: before.updatedAt,
+            agent_name: 'Claude',
+          },
+        ],
+      })
+      expect(isError).toBe(true)
+      const failure = parsed.error as unknown as RollbackError
+      expect(failure).toMatchObject({
+        code: 'conflict',
+        stopped_at: 4,
+        applied_before_failure: 4,
+        rolled_back: true,
+      })
+      expect(failure.restored).toEqual(expect.arrayContaining([FRAME_ID, 'hero-rules', 'tone']))
+      /* the frame the batch created is gone, the guide it wrote is gone, the
+         guide it rewrote reads as it did, and the seeded frame is unchanged */
+      expect(store.getCanvas(CANVAS_ID)!.frames.map((f) => f.id)).toEqual([FRAME_ID])
+      expect(
+        store.getGuidelines(CANVAS_ID).map((d) => ({ name: d.name, title: d.title, markdown: d.markdown })),
+      ).toEqual([{ name: 'tone', title: undefined, markdown: 'Original tone rules' }])
+      const after = await readFrame(client, FRAME_ID)
+      expect(after.html).toBe(before.html)
+      expect(after.name).toBe(before.name)
+    } finally {
+      await close()
+    }
+  })
+
+  it('brings back a frame the batch deleted, naming the id it returns with', async () => {
+    const { client, close } = await connect()
+    try {
+      const before = await readFrame(client, FRAME_ID)
+      const { parsed, isError } = await callTool(client, 'apply_ops', {
+        canvas_id: CANVAS_ID,
+        atomic: true,
+        agent_name: 'Claude',
+        ops: [
+          { op: 'delete_frame', frame_id: FRAME_ID, agent_name: 'Claude' },
+          /* this op read the frame before op 0 deleted it, so it fails while
+             applying — pre-flight saw the frame still there */
+          {
+            op: 'set_frame_html',
+            frame_id: FRAME_ID,
+            html: '<h1>never</h1>',
+            expected_updated_at: before.updatedAt,
+            agent_name: 'Claude',
+          },
+        ],
+      })
+      expect(isError).toBe(true)
+      const failure = parsed.error as unknown as RollbackError
+      expect(failure).toMatchObject({ stopped_at: 1, applied_before_failure: 1, rolled_back: true })
+      expect(failure.recreated).toHaveLength(1)
+      const recreated = failure.recreated![0]!
+      expect(recreated.name).toBe(before.name)
+      expect(recreated.from).toBe(FRAME_ID)
+      /* the design came back whole, under the id the error names */
+      const back = await readFrame(client, recreated.to)
+      expect(back.html).toBe(before.html)
+      expect(store.getCanvas(CANVAS_ID)!.frames.map((f) => f.id)).toEqual([recreated.to])
+      expect(failure.message).toContain(recreated.to)
+    } finally {
+      await close()
+    }
+  })
+
+  it('answers a dry run with what each op would do, writing nothing', async () => {
+    const { client, close } = await connect()
+    try {
+      const before = await readFrame(client, FRAME_ID)
+      const { parsed, isError } = await callTool(client, 'apply_ops', {
+        canvas_id: CANVAS_ID,
+        dry_run: true,
+        agent_name: 'Claude',
+        ops: [
+          { op: 'set_frame_html', frame_id: FRAME_ID, html: '<h1>would land</h1>', agent_name: 'Claude' },
+          { op: 'create_frame', name: 'Would exist', html: '<p>x</p>', agent_name: 'Claude' },
+          { op: 'set_frame_html', frame_id: 'nope', html: '<p>x</p>', agent_name: 'Claude' },
+        ],
+      })
+      expect(isError).toBeFalsy()
+      expect(parsed.dry_run).toBe(true)
+      expect(parsed.applied).toBe(0)
+      expect(parsed.failed).toBe(1)
+      expect(parsed.would_apply).toBe(2)
+      const results = parsed.results as unknown as (OpResult & {
+        would_apply?: boolean
+        diff?: { added: number; removed: number }
+        bytes_before?: number
+        bytes_after?: number
+      })[]
+      expect(results[0]!.would_apply).toBe(true)
+      expect(results[0]!.diff).toBeTruthy()
+      expect(results[0]!.bytes_before).toBe(before.html.length)
+      expect(results[0]!.bytes_after).toBe('<h1>would land</h1>'.length)
+      /* create_frame has no diff of its own — pre-flight passing is the answer */
+      expect(results[1]!.would_apply).toBe(true)
+      expect(results[1]!.diff).toBeUndefined()
+      expect(results[2]!.error!.error!.code).toBe('not_found')
+      /* nothing was written, and the frame is untouched */
+      expect(store.getCanvas(CANVAS_ID)!.frames.map((f) => f.id)).toEqual([FRAME_ID])
+      expect((await readFrame(client, FRAME_ID)).updatedAt).toBe(before.updatedAt)
+    } finally {
+      await close()
+    }
+  })
+
+  it('reports what a best-effort batch landed and what cannot be taken back', async () => {
+    const { client, close } = await connect()
+    try {
+      const commentsBefore = actions.getComments(CANVAS_ID).length
+      const { parsed } = await callTool(client, 'apply_ops', {
+        canvas_id: CANVAS_ID,
+        ops: [
+          { op: 'add_comment', frame_id: FRAME_ID, selector: 'h1', text: 'check the contrast', agent_name: 'Claude' },
+          { op: 'set_frame_html', frame_id: 'nope', html: '<p>x</p>', agent_name: 'Claude' },
+          { op: 'update_frame', frame_id: FRAME_ID, name: 'Still here', agent_name: 'Claude' },
+        ],
+        agent_name: 'Claude',
+      })
+      expect(parsed.applied).toBe(2)
+      expect(parsed.failed).toBe(1)
+      /* nothing is rolled back here by design, and the payload says how far the
+         batch got and which of the ops that landed cannot be taken back */
+      expect(parsed.applied_before_failure).toBe(1)
+      expect(parsed.not_rolled_back).toEqual([0])
+      /* the comment op landed and stayed landed — that is what the field says */
+      expect(actions.getComments(CANVAS_ID)).toHaveLength(commentsBefore + 1)
+      expect(store.getFrame(FRAME_ID)!.name).toBe('Still here')
     } finally {
       await close()
     }

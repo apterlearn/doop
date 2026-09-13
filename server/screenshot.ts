@@ -137,6 +137,45 @@ export async function openIsolatedPage(): Promise<IsolatedPage> {
   }
 }
 
+/** Render an element in the state a human only sees while interacting with it.
+ *  `selector` names the element; `pseudo` is the state to force on it. */
+export interface InteractionState {
+  selector: string
+  pseudo: 'hover' | 'focus' | 'active'
+}
+
+/** A state render whose selector matches nothing. The tools map this to their
+ *  own `not_found` refusal, the same code a missing element already gets. */
+export class StateRenderError extends Error {
+  readonly code = 'not_found' as const
+
+  constructor(message: string) {
+    super(message)
+    this.name = 'StateRenderError'
+  }
+}
+
+/**
+ * Ask the browser to render the element as if it were hovered/focused/active.
+ *
+ * Injecting a rule is not an option: a synthetic class would lose to the
+ * frame's own selectors and show a design nobody sees, and rewriting `:hover`
+ * into a class changes specificity. `CSS.forcePseudoState` forces the state on
+ * the node itself, so the render is the frame's own cascade in that state.
+ */
+async function forcePseudoState(page: Page, state: InteractionState): Promise<void> {
+  const cdp = await page.createCDPSession()
+  await cdp.send('DOM.enable')
+  await cdp.send('CSS.enable')
+  const { root } = await cdp.send('DOM.getDocument', { depth: 1 })
+  const { nodeId } = await cdp.send('DOM.querySelector', { nodeId: root.nodeId, selector: state.selector })
+  if (!nodeId)
+    throw new StateRenderError(
+      `no element matches “${state.selector}” — call inspect_frame or get_element to find the current selector`,
+    )
+  await cdp.send('CSS.forcePseudoState', { nodeId, forcedPseudoClasses: [state.pseudo] })
+}
+
 /** Device presets for responsive checks — one definition, so the screenshot,
  *  inspection and audit tools all mean the same thing by "mobile". */
 export const VIEWPORTS = {
@@ -156,7 +195,12 @@ export type DeviceName = keyof typeof VIEWPORTS
  *  `tokens: null` to render the frame's own document verbatim. */
 export async function loadFramePage(
   frame: Frame,
-  opts: { viewport?: { width: number; height: number }; tokens?: DesignTokens | null } = {},
+  opts: {
+    viewport?: { width: number; height: number }
+    tokens?: DesignTokens | null
+    /** force a pseudo-class on `selector` before anything reads the page */
+    state?: InteractionState
+  } = {},
 ): Promise<IsolatedPage> {
   const loaded = await openIsolatedPage()
   const { page } = loaded
@@ -193,6 +237,7 @@ export async function loadFramePage(
       /* no font API, or the page navigated away — carry on */
     }
     await new Promise((resolve) => setTimeout(resolve, 120))
+    if (opts.state) await forcePseudoState(page, opts.state)
     return loaded
   } catch (error) {
     await loaded.close()
@@ -214,6 +259,8 @@ export async function renderFrame(
     fullPage?: boolean
     /** capture this region of the frame, in frame pixels */
     clip?: { x: number; y: number; width: number; height: number }
+    /** render the element `selector` names in this pseudo-class state */
+    state?: InteractionState
   } = {},
 ): Promise<Buffer> {
   const width = Math.max(1, Math.round(opts.viewport?.width ?? frame.width))
@@ -222,6 +269,8 @@ export async function renderFrame(
   const { page } = loaded
   try {
     await page.setViewport({ width, height, deviceScaleFactor: scale })
+    /* after the viewport, so the forced state is not lost to a resize */
+    if (opts.state) await forcePseudoState(page, opts.state)
     const type = opts.type ?? 'png'
     const clip =
       opts.clip !== undefined

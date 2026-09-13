@@ -1,10 +1,13 @@
+import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js'
+
 /**
- * Replay-safe creates.
+ * Replay-safe writes.
  *
- * A create is not idempotent: an agent whose connection dropped mid-call has
- * no way to know whether the frame landed, and retrying duplicates it. With an
- * `op_id`, the retry returns the first payload instead. Keyed per account, so
- * one agent's ids can never collide with another's.
+ * A write is not idempotent: an agent whose connection dropped mid-call has no
+ * way to know whether the frame landed, and retrying duplicates it (a second
+ * frame) or re-applies it (a second edit). With an `op_id`, the retry returns
+ * the first result instead of running again. Keyed per account, so one agent's
+ * ids can never collide with another's.
  */
 const TTL_MS = 10 * 60_000
 const MAX_ENTRIES = 1000
@@ -55,6 +58,33 @@ export async function replayAsync<T extends object>(
   const payload = await create()
   payloads.set(key, { payload, at: now })
   return payload
+}
+
+/**
+ * The same record for every other write: the whole tool result, so a replay is
+ * indistinguishable from the call it replays (feedback, focus and session
+ * notices are re-attached by the wrapper, which is why the result is stored
+ * before they are appended).
+ *
+ * Cloned both ways. The caller keeps editing the result it returns, so storing
+ * the live object would let the first call's notices leak into every replay of
+ * it; and a caller that edits a replay must not be able to corrupt the record.
+ */
+export function remember(ownerId: string, opId: string, result: CallToolResult): void {
+  const key = `${ownerId}::${opId}`
+  const now = Date.now()
+  sweep(now)
+  payloads.set(key, { payload: structuredClone(result), at: now })
+}
+
+/** The result this `op_id` already produced, or undefined. A fresh copy, so
+ *  appending to it cannot reach back into the record. */
+export function recall(ownerId: string, opId: string): CallToolResult | undefined {
+  const key = `${ownerId}::${opId}`
+  const now = Date.now()
+  sweep(now)
+  const hit = payloads.get(key)
+  return hit ? structuredClone(hit.payload as CallToolResult) : undefined
 }
 
 /** Test-only: drop remembered payloads. */
