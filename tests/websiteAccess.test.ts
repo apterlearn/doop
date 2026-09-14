@@ -65,12 +65,10 @@ describe('website automated-access detection', () => {
     )
   })
 
-  it('gives connected and resident agents recovery instructions suited to their capabilities', () => {
+  it('gives connected agents and users recovery instructions suited to their capabilities', () => {
     const error = new WebsiteCaptureUnavailableError('The site blocked automated access')
     expect(websiteAccessErrorMessage(error, 'connected-agent')).toContain('another browser or web-access tool')
     expect(websiteAccessErrorMessage(error, 'connected-agent')).toContain('upload_asset')
-    expect(websiteAccessErrorMessage(error, 'resident')).toContain('ask the user to attach screenshots')
-    expect(websiteAccessErrorMessage(error, 'resident')).not.toContain('web-access tool')
     expect(websiteAccessErrorMessage(error, 'user')).toContain('use screenshots as references')
   })
 

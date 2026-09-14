@@ -27,6 +27,10 @@ vi.mock('../server/db/persist.ts', async (importOriginal) => ({
   saveProposal: () => {},
   saveDecision: () => {},
   deleteTask: () => {},
+  /* review_canvas and the ship gate read and write stored reports; the store
+     and the renderer are real here, the database is not */
+  saveFrameReview: () => {},
+  listFrameReviews: async () => [],
 }))
 
 /* The webpage importer drives a real browser at a real URL. The import itself
@@ -676,4 +680,268 @@ describe('MCP phase-0 tool contract', () => {
       await close()
     }
   })
+})
+
+/* The canvas-wide half of the surface: the sweep that judges a whole design,
+   the fixer for a11y/content findings, the canvas-wide rename, the release
+   diff and the two pull-request tools that update a handoff. */
+describe('MCP ship and verify tool contract', () => {
+  const browser = findBrowserPath()
+
+  beforeEach(() => {
+    actions.wirePresence(() => [])
+  })
+
+  const NEW_TOOLS = [
+    'review_canvas',
+    'fix_frame_a11y',
+    'replace_in_frames',
+    'diff_release',
+    'update_pull_request',
+    'comment_pull_request',
+    'propose_canvas_change',
+    'list_canvas_proposals',
+    'resolve_canvas_proposal',
+  ]
+
+  it('registers the sweep, the fixer, the rename, the diff and the handoff tools', async () => {
+    const { client, close } = await connect()
+    try {
+      const { tools } = await client.listTools()
+      const byName = new Map(tools.map((tool) => [tool.name, tool]))
+      const schema = (name: string) => byName.get(name)!.inputSchema as ToolInputSchema
+
+      for (const name of NEW_TOOLS) expect(byName.has(name), `${name} should be registered`).toBe(true)
+
+      /* the two that only read must say so — a client auto-approves on it */
+      expect(byName.get('diff_release')!.annotations?.readOnlyHint).toBe(true)
+      expect(byName.get('list_canvas_proposals')!.annotations?.readOnlyHint).toBe(true)
+      /* and the ones that write must never claim to be reads: review_canvas
+         stores a report per frame, the fixer edits the frame, the rename and
+         the pull-request pair change state on two surfaces */
+      for (const name of [
+        'review_canvas',
+        'fix_frame_a11y',
+        'replace_in_frames',
+        'update_pull_request',
+        'comment_pull_request',
+        'propose_canvas_change',
+        'resolve_canvas_proposal',
+      ])
+        expect(byName.get(name)!.annotations?.readOnlyHint, `${name} writes`).not.toBe(true)
+
+      /* every new tool publishes the shape it returns */
+      for (const name of NEW_TOOLS) expect(byName.get(name)!.outputSchema, `${name} outputSchema`).toBeDefined()
+
+      /* the writes carry the idempotency key the wrapper replays on */
+      for (const name of ['review_canvas', 'fix_frame_a11y', 'replace_in_frames', 'update_pull_request'])
+        expect(schema(name).properties, `${name} takes op_id`).toHaveProperty('op_id')
+
+      /* canvas_id is optional on the wire: the session supplies the canvas the
+         agent is already working on, and a call that resolves none is refused
+         by the handler rather than by the protocol */
+      expect(new Set(schema('replace_in_frames').required)).toEqual(new Set(['find', 'replace']))
+      expect(schema('replace_in_frames').properties).toHaveProperty('canvas_id')
+      expect(schema('replace_in_frames').properties).toHaveProperty('dry_run')
+      expect(schema('replace_in_frames').properties).toHaveProperty('frame_ids')
+      expect(schema('fix_frame_a11y').properties).toHaveProperty('only')
+      expect(schema('fix_frame_a11y').properties).toHaveProperty('dry_run')
+      expect(new Set(schema('review_canvas').required)).toEqual(new Set())
+      expect(schema('review_canvas').properties).toHaveProperty('page')
+      expect(new Set(schema('diff_release').required)).toEqual(new Set(['release_id']))
+      expect(new Set(schema('comment_pull_request').required)).toEqual(new Set(['repo', 'pull', 'body']))
+
+      /* the export format gained the developer handoff, and open_pull_request
+         gained the gate's override */
+      const formatField = (schema('export_canvas').properties ?? {}) as Record<string, { enum?: string[] }>
+      expect(formatField.format!.enum).toContain('code')
+      expect(schema('open_pull_request').properties).toHaveProperty('force')
+      for (const name of ['publish_canvas', 'create_release', 'restore_release'])
+        expect(schema(name).properties, `${name} takes force`).toHaveProperty('force')
+    } finally {
+      await close()
+    }
+  })
+
+  it('renames a string across every frame of a canvas', async () => {
+    const canvas = store.createCanvas('Canvas rename', OWNER_ID)
+    const hero = store.createFrame(
+      canvas.id,
+      { name: 'Hero', html: '<h1>Acme</h1><p>Acme ships today</p>', width: 800, height: 600 },
+      'alice',
+    )!
+    const pricing = store.createFrame(
+      canvas.id,
+      { name: 'Pricing', html: '<h1>Acme pricing</h1>', width: 800, height: 600 },
+      'alice',
+    )!
+    const { client, close } = await connect()
+    try {
+      const dry = await call(client, 'replace_in_frames', {
+        canvas_id: canvas.id,
+        find: 'Acme',
+        replace: 'Doop',
+        dry_run: true,
+        agent_name: 'Claude',
+      })
+      expect(dry.isError, dry.text).toBe(false)
+      expect(dry.structured.total_matches).toBe(3)
+      expect(dry.structured.dry_run).toBe(true)
+      /* a rehearsal counts and writes nothing */
+      expect(store.getFrame(hero.id)!.html).toContain('Acme')
+
+      const applied = await call(client, 'replace_in_frames', {
+        canvas_id: canvas.id,
+        find: 'Acme',
+        replace: 'Doop',
+        agent_name: 'Claude',
+      })
+      expect(applied.isError, applied.text).toBe(false)
+      expect(applied.structured.total_matches).toBe(3)
+      expect(applied.structured.frames).toEqual([
+        { frame_id: hero.id, name: 'Hero', matches: 2, applied: true },
+        { frame_id: pricing.id, name: 'Pricing', matches: 1, applied: true },
+      ])
+      expect(store.getFrame(hero.id)!.html).toBe('<h1>Doop</h1><p>Doop ships today</p>')
+      expect(store.getFrame(pricing.id)!.html).toBe('<h1>Doop pricing</h1>')
+
+      /* a pattern that will not compile is refused before anything is read */
+      const bad = await call(client, 'replace_in_frames', {
+        canvas_id: canvas.id,
+        find: '([',
+        replace: 'x',
+        regex: true,
+        agent_name: 'Claude',
+      })
+      expect(bad.isError).toBe(true)
+      expect(bad.structured).toMatchObject({ error: { code: 'invalid_input' } })
+    } finally {
+      await close()
+    }
+  })
+
+  it.skipIf(!browser)(
+    'fixes the a11y findings that need no judgement and names the rest',
+    async () => {
+      const canvas = store.createCanvas('A11y fixer', OWNER_ID)
+      const frame = store.createFrame(
+        canvas.id,
+        {
+          name: 'Landing',
+          html: '<!doctype html><html><head><meta charset="utf-8"></head><body><button class="cta">Buy</button><p>Lorem ipsum dolor sit amet</p></body></html>',
+          width: 800,
+          height: 600,
+        },
+        'alice',
+      )!
+      const { client, close } = await connect()
+      try {
+        const dry = await call(client, 'fix_frame_a11y', {
+          canvas_id: canvas.id,
+          frame_id: frame.id,
+          dry_run: true,
+          agent_name: 'Claude',
+        })
+        expect(dry.isError, dry.text).toBe(false)
+        expect(dry.structured.would_apply).toBe(true)
+        const planned = dry.structured.applied as string[]
+        for (const rule of ['html_lang', 'no_title', 'missing_state'])
+          expect(
+            planned.some((entry) => entry.startsWith(`${rule}:`)),
+            `${rule} should be planned`,
+          ).toBe(true)
+        /* the judgement calls are named, not guessed at */
+        const skipped = dry.structured.skipped as { rule: string }[]
+        expect(skipped.map((entry) => entry.rule)).toContain('placeholder_text')
+        /* a rehearsal writes nothing */
+        expect(store.getFrame(frame.id)!.html).not.toContain('lang=')
+
+        const applied = await call(client, 'fix_frame_a11y', {
+          canvas_id: canvas.id,
+          frame_id: frame.id,
+          agent_name: 'Claude',
+        })
+        expect(applied.isError, applied.text).toBe(false)
+        expect(applied.structured.changed).toBe(true)
+        const html = store.getFrame(frame.id)!.html
+        expect(html).toContain('lang="en"')
+        expect(html).toContain('<title>Landing</title>')
+        expect(html).toContain(':focus-visible')
+        expect(html).toContain('Lorem ipsum')
+
+        /* running it again is quiet: nothing left to fix is not a failure */
+        const again = await call(client, 'fix_frame_a11y', {
+          canvas_id: canvas.id,
+          frame_id: frame.id,
+          only: ['html_lang', 'no_title', 'missing_state'],
+          agent_name: 'Claude',
+        })
+        expect(again.isError, again.text).toBe(false)
+        expect(again.structured.changed).toBe(false)
+        expect(again.structured.applied).toEqual([])
+      } finally {
+        await close()
+      }
+    },
+    120_000,
+  )
+
+  it.skipIf(!browser)(
+    'sweeps a whole canvas and fails it on one failing frame',
+    async () => {
+      const canvas = store.createCanvas('Sweep', OWNER_ID)
+      /* one frame with an image that has no alt text: a blocking finding, so the
+       canvas verdict has to be fail — not merely "not pass yet" */
+      const broken = store.createFrame(
+        canvas.id,
+        {
+          name: 'Broken',
+          html: '<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Broken</title></head><body><main><h1>Hello</h1><img src="hero.png"></main></body></html>',
+          width: 800,
+          height: 600,
+        },
+        'alice',
+      )!
+      const { client, close } = await connect()
+      try {
+        const result = await call(client, 'review_canvas', { canvas_id: canvas.id, agent_name: 'Claude' })
+        expect(result.isError, result.text).toBe(false)
+        expect(result.structured.verdict).toBe('fail')
+        const rows = result.structured.frames as { frame_id: string; verdict: string; blocking: number }[]
+        const totals = result.structured.totals as { fail: number }
+        expect(rows.map((row) => row.frame_id)).toEqual([broken.id])
+        expect(rows[0]).toMatchObject({ verdict: 'fail' })
+        expect(rows[0]!.blocking).toBeGreaterThan(0)
+        expect(totals.fail).toBe(1)
+
+        /* the result points at the per-frame gate for the fix, not at another
+         sweep: review_frame/ready_for_review stay how one frame is cleared */
+        const nudge = (await client.callTool({
+          name: 'review_canvas',
+          arguments: { canvas_id: canvas.id, agent_name: 'Claude' },
+        })) as unknown as { content: Array<{ type: string; text?: string }> }
+        const prose = nudge.content.map((block) => block.text ?? '').join(' ')
+        expect(prose).toContain('ready_for_review')
+        expect(prose).toContain('not shipping clean')
+
+        /* the sweep is canvas-wide: a page filter is the only narrowing */
+        const page = store.getCanvas(canvas.id)!.pages![0]!.id
+        const scoped = await call(client, 'review_canvas', {
+          canvas_id: canvas.id,
+          page,
+          agent_name: 'Claude',
+        })
+        expect(scoped.isError, scoped.text).toBe(false)
+        const scopedRows = scoped.structured.frames as unknown[]
+        expect(scopedRows.length).toBe(1)
+
+        const unknown = await call(client, 'review_canvas', { canvas_id: 'nope', agent_name: 'Claude' })
+        expect(unknown.isError).toBe(true)
+        expect(unknown.structured).toMatchObject({ error: { code: 'not_found' } })
+      } finally {
+        await close()
+      }
+    },
+    180_000,
+  )
 })

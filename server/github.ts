@@ -11,7 +11,7 @@ import type { Frame } from '../shared/types.ts'
  * GitHub repo as an import source — a ONE-TIME, CODE-ONLY job: connect a
  * repo (GitHub App install or fine-grained PAT), let doop enumerate its
  * screens from framework routing conventions, and queue the selected ones as
- * cards on the board. The resident Doop agent works the cards one by one
+ * cards on the board. An MCP agent works the cards one by one
  * (server/githubRecon.ts): repo HTML lands as-is, and a screen that only
  * exists as code is designed from its source. Nothing in this flow touches
  * the live site — capturing deployed pages belongs to the website importer,

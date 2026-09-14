@@ -2,7 +2,8 @@ import { TimeoutError, type HTTPResponse, type Page } from 'puppeteer-core'
 
 /** A site refused, challenged, or never completed a visit from Doop's
  * automated browser. Different callers need different recovery instructions:
- * connected agents may have their own browser, while resident agents do not. */
+ * an MCP agent may have its own browser, while a human asking for the page
+ * just needs to know why it is not there. */
 export class WebsiteCaptureUnavailableError extends Error {
   constructor(readonly reason: string) {
     super(`${reason}, so Doop could not capture the page. Try another public URL or use screenshots as references.`)
@@ -10,14 +11,11 @@ export class WebsiteCaptureUnavailableError extends Error {
   }
 }
 
-export type WebsiteAccessAudience = 'connected-agent' | 'resident' | 'user'
+export type WebsiteAccessAudience = 'connected-agent' | 'user'
 
 export function websiteAccessErrorMessage(error: unknown, audience: WebsiteAccessAudience): string | undefined {
   if (!(error instanceof WebsiteCaptureUnavailableError)) return undefined
   if (audience === 'user') return error.message
-  if (audience === 'resident') {
-    return `${error.reason}. Use an existing source frame or attached screenshots if available. Otherwise stop and ask the user to attach screenshots, then retry. Do not guess or invent page content.`
-  }
   return `${error.reason}, so no page content was captured. Do not retry with view_website because it uses the same website-capture path. If you have another browser or web-access tool, inspect the URL there and continue only from content you actually observe. If upload_asset is available, capture a screenshot, upload it, and place it in a canvas reference frame. Otherwise ask the user for screenshots or an HTML export. Do not guess or invent page content.`
 }
 

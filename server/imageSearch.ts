@@ -1,7 +1,7 @@
 /**
  * Image sourcing for design agents: stock photo search (Pexels) and icon /
  * brand-logo search (Iconify). Both power the search_images / search_icons
- * tools in mcp.ts and resident.ts.
+ * tools in mcp.ts.
  *
  * Photos come back with a tiny thumbnail the agent can SEE (returned as an
  * image block) plus a display-resolution URL to embed. Photo search needs

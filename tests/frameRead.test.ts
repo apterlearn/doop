@@ -2,11 +2,10 @@ import { describe, expect, it } from 'vitest'
 import { MAX_HTML_READ_CHARS, readFrameHtml } from '../server/screenshot.ts'
 
 /**
- * The one bounded reader both the resident team and the MCP surface use to look
- * at a frame's source. Its whole reason to exist is that a 60 KB imported
- * document must not land in an agent's context whole, so the caps are the
- * contract: they are the only thing standing between an agent and an
- * out-of-context failure mid-design.
+ * The one bounded reader the MCP surface uses to look at a frame's source. Its
+ * whole reason to exist is that a 60 KB imported document must not land in an
+ * agent's context whole, so the caps are the contract: they are the only thing
+ * standing between an agent and an out-of-context failure mid-design.
  */
 
 const doc = `<html><body><h1 class="hero">Hero</h1>${'x'.repeat(5000)}<p>hero again</p></body></html>`

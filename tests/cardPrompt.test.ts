@@ -7,7 +7,6 @@ vi.mock('../server/db/persist.ts', () => ({
   getNotificationPrefs: async () => new Map(),
   saveNotificationPref: () => {},
   pruneRunEvents: () => {},
-  saveJournal: () => {},
   saveRunEvent: () => {},
   saveQuestion: () => {},
   saveFrameProposal: () => {},
@@ -43,8 +42,8 @@ const actions = await import('../server/actions.ts')
 const { store } = await import('../server/store.ts')
 
 /**
- * A card's text IS the prompt the resident agent runs on. It used to be cut
- * to 200 characters on the way in, so any instruction past that point never
+ * A card's text IS the prompt the agent that takes it runs on. It used to be
+ * cut to 200 characters on the way in, so any instruction past that point never
  * reached the agent. These tests pin that the whole prompt is kept.
  */
 

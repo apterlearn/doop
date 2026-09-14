@@ -1,22 +1,18 @@
 import { nanoid } from 'nanoid'
-import { asc, eq, lte } from 'drizzle-orm'
+import { eq, lte } from 'drizzle-orm'
 import { db } from './db/index.ts'
-import { runEvents, runJournals, runSteps, runs } from './db/schema.ts'
-import type { RunEvent, RunJournal, ServerMessage } from '../shared/types.ts'
+import { runEvents } from './db/schema.ts'
+import type { RunEvent, ServerMessage } from '../shared/types.ts'
 
 /**
- * The resident agent's run timeline: one record per model turn, tool call,
- * status line, error or stop, so a human can see what an agent actually did
- * instead of only where it ended up.
+ * An agent's run timeline: one record per model turn, tool call, status line,
+ * error or stop, so a human can see what an agent actually did instead of
+ * only where it ended up.
  *
  * The per-canvas ring is the hot path and the source of truth for reads, the
  * same shape as actions.ts's activityLog. Each event is mirrored to the
  * database fire-and-forget so a restart does not erase the recent history; a
  * write that fails, or cannot happen yet, never reaches the run.
- *
- * The module also owns the `runs` / `run_steps` tables — the run's own durable
- * record and the transcript a restart replays it from (see the durable-runs
- * section below) — so every DB write behind the resident loop lives here.
  */
 /** Ring size per canvas: the Run tab reads a bounded recent window. */
 const CAP = 500
@@ -108,107 +104,4 @@ export function pruneOlderThan(ms: number): void {
     else runLog.set(canvasId, kept)
   }
   writeBehind(() => db.delete(runEvents).where(lte(runEvents.at, cutoff)))
-}
-
-/* ---- durable runs ---- */
-
-/* The `runs` / `run_steps` half of the log: the row that says a run happened
-   and the transcript a restart can replay it from. The events above are what
-   a human reads; these rows are what the resident loop itself resumes from,
-   so they are written through the same fire-and-forget — losing a step
-   degrades a replay, it must not fail the turn that produced it. */
-
-/** Open a run's durable record at the moment its id is minted: `cardIds` and
-   `model` name what the run is working and on whose behalf, everything a
-   resume needs to re-bill the same work. */
-export function startRun(row: {
-  id: string
-  canvasId: string
-  agentName: string
-  cardIds: string[]
-  model: string
-}): void {
-  const at = Date.now()
-  writeBehind(() =>
-    db.insert(runs).values({
-      id: row.id,
-      canvasId: row.canvasId,
-      agentName: row.agentName,
-      cardIds: row.cardIds,
-      model: row.model,
-      status: 'running',
-      startedAt: at,
-      updatedAt: at,
-    }),
-  )
-}
-
-/** Append one transcript entry. `payload` is the message object exactly as it
-   was pushed into the loop, so a replay re-feeds the provider the same bytes. */
-export function appendRunStep(runId: string, seq: number, role: 'assistant' | 'user', payload: unknown): void {
-  writeBehind(() =>
-    db.insert(runSteps).values({ id: nanoid(8), runId, seq, role, payload: payload as object, createdAt: Date.now() }),
-  )
-}
-
-/** Close a run's durable record with how it ended: done reached its goal,
-   failed crashed or was refused, stopped was cancelled by a human. */
-export function finishRun(runId: string, status: 'done' | 'failed' | 'stopped'): void {
-  writeBehind(() => db.update(runs).set({ status, updatedAt: Date.now() }).where(eq(runs.id, runId)))
-}
-
-/** A run whose row still says `running` when the process starts never got to
-   close its record: the server died under it. These are what
-   `resumeInterruptedRuns` replays. */
-export async function interruptedRuns(): Promise<
-  { id: string; canvasId: string; agentName: string; cardIds: string[]; model?: string }[]
-> {
-  if (!db) return []
-  const rows = await db.select().from(runs).where(eq(runs.status, 'running'))
-  return rows.map((row) => ({
-    id: row.id,
-    canvasId: row.canvasId,
-    agentName: row.agentName,
-    cardIds: row.cardIds ?? [],
-    ...(row.model ? { model: row.model } : {}),
-  }))
-}
-
-/** One run's transcript in order — the `seq` the loop wrote, oldest first. */
-export async function runStepsFor(
-  runId: string,
-): Promise<{ seq: number; role: 'assistant' | 'user'; payload: unknown }[]> {
-  const rows = await db.select().from(runSteps).where(eq(runSteps.runId, runId)).orderBy(asc(runSteps.seq))
-  return rows.map((row) => ({ seq: row.seq, role: row.role as 'assistant' | 'user', payload: row.payload }))
-}
-
-/** Drop a run's transcript when its canvas is forgotten; the events above go
-   through `forgetCanvas`, the run rows follow the same lifecycle. */
-export function forgetRuns(canvasId: string): void {
-  writeBehind(async () => {
-    const rows = await db.select({ id: runs.id }).from(runs).where(eq(runs.canvasId, canvasId))
-    for (const row of rows) await db.delete(runSteps).where(eq(runSteps.runId, row.id))
-    await db.delete(runs).where(eq(runs.canvasId, canvasId))
-  })
-}
-
-/* The journal columns `recordRunJournal` now carries — duration, totals, cost —
-   ride in memory through `saveJournal` until persist.ts adds the columns; the
-   mirror below is what closes that gap from the one file that owns run-event
-   writes. Written after `actions.recordRunJournal` has stored the entry, keyed
-   by the journal id the action returned in the log. */
-export function mirrorJournal(journal: RunJournal): void {
-  writeBehind(() =>
-    db
-      .update(runJournals)
-      .set({
-        startedAt: journal.startedAt ?? null,
-        endedAt: journal.endedAt ?? null,
-        turns: journal.turns ?? null,
-        toolCalls: journal.toolCalls ?? null,
-        tokens: journal.tokens ?? null,
-        costUsd: journal.costUsd ?? null,
-      })
-      .where(eq(runJournals.id, journal.id)),
-  )
 }

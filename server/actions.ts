@@ -25,6 +25,8 @@ import type {
   AgentTask,
   Canvas,
   CanvasFocus,
+  CanvasProposal,
+  CanvasProposalKind,
   Component,
   ComponentSummary,
   DesignDecision,
@@ -33,8 +35,6 @@ import type {
   Frame,
   FrameProposal,
   AgentQuestion,
-  TaskUsage,
-  RunJournal,
   GuidelineDoc,
   MemoryProposal,
   MemoryReference,
@@ -66,21 +66,14 @@ type AgentTouch = (
 let broadcast: Broadcast = () => {}
 let agentTouch: AgentTouch = () => {}
 
-/** Abort the in-flight resident run(s) on a canvas. Absent when the resident
- *  team is not wired — the no-op keeps every other behaviour intact. */
-type Cancel = (canvasId: string) => void
-
-let cancel: Cancel = () => {}
-
 /** Flag an agent's presence as parked in a long wait; owned by index.ts. */
 type MarkWaiting = (canvasId: string, agentName: string, waiting: boolean) => void
 
 let markWaiting: MarkWaiting = () => {}
 
-export function wire(b: Broadcast, t: AgentTouch, c?: Cancel, w?: MarkWaiting) {
+export function wire(b: Broadcast, t: AgentTouch, w?: MarkWaiting) {
   broadcast = b
   agentTouch = t
-  cancel = c ?? (() => {})
   markWaiting = w ?? (() => {})
 }
 
@@ -153,9 +146,6 @@ export function hydrateLogs(data: {
   proposals: Map<string, MemoryProposal[]>
   /** canvasId -> agentName -> plan */
   plans?: Map<string, Map<string, AgentPlan>>
-  /** canvasId -> journals, newest first — the resident's cross-run memory,
-   *  which the next kickoff and revert_run read after a restart */
-  journals?: Map<string, RunJournal[]>
 }) {
   for (const [canvasId, list] of data.tasks) taskLog.set(canvasId, list)
   for (const [canvasId, list] of data.feedback) feedbackLog.set(canvasId, list)
@@ -164,7 +154,6 @@ export function hydrateLogs(data: {
   for (const [canvasId, list] of data.decisions) decisionLog.set(canvasId, list)
   for (const [canvasId, list] of data.proposals) proposalLog.set(canvasId, list)
   for (const [canvasId, byAgent] of data.plans ?? []) planLog.set(canvasId, byAgent)
-  for (const [canvasId, list] of data.journals ?? []) journalLog.set(canvasId, list)
   /* A stop is per-canvas session state like the task log: a canvas whose logs
      were just re-read has no stop outstanding against it. */
   for (const canvasId of data.tasks.keys()) cancellations.delete(canvasId)
@@ -344,7 +333,7 @@ export function sweepExpiredLocks(now = Date.now()): number {
 }
 
 /** Refuse a write to a frame another agent has locked. Shared by every
- *  mutation path so external agents and the resident team obey one rule. */
+ *  mutation path so every agent obeys one rule. */
 function assertUnlocked(frameId: string, actor: Actor) {
   const holder = frameLocks.heldBy(frameId, actor.name)
   if (holder) throw new frameLocks.FrameLockedError(holder)
@@ -429,8 +418,8 @@ function touch(canvasId: string, actor: Actor, frameId?: string | null) {
 
 /** Refresh an agent's presence without changing its frame or status. A model
  *  turn can stay silent longer than the presence TTL, and expiry fails the
- *  run's claimed cards as "disconnected" — resident runs beat this on a timer
- *  for as long as they are actually alive. */
+ *  run's claimed cards as "disconnected" — a long-running agent beats this on
+ *  a timer for as long as it is actually alive. */
 export function heartbeatAgent(canvasId: string, actor: Actor) {
   touch(canvasId, actor)
 }
@@ -453,80 +442,6 @@ function sameAgent(t: { agentName: string; ownerId?: string }, actor: Actor): bo
 /** The pipeline of a card, tolerating cards queued before pipelines existed. */
 export function pipelineOf(task: AgentTask): string[] {
   return task.pipeline?.length ? task.pipeline : [DEFAULT_ROLE_ID]
-}
-
-/** The agent whose turn it is on this card. */
-function stageAgent(task: AgentTask): string {
-  const pipeline = pipelineOf(task)
-  return roleName(pipeline[Math.min(task.stage ?? 0, pipeline.length - 1)])
-}
-
-/** Distinct resident agents with work waiting, in the order work arrived. */
-export function pendingWorkAgents(canvasId: string): string[] {
-  const names: string[] = []
-  const add = (name: string) => {
-    if (!names.includes(name)) names.push(name)
-  }
-  /* priority first, then position, then arrival (queueOrder in card utils) */
-  for (const card of queuedCards(canvasId).reverse()) {
-    add(stageAgent(card))
-  }
-  for (const f of [...(feedbackLog.get(canvasId) ?? [])].reverse()) {
-    if (!f.deliveredAt && !f.failedAt) add(f.targetAgent ?? roleName(DEFAULT_ROLE_ID))
-  }
-  for (const c of [...(commentLog.get(canvasId) ?? [])].reverse()) {
-    if (c.forAgent && !c.claimedBy && !c.failedAt && !c.resolvedAt) add(c.targetAgent ?? roleName(DEFAULT_ROLE_ID))
-  }
-  return names
-}
-
-/**
- * Who pays for the next run: the account behind the OLDEST piece of work this
- * agent can claim. A run bills exactly one person, so the queue is worked one
- * requester at a time rather than sweeping several people's work into a single
- * model call on whichever account happened to be found first.
- *
- * Returns '' when the oldest item predates per-user attribution (the caller
- * falls back to the canvas owner), and undefined when nothing is claimable.
- * `skip` holds payers already found to have no usable model this sweep, so one
- * stalled requester never blocks everyone behind them.
- */
-export function nextWorkPayer(canvasId: string, agentName: string, skip?: ReadonlySet<string>): string | undefined {
-  let oldest: { at: number; payer: string } | undefined
-  const consider = (at: number, userId: string | undefined) => {
-    const payer = userId ?? ''
-    if (skip?.has(payer)) return
-    if (!oldest || at < oldest.at) oldest = { at, payer }
-  }
-  for (const card of taskLog.get(canvasId) ?? []) {
-    if (
-      card.queuedBy &&
-      !card.agentName &&
-      !card.failedAt &&
-      !card.endedAt &&
-      !card.cancelledAt &&
-      stageAgent(card) === agentName
-    ) {
-      consider(card.startedAt, card.queuedByUserId)
-    }
-  }
-  for (const c of commentLog.get(canvasId) ?? []) {
-    if (
-      c.forAgent &&
-      !c.claimedBy &&
-      !c.failedAt &&
-      !c.resolvedAt &&
-      (c.targetAgent ?? roleName(DEFAULT_ROLE_ID)) === agentName
-    ) {
-      consider(c.at, c.fromUserId)
-    }
-  }
-  for (const f of feedbackLog.get(canvasId) ?? []) {
-    if (!f.deliveredAt && !f.failedAt && (!f.targetAgent || f.targetAgent === agentName)) {
-      consider(f.at, f.fromUserId)
-    }
-  }
-  return oldest?.payer
 }
 
 /* ------------------------------------------------------------------ */
@@ -638,9 +553,6 @@ export function addTaskFeedback(
     persist.saveFeedback(fb)
     broadcast(canvasId, { type: 'feedback', feedback: fb })
     agentEvents.push(canvasId, { kind: 'feedback', targetAgent: fb.targetAgent, data: { text: clean, from, taskId } })
-    /* resident Doop agent picks feedback up instantly (no-op without an API
-       key). Dynamic import: resident depends on this module. */
-    import('./resident.ts').then((r) => r.onFeedback(canvasId)).catch(() => {})
     logActivity(
       canvasId,
       resolveActor({ name: from, kind: 'user' }),
@@ -722,7 +634,6 @@ export function retryTaskFeedback(feedbackId: string, by: string): TaskFeedback 
     persist.saveFeedback(feedback)
     broadcast(canvasId, { type: 'feedback', feedback })
     logActivity(canvasId, resolveActor({ name: by, kind: 'user' }), 'retried agent feedback')
-    import('./resident.ts').then((r) => r.onFeedback(canvasId)).catch(() => {})
     return feedback
   }
   return undefined
@@ -942,8 +853,8 @@ export function expireQuestion(questionId: string): AgentQuestion | undefined {
 /* ------------------------------------------------------------------ */
 
 /* Element comments: pinned to a specific element inside a frame.      */
-/* Comments mentioning @Doop are routed to the resident agent; the     */
-/* rest are notes for the humans in the room.                          */
+/* Comments mentioning an agent are routed to it; the rest are notes   */
+/* for the humans in the room.                                         */
 /* ------------------------------------------------------------------ */
 
 const commentLog = new Map<string, ElementComment[]>() // canvasId -> entries (newest first)
@@ -1009,7 +920,7 @@ export function replyToComment(
 
 /** The root and frame a reply to this comment would land on, or undefined
  *  when the thread is resolved or its frame is gone — checked before any
- *  metering so a rejected reply never costs a resident task. */
+ *  metering so a rejected reply never costs an agent task. */
 export function openThread(commentId: string): { root: ElementComment; frame: Frame } | undefined {
   const parent = findComment(commentId)
   if (!parent) return undefined
@@ -1029,7 +940,7 @@ function postComment(
 ): ElementComment | undefined {
   const clean = text.trim()
   if (!clean) return undefined
-  /* @Doop, @brand, @a11y… — whichever resident agent is mentioned picks it up */
+  /* a role mention (@Doop, @brand, @a11y…) addresses whichever agent fills it */
   const role = mentionedRole(clean)
   /* a role is not the only addressable agent: an outside agent connected over
      MCP has a name of its own, and @-mentioning it routes the comment to that
@@ -1074,11 +985,6 @@ function postComment(
       : `commented on an element in “${frame.name}”: “${excerpt}”`,
     frame.id,
   )
-  if (comment.forAgent) {
-    /* @Doop mention: the resident agent picks it up instantly (no-op without
-       an API key). Dynamic import: resident depends on this module. */
-    import('./resident.ts').then((r) => r.onFeedback(frame.canvasId)).catch(() => {})
-  }
   return comment
 }
 
@@ -1144,7 +1050,6 @@ export function retryComment(commentId: string, by: string): ElementComment | un
     persist.saveComment(comment)
     broadcast(canvasId, { type: 'comment', comment })
     logActivity(canvasId, resolveActor({ name: by, kind: 'user' }), 'retried an element comment', comment.frameId)
-    import('./resident.ts').then((r) => r.onFeedback(canvasId)).catch(() => {})
     return comment
   }
   return undefined
@@ -1222,31 +1127,6 @@ function endAutoTask(canvasId: string, actor: Actor) {
   }
 }
 
-/** Close an agent's open tasks, e.g. when its presence expires. */
-export function endAgentTasks(canvasId: string, agentName: string, ownerId?: string) {
-  releaseLocksForAgent(canvasId, agentName)
-  /* a finished plan is history the panel does not need; the activity log keeps
-     the record of what happened */
-  if (planLog.get(canvasId)?.delete(agentName)) persist.deletePlan(canvasId, agentName)
-  const now = Date.now()
-  for (const t of taskLog.get(canvasId) ?? []) {
-    if (t.agentName !== agentName || t.endedAt || t.cancelledAt) continue
-    if (ownerId !== undefined && t.ownerId !== undefined && t.ownerId !== ownerId) continue
-    if (t.queuedBy) {
-      /* A card the run already failed keeps its failure: the crash is the
-         actionable story, and overwriting it with "the agent went away" would
-         hide why. Only a card still open when the agent vanished is stopped. */
-      if (t.failedAt) continue
-      t.cancelledAt = now
-      delete t.failureReason
-    } else {
-      t.endedAt = now
-    }
-    persist.saveTask(canvasId, t)
-    broadcast(canvasId, { type: 'task', task: t })
-  }
-}
-
 /* ------------------------------------------------------------------ */
 /* Board cards: humans queue work; agents claim it. Same AgentTask     */
 /* object — queuedBy set, agentName empty until claimed.               */
@@ -1255,8 +1135,8 @@ export function endAgentTasks(canvasId: string, agentName: string, ownerId?: str
 /* canvasId -> agent name -> the stop record. Kept so the MCP result-nudge
    layer can tell a stopped agent to stop, and so nothing re-claims the work
    before the run has actually unwound. The record carries the account the
-   stop was aimed at; a stop recorded without one (the resident team) is read
-   by any agent of that name, which is exactly the old behaviour. */
+   stop was aimed at; a stop recorded without one is read by any agent of that
+   name. */
 interface StopRecord {
   at: number
   ownerId?: string
@@ -1265,9 +1145,9 @@ const cancellations = new Map<string, Map<string, StopRecord>>()
 
 /** How long a stop keeps being reported to the agent it was aimed at.
  *
- *  A resident run clears its own record as it unwinds. An external MCP agent
- *  has no run we control, so the record has to age out on its own — without
- *  this, one stop would mute that agent name on this canvas forever. */
+ *  An external MCP agent has no run we control, so the record has to age out
+ *  on its own — without this, one stop would mute that agent name on this
+ *  canvas forever. */
 const STOP_TTL_MS = 10 * 60_000
 
 /** True while a stop request is outstanding for this agent on this canvas. */
@@ -1278,34 +1158,20 @@ export function wasStopped(canvasId: string, agentName: string, ownerId?: string
     cancellations.get(canvasId)?.delete(agentName)
     return false
   }
-  /* a stop with no account behind it (the resident team) reaches everyone
-     running that name; an account-scoped stop reaches only its own agent */
+  /* a stop with no account behind it reaches everyone running that name; an
+     account-scoped stop reaches only its own agent */
   if (record.ownerId === undefined || ownerId === undefined) return true
   return record.ownerId === ownerId
 }
 
-/** True while a stop is outstanding for any agent on this canvas.
- *
- *  The sweep's teardown uses it to tell a stop from a pause: both abort the
- *  in-flight model call, but a stop must not be undone by the re-sweep it just
- *  queued, while a pause followed by a resume is exactly the re-sweep a human
- *  asked for. */
-export function anyStopOutstanding(canvasId: string): boolean {
-  const byName = cancellations.get(canvasId)
-  if (!byName) return false
-  for (const name of [...byName.keys()]) if (wasStopped(canvasId, name)) return true
-  return false
-}
-
 /** Clear the record when a fresh run claims work, so a stop cannot leak into a
- *  later, unrelated session under the same agent name. Called by the resident
- *  runner right after it claims (server/resident.ts). */
+ *  later, unrelated session under the same agent name. */
 export function clearStop(canvasId: string, agentName: string, ownerId?: string) {
   const byName = cancellations.get(canvasId)
   const record = byName?.get(agentName)
   if (!record) return
-  /* the resident team clears unconditionally: it owns the bare name. An
-     account-scoped agent only clears its own record. */
+  /* a record with no account behind it is cleared unconditionally: it owns the
+     bare name. An account-scoped agent only clears its own record. */
   if (ownerId !== undefined && record.ownerId !== undefined && record.ownerId !== ownerId) return
   byName!.delete(agentName)
 }
@@ -1349,7 +1215,6 @@ export function cancelAgentWork(canvasId: string, agentName: string, by: string,
     }
     /* a stopped run holds nothing: its frames are free for the human to edit */
     releaseLocksForAgent(canvasId, agentName)
-    cancel(canvasId)
     logActivity(canvasId, resolveActor({ name: by, kind: 'user' }), `stopped ${agentName}`)
   }
   return stopped
@@ -1482,8 +1347,6 @@ export function addQueuedCard(
     resolveActor({ name: from, kind: 'user' }),
     `queued a card for ${pipeline.map(roleName).join(' → ')}: “${clean}”`,
   )
-  /* the resident agents pick queued cards up instantly (no-op without a key) */
-  import('./resident.ts').then((r) => r.onFeedback(canvasId)).catch(() => {})
   return card
 }
 
@@ -1511,8 +1374,8 @@ export function trimTaskLog(list: AgentTask[]): AgentTask[] {
 
 /** One repo import as board cards: the design-system extraction first (it
  *  becomes the guide the sketches follow), then one sketch card per selected
- *  screen. Structured cards — the resident runner dispatches them straight to
- *  the GitHub sketch runner (server/githubRecon.ts) instead of the chat agent.
+ *  screen. Structured cards carry their own payload for the GitHub sketch
+ *  runner (server/githubRecon.ts) rather than chat work.
  *  A screen already queued or in flight from the same connection is not
  *  queued twice. Returns the cards, oldest first. */
 export interface RepoImportInput {
@@ -1523,8 +1386,8 @@ export interface RepoImportInput {
 }
 
 /** What an import would queue, after removing screens already waiting or in
- *  flight from the same connection. Pure — the route checks this BEFORE
- *  spending the requester's allowance, so a no-op re-import costs nothing. */
+ *  flight from the same connection. Pure — the route checks this before it
+ *  queues anything, so a no-op re-import costs nothing. */
 export function planRepoCards(
   canvasId: string,
   input: RepoImportInput,
@@ -1587,38 +1450,19 @@ export function addRepoCards(canvasId: string, input: RepoImportInput, from: str
       .filter(Boolean)
       .join(' and ')
     logActivity(canvasId, actor, `queued ${what} from ${input.repo} for ${roleName(DEFAULT_ROLE_ID)}`)
-    import('./resident.ts').then((r) => r.onFeedback(canvasId)).catch(() => {})
   }
   return cards
 }
 
-/** Cards waiting on THIS agent's stage, claimed by it. A card at another
- *  stage is invisible here — that is what keeps a pipeline in order. */
-export function takeQueuedCardsFor(canvasId: string, agentName: string, payer?: string): AgentTask[] {
-  /* same ordering the sweep sees: priority, then position, then arrival;
-     paused cards are invisible until a human resumes them */
-  const pending = queuedCards(canvasId).filter(
-    (t) => stageAgent(t) === agentName && (payer === undefined || (t.queuedByUserId ?? '') === payer),
-  )
-  for (const c of pending) {
-    c.agentName = agentName
-    c.color = colorFor(agentName)
-    c.claimedAt = Date.now()
-    persist.saveTask(canvasId, c)
-    broadcast(canvasId, { type: 'task', task: c })
-  }
-  return pending
-}
-
 /** Claim one open card by id for an outside agent (an MCP connection, which
- *  no pipeline stage names). The stage gate of takeQueuedCardsFor keeps the
- *  resident pipeline in order; an outside claim is a human-visible takeover of
- *  queued work — the board shows who holds the card, and Stop/Retry still work.
+ *  no pipeline stage names). The stage gate of the pipeline is invisible to an
+ *  outside claim: taking queued work is a human-visible takeover — the board
+ *  shows who holds the card, and Stop/Retry still work.
  *  Throws on the specific reason so the MCP layer can report it. */
 export function claimCard(canvasId: string, cardId: string, agentName: string): AgentTask {
   const card = (taskLog.get(canvasId) ?? []).find((t) => t.id === cardId && t.queuedBy)
   if (!card) throw new Error(`no card with id ${cardId} on this canvas`)
-  if (card.kind) throw new Error('this is a structured import card — the resident team dispatches on it')
+  if (card.kind) throw new Error('this is a structured import card — it has no chat work to claim')
   if (card.agentName) throw new Error(`card already claimed by ${card.agentName}`)
   if (card.endedAt || card.cancelledAt) throw new Error('card is no longer open — it was completed or stopped')
   if (card.failedAt) throw new Error('card failed and waits for a human retry')
@@ -1649,7 +1493,6 @@ export function advanceCard(canvasId: string, cardId: string, by: Actor, stageSu
   persist.saveTask(canvasId, card)
   broadcast(canvasId, { type: 'task', task: card })
   logActivity(canvasId, by, `handed “${card.status}” to ${roleName(pipeline[next])}`)
-  import('./resident.ts').then((r) => r.onFeedback(canvasId)).catch(() => {})
   return card
 }
 
@@ -1693,7 +1536,6 @@ export function retryCard(canvasId: string, cardId: string, by: string): AgentTa
   persist.saveTask(canvasId, card)
   broadcast(canvasId, { type: 'task', task: card })
   logActivity(canvasId, resolveActor({ name: by, kind: 'user' }), `retried a card: “${card.status}”`)
-  import('./resident.ts').then((r) => r.onFeedback(canvasId)).catch(() => {})
   return card
 }
 
@@ -2923,55 +2765,278 @@ export function proposeInsteadOfWrite(
   return addFrameProposal(canvasId, op, actor)
 }
 
-/** Pause a live run: abort the model call like a stop, but keep the card
- *  open and paused instead of cancelling it. */
-export function pauseAgentWork(canvasId: string, agentName: string, by: string): number {
-  const now = Date.now()
-  let paused = 0
-  /* the card the journal names: the resume re-runs from a fresh kickoff, and
-     the journal is the only thing that tells it why it stopped */
-  let first: AgentTask | undefined
-  for (const t of taskLog.get(canvasId) ?? []) {
-    if (t.agentName !== agentName || !t.queuedBy) continue
-    if (t.endedAt || t.cancelledAt || t.pausedAt || t.failedAt) continue
-    first ??= t
-    t.pausedAt = now
-    t.pausedBy = by
-    /* the card goes back into the queue (stage kept, claim dropped) so a
-       resume is one click and the next sweep re-claims it */
-    t.agentName = ''
-    delete t.claimedAt
-    persist.saveTask(canvasId, t)
-    broadcast(canvasId, { type: 'task', task: t })
-    paused++
-  }
-  if (paused > 0) {
-    releaseLocksForAgent(canvasId, agentName)
-    cancel(canvasId)
-    logActivity(canvasId, resolveActor({ name: by, kind: 'user' }), `paused ${agentName}`)
-    /* continuity for the resumed run: the message transcript is not
-       checkpointed, so the journal plus the plan are what survive */
-    recordRunJournal({
-      canvasId,
-      agentName,
-      ...(first ? { cardId: first.id } : {}),
-      summary: `paused by ${by}: ${first?.status ?? `${paused} open task(s) stopped`}`,
-    })
-  }
-  return paused
+/* ------------------------------------------------------------------ */
+/* Canvas-level proposals (review mode): the frame path's counterpart  */
+/* for everything that is not a frame — the design tokens, one guide   */
+/* doc, the breakpoints, the page set. Nothing touches the canvas      */
+/* until a human accepts; the accept then applies the payload through  */
+/* the ordinary setters, so the change versions, broadcasts and logs   */
+/* exactly like a human edit.                                          */
+/* ------------------------------------------------------------------ */
+
+/** What each kind is called in the activity feed. */
+const CANVAS_PROPOSAL_WORD: Record<CanvasProposalKind, string> = {
+  tokens: 'design-token',
+  guidelines: 'guide',
+  breakpoints: 'breakpoint',
+  pages: 'page',
 }
 
-/** Resume a paused card: clears the pause and re-fires the resident sweep. */
-export function resumeCard(canvasId: string, cardId: string, by: string): AgentTask | undefined {
-  const card = (taskLog.get(canvasId) ?? []).find((t) => t.id === cardId)
-  if (!card || !card.pausedAt) return card
-  delete card.pausedAt
-  delete card.pausedBy
-  persist.saveTask(canvasId, card)
-  broadcast(canvasId, { type: 'task', task: card })
-  logActivity(canvasId, resolveActor({ name: by, kind: 'user' }), `resumed ${card.agentName || 'a paused card'}`)
-  import('./resident.ts').then((r) => r.onFeedback(canvasId)).catch(() => {})
-  return card
+/** The bounds `set_breakpoints` enforces at the tool boundary. The store takes
+ *  the caller's word for both ("order and bounds are the caller's contract"),
+ *  so a proposal has to hold them here — an accepted payload would otherwise
+ *  land unchecked. */
+const MAX_BREAKPOINTS = 8
+const MAX_BREAKPOINT_WIDTH = 20_000
+
+/** One page operation a `pages` proposal carries: the exact call its accept
+ *  makes, so the reviewer reads what will run. */
+type PageOp =
+  | { op: 'create'; name: string }
+  | { op: 'rename'; pageId: string; name: string }
+  | { op: 'delete'; pageId: string }
+  | { op: 'move_frame'; frameId: string; pageId: string }
+
+/** A `tokens` payload: the whole token set, or null to clear it. Checked with
+ *  the rules the setter applies, so a proposal that could not land is refused
+ *  when it is made rather than when a human accepts it. */
+function tokensPayload(payload: unknown): DesignTokens | null {
+  if (payload === null) return null
+  if (typeof payload !== 'object' || Array.isArray(payload))
+    throw new Error('a tokens proposal carries the token set (colors, fonts, spacing…) or null to clear it')
+  const tokens = payload as unknown as DesignTokens
+  validateTokens(tokens)
+  return tokens
+}
+
+/** A `guidelines` payload: one doc by slug with its whole markdown, empty
+ *  markdown deleting the doc. Normalised here the way the setter normalises
+ *  it, so the stored payload is exactly what the accept will write. */
+function guidelinePayload(payload: unknown): { name: string; markdown: string } {
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload))
+    throw new Error('a guidelines proposal carries { name, markdown }')
+  const { name, markdown } = payload as { name?: unknown; markdown?: unknown }
+  if (typeof name !== 'string' || typeof markdown !== 'string')
+    throw new Error('a guidelines proposal carries { name, markdown } — both strings')
+  const slug = name.trim().toLowerCase()
+  if (!GUIDELINE_NAME_RE.test(slug))
+    throw new Error(`invalid doc name “${name}” — use a lowercase slug like "feature-image" (a-z, 0-9, hyphens)`)
+  const clean = markdown.replace(/\r\n/g, '\n').trim()
+  if (clean.length > MAX_GUIDELINE_CHARS)
+    throw new Error(`doc is ${clean.length} chars — the limit is ${MAX_GUIDELINE_CHARS}`)
+  return { name: slug, markdown: clean }
+}
+
+/** A `breakpoints` payload: the widths this canvas designs for, ascending, or
+ *  an empty list to clear them. */
+function breakpointsPayload(payload: unknown): { name: string; min_width: number }[] {
+  if (!Array.isArray(payload)) throw new Error('a breakpoints proposal carries the { name, min_width } list')
+  if (payload.length > MAX_BREAKPOINTS)
+    throw new Error(`${payload.length} breakpoints — the limit is ${MAX_BREAKPOINTS}`)
+  const clean = payload.map((entry: unknown) => {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry))
+      throw new Error('a breakpoints proposal carries the { name, min_width } list')
+    const { name, min_width } = entry as { name?: unknown; min_width?: unknown }
+    const label = typeof name === 'string' ? name.trim() : ''
+    if (!label) throw new Error('a breakpoint name is empty')
+    if (
+      typeof min_width !== 'number' ||
+      !Number.isInteger(min_width) ||
+      min_width < 0 ||
+      min_width > MAX_BREAKPOINT_WIDTH
+    )
+      throw new Error(
+        `invalid breakpoint width ${String(min_width)} for “${label}” — an integer 0-${MAX_BREAKPOINT_WIDTH}px`,
+      )
+    return { name: label, min_width }
+  })
+  const names = clean.map((b) => b.name.toLowerCase())
+  const clash = names.find((n, i) => names.indexOf(n) !== i)
+  if (clash) throw new Error(`two breakpoints are both named “${clash}” — names must be unique`)
+  /* ascending is the order review_frame renders in and the order the panel
+     shows, so the proposer's ordering never decides what "mobile first" means */
+  return clean.sort((a, b) => a.min_width - b.min_width)
+}
+
+/** A `pages` payload: one page operation, checked against the canvas — a
+ *  proposal naming a page that is not there could only sit in the queue until
+ *  a human accepted it and nothing happened. */
+function pagePayload(canvasId: string, payload: unknown): PageOp {
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload))
+    throw new Error('a pages proposal carries { op, … }')
+  const { op, pageId, frameId, name } = payload as {
+    op?: unknown
+    pageId?: unknown
+    frameId?: unknown
+    name?: unknown
+  }
+  const label = typeof name === 'string' ? name.trim() : ''
+  if (op === 'create') {
+    if (!label) throw new Error('a page proposal needs a name')
+    return { op, name: label }
+  }
+  if (op !== 'rename' && op !== 'delete' && op !== 'move_frame')
+    throw new Error(`unknown page op “${String(op)}” — use create, rename, delete or move_frame`)
+  const canvas = store.getCanvas(canvasId)!
+  if (typeof pageId !== 'string' || !canvas.pages?.some((p) => p.id === pageId))
+    throw new Error(`no page with id ${String(pageId)} on this canvas`)
+  if (op === 'rename') {
+    if (!label) throw new Error('a page proposal needs a name')
+    return { op, pageId, name: label }
+  }
+  if (op === 'delete') return { op, pageId }
+  const frame = typeof frameId === 'string' ? store.getFrame(frameId) : undefined
+  if (!frame || frame.canvasId !== canvasId) throw new Error(`no frame with id ${String(frameId)} on this canvas`)
+  return { op, frameId: frame.id, pageId }
+}
+
+/** The payload a proposal will apply, plus the canvas value it replaces, both
+ *  checked per kind. `before` is what the reviewer reads the change against,
+ *  so it is the value as the canvas holds it now — never a copy the accept
+ *  could have moved past. */
+function readCanvasChange(
+  canvas: Canvas,
+  kind: CanvasProposalKind,
+  payload: unknown,
+): { payload: unknown; before: unknown } {
+  switch (kind) {
+    case 'tokens': {
+      const next = tokensPayload(payload)
+      /* a null payload is how "clear the tokens" is stored — the column is
+         nullable, so the clear round-trips as itself instead of a sentinel */
+      return { payload: next, before: canvas.tokens ?? null }
+    }
+    case 'guidelines': {
+      const next = guidelinePayload(payload)
+      const existing = store.getGuidelines(canvas.id).find((d) => d.name === next.name)
+      return { payload: next, before: existing?.markdown ?? null }
+    }
+    case 'breakpoints':
+      return { payload: breakpointsPayload(payload), before: canvas.breakpoints ?? null }
+    case 'pages':
+      /* the page list is mutated in place by the page actions (a create
+         pushes, a delete splices), so `before` has to be a snapshot: a live
+         array would grow under the reviewer reading the proposal */
+      return { payload: pagePayload(canvas.id, payload), before: canvas.pages?.map((p) => ({ ...p })) ?? null }
+  }
+  throw new Error(`unknown canvas proposal kind “${String(kind)}”`)
+}
+
+/** An agent proposed a canvas-level change: the row is stored pending and the
+ *  room is told, and nothing on the canvas moves until a human accepts. Throws
+ *  with a caller-facing message when the canvas is missing or the payload is
+ *  not something its kind could apply. */
+export async function proposeCanvasChange(
+  canvasId: string,
+  kind: CanvasProposalKind,
+  payload: unknown,
+  actor: { userId: string; agentName: string },
+): Promise<CanvasProposal> {
+  const canvas = store.getCanvas(canvasId)
+  if (!canvas) throw new Error(`no canvas with id ${canvasId}`)
+  const change = readCanvasChange(canvas, kind, payload)
+  const proposal: CanvasProposal = {
+    id: nanoid(8),
+    canvasId,
+    kind,
+    payload: change.payload,
+    before: change.before,
+    proposedBy: actor.agentName,
+    proposedByUser: actor.userId,
+    status: 'pending',
+    createdAt: Date.now(),
+  }
+  await persist.saveCanvasProposal(proposal)
+  broadcast(canvasId, { type: 'canvasProposal', proposal })
+  logActivity(
+    canvasId,
+    resolveActor({ name: actor.agentName, kind: 'agent', ownerId: actor.userId }),
+    `proposed a ${CANVAS_PROPOSAL_WORD[kind]} change — waiting for review`,
+  )
+  return proposal
+}
+
+/** Run one page operation through the page actions. False when the page or
+ *  frame it names has gone since the proposal was made. */
+function applyPageOp(canvasId: string, op: PageOp, actor: Actor): boolean {
+  switch (op.op) {
+    case 'create':
+      return !!createPage(canvasId, op.name, actor)
+    case 'rename':
+      return !!renamePage(op.pageId, op.name, actor)
+    case 'delete':
+      return !!deletePage(op.pageId, actor)
+    case 'move_frame':
+      return !!moveFrameToPage(op.frameId, op.pageId, actor)
+  }
+}
+
+/** Apply an accepted payload through the setters a human edit uses, so the
+ *  change versions, broadcasts and logs like one. A target that has gone
+ *  missing since the proposal was made throws with the row still pending:
+ *  nothing was applied, and a decision that changed nothing is not a decision. */
+function applyCanvasChange(canvasId: string, proposal: CanvasProposal, actor: Actor): void {
+  switch (proposal.kind) {
+    case 'tokens': {
+      const tokens = proposal.payload as DesignTokens | null
+      /* a null payload is the clear the proposer asked for */
+      if (!setTokens(canvasId, tokens ?? undefined, actor)) throw new Error(`no canvas with id ${canvasId}`)
+      return
+    }
+    case 'guidelines': {
+      const { name, markdown } = proposal.payload as { name: string; markdown: string }
+      if (setGuideline(canvasId, name, markdown, actor) === undefined) throw new Error(`no canvas with id ${canvasId}`)
+      return
+    }
+    case 'breakpoints': {
+      const list = proposal.payload as { name: string; min_width: number }[]
+      /* No ws message carries a breakpoint list — the canvas resource is what
+         refreshes — so this is the setter the MCP tool uses for a human too. */
+      if (!store.setBreakpoints(canvasId, list.length ? list : undefined, actor.name))
+        throw new Error(`no canvas with id ${canvasId}`)
+      return
+    }
+    case 'pages': {
+      const op = proposal.payload as PageOp
+      if (!applyPageOp(canvasId, op, actor))
+        throw new Error(`the ${op.op} page change no longer applies — the page or frame it names is gone`)
+      return
+    }
+  }
+}
+
+/** A human accepted or rejected a canvas-level proposal. Accepting applies the
+ *  payload through the ordinary setters, so the change versions, broadcasts and
+ *  logs exactly like a human edit; rejecting changes nothing. A proposal that
+ *  is gone, belongs to another canvas or is already resolved is refused — the
+ *  queue is a decision, not a replayable command. */
+export async function resolveCanvasProposal(
+  canvasId: string,
+  proposalId: string,
+  opts: { accept: boolean; note?: string; actor: { userId: string; agentName: string } },
+): Promise<CanvasProposal> {
+  const proposal = (await persist.listCanvasProposals(canvasId)).find((p) => p.id === proposalId)
+  if (!proposal || proposal.status !== 'pending')
+    throw new Error(`no pending proposal with id ${proposalId} on this canvas`)
+  /* The reviewer is the human the queue answers to: the change is applied
+     under their account, so it is not gated as agent work and the activity
+     feed names who accepted it. */
+  const reviewer = resolveActor({ name: opts.actor.agentName, kind: 'user', ownerId: opts.actor.userId })
+  if (opts.accept) applyCanvasChange(canvasId, proposal, reviewer)
+  const note = opts.note?.trim().slice(0, 1000)
+  const status: CanvasProposal['status'] = opts.accept ? 'accepted' : 'rejected'
+  const resolvedAt = Date.now()
+  proposal.status = status
+  if (note) proposal.resolutionNote = note
+  proposal.resolvedAt = resolvedAt
+  await persist.resolveCanvasProposal(proposal.id, { status, ...(note ? { note } : {}), resolvedAt })
+  broadcast(canvasId, { type: 'canvasProposal', proposal })
+  logActivity(
+    canvasId,
+    reviewer,
+    `${opts.accept ? 'accepted' : 'rejected'} ${proposal.proposedBy}’s ${CANVAS_PROPOSAL_WORD[proposal.kind]} proposal`,
+  )
+  return proposal
 }
 
 /* ------------------------------------------------------------------ */
@@ -2991,7 +3056,7 @@ function queueOrder(a: AgentTask, b: AgentTask): number {
 /** Queued cards in the order work should be taken. */
 export function queuedCards(canvasId: string): AgentTask[] {
   return (taskLog.get(canvasId) ?? [])
-    .filter((t) => t.queuedBy && !t.agentName && !t.failedAt && !t.endedAt && !t.cancelledAt && !t.pausedAt)
+    .filter((t) => t.queuedBy && !t.agentName && !t.failedAt && !t.endedAt && !t.cancelledAt)
     .sort(queueOrder)
 }
 
@@ -3039,20 +3104,7 @@ export function handBackCard(
   broadcast(canvasId, { type: 'task', task: card })
   logActivity(canvasId, actor, `handed the card back to ${toAgent}: ${card.handback.reason}`)
   agentEvents.push(canvasId, { kind: 'card', data: { cardId: card.id, handback: true, toAgent } })
-  import('./resident.ts').then((r) => r.onFeedback(canvasId)).catch(() => {})
   return card
-}
-
-/** Record what a card's run cost, from the provider's own report. */
-export function recordRunUsage(taskIds: string[], usage: TaskUsage): void {
-  for (const [canvasId, list] of taskLog) {
-    for (const t of list) {
-      if (!taskIds.includes(t.id)) continue
-      t.usage = usage
-      persist.saveTask(canvasId, t)
-      broadcast(canvasId, { type: 'task', task: t })
-    }
-  }
 }
 
 /** Restore a frame to a saved version. An ordinary edit: it versions, it
@@ -3079,97 +3131,6 @@ export async function revertFrame(frameId: string, versionId: string, actor: Act
   )
 }
 
-/** Cross-run memory: what an agent did on its last runs of this canvas. */
-const journalLog = new Map<string, RunJournal[]>() // canvasId -> newest first
-
-/** How many frames of a run's change set a journal keeps. The journal is read
- *  by the next kickoff and by revert_run, not audited — the newest frames are
- *  the ones still worth reverting. */
-const MAX_JOURNAL_FRAMES = 20
-
-export function recordRunJournal(input: {
-  canvasId: string
-  agentName: string
-  cardId?: string
-  runId?: string
-  summary: string
-  decisions?: string
-  frames?: RunJournal['frames']
-  /** when the run's first turn started and when it stopped */
-  startedAt?: number
-  endedAt?: number
-  /** model turns taken, tool calls made, tokens spent and what they cost */
-  turns?: number
-  toolCalls?: number
-  tokens?: number
-  costUsd?: number | null
-}): RunJournal {
-  /* newest first, one entry per frame: a run that wrote the same frame five
-     times changed one frame, and the change set is what it touched */
-  const frames = (input.frames ?? [])
-    .filter((f, i, all) => all.findIndex((x) => x.frameId === f.frameId) === i)
-    .slice(0, MAX_JOURNAL_FRAMES)
-  const entry: RunJournal = {
-    id: nanoid(8),
-    canvasId: input.canvasId,
-    agentName: input.agentName,
-    ...(input.cardId ? { cardId: input.cardId } : {}),
-    ...(input.runId ? { runId: input.runId } : {}),
-    summary: input.summary.slice(0, 800),
-    ...(input.decisions ? { decisions: input.decisions } : {}),
-    ...(frames.length ? { frames } : {}),
-    ...(input.startedAt !== undefined ? { startedAt: input.startedAt } : {}),
-    ...(input.endedAt !== undefined ? { endedAt: input.endedAt } : {}),
-    ...(input.turns !== undefined ? { turns: input.turns } : {}),
-    ...(input.toolCalls !== undefined ? { toolCalls: input.toolCalls } : {}),
-    ...(input.tokens !== undefined ? { tokens: input.tokens } : {}),
-    ...(input.costUsd !== undefined ? { costUsd: input.costUsd } : {}),
-    at: Date.now(),
-  }
-
-  const list = journalLog.get(input.canvasId) ?? []
-  list.unshift(entry)
-  if (list.length > 100) list.length = 100
-  journalLog.set(input.canvasId, list)
-  persist.saveJournal(entry)
-  return entry
-}
-
-/** The canvas's last runs, newest first, whatever agent ran them — the Run
- *  tab's history view (getRunJournals is the per-agent kickoff read). */
-export function listRunJournals(canvasId: string, limit = 20): RunJournal[] {
-  return (journalLog.get(canvasId) ?? []).slice(0, limit)
-}
-
-/** How long after a run a frame may still be reverted — a write within this
- *  window of the journal is the run's own tail, not someone else's later
- *  work. The revert_run tool and the REST revert route both read it here. */
-export const REVERT_RUN_GRACE_MS = 5_000
-
-/** The role's last runs on this canvas, oldest first — kickoff context. */
-export function getRunJournals(canvasId: string, agentName: string, limit = 3): RunJournal[] {
-  return (journalLog.get(canvasId) ?? [])
-    .filter((j) => j.agentName === agentName)
-    .slice(0, limit)
-    .reverse()
-}
-
-/** One journal, by the run it recorded or the card it worked — the read behind
- *  get_run_changes and revert_run. The log is newest first, so the most recent
- *  match wins. A journal written before the run id was stored on it carries
- *  only its own id, which is why a run id matches that too. */
-export function getRunJournalBy(canvasId: string, query: { runId?: string; cardId?: string }): RunJournal | undefined {
-  const list = journalLog.get(canvasId) ?? []
-  if (query.runId) {
-    const wanted = query.runId
-    const byRun = list.find((j) => j.runId === wanted || j.id === wanted)
-    if (byRun) return byRun
-  }
-  if (query.cardId) return list.find((j) => j.cardId === query.cardId)
-  return undefined
-}
-
-/* ------------------------------------------------------------------ */
 /* Component library: reusable markup a frame instantiates by carrying */
 /* `data-doop-component` on one wrapper element. The frame HTML stays   */
 /* the only document — an instance is an element, not a pointer into a  */

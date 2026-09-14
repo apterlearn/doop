@@ -15,8 +15,9 @@ import { guardPublicPageRequests } from './publicUrl.ts'
 export const MAX_HTML_READ_CHARS = 30_000
 
 /** Bounded read of a frame's source HTML for agents: literal-text snippets or a
- *  paged range. Shared by the resident team's get_frame_html and the MCP
- *  get_frame_html so the two can never drift. */
+ *  paged range. The MCP get_frame_html is its one caller, and search_frames
+ *  applies the same cap, so neither can become a way to pull a whole document
+ *  into context. */
 export function readFrameHtml(
   html: string,
   opts: { query?: string; offset?: number; limit?: number },

@@ -7,7 +7,6 @@ vi.mock('../server/db/persist.ts', () => ({
   getNotificationPrefs: async () => new Map(),
   saveNotificationPref: () => {},
   pruneRunEvents: () => {},
-  saveJournal: () => {},
   saveRunEvent: () => {},
   saveQuestion: () => {},
   saveFrameProposal: () => {},
@@ -69,7 +68,7 @@ async function callTool(client: InstanceType<typeof Client>, name: string, args:
 
 function claimedCard() {
   const card = actions.addQueuedCard(CANVAS, 'Make a hero', 'alice', undefined, undefined, 'alice')!
-  actions.takeQueuedCardsFor(CANVAS, AGENT, 'alice')
+  actions.claimCard(CANVAS, card.id, AGENT)
   return card
 }
 
@@ -110,8 +109,7 @@ describe('stopping agent work', () => {
     const queued = claimedCard()
     actions.cancelAgentWork(CANVAS, AGENT, 'alice')
 
-    expect(actions.takeQueuedCardsFor(CANVAS, AGENT, 'alice')).toEqual([])
-    expect(actions.pendingWorkAgents(CANVAS)).toEqual([])
+    expect(actions.queuedCards(CANVAS)).toEqual([])
     expect(card(queued.id).cancelledAt).toBeDefined()
   })
 
@@ -124,7 +122,7 @@ describe('stopping agent work', () => {
     expect(card(queued.id).cancelledAt).toBeUndefined()
     expect(card(queued.id).cancelledBy).toBeUndefined()
     expect(card(queued.id).agentName).toBe('')
-    expect(actions.takeQueuedCardsFor(CANVAS, AGENT, 'alice').map((c) => c.id)).toEqual([queued.id])
+    expect(actions.queuedCards(CANVAS).map((c) => c.id)).toEqual([queued.id])
   })
 
   it('refuses to fail or advance a stopped card', () => {
@@ -151,7 +149,7 @@ describe('stopping agent work', () => {
     expect(stopped?.failedAt).toBeUndefined()
     /* the other card is untouched, and still claimable */
     expect(card(second.id).cancelledAt).toBeUndefined()
-    expect(actions.takeQueuedCardsFor(CANVAS, AGENT, 'alice').map((c) => c.id)).toEqual([second.id])
+    expect(actions.queuedCards(CANVAS).map((c) => c.id)).toEqual([second.id])
     /* and no agent-level stop: the agent keeps its other work and its calls */
     expect(actions.wasStopped(CANVAS, AGENT)).toBe(false)
   })
@@ -167,16 +165,6 @@ describe('stopping agent work', () => {
     expect(actions.wasStopped(CANVAS, AGENT)).toBe(false)
   })
 
-  it('stops a card an agent abandoned without attributing it to a person', () => {
-    const queued = claimedCard()
-
-    actions.endAgentTasks(CANVAS, AGENT)
-
-    expect(card(queued.id).cancelledAt).toBeGreaterThan(0)
-    expect(card(queued.id).cancelledBy).toBeUndefined()
-    expect(card(queued.id).failedAt).toBeUndefined()
-  })
-
   it('ends an open status task rather than stopping it', () => {
     actions.setAgentStatus(CANVAS, actions.resolveActor({ name: AGENT, kind: 'agent' }), 'Designing')
 
@@ -187,7 +175,7 @@ describe('stopping agent work', () => {
     expect(narration.cancelledAt).toBeUndefined()
   })
 
-  it('reports an outstanding stop until a run clears it', () => {
+  it('reports an outstanding stop until it is cleared', () => {
     actions.cancelAgentWork(CANVAS, AGENT, 'alice')
     expect(actions.wasStopped(CANVAS, AGENT)).toBe(true)
     expect(actions.wasStopped(CANVAS, 'Someone Else')).toBe(false)
@@ -222,7 +210,7 @@ describe('stopping agent work', () => {
     expect(actions.removeCard(CANVAS, queued.id, 'alice')).toBe(false)
   })
 
-  it('stops the run behind a card it removes', () => {
+  it('stops the agent work behind a card it removes', () => {
     const queued = claimedCard()
 
     actions.removeCard(CANVAS, queued.id, 'alice')
@@ -245,7 +233,7 @@ describe('stopping agent work', () => {
       expect(card(first.id).cancelledAt).toBeGreaterThan(0)
       /* the second card is untouched and still waiting to be claimed */
       expect(card(second.id).cancelledAt).toBeUndefined()
-      expect(actions.takeQueuedCardsFor(CANVAS, AGENT, 'alice').map((c) => c.id)).toEqual([second.id])
+      expect(actions.queuedCards(CANVAS).map((c) => c.id)).toEqual([second.id])
 
       /* no agent-level latch: the agent's next call runs */
       const next = await callTool(client, 'set_status', {

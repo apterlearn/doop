@@ -24,7 +24,9 @@ import {
 } from './screenshot.ts'
 import { htmlDiff } from './htmlDiff.ts'
 import { inspectFrame } from './domProbe.ts'
-import { auditFrame, type A11yReport } from './a11y.ts'
+import { auditFrame, auditProbe, type A11yReport } from './a11y.ts'
+import { planA11yFixes } from './a11yFix.ts'
+import { contentProbe } from './contentLint.ts'
 import { diffFrames } from './visualDiff.ts'
 import { cssForTokens, stripTokenStyle } from '../shared/tokens.ts'
 import { lintFrame, lintProbe, planTokenFixes, type LintRule } from './designLint.ts'
@@ -66,14 +68,34 @@ import { createImportedWebpageFrame } from './webpageImport.ts'
 import { discoverSitePages, importPage, normalizeImportUrl, type DiscoveredSite } from './importer.ts'
 import { cancelJob, getJob, jobProgress, recordUnit, startJob, waitForJobs } from './jobs.ts'
 import { websiteAccessErrorMessage } from './websiteAccess.ts'
-import { frameSha, htmlSha, reviewFrame, reviewToRecord } from './review.ts'
+import { frameSha, htmlSha, reportIsCurrent, reviewFrame, reviewToRecord } from './review.ts'
 import { AGENT_ROLES, PIPELINE_PRESETS, roleName } from '../shared/agents.ts'
 import { feedbackAbout, feedbackBlock } from './feedbackText.ts'
 import { parseListing, publishCanvas, unpublishCanvas } from './community.ts'
 import { COMMUNITY_CATEGORIES } from '../shared/types.ts'
 import { sanitizeImportedHtml } from './sanitizeHtml.ts'
-import { agentsMd, designMd, rewriteAssetUrls, specMd, tailwindThemeCss, tokensDtcg, tokensJson } from './codeExport.ts'
-import { commitFiles, GithubWriteError, readPullRequest } from './githubWrite.ts'
+import {
+  agentsMd,
+  designMd,
+  handoffFileName,
+  handoffFiles,
+  HandoffError,
+  rewriteAssetUrls,
+  specMd,
+  tailwindThemeCss,
+  tokensDtcg,
+  tokensJson,
+} from './codeExport.ts'
+import { reviewCanvas } from './canvasReview.ts'
+import { replaceInFrames } from './findReplace.ts'
+import { diffRelease } from './releaseDiff.ts'
+import {
+  commentPullRequest,
+  commitToBranch,
+  ensurePullRequest,
+  GithubWriteError,
+  readPullRequest,
+} from './githubWrite.ts'
 import * as github from './github.ts'
 import { importRepoScreen, type RepoScreenImport } from './githubRecon.ts'
 import { touchClient } from './mcpClients.ts'
@@ -89,6 +111,8 @@ import { htmlBundle, htmlToReact } from './codeExport.ts'
 import type {
   AgentTask,
   Canvas,
+  CanvasProposal,
+  CanvasProposalKind,
   CanvasView,
   Component,
   DesignTokens,
@@ -558,6 +582,33 @@ const diffShape = z.object({
   removed: z.number(),
 })
 
+/** Every rule id `fix_frame_a11y` can be pointed at: the accessibility audit's
+ *  rules and the content lint's, in one list. Only three of them have a
+ *  mechanical repair — the rest come back in `skipped` naming the judgement
+ *  they need, which is exactly what `only` is for. */
+const A11Y_FIX_RULES = [
+  'contrast',
+  'missing_alt',
+  'heading_order',
+  'focus_order',
+  'tap_target',
+  'missing_main',
+  'unlabeled_nav',
+  'form_label',
+  'html_lang',
+  'placeholder_text',
+  'placeholder_image',
+  'broken_image',
+  'no_title',
+  'no_meta_description',
+  'dead_zone',
+  'missing_state',
+  'contrast_unverified',
+  'motion_no_reduced_motion',
+  'motion_long_duration',
+  'motion_infinite_animation',
+] as const
+
 const opId = z
   .string()
   .max(120)
@@ -583,6 +634,7 @@ export const MUTATING_TOOLS: Record<string, true> = {
   begin_frame_edit: true,
   cancel_job: true,
   complete_card: true,
+  comment_pull_request: true,
   copy_frame: true,
   create_canvas: true,
   create_card: true,
@@ -603,6 +655,7 @@ export const MUTATING_TOOLS: Record<string, true> = {
   edit_frame_html: true,
   end_frame_edit: true,
   extract_design_system: true,
+  fix_frame_a11y: true,
   fix_frame_tokens: true,
   generate_image: true,
   get_feedback: true,
@@ -615,7 +668,7 @@ export const MUTATING_TOOLS: Record<string, true> = {
   insert_element: true,
   move_frame: true,
   open_pull_request: true,
-  pause_work: true,
+  propose_canvas_change: true,
   propose_frame_create: true,
   propose_frame_delete: true,
   propose_frame_html: true,
@@ -626,16 +679,17 @@ export const MUTATING_TOOLS: Record<string, true> = {
   rename_canvas: true,
   rename_page: true,
   rename_release: true,
+  replace_in_frames: true,
   reply_to_comment: true,
+  resolve_canvas_proposal: true,
   resolve_comment: true,
   resolve_frame_proposal: true,
   resolve_frame_proposals: true,
   restore_release: true,
-  resume_work: true,
   retry_card: true,
   retry_feedback: true,
   revert_frame: true,
-  revert_run: true,
+  review_canvas: true,
   review_frame: true,
   run_frame_script: true,
   save_decision: true,
@@ -656,6 +710,7 @@ export const MUTATING_TOOLS: Record<string, true> = {
   update_elements: true,
   update_frame: true,
   update_plan_step: true,
+  update_pull_request: true,
   upload_asset: true,
   upload_font: true,
   withdraw_proposal: true,
@@ -676,6 +731,7 @@ export const TOOL_DOMAINS: Record<string, string> = {
   begin_frame_edit: 'frame',
   cancel_job: 'web',
   check_brand_compliance: 'verify',
+  comment_pull_request: 'handoff',
   complete_card: 'board',
   copy_frame: 'frame',
   create_canvas: 'canvas',
@@ -693,6 +749,7 @@ export const TOOL_DOMAINS: Record<string, string> = {
   delete_release: 'canvas',
   detach_component: 'element',
   diff_frame: 'verify',
+  diff_release: 'handoff',
   duplicate_canvas: 'canvas',
   duplicate_frame: 'frame',
   edit_frame_html: 'frame',
@@ -700,6 +757,7 @@ export const TOOL_DOMAINS: Record<string, string> = {
   export_canvas: 'handoff',
   export_frame: 'frame',
   extract_design_system: 'web',
+  fix_frame_a11y: 'verify',
   fix_frame_tokens: 'verify',
   frame_script_api: 'element',
   generate_image: 'assets',
@@ -728,7 +786,6 @@ export const TOOL_DOMAINS: Record<string, string> = {
   get_plan: 'run',
   get_pull_request_review: 'handoff',
   get_reference: 'canvas',
-  get_run_changes: 'run',
   get_run_events: 'run',
   get_token_usage: 'verify',
   get_tokens: 'canvas',
@@ -744,6 +801,7 @@ export const TOOL_DOMAINS: Record<string, string> = {
   list_assets: 'assets',
   list_backgrounds: 'assets',
   list_canvases: 'canvas',
+  list_canvas_proposals: 'review',
   list_cards: 'board',
   list_change_proposals: 'review',
   list_components: 'canvas',
@@ -753,7 +811,7 @@ export const TOOL_DOMAINS: Record<string, string> = {
   list_repo_screens: 'web',
   move_frame: 'frame',
   open_pull_request: 'handoff',
-  pause_work: 'run',
+  propose_canvas_change: 'review',
   propose_frame_create: 'review',
   propose_frame_delete: 'review',
   propose_frame_html: 'review',
@@ -764,16 +822,17 @@ export const TOOL_DOMAINS: Record<string, string> = {
   rename_canvas: 'canvas',
   rename_page: 'canvas',
   rename_release: 'canvas',
+  replace_in_frames: 'canvas',
   reply_to_comment: 'board',
+  resolve_canvas_proposal: 'review',
   resolve_comment: 'board',
   resolve_frame_proposal: 'review',
   resolve_frame_proposals: 'review',
   restore_release: 'canvas',
-  resume_work: 'run',
   retry_card: 'board',
   retry_feedback: 'board',
   revert_frame: 'frame',
-  revert_run: 'run',
+  review_canvas: 'verify',
   review_frame: 'verify',
   run_frame_script: 'frame',
   save_decision: 'canvas',
@@ -800,6 +859,7 @@ export const TOOL_DOMAINS: Record<string, string> = {
   update_elements: 'element',
   update_frame: 'frame',
   update_plan_step: 'run',
+  update_pull_request: 'handoff',
   upload_asset: 'assets',
   upload_font: 'assets',
   view_website: 'web',
@@ -1300,6 +1360,57 @@ export function buildMcpServer(
       { frames: pending },
     )
   }
+
+  /**
+   * Frames on the canvas that are not currently verified, whoever wrote them.
+   *
+   * `unverifiedFrames` above answers "did *I* verify what *I* designed", which
+   * is the right question for a card an agent claimed. Shipping is a different
+   * claim: a release, a pull request and a gallery listing present the WHOLE
+   * canvas, so a frame someone else left failing would ship under this caller's
+   * name. Same evidence either way — the newest stored report for the frame,
+   * current for the document it holds and passing.
+   */
+  async function canvasUnverifiedFrames(
+    canvasId: string,
+  ): Promise<{ frameId: string; name: string; reason: string }[]> {
+    const canvas = store.getCanvas(canvasId)
+    if (!canvas) return []
+    const out: { frameId: string; name: string; reason: string }[] = []
+    for (const frame of canvas.frames.filter((f) => !f.demo && f.html)) {
+      const [newest] = await persist.listFrameReviews(frame.id, 1)
+      if (!newest) {
+        out.push({ frameId: frame.id, name: frame.name, reason: 'never reviewed' })
+        continue
+      }
+      if (!reportIsCurrent({ html_sha: newest.htmlSha }, frame, canvas.tokens)) {
+        out.push({ frameId: frame.id, name: frame.name, reason: 'changed after its last review' })
+        continue
+      }
+      if (newest.verdict !== 'pass') {
+        out.push({ frameId: frame.id, name: frame.name, reason: 'its last review failed' })
+      }
+    }
+    return out
+  }
+
+  /** The refusal every ship path returns when the canvas is not verified end
+   *  to end: the frames named, the one call that clears them, and — because a
+   *  human may know better than the gate — how to override it. */
+  async function shipRefusal(canvasId: string, force?: boolean) {
+    if (force) return undefined
+    const pending = await canvasUnverifiedFrames(canvasId)
+    if (!pending.length) return undefined
+    return err(
+      'conflict',
+      `this canvas is not verified end to end — ${pending
+        .map((entry) => `“${entry.name}” (${entry.reason})`)
+        .join(
+          ', ',
+        )}. Call review_canvas to check every frame in one sweep, or pass force: true to ship anyway and state in your summary that the unverified frames were shipped unchecked.`,
+      { frames: pending, hint: 'review_canvas runs the canvas-wide sweep and records a report per frame' },
+    )
+  }
   /* Webpage capture is a shared, slow, externally-metred resource: one helper
      so every capture path spends from the same per-user budget. */
   const takeImport = (agentName?: string) => {
@@ -1511,11 +1622,10 @@ export function buildMcpServer(
     }
   }
 
-  /** Connected MCP agents work on the same canvases as the resident team, so
-   *  their calls belong on the same timeline: the Run tab is where a human
-   *  watches what an agent did, and an external agent's work was invisible
-   *  there. One event per canvas-scoped call, named by the agent that made it —
-   *  a separate runId per agent session, so the panel can group them. */
+  /** Every agent's calls belong on the canvas timeline: the Run tab is where a
+   *  human watches what an agent did, and a connected MCP agent's work is
+   *  exactly that. One event per canvas-scoped call, named by the agent that
+   *  made it — a separate runId per agent session, so the panel can group them. */
   const recordRunEvent = (name: string, args: unknown, ok: boolean, ms: number, summary: string) => {
     if (!args || typeof args !== 'object') return
     const record = args as Record<string, unknown>
@@ -2251,7 +2361,7 @@ export function buildMcpServer(
     {
       title: 'List agents and pipelines',
       description:
-        'The resident design team this canvas can be worked by, and who is live on it right now: the roles with what each one is for, the ready-made pipelines (an ordered list of role ids), and every agent currently present on the canvas. Use it to address work to a specific agent, or to see whether the agent you expected is actually connected before you hand something back.',
+        'The roles this canvas organises work by, and who is live on it right now: each role with what it is for, the ready-made pipelines (an ordered list of role ids) that a card can be routed through, and every agent currently present on the canvas. Roles and pipelines describe how work is organised on the board — no agent is attached to a role, a connected MCP client claims a card and works it. Use it to pick the pipeline for a card you queue, or to see whether the agent you expected is actually connected before you hand something back.',
       annotations: { readOnlyHint: true, destructiveHint: false },
       inputSchema: { canvas_id: z.string(), agent_name: agentName.optional() },
       outputSchema: {
@@ -2631,7 +2741,7 @@ export function buildMcpServer(
     {
       title: 'List board cards',
       description:
-        "Open board cards on this canvas — work humans have queued for agents. Each card's text is the full prompt. Call take_card to claim one and work it, or get going on the queue. Structured import cards (GitHub recon) are handled by the resident team and never listed here.",
+        "Open board cards on this canvas — work humans have queued for agents. Each card's text is the full prompt. Call take_card to claim one and work it, or get going on the queue. Structured import cards (GitHub recon) never appear here: work those screens with list_repo_screens and import_repo_screen.",
       annotations: { readOnlyHint: true, destructiveHint: false },
       inputSchema: {
         canvas_id: z.string(),
@@ -2642,9 +2752,22 @@ export function buildMcpServer(
     async ({ canvas_id, agent_name }) => {
       if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
       arrive(canvas_id, agent_name)
+      /* A card with a future schedule_at is deliberately not open yet: the
+         server used to hold it back on its own sweep, so the reader that
+         replaced that sweep is where the deferral now lives. */
+      const now = Date.now()
       const cards = actions
         .getTasks(canvas_id)
-        .filter((t) => t.queuedBy && !t.agentName && !t.failedAt && !t.endedAt && !t.cancelledAt && !t.kind)
+        .filter(
+          (t) =>
+            t.queuedBy &&
+            !t.agentName &&
+            !t.failedAt &&
+            !t.endedAt &&
+            !t.cancelledAt &&
+            !t.kind &&
+            (t.scheduledAt ?? 0) <= now,
+        )
         .map((t) => ({
           id: t.id,
           title: t.status,
@@ -2791,7 +2914,7 @@ export function buildMcpServer(
       annotations: { readOnlyHint: false, destructiveHint: false },
       title: 'Queue a board card',
       description:
-        'Queue work on this canvas’s board the way a human does: the title is the full brief, an optional pipeline names the roles that should work it in order, target_frame_ids are the frames the card is ABOUT (edit those in place), target_selector points at one element, attachments are reference-image frame ids, and schedule_at (epoch ms) defers the card until then. The card is attributed to the account behind your connection and the resident team can claim it.',
+        'Queue work on this canvas’s board the way a human does: the title is the full brief, an optional pipeline names the roles that should work it in order, target_frame_ids are the frames the card is ABOUT (edit those in place), target_selector points at one element, attachments are reference-image frame ids, and schedule_at (epoch ms) defers the card until then. The card is attributed to the account behind your connection, and any connected agent can claim it with take_card.',
       inputSchema: {
         canvas_id: z.string(),
         title: z
@@ -2819,7 +2942,7 @@ export function buildMcpServer(
           .max(4)
           .optional()
           .describe('Reference-image frame ids — source material the agent must not edit'),
-        schedule_at: z.number().int().optional().describe('Epoch ms before which the sweep must not start this card'),
+        schedule_at: z.number().int().optional().describe('Epoch ms before which agents should leave this card alone'),
         op_id: opId,
         agent_name: agentName,
       },
@@ -2864,7 +2987,7 @@ export function buildMcpServer(
           title: card.status,
           pipeline: actions.pipelineOf(card),
           ...(card.scheduledAt ? { scheduled_at: new Date(card.scheduledAt).toISOString() } : {}),
-          note: 'Queued. list_cards shows it; the resident team claims it on its next sweep (after schedule_at, if set).',
+          note: 'Queued. list_cards shows it to any agent on this canvas (after schedule_at, if set).',
         }),
         canvas_id,
         actor,
@@ -2878,7 +3001,7 @@ export function buildMcpServer(
       annotations: { readOnlyHint: false, destructiveHint: true },
       title: 'Retry a failed card',
       description:
-        'Re-queue a failed or cancelled board card: its failure clears and the next sweep re-claims it. A retry also lifts a human’s stop on the card. Only failed or cancelled work is retryable — an in-progress or finished card stays where it is.',
+        'Re-queue a failed or cancelled board card: its failure clears and list_cards shows it as open again for any agent to claim. A retry also lifts a human’s stop on the card. Only failed or cancelled work is retryable — an in-progress or finished card stays where it is.',
       inputSchema: { card_id: z.string(), agent_name: agentName },
     },
     async ({ card_id, agent_name }) => {
@@ -2894,7 +3017,7 @@ export function buildMcpServer(
         ok: true as const,
         card_id: card.id,
         status: card.status,
-        note: 're-queued — the next sweep claims it',
+        note: 're-queued — it is open again for any agent on this canvas',
       })
     },
   )
@@ -4691,6 +4814,111 @@ export function buildMcpServer(
   )
 
   tool(
+    'fix_frame_a11y',
+    {
+      annotations: { readOnlyHint: false, destructiveHint: false },
+      title: 'Fix a frame’s accessibility and content findings',
+      description:
+        'The mechanical counterpart of fix_frame_tokens for accessibility and content: a fresh audit runs (the same render and the same probe review_frame uses), and every finding that has a one-line repair is applied — the document language, a missing or empty title, controls with no hover or focus rule. Each applied entry names what changed and what it became; each skipped entry names the decision that rule needs (alt text, form labels, contrast, tap targets), which no fixer can make for you. Restrict the pass with only (rule ids from review_frame); rehearse it with dry_run, which returns the plan and the diff and writes nothing. The write goes through the ordinary frame write, so locks, version history and review mode all apply.',
+      inputSchema: {
+        canvas_id: z.string(),
+        frame_id: z.string(),
+        only: z
+          .array(z.enum(A11Y_FIX_RULES))
+          .optional()
+          .describe('Fix only these rules; default considers every finding the audit reports'),
+        expected_updated_at: z.string().optional().describe("The frame's updatedAt from when you read it"),
+        takeover: z.boolean().optional().describe('Edit a frame another agent holds the lock on'),
+        dry_run: z.boolean().optional().describe('Report the planned fixes and the diff, and write nothing'),
+        op_id: opId,
+        agent_name: agentName,
+      },
+      outputSchema: {
+        ok: z.literal(true),
+        frame: z.unknown().optional(),
+        applied: z.array(z.string()),
+        skipped: z.array(z.object({ rule: z.string(), reason: z.string() })),
+        changed: z.boolean(),
+        dry_run: z.literal(true).optional(),
+        would_apply: z.boolean().optional(),
+        diff: diffShape.optional(),
+        bytes_before: z.number().optional(),
+        bytes_after: z.number().optional(),
+      },
+    },
+    async ({ canvas_id, frame_id, only, expected_updated_at, takeover, dry_run, agent_name }) => {
+      const before = frameFor(frame_id)
+      if (!before || before.canvasId !== canvas_id) return noFrame(frame_id)
+      const stale = staleConflict(before, expected_updated_at)
+      if (stale) return stale
+      const gated = reviewGate(before.canvasId)
+      if (gated) return gated
+      const budget = takeRender(agent_name)
+      if (budget) return budget
+      arrive(before.canvasId, agent_name)
+      /* One render, two probes: the audit's findings and the content lint's are
+         the inputs the fixer plans against, and both read the same DOM the
+         review would have measured. */
+      let findings: { rule: string; selector?: string }[]
+      try {
+        const probe = await probeFrame(before)
+        findings = [
+          ...auditProbe(probe).issues.map((issue) => ({ rule: issue.rule as string, selector: issue.selector })),
+          ...contentProbe(probe).issues.map((issue) => ({ rule: issue.rule as string, selector: issue.selector })),
+        ]
+      } catch (e) {
+        return err('upstream_failed', e instanceof Error ? e.message : 'could not render this frame for the fixer')
+      }
+      /* `only` narrows what the fixer is asked about, not what it reports: a
+         rule outside the filter is not this call's business, so it is neither
+         applied nor skipped. */
+      const asked = only?.length
+        ? findings.filter((finding) => (only as readonly string[]).includes(finding.rule))
+        : findings
+      const plan = planA11yFixes(before.html, before.name, asked)
+      const fixed = plan.fixedHtml
+      if (fixed === null)
+        return structured({
+          ok: true as const,
+          applied: plan.applied,
+          skipped: plan.skipped,
+          changed: false,
+        })
+      if (dry_run)
+        return structured({
+          ...dryRunPayload(before.html, storedHtml(fixed), { applied: plan.applied, skipped: plan.skipped }),
+          ok: true as const,
+          changed: true,
+        })
+      takeOver(frame_id, before.canvasId, actorFrom(agent_name), takeover)
+      let frame: Frame | undefined
+      try {
+        frame = actions.updateFrame(frame_id, { html: fixed }, actorFrom(agent_name))
+      } catch (e) {
+        const conflict = lockConflict(e)
+        if (conflict) return conflict
+        throw e
+      }
+      if (!frame) return noFrame(frame_id)
+      return withStatusNudge(
+        withFeedback(
+          structured({
+            ok: true as const,
+            frame: frameSummary(frame),
+            applied: plan.applied,
+            skipped: plan.skipped,
+            changed: true,
+          }),
+          before.canvasId,
+          actorFrom(agent_name),
+        ),
+        before.canvasId,
+        actorFrom(agent_name),
+      )
+    },
+  )
+
+  tool(
     'inspect_frame',
     {
       title: 'Inspect a rendered frame',
@@ -5134,20 +5362,20 @@ export function buildMcpServer(
       annotations: { readOnlyHint: true, destructiveHint: false },
       title: 'Export a whole canvas',
       description:
-        "Hand a canvas to a human's machine in one piece. format: 'manifest' returns the frame list with file names and the canvas tokens. format: 'html' returns one self-contained document containing every frame, with each frame's stylesheet scoped to it (frames that style html/body or use :root are noted, since that cannot be scoped perfectly). format: 'zip' returns the same document plus every frame's original HTML as a ZIP archive: it is stored and you get back zip_url, a public download link — fetch that (no auth needed) instead of carrying the bytes through your context. Pass inline: true only when you cannot fetch a URL and need archive_base64 in the result.",
+        "Hand a canvas to a human's machine in one piece. format: 'manifest' returns the frame list with file names and the canvas tokens. format: 'html' returns one self-contained document containing every frame, with each frame's stylesheet scoped to it (frames that style html/body or use :root are noted, since that cannot be scoped perfectly). format: 'zip' returns the same document plus every frame's original HTML as a ZIP archive: it is stored and you get back zip_url, a public download link — fetch that (no auth needed) instead of carrying the bytes through your context. format: 'code' is the developer handoff open_pull_request commits — each frame's document, its React component and build spec, the design system in three forms and the assets that travel as text — returned as a file manifest (files) plus the same stored archive. Pass inline: true only when you cannot fetch a URL and need archive_base64 in the result.",
       inputSchema: {
         canvas_id: z.string(),
         page: z.string().optional().describe('Only frames on this page (name or id, from get_canvas)'),
         format: z
-          .enum(['html', 'manifest', 'zip', 'tokens'])
+          .enum(['html', 'manifest', 'zip', 'tokens', 'code'])
           .optional()
           .describe(
-            'default manifest; "tokens" returns the design tokens as JSON + plain CSS + a Tailwind v4 @theme block',
+            'default manifest; "tokens" returns the design tokens as JSON + plain CSS + a Tailwind v4 @theme block; "code" returns the repository file set as a manifest plus a stored archive',
           ),
         inline: z
           .boolean()
           .optional()
-          .describe('zip only: return archive_base64 in the result instead of zip_url (default false)'),
+          .describe('zip/code only: return archive_base64 in the result instead of zip_url (default false)'),
         agent_name: agentName.optional(),
       },
       outputSchema: {
@@ -5162,6 +5390,10 @@ export function buildMcpServer(
         tailwind_css: z.string().optional(),
         design_md: z.string().optional(),
         html: z.string().optional(),
+        /** code format: the repository paths the archive holds */
+        files: z.array(z.string()).optional(),
+        /** code format: the pull request this file set is meant to be opened as */
+        pr: z.object({ title: z.string(), body: z.string() }).optional(),
         zip_url: z.string().optional(),
         archive_base64: z.string().optional(),
         bytes: z.number().optional(),
@@ -5197,6 +5429,54 @@ export function buildMcpServer(
         filename: `${c.name.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'canvas'}.doop`,
         frames: manifest,
         tokens_css: tokens ? cssForTokens(tokens) : '',
+      }
+      /* The archive is the largest payload this surface can emit, and inlined
+         base64 puts all of it in the agent's context. It is stored through the
+         asset store instead and handed back as a public URL, which is also what
+         the /a/<id>.<ext> route already serves. `inline: true` keeps the old
+         shape for a client that cannot fetch a URL, and a store that refuses an
+         oversized archive falls back to it too: a storage failure must not cost
+         the caller its export. */
+      const storeArchive = async (
+        filename: string,
+        archive: Buffer,
+        notes: string[],
+      ): Promise<Record<string, unknown>> => {
+        const inlineNote = 'archive_base64 is a ZIP file: decode it and write it to disk, then unzip.'
+        if (inline)
+          return {
+            filename,
+            archive_base64: archive.toString('base64'),
+            bytes: archive.length,
+            notes: [...notes, inlineNote],
+          }
+        try {
+          const asset = await assets.createAsset(archive, {
+            canvasId: canvas_id,
+            ownerId,
+            uploadedBy: actorFrom(agent_name).name,
+          })
+          return {
+            filename,
+            zip_url: `${PUBLIC_ORIGIN}/a/${asset.id}.${asset.ext}`,
+            bytes: archive.length,
+            notes: [
+              ...notes,
+              'zip_url serves the archive from this server with no auth — fetch it and unzip; the bytes are not in this result.',
+            ],
+          }
+        } catch (e) {
+          return {
+            filename,
+            archive_base64: archive.toString('base64'),
+            bytes: archive.length,
+            notes: [
+              ...notes,
+              `the archive could not be stored for download (${e instanceof Error ? e.message : 'storage failed'}), so it is returned inline.`,
+              inlineNote,
+            ],
+          }
+        }
       }
       if (format === undefined || format === 'manifest') return structured({ format: 'manifest', ...base, notes: [] })
 
@@ -5242,6 +5522,43 @@ export function buildMcpServer(
               : []),
           ],
         })
+      }
+
+      if (format === 'code') {
+        /* The developer handoff, built without a GitHub connection: the same
+           file set open_pull_request commits. It renders every frame (JSX and
+           specs come from the browser), so it spends the render budget the way
+           the zip export does — one unit per frame. */
+        for (const _frame of frames) {
+          const budget = takeRender(agent_name)
+          if (budget) return budget
+        }
+        let handoff
+        try {
+          handoff = await handoffFiles(canvas_id, pageId === undefined ? {} : { pageId })
+        } catch (e) {
+          if (e instanceof HandoffError) return err(e.code, e.message)
+          return err('upstream_failed', e instanceof Error ? e.message : 'could not build the code handoff')
+        }
+        const file = (path: string) => handoff.files.find((entry) => entry.path === path)?.content
+        const designMdContent = file('design/DESIGN.md')
+        const dtcg = file('design/tokens.dtcg.json')
+        const tailwind = file('design/tailwind.css')
+        const archive = buildZip(handoff.files.map((entry) => ({ name: entry.path, content: entry.content })))
+        return structured({
+          format: 'code',
+          ...base,
+          filename: `${base.filename}.code.zip`,
+          files: handoff.files.map((entry) => entry.path),
+          ...(designMdContent === undefined ? {} : { design_md: designMdContent }),
+          ...(dtcg === undefined ? {} : { tokens_dtcg: dtcg }),
+          ...(tailwind === undefined ? {} : { tailwind_css: tailwind }),
+          pr: handoff.pr,
+          ...(await storeArchive(`${base.filename}.code.zip`, archive, [
+            ...handoff.notes,
+            'files lists every path in the archive; the archive itself is the file set open_pull_request commits to a branch.',
+          ])),
+        } as never)
       }
 
       let bundle
@@ -5351,54 +5668,11 @@ export function buildMcpServer(
         ...(bundle.fontsCss ? ['fonts.css carries the frames’ @font-face rules and linked stylesheets.'] : []),
       ]
       const filename = `${base.filename}.zip`
-      /* The archive is the largest payload this surface can emit, and inlined
-         base64 puts all of it in the agent's context. It is stored through the
-         asset store instead and handed back as a public URL, which is also what
-         the /a/<id>.<ext> route already serves. `inline: true` keeps the old
-         shape for a client that cannot fetch a URL. */
-      if (inline) {
-        return structured({
-          format: 'zip',
-          ...base,
-          filename,
-          archive_base64: archive.toString('base64'),
-          bytes: archive.length,
-          notes: [...exportNotes, 'archive_base64 is a ZIP file: decode it and write it to disk, then unzip.'],
-        })
-      }
-      try {
-        const asset = await assets.createAsset(archive, {
-          canvasId: canvas_id,
-          ownerId,
-          uploadedBy: actorFrom(agent_name).name,
-        })
-        return structured({
-          format: 'zip',
-          ...base,
-          filename,
-          zip_url: `${PUBLIC_ORIGIN}/a/${asset.id}.${asset.ext}`,
-          bytes: archive.length,
-          notes: [
-            ...exportNotes,
-            'zip_url serves the archive from this server with no auth — fetch it and unzip; the bytes are not in this result.',
-          ],
-        })
-      } catch (e) {
-        /* an archive over the asset ceiling (or a storage failure) must not cost
-           the caller its export: fall back to the inline form and say why */
-        return structured({
-          format: 'zip',
-          ...base,
-          filename,
-          archive_base64: archive.toString('base64'),
-          bytes: archive.length,
-          notes: [
-            ...exportNotes,
-            `the archive could not be stored for download (${e instanceof Error ? e.message : 'storage failed'}), so it is returned inline.`,
-            'archive_base64 is a ZIP file: decode it and write it to disk, then unzip.',
-          ],
-        })
-      }
+      return structured({
+        format: 'zip',
+        ...base,
+        ...(await storeArchive(filename, archive, exportNotes)),
+      } as never)
     },
   )
 
@@ -6725,6 +6999,92 @@ export function buildMcpServer(
         ),
         frame.canvasId,
         actorFrom(agent_name),
+      )
+    },
+  )
+
+  tool(
+    'replace_in_frames',
+    {
+      annotations: { readOnlyHint: false, destructiveHint: false },
+      title: 'Find and replace across a canvas',
+      description:
+        'Rename a string across a whole canvas in one call — a product name, a nav label, a price — instead of looping edit_frame_html with a screenshot per frame. Each frame reports how many matches it held and whether the replacement landed; a frame another agent holds the lock on is reported and stepped over, so one busy frame never costs the sweep the rest of the canvas. regex: true treats find as a regular expression (use $1 in replace for groups); case_sensitive only affects the regex path, since the literal path is the exact match edit_frame_html makes. Rehearse with dry_run, which counts the matches and writes nothing. Narrow with frame_ids or page.',
+      inputSchema: {
+        canvas_id: z.string(),
+        find: z.string().min(1).max(2000).describe('The text to find'),
+        replace: z.string().max(2000).describe('The replacement text'),
+        frame_ids: z.array(z.string()).optional().describe('Only these frames (ids from get_canvas)'),
+        page: z.string().optional().describe('Only frames on this page (name or id) — ignored when frame_ids is set'),
+        regex: z.boolean().optional().describe('Treat find as a regular expression (default false)'),
+        case_sensitive: z.boolean().optional().describe('Regex only: match case-sensitively (default false)'),
+        dry_run: z.boolean().optional().describe('Count the matches and change nothing'),
+        op_id: opId,
+        agent_name: agentName,
+      },
+      outputSchema: {
+        ok: z.literal(true),
+        frames: z.array(
+          z.object({
+            frame_id: z.string(),
+            name: z.string(),
+            matches: z.number(),
+            applied: z.boolean(),
+            skipped_reason: z.string().optional(),
+          }),
+        ),
+        total_matches: z.number(),
+        dry_run: z.literal(true).optional(),
+      },
+    },
+    async ({ canvas_id, find, replace, frame_ids, page, regex, case_sensitive, dry_run, agent_name }) => {
+      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      arrive(canvas_id, agent_name)
+      const gated = reviewGate(canvas_id)
+      if (gated) return gated
+      let pageId: string | undefined
+      if (page !== undefined) {
+        const resolved = resolvePage(canvas_id, page)
+        if (resolved.error !== undefined) return err('invalid_input', resolved.error)
+        pageId = resolved.page.id
+      }
+      const actor = actorFrom(agent_name)
+      let result
+      try {
+        result = await replaceInFrames(canvas_id, {
+          find,
+          replace,
+          ...(frame_ids?.length ? { frameIds: frame_ids } : {}),
+          ...(pageId === undefined ? {} : { pageId }),
+          ...(regex ? { regex: true } : {}),
+          ...(case_sensitive ? { caseSensitive: true } : {}),
+          ...(dry_run ? { dryRun: true } : {}),
+          actor: { name: actor.name, ...(ownerId ? { userId: ownerId } : {}) },
+        })
+      } catch (e) {
+        /* the canvas was checked above, so what is left is the pattern itself:
+           an invalid regular expression is the caller's to fix */
+        return err('invalid_input', e instanceof Error ? e.message : 'the find pattern could not be compiled')
+      }
+      return withStatusNudge(
+        withFeedback(
+          structured({
+            ok: true as const,
+            frames: result.frames.map((row) => ({
+              frame_id: row.frameId,
+              name: row.name,
+              matches: row.matches,
+              applied: row.applied,
+              ...(row.skippedReason ? { skipped_reason: row.skippedReason } : {}),
+            })),
+            total_matches: result.totalMatches,
+            ...(dry_run ? { dry_run: true as const } : {}),
+          }),
+          canvas_id,
+          actor,
+        ),
+        canvas_id,
+        actor,
       )
     },
   )
@@ -8087,7 +8447,7 @@ export function buildMcpServer(
       annotations: { readOnlyHint: true, destructiveHint: false },
       title: 'Get server capabilities',
       description:
-        'Which optional integrations are actually configured on this server (screenshot renderer, image/icon/logo search, website capture, model accounts for the resident agent, GitHub), plus the current size and rate limits. It also catalogues the surface itself: every registered tool with its domain and its read-only/destructive/idempotent flags, and the resources and prompts this server exposes. Call it ONCE before planning asset-heavy, import-heavy or export-heavy work: it is how you know a feature is available instead of discovering a failure mid-task.',
+        'Which optional integrations are actually configured on this server (screenshot renderer, image/icon/logo search, website capture, model accounts, GitHub), plus the current size and rate limits. It also catalogues the surface itself: every registered tool with its domain and its read-only/destructive/idempotent flags, and the resources and prompts this server exposes. Call it ONCE before planning asset-heavy, import-heavy or export-heavy work: it is how you know a feature is available instead of discovering a failure mid-task.',
       inputSchema: {},
       outputSchema: { capabilities: z.record(z.unknown()) },
     },
@@ -8500,6 +8860,12 @@ export function buildMcpServer(
       }
       if (tooLarge(html))
         return err('too_large', `html is ${html.length} characters; the limit is ${MAX_FRAME_HTML_BYTES}.`)
+      arrive(canvas_id, agent_name)
+      /* the propose path exists BECAUSE review mode is on: with it off the
+         write should land directly, and a proposal would sit in a queue nobody
+         is reviewing instead of changing the canvas */
+      if (!store.getCanvas(canvas_id)?.reviewMode)
+        return err('unsupported', 'review mode is off on this canvas — write directly with edit_frame_html instead')
       const base = expected_updated_at ? Date.parse(expected_updated_at) : f.updatedAt
       const proposal = actions.addFrameProposal(
         canvas_id,
@@ -8603,6 +8969,11 @@ export function buildMcpServer(
       arrive(canvas_id, agent_name)
       const proposals = actions.getFrameProposals(canvas_id, status).map((p) => ({
         proposal_id: p.id,
+        /* the frame version this was proposed against: the anchor a reviewer
+           compares the frame to before accepting, and what the stale guard
+           reads — without it the list cannot say whether a proposal still
+           describes what is on the canvas */
+        base_updated_at: new Date(p.baseUpdatedAt).toISOString(),
         ...(p.html !== undefined ? { diff: { added: p.html.length, removed: 0 } } : {}),
         ...(p.mode === 'patch' && p.edits?.length
           ? {
@@ -8776,6 +9147,148 @@ export function buildMcpServer(
     },
   )
 
+  /* ---- canvas-level proposals: review mode for everything that is not a frame ---- */
+
+  tool(
+    'propose_canvas_change',
+    {
+      annotations: { readOnlyHint: false, destructiveHint: false },
+      title: 'Propose a canvas-level change',
+      description:
+        'Propose a change to the canvas itself — its design tokens, one style guide, the responsive breakpoints, or the page set — without touching it. This is the review-mode counterpart of set_tokens / set_guidelines / set_breakpoints / the page tools: the change appears in the human Review panel with what it replaces, and lands through the ordinary setters the moment a human accepts. payload is shaped per kind: tokens carries the whole DesignTokens object (or null to clear them); guidelines carries { name, markdown } (empty markdown deletes the doc); breakpoints carries the { name, min_width }[] list (empty clears it); pages carries one page operation — { op: "create", name }, { op: "rename", pageId, name }, { op: "delete", pageId } or { op: "move_frame", frameId, pageId }.',
+      inputSchema: {
+        canvas_id: z.string(),
+        kind: z.enum(['tokens', 'guidelines', 'breakpoints', 'pages']).describe('Which part of the canvas changes'),
+        payload: z
+          .unknown()
+          .describe(
+            'The change to apply on accept, shaped per kind — see the description; a payload that kind could not apply is refused here rather than when a human accepts it',
+          ),
+        summary: z.string().max(500).optional().describe('One line on why — the first thing the reviewer reads'),
+        op_id: opId,
+        agent_name: agentName,
+      },
+      outputSchema: {
+        ok: z.literal(true),
+        proposal_id: z.string(),
+        kind: z.string(),
+        status: z.string(),
+      },
+    },
+    async ({ canvas_id, kind, payload, summary, agent_name }) => {
+      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      arrive(canvas_id, agent_name)
+      if (!store.getCanvas(canvas_id)?.reviewMode)
+        return err(
+          'unsupported',
+          'review mode is off on this canvas — write directly with set_tokens / set_guidelines / set_breakpoints / the page tools instead',
+        )
+      const actor = actorFrom(agent_name)
+      try {
+        const proposal = await actions.proposeCanvasChange(canvas_id, kind as CanvasProposalKind, payload, {
+          userId: ownerId ?? '',
+          agentName: actor.name,
+        })
+        if (summary) actions.logActivity(canvas_id, actor, summary)
+        return structured({
+          ok: true as const,
+          proposal_id: proposal.id,
+          kind: proposal.kind,
+          status: proposal.status,
+        })
+      } catch (e) {
+        return err('invalid_input', e instanceof Error ? e.message : 'the proposal could not be stored')
+      }
+    },
+  )
+
+  tool(
+    'list_canvas_proposals',
+    {
+      annotations: { readOnlyHint: true, destructiveHint: false },
+      title: 'List the canvas-level proposals',
+      description:
+        'The canvas-level change proposals on this canvas and their status — pending, accepted, rejected or withdrawn — newest first. Read it after a review to learn what the human decided about the tokens, a guide doc, the breakpoints or the page set. Frame-level proposals live in list_change_proposals.',
+      inputSchema: {
+        canvas_id: z.string(),
+        status: z.enum(['pending', 'accepted', 'rejected', 'withdrawn']).optional(),
+        agent_name: agentName,
+      },
+      outputSchema: {
+        proposals: z.array(
+          z.object({
+            proposal_id: z.string(),
+            kind: z.string(),
+            status: z.string(),
+            payload: z.unknown(),
+            before: z.unknown(),
+            proposed_by: z.string(),
+            created_at: z.number(),
+            resolved_at: z.number().optional(),
+            resolution_note: z.string().optional(),
+          }),
+        ),
+      },
+    },
+    async ({ canvas_id, status, agent_name }) => {
+      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      arrive(canvas_id, agent_name)
+      const proposals = await persist.listCanvasProposals(
+        canvas_id,
+        status === undefined ? {} : { status: status as CanvasProposal['status'] },
+      )
+      return structured({
+        proposals: proposals.map((proposal) => ({
+          proposal_id: proposal.id,
+          kind: proposal.kind,
+          status: proposal.status,
+          payload: proposal.payload,
+          before: proposal.before,
+          proposed_by: proposal.proposedBy,
+          created_at: proposal.createdAt,
+          ...(proposal.resolvedAt === undefined ? {} : { resolved_at: proposal.resolvedAt }),
+          ...(proposal.resolutionNote === undefined ? {} : { resolution_note: proposal.resolutionNote }),
+        })),
+      })
+    },
+  )
+
+  tool(
+    'resolve_canvas_proposal',
+    {
+      annotations: { readOnlyHint: false, destructiveHint: true },
+      title: 'Accept or reject a canvas-level proposal',
+      description:
+        'Accept or reject a pending canvas-level proposal (owner-only, exactly like resolve_frame_proposal). Accepting applies the payload through the ordinary setters, so the change versions, broadcasts and logs like a human edit; rejecting changes nothing. A note rides back to the proposing agent.',
+      inputSchema: {
+        canvas_id: z.string(),
+        proposal_id: z.string(),
+        action: z.enum(['accept', 'reject']),
+        note: z.string().max(1000).optional().describe('One line the proposing agent reads with the decision'),
+        op_id: opId,
+        agent_name: agentName,
+      },
+      outputSchema: { ok: z.literal(true), proposal_id: z.string(), status: z.string() },
+    },
+    async ({ canvas_id, proposal_id, action, note, agent_name }) => {
+      const c = canvasFor(canvas_id)
+      if (!c) return noCanvas(canvas_id)
+      arrive(canvas_id, agent_name)
+      const denied = ownerOnly(c, 'resolve a canvas-level proposal')
+      if (denied) return denied
+      try {
+        const proposal = await actions.resolveCanvasProposal(canvas_id, proposal_id, {
+          accept: action === 'accept',
+          ...(note ? { note } : {}),
+          actor: { userId: ownerId ?? '', agentName: actorFrom(agent_name).name },
+        })
+        return structured({ ok: true as const, proposal_id, status: proposal.status })
+      } catch (e) {
+        return err('not_found', e instanceof Error ? e.message : `no pending proposal with id ${proposal_id}`)
+      }
+    },
+  )
+
   /* ---- review_frame: one call, every viewport ---- */
 
   tool(
@@ -8846,6 +9359,88 @@ export function buildMcpServer(
         content: [{ type: 'text' as const, text }],
         structuredContent: report as unknown as Record<string, unknown>,
       }
+    },
+  )
+
+  /* ---- review_canvas: the whole canvas in one sweep ---- */
+
+  tool(
+    'review_canvas',
+    {
+      annotations: { readOnlyHint: false, destructiveHint: false },
+      title: 'Review every frame on a canvas',
+      description:
+        'The canvas-wide counterpart of review_frame: one verdict for the whole design, with a row per frame — its verdict, how many blocking and advisory findings it carries, and why a frame could not be checked. Frames whose stored report still describes them are reused, so a sweep over an already-verified canvas costs no renders; the rest are reviewed at the device presets and the canvas breakpoints and every fresh report is recorded against the document it checked. This is the check the ship paths ask for: open_pull_request, publish_canvas, create_release and restore_release refuse a canvas whose frames are not currently verified and point here. ready_for_review and review_frame remain the per-frame gate for a frame you just changed.',
+      inputSchema: {
+        canvas_id: z.string(),
+        page: z.string().optional().describe('Only frames on this page (name or id, from get_canvas)'),
+        op_id: opId,
+        agent_name: agentName,
+      },
+      outputSchema: {
+        verdict: z.enum(['pass', 'fail']),
+        totals: z.object({ pass: z.number(), fail: z.number(), stale: z.number(), skipped: z.number() }),
+        frames: z.array(
+          z.object({
+            frame_id: z.string(),
+            name: z.string(),
+            verdict: z.enum(['pass', 'fail', 'stale', 'skipped']),
+            blocking: z.number(),
+            advisory: z.number(),
+            reason: z.string().optional(),
+          }),
+        ),
+        duration_ms: z.number(),
+      },
+    },
+    async ({ canvas_id, page, agent_name }) => {
+      const c = canvasFor(canvas_id)
+      if (!c) return noCanvas(canvas_id)
+      arrive(canvas_id, agent_name)
+      let pageId: string | undefined
+      if (page !== undefined) {
+        const resolved = resolvePage(canvas_id, page)
+        if (resolved.error !== undefined) return err('invalid_input', resolved.error)
+        pageId = resolved.page.id
+      }
+      const actor = actorFrom(agent_name)
+      let summary
+      try {
+        summary = await reviewCanvas(canvas_id, {
+          ...(pageId === undefined ? {} : { pageId }),
+          actor: { userId: ownerId ?? '', agentName: actor.name },
+        })
+      } catch (e) {
+        /* the canvas was checked above, so this is a crash inside the sweep */
+        return err(codeFor(e), e instanceof Error ? e.message : 'the canvas sweep failed')
+      }
+      const failed = summary.frames.filter((row) => row.verdict === 'fail' || row.verdict === 'stale')
+      return withFeedback(
+        structuredWithNudge(
+          {
+            verdict: summary.verdict,
+            totals: summary.totals,
+            frames: summary.frames.map((row) => ({
+              frame_id: row.frameId,
+              name: row.name,
+              verdict: row.verdict,
+              blocking: row.blocking,
+              advisory: row.advisory,
+              ...(row.reason === undefined ? {} : { reason: row.reason }),
+            })),
+            duration_ms: summary.durationMs,
+          },
+          summary.verdict === 'pass'
+            ? 'Every frame passes. ready_for_review and review_frame remain the per-frame gate: run one on any frame you change after this sweep, and the ship paths will ask for a fresh sweep if a frame moves.'
+            : `${failed.length} frame(s) are not shipping clean: ${failed
+                .map((row) => `“${row.name}” (${row.verdict}${row.reason ? `: ${row.reason}` : ''})`)
+                .join(
+                  ', ',
+                )}. Fix them and run review_canvas again — the ship paths refuse a canvas that is not verified end to end. ready_for_review on a single frame is still how you record one frame's fix.`,
+        ),
+        canvas_id,
+        actor,
+      )
     },
   )
 
@@ -9060,27 +9655,124 @@ export function buildMcpServer(
 
   /* ---- open_pull_request: the repo handoff ---- */
 
+  /** The canvas's connection for a repo, normalized: a handoff and a repo read
+   *  both resolve the credential the same way, canvas-scoped so neither can
+   *  spend another canvas's token. Undefined means the caller must connect the
+   *  repository first — the GitHub write paths say so themselves. */
+  const repoConnection = async (canvasId: string, repo: string) => {
+    const wanted = repo
+      .trim()
+      .replace(/^https?:\/\/github\.com\//i, '')
+      .replace(/\.git$/, '')
+    const connections = await github.listConnections(canvasId)
+    return connections.find(
+      (conn) => conn.repo.toLowerCase() === wanted.toLowerCase() && !!(conn.token || conn.installationId),
+    )
+  }
+
   tool(
     'open_pull_request',
     {
       annotations: { readOnlyHint: false, destructiveHint: false },
       title: 'Open a pull request with the canvas design',
       description:
-        'Hand the design to a developer: write the exported frames (design/<frame-name>.html, tokens.css, README) to a branch in a connected GitHub repo and open a pull request. Requires a GitHub connection with contents:write and pull_requests:write. Check get_capabilities first — github is "none" when no connection is configured.',
+        'Hand the design to a developer: write the exported frames (design/<frame-name>.html, its React component, its build spec, the design system and the assets that travel as text) to a branch in a connected GitHub repo and open a pull request. The title and body come from the handoff itself; message overrides the title. Requires a GitHub connection with contents:write and pull_requests:write — check get_capabilities first, github is "none" when no connection is configured. Every non-demo frame on the canvas must hold a CURRENT passing review or the handoff is refused with conflict, naming the frames; run review_canvas to clear them, or force: true to ship an unverified canvas deliberately.',
       inputSchema: {
         canvas_id: z.string(),
         repo: z.string().describe('owner/name'),
         branch: z.string().optional().describe('Defaults to doop/<canvas-id>'),
         base: z.string().optional().describe("PR target branch; defaults to the repo connection's own branch"),
-        message: z.string().max(200).describe('PR title'),
+        message: z.string().max(200).optional().describe('PR title; defaults to the handoff’s own title'),
         release_id: z
           .string()
           .optional()
           .describe('Hand off this frozen release instead of the live frames — the PR then matches the link you sent'),
+        force: z
+          .boolean()
+          .optional()
+          .describe('Ship even though frames on this canvas are not currently verified — state that in your summary'),
         op_id: opId,
         agent_name: agentName,
       },
       outputSchema: { ok: z.literal(true), branch: z.string(), commit: z.string(), url: z.string() },
+    },
+    async ({ canvas_id, repo, branch, base, message, release_id, force, agent_name, op_id }) => {
+      const c = canvasFor(canvas_id)
+      if (!c) return noCanvas(canvas_id)
+      arrive(canvas_id, agent_name)
+      const actor = actorFrom(agent_name)
+      const withOp = replayAsync(ownerId ?? '', op_id ?? '', async () => {
+        const gated = reviewGate(canvas_id)
+        if (gated) return gated
+        /* the whole canvas ships in this pull request, so the whole canvas has
+           to be verified — not just the frames this agent happened to touch */
+        const unverified = await shipRefusal(canvas_id, force)
+        if (unverified) return unverified
+        let handoff
+        try {
+          handoff = await handoffFiles(canvas_id, release_id ? { releaseId: release_id } : {})
+        } catch (e) {
+          if (e instanceof HandoffError) return err(e.code, e.message)
+          return err('upstream_failed', e instanceof Error ? e.message : 'could not build the handoff')
+        }
+        const head = branch?.trim() || `doop/${canvas_id}`
+        try {
+          /* canvasId scopes the credential lookup to this canvas's
+             connections: a handoff can never spend another canvas's token.
+             The two halves run on that one connection: the commit carries the
+             message, the pull request the handoff's own title and body. */
+          const conn = await repoConnection(canvas_id, repo)
+          const baseRef = base?.trim() || conn?.branch || 'main'
+          const commit = await commitToBranch({
+            repo,
+            baseRef,
+            headRef: head,
+            files: handoff.files,
+            message: message ?? handoff.pr.title,
+            canvasId: canvas_id,
+          })
+          const pull = await ensurePullRequest({
+            repo,
+            baseRef,
+            headRef: head,
+            title: message ?? handoff.pr.title,
+            body: handoff.pr.body,
+            canvasId: canvas_id,
+          })
+          return structured({ ok: true as const, branch: commit.branch, commit: commit.commitSha, url: pull.url })
+        } catch (e) {
+          if (e instanceof GithubWriteError) return err(e.code, e.message)
+          return err(codeFor(e), e instanceof Error ? e.message : 'the GitHub handoff failed')
+        }
+      })
+      return withFeedback(await withOp, canvas_id, actor)
+    },
+  )
+
+  tool(
+    'update_pull_request',
+    {
+      annotations: { readOnlyHint: false, destructiveHint: false },
+      title: 'Push an update to an open handoff pull request',
+      description:
+        'Re-commit the canvas onto the branch a previous handoff opened and post a summary comment on its pull request — the "send the client an update" path. The branch defaults to doop/<canvas-id> and the base to the repository connection’s own branch, so a caller that handed off with open_pull_request passes neither. The pull request must already exist for that branch pair; when none does, this refuses with not_found rather than quietly opening one.',
+      inputSchema: {
+        canvas_id: z.string(),
+        repo: z.string().describe('owner/name'),
+        branch: z.string().optional().describe('The branch the handoff opened; defaults to doop/<canvas-id>'),
+        base: z.string().optional().describe("PR target branch; defaults to the repo connection's own branch"),
+        message: z.string().max(200).optional().describe('Commit message; defaults to a dated handoff line'),
+        release_id: z.string().optional().describe('Update from this frozen release instead of the live frames'),
+        op_id: opId,
+        agent_name: agentName,
+      },
+      outputSchema: {
+        ok: z.literal(true),
+        number: z.number(),
+        url: z.string(),
+        commit: z.string(),
+        comment_id: z.number(),
+      },
     },
     async ({ canvas_id, repo, branch, base, message, release_id, agent_name, op_id }) => {
       const c = canvasFor(canvas_id)
@@ -9090,36 +9782,110 @@ export function buildMcpServer(
       const withOp = replayAsync(ownerId ?? '', op_id ?? '', async () => {
         const gated = reviewGate(canvas_id)
         if (gated) return gated
-        let files
-        if (release_id) {
-          const release = await persist.getRelease(release_id)
-          if (!release || release.canvasId !== canvas_id)
-            return err('not_found', `no release ${release_id} on this canvas`)
-          files = await designHandoffFiles(c, {
-            frames: persist.releaseFrames(release),
-            ...(release.tokens ? { tokens: release.tokens } : {}),
-          })
-        } else {
-          files = await designHandoffFiles(c)
-        }
+        let handoff
         try {
-          /* canvasId scopes the credential lookup to this canvas's
-             connections: a handoff can never spend another canvas's token. */
-          const result = await commitFiles({
+          handoff = await handoffFiles(canvas_id, release_id ? { releaseId: release_id } : {})
+        } catch (e) {
+          if (e instanceof HandoffError) return err(e.code, e.message)
+          return err('upstream_failed', e instanceof Error ? e.message : 'could not build the handoff')
+        }
+        const conn = await repoConnection(canvas_id, repo)
+        const baseRef = base?.trim() || conn?.branch || 'main'
+        const head = branch?.trim() || `doop/${canvas_id}`
+        const line = message?.trim() || `Design update: ${c.name}`
+        try {
+          const commit = await commitToBranch({
             repo,
-            branch: branch ?? `doop/${canvas_id}`,
-            ...(base ? { base } : {}),
-            files,
-            message,
+            baseRef,
+            headRef: head,
+            files: handoff.files,
+            message: line,
             canvasId: canvas_id,
           })
-          return structured({ ok: true as const, branch: result.branch, commit: result.commit, url: result.url })
+          const pull = await ensurePullRequest({
+            repo,
+            baseRef,
+            headRef: head,
+            title: handoff.pr.title,
+            body: handoff.pr.body,
+            canvasId: canvas_id,
+          })
+          /* `created` is the existence answer: true means GitHub had no pull
+             request for this head/base and one was opened just now, so there
+             was no handoff to update. */
+          if (pull.created)
+            return err(
+              'not_found',
+              `no pull request existed for ${head} → ${baseRef} on ${repo} — this call committed the canvas and opened #${pull.number} (${pull.url}) with the current design. Use open_pull_request for a deliberate first handoff, or call update_pull_request again now that the pull request exists.`,
+              { number: pull.number, url: pull.url },
+            )
+          const comment = await commentPullRequest({
+            repo,
+            prNumber: pull.number,
+            body: [
+              `${line}`,
+              '',
+              handoff.pr.body,
+              '',
+              `Committed \`${commit.commitSha.slice(0, 7)}\` to \`${head}\`.`,
+            ].join('\n'),
+            canvasId: canvas_id,
+          })
+          return structured({
+            ok: true as const,
+            number: pull.number,
+            url: pull.url,
+            commit: commit.commitSha,
+            comment_id: comment.commentId,
+          })
         } catch (e) {
           if (e instanceof GithubWriteError) return err(e.code, e.message)
-          return err(codeFor(e), e instanceof Error ? e.message : 'the GitHub handoff failed')
+          return err(codeFor(e), e instanceof Error ? e.message : 'the pull request update failed')
         }
       })
       return withFeedback(await withOp, canvas_id, actor)
+    },
+  )
+
+  tool(
+    'comment_pull_request',
+    {
+      annotations: { readOnlyHint: false, destructiveHint: false },
+      title: 'Comment on a handoff pull request',
+      description:
+        'Say something on a pull request this canvas opened: a comment in the conversation, or — with in_reply_to — an answer on one of the inline review comments, which keeps the reply attached to the file and line the reviewer asked about. Read the thread first with get_pull_request_review.',
+      inputSchema: {
+        canvas_id: z.string(),
+        repo: z.string().describe('owner/name'),
+        pull: z.number().int().positive().describe('pull request number'),
+        body: z.string().max(10_000).describe('The comment text (markdown)'),
+        in_reply_to: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe('Reply to this inline review comment id instead of adding to the conversation'),
+        op_id: opId,
+        agent_name: agentName,
+      },
+      outputSchema: { ok: z.literal(true), comment_id: z.number() },
+    },
+    async ({ canvas_id, repo, pull, body, in_reply_to, agent_name }) => {
+      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      arrive(canvas_id, agent_name)
+      try {
+        const created = await commentPullRequest({
+          repo,
+          prNumber: pull,
+          body,
+          ...(in_reply_to === undefined ? {} : { inReplyTo: in_reply_to }),
+          canvasId: canvas_id,
+        })
+        return structured({ ok: true as const, comment_id: created.commentId })
+      } catch (e) {
+        if (e instanceof GithubWriteError) return err(e.code, e.message)
+        return err(codeFor(e), e instanceof Error ? e.message : 'the comment could not be posted')
+      }
     },
   )
 
@@ -9203,17 +9969,6 @@ export function buildMcpServer(
   /* ---- repo recon: what a connected repository holds, and importing one of
      its screens as a frame. The same connection model as open_pull_request:
      canvas-scoped, so a call can never spend another canvas's credential. */
-
-  const repoConnection = async (canvasId: string, repo: string) => {
-    const wanted = repo
-      .trim()
-      .replace(/^https?:\/\/github\.com\//i, '')
-      .replace(/\.git$/, '')
-    const connections = await github.listConnections(canvasId)
-    return connections.find(
-      (conn) => conn.repo.toLowerCase() === wanted.toLowerCase() && !!(conn.token || conn.installationId),
-    )
-  }
 
   tool(
     'list_repo_screens',
@@ -9341,7 +10096,7 @@ export function buildMcpServer(
           screen: { route: screen.route, file: screen.sourcePath, kind: screen.kind, title: screen.title },
           frame: null,
           source: outcome.files,
-          note: `This screen exists only as code (${screen.sourcePath}). Design a complete self-contained document from the source above — the same brief the import's own sketch lane gives its model — then call import_repo_screen again with the same route/file and html to land it with the import marker.`,
+          note: `This screen exists only as code (${screen.sourcePath}). Design a complete self-contained document from the source above, then call import_repo_screen again with the same route/file and html to land it with the import marker.`,
         })
       }
       const gated = reviewGate(canvas_id)
@@ -9430,15 +10185,76 @@ export function buildMcpServer(
   /* ---- releases: the frozen handoff artifact ---- */
 
   tool(
+    'diff_release',
+    {
+      annotations: { readOnlyHint: true, destructiveHint: false },
+      title: 'What changed since a release',
+      description:
+        'Compare the live canvas against a frozen release: per frame, whether it changed and how — a pixel ratio when both versions render at the same size, a line diff when they do not — plus which frames were added or removed since. Use it to answer "what moved since the link I sent?" before writing the update note, or to check that a fix actually landed in the release you are about to ship.',
+      inputSchema: {
+        canvas_id: z.string(),
+        release_id: z.string().describe('Release id from list_releases'),
+        agent_name: agentName,
+      },
+      outputSchema: {
+        release_name: z.string(),
+        changed_count: z.number(),
+        frames: z.array(
+          z.object({
+            frame_id: z.string(),
+            name: z.string(),
+            changed: z.boolean(),
+            status: z.enum(['changed', 'unchanged', 'added', 'removed']),
+            changed_ratio: z.number().optional(),
+            text_added: z.number().optional(),
+            text_removed: z.number().optional(),
+          }),
+        ),
+      },
+    },
+    async ({ canvas_id, release_id, agent_name }) => {
+      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      arrive(canvas_id, agent_name)
+      try {
+        const diff = await diffRelease(canvas_id, release_id)
+        return structured({
+          release_name: diff.releaseName,
+          changed_count: diff.changedCount,
+          frames: diff.frames.map((frame) => ({
+            frame_id: frame.frameId,
+            name: frame.name,
+            changed: frame.changed,
+            status: frame.status,
+            ...(frame.changedRatio === undefined ? {} : { changed_ratio: frame.changedRatio }),
+            ...(frame.textAdded === undefined ? {} : { text_added: frame.textAdded }),
+            ...(frame.textRemoved === undefined ? {} : { text_removed: frame.textRemoved }),
+          })),
+        })
+      } catch (e) {
+        /* diffRelease throws for a missing canvas, a missing release and a
+           release of another canvas — all three are "you named something that
+           is not here" from the caller's side */
+        return err('not_found', e instanceof Error ? e.message : `no release ${release_id} on this canvas`)
+      }
+    },
+  )
+
+  tool(
     'create_release',
     {
       annotations: { readOnlyHint: false, destructiveHint: false },
       title: 'Freeze the canvas as a release',
       description:
-        'Snapshot every frame as it is right now and return a public, permanent preview URL (/p/<canvas>/<release>). Frames keep changing afterwards, so a handoff needs a frozen artifact: send this URL to a client, attach it to a pull request (open_pull_request accepts release_id) or point a listing at it. The snapshot is stored whole — later edits, renames and deletions on the canvas never change it. Restoring it later is possible with restore_release.',
+        'Snapshot every frame as it is right now and return a public, permanent preview URL (/p/<canvas>/<release>). Frames keep changing afterwards, so a handoff needs a frozen artifact: send this URL to a client, attach it to a pull request (open_pull_request accepts release_id) or point a listing at it. The snapshot is stored whole — later edits, renames and deletions on the canvas never change it. Restoring it later is possible with restore_release. Every non-demo frame on the canvas must hold a CURRENT passing review, or this refuses with conflict naming the frames: run review_canvas to sweep them, or force: true to release an unverified canvas deliberately.',
       inputSchema: {
         canvas_id: z.string(),
         name: z.string().max(120).optional().describe('A label for this release, e.g. "v2 — pricing review"'),
+        force: z
+          .boolean()
+          .optional()
+          .describe(
+            'Release even though frames on this canvas are not currently verified — state that in your summary',
+          ),
         agent_name: agentName,
       },
       outputSchema: {
@@ -9449,12 +10265,17 @@ export function buildMcpServer(
         created_at: z.number(),
       },
     },
-    async ({ canvas_id, name, agent_name }) => {
+    async ({ canvas_id, name, force, agent_name }) => {
       const c = canvasFor(canvas_id)
       if (!c) return noCanvas(canvas_id)
       arrive(canvas_id, agent_name)
       const frames = c.frames.filter((f) => !f.demo)
       if (frames.length === 0) return err('not_found', 'this canvas has no frames to release')
+      /* a release is a frozen artifact handed to a client, so it is a ship
+         path: every frame in it has to be verified now, not whenever it was
+         last looked at */
+      const unverified = await shipRefusal(canvas_id, force)
+      if (unverified) return unverified
       const actor = actorFrom(agent_name)
       const release: persist.CanvasRelease = {
         id: nanoid(10),
@@ -9602,10 +10423,16 @@ export function buildMcpServer(
       annotations: { readOnlyHint: false, destructiveHint: true },
       title: 'Put a release’s frames back on the canvas',
       description:
-        'Write a release’s frames back onto the live canvas, as ordinary edits: each frame is written through the same path as any other edit, so the restore is logged, streamed to the room and reversible frame by frame with get_frame_history + revert_frame. Frames that no longer exist are recreated; frames added after the release are left alone.',
+        'Write a release’s frames back onto the live canvas, as ordinary edits: each frame is written through the same path as any other edit, so the restore is logged, streamed to the room and reversible frame by frame with get_frame_history + revert_frame. Frames that no longer exist are recreated; frames added after the release are left alone. Every non-demo frame on the canvas must hold a CURRENT passing review, or this refuses with conflict naming the frames: run review_canvas to sweep them, or force: true to restore anyway.',
       inputSchema: {
         canvas_id: z.string(),
         release_id: z.string(),
+        force: z
+          .boolean()
+          .optional()
+          .describe(
+            'Restore even though frames on this canvas are not currently verified — state that in your summary',
+          ),
         agent_name: agentName,
       },
       outputSchema: {
@@ -9613,12 +10440,17 @@ export function buildMcpServer(
         skipped: z.array(z.object({ name: z.string(), reason: z.string() })),
       },
     },
-    async ({ canvas_id, release_id, agent_name }) => {
+    async ({ canvas_id, release_id, force, agent_name }) => {
       const c = canvasFor(canvas_id)
       if (!c) return noCanvas(canvas_id)
       arrive(canvas_id, agent_name)
       const gated = reviewGate(canvas_id)
       if (gated) return gated
+      /* restoring rewrites the live canvas from a snapshot, and the frames that
+         come back are whatever was frozen — so the canvas has to be verified
+         before it is moved under a caller who is about to ship it */
+      const unverified = await shipRefusal(canvas_id, force)
+      if (unverified) return unverified
       const release = await persist.getRelease(release_id)
       if (!release || release.canvasId !== canvas_id) return err('not_found', `no release ${release_id} on this canvas`)
       const actor = actorFrom(agent_name)
@@ -9687,22 +10519,32 @@ export function buildMcpServer(
       annotations: { readOnlyHint: false, destructiveHint: false },
       title: 'List the canvas in the community gallery',
       description:
-        'Publish this canvas to the Doop community gallery with a short description and a shelf. Owner-only. The gallery hands out previews and copies — never the source canvas or a seat in its room. Pass release_id to publish the frozen snapshot instead of the live frames.',
+        'Publish this canvas to the Doop community gallery with a short description and a shelf. Owner-only. The gallery hands out previews and copies — never the source canvas or a seat in its room. Pass release_id to publish the frozen snapshot instead of the live frames. Every non-demo frame on the canvas must hold a CURRENT passing review, or this refuses with conflict naming the frames: run review_canvas to sweep them, or force: true to list an unverified canvas deliberately.',
       inputSchema: {
         canvas_id: z.string(),
         description: z.string().max(280).optional(),
         category: z.enum(COMMUNITY_CATEGORIES).describe('gallery shelf the canvas is listed under'),
         release_id: z.string().optional().describe('Publish this release rather than the live canvas'),
+        force: z
+          .boolean()
+          .optional()
+          .describe(
+            'Publish even though frames on this canvas are not currently verified — state that in your summary',
+          ),
         agent_name: agentName,
       },
       outputSchema: { published_at: z.number(), description: z.string().optional(), category: z.string() },
     },
-    async ({ canvas_id, description, category, release_id, agent_name }) => {
+    async ({ canvas_id, description, category, release_id, force, agent_name }) => {
       const c = canvasFor(canvas_id)
       if (!c) return noCanvas(canvas_id)
       arrive(canvas_id, agent_name)
       const gated = reviewGate(canvas_id)
       if (gated) return gated
+      /* a listing hands the design to strangers, so it is a ship path: the
+         canvas it points at has to be verified end to end first */
+      const unverified = await shipRefusal(canvas_id, force)
+      if (unverified) return unverified
       const release = release_id ? await persist.getRelease(release_id) : undefined
       if (release_id && (!release || release.canvasId !== canvas_id))
         return err('not_found', `no release ${release_id} on this canvas`)
@@ -9947,76 +10789,18 @@ export function buildMcpServer(
     },
   )
 
-  /* ---- run lifecycle: what a run changed, its timeline, and the run undo ---- */
+  /* ---- run timeline: what every agent did, in one place ---- */
 
   /* The run timeline ring holds 500 events per canvas; one read of the whole
      ring is what makes the cursor a plain offset, with no server-side state. */
   const RUN_EVENT_SCAN = 500
-  /* A journal is written at teardown, after the run's own writes. A frame
-     updated later than the journal by more than this is someone else's work,
-     and a revert must not discard it. */
-  const REVERT_RUN_GRACE_MS = 5_000
-
-  tool(
-    'get_run_changes',
-    {
-      title: 'What a run changed',
-      description:
-        "A run's change set: the frames it touched, each with the version it started from and the one it produced, plus the run's summary and the decisions it recorded. Pick the run with run_id (from get_run_events) or card_id (from list_cards). Empty frames means the run recorded no frame changes. Undo the whole set with revert_run.",
-      annotations: { readOnlyHint: true, destructiveHint: false },
-      inputSchema: {
-        canvas_id: z.string(),
-        run_id: z.string().optional().describe('A run id from get_run_events or get_run_changes'),
-        card_id: z.string().optional().describe('A board card id from list_cards — resolves the run that worked it'),
-        agent_name: agentName.optional(),
-      },
-    },
-    async ({ canvas_id, run_id, card_id, agent_name }) => {
-      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
-      if (!run_id && !card_id) return err('invalid_input', 'pass run_id or card_id to pick the run')
-      if (agent_name) arrive(canvas_id, agent_name)
-      const journal = actions.getRunJournalBy(canvas_id, {
-        ...(run_id ? { runId: run_id } : {}),
-        ...(card_id ? { cardId: card_id } : {}),
-      })
-      if (!journal)
-        return err(
-          'not_found',
-          `no run journal for ${run_id ? `run ${run_id}` : `card ${card_id}`} on this canvas — read the timeline with get_run_events`,
-        )
-      /* the decisions blob is a JSON string the resident wrote: hand it back
-         parsed when it is valid JSON, so a reader does not have to parse it */
-      let decisions: unknown
-      if (journal.decisions !== undefined) {
-        try {
-          decisions = JSON.parse(journal.decisions)
-        } catch {
-          decisions = journal.decisions
-        }
-      }
-      const journalRunId = journal.runId ?? journal.id
-      return structured({
-        run_id: journalRunId,
-        ...(journal.cardId ? { card_id: journal.cardId } : {}),
-        agent: journal.agentName,
-        summary: journal.summary,
-        frames: (journal.frames ?? []).map((entry) => ({
-          frame_id: entry.frameId,
-          name: entry.name,
-          ...(entry.beforeVersionId ? { before_version_id: entry.beforeVersionId } : {}),
-          ...(entry.afterVersionId ? { after_version_id: entry.afterVersionId } : {}),
-        })),
-        ...(decisions !== undefined ? { decisions } : {}),
-      })
-    },
-  )
 
   tool(
     'get_run_events',
     {
       title: 'Read a run’s timeline',
       description:
-        'The run timeline, newest first: one entry per model turn, tool call, status line, error and stop, with its agent, outcome and duration. Filter to one run with run_id, or read the canvas’s whole recent history. Page with cursor: pass the previous next_offset back as cursor.',
+        'The run timeline, newest first: one entry per tool call an agent made on this canvas, with the agent, the outcome and how long it took, plus any status, error or stop that was recorded. Filter to one run with run_id, or read the canvas’s whole recent history. Page with cursor: pass the previous next_offset back as cursor.',
       annotations: { readOnlyHint: true, destructiveHint: false },
       inputSchema: {
         canvas_id: z.string(),
@@ -10057,173 +10841,6 @@ export function buildMcpServer(
     },
   )
 
-  tool(
-    'revert_run',
-    {
-      title: 'Undo everything a run changed',
-      description:
-        'Put every frame a run changed back to the version it started from — the run-level undo, for a redesign that went wrong. Read the change set with get_run_changes first. A frame someone else has edited since the run, or deleted since, is skipped and reported instead of being clobbered.',
-      annotations: { readOnlyHint: false, destructiveHint: true },
-      inputSchema: {
-        canvas_id: z.string(),
-        run_id: z.string().describe('The run to undo, from get_run_changes or get_run_events'),
-        agent_name: agentName,
-      },
-    },
-    async ({ canvas_id, run_id, agent_name }) => {
-      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
-      const gated = reviewGate(canvas_id)
-      if (gated) return gated
-      const journal = actions.getRunJournalBy(canvas_id, { runId: run_id })
-      if (!journal) return err('not_found', `no run journal for ${run_id} on this canvas`)
-      const actor = actorFrom(agent_name)
-      const entries = journal.frames ?? []
-      if (entries.length === 0)
-        return withFeedback(
-          structured({ reverted: [], skipped: [], note: 'this run recorded no frame changes' }),
-          canvas_id,
-          actor,
-        )
-      const reverted: string[] = []
-      const skipped: { frame_id: string; reason: string }[] = []
-      for (const entry of entries) {
-        if (!entry.beforeVersionId) {
-          skipped.push({ frame_id: entry.frameId, reason: 'no starting version was recorded for this frame' })
-          continue
-        }
-        const frame = store.getFrame(entry.frameId)
-        if (!frame || frame.canvasId !== canvas_id) {
-          skipped.push({ frame_id: entry.frameId, reason: 'the frame no longer exists' })
-          continue
-        }
-        if (frame.updatedAt > journal.at + REVERT_RUN_GRACE_MS) {
-          skipped.push({
-            frame_id: entry.frameId,
-            reason: `changed after the run by ${frame.updatedBy} — reverting would discard that work`,
-          })
-          continue
-        }
-        try {
-          const restored = await actions.revertFrame(entry.frameId, entry.beforeVersionId, actor)
-          if (!restored) {
-            skipped.push({ frame_id: entry.frameId, reason: 'the recorded version is no longer stored' })
-            continue
-          }
-          reverted.push(entry.frameId)
-        } catch (e) {
-          const conflict = lockConflict(e)
-          if (!conflict) throw e
-          skipped.push({
-            frame_id: entry.frameId,
-            reason: `still locked by another agent — ${conflict.content[0]?.text}`,
-          })
-        }
-      }
-      return withFeedback(
-        structured({
-          reverted,
-          skipped,
-          note: reverted.length
-            ? `${reverted.length} frame(s) restored to their pre-run version.`
-            : 'nothing was reverted — see skipped for why.',
-        }),
-        canvas_id,
-        actor,
-      )
-    },
-  )
-
-  /* Pausing acts on another account's agent only for the canvas owner and its
-     members — the same rule stop_work applies, since an agent name is typed by
-     the caller and two accounts can both be running a "Claude". */
-  const foreignAgentRefusal = (c: Canvas, canvasId: string, target: string) => {
-    const targetOwners = new Set(
-      actions
-        .getTasks(canvasId)
-        .filter((t) => t.agentName === target && !t.endedAt && !t.cancelledAt && t.ownerId !== undefined)
-        .map((t) => t.ownerId as string),
-    )
-    const foreign = [...targetOwners].some((id) => id !== ownerId)
-    const privileged = ownerId !== undefined && (c.ownerId === ownerId || (c.memberIds ?? []).includes(ownerId))
-    if (!foreign || privileged) return undefined
-    return err('forbidden', `${target} belongs to another account — only the canvas owner or a member can pause it`, {
-      target_agent: target,
-      hint: 'pause your own agent, or ask the canvas owner to pause that one',
-    })
-  }
-
-  tool(
-    'pause_work',
-    {
-      title: 'Pause an agent’s run',
-      description:
-        "Pause an agent's live run without losing its card: the model call aborts, its frame locks are released, and the card goes back to the queue paused instead of failed — resume_work re-claims it, and the run's journal carries the context forward. Pass target_agent to pause another agent (the name you see on the canvas), or omit it to pause yourself.",
-      annotations: { readOnlyHint: false, destructiveHint: false },
-      inputSchema: {
-        canvas_id: z.string(),
-        agent_name: agentName,
-        target_agent: z
-          .string()
-          .optional()
-          .describe('The agent to pause, as named on the canvas. Omit to pause your own run.'),
-      },
-    },
-    async ({ canvas_id, agent_name, target_agent }) => {
-      const c = canvasFor(canvas_id)
-      if (!c) return noCanvas(canvas_id)
-      const target = (target_agent ?? agent_name).trim()
-      if (!target)
-        return err('invalid_input', 'target_agent is empty — name the agent to pause, or omit it to pause yourself')
-      const denied = foreignAgentRefusal(c, canvas_id, target)
-      if (denied) return denied
-      const paused = actions.pauseAgentWork(canvas_id, target, actorFrom(agent_name).name)
-      return structured({
-        ok: paused > 0,
-        paused_agent: target,
-        cards_paused: paused,
-        note:
-          paused > 0
-            ? `${target} was paused. Its card stays open and paused — resume_work re-claims it, and the run's journal carries the context forward.`
-            : `${target} had no live card on this canvas to pause.`,
-      })
-    },
-  )
-
-  tool(
-    'resume_work',
-    {
-      title: 'Resume a paused card',
-      description:
-        "Resume a card a human (or pause_work) paused: the pause clears and the canvas's resident sweep re-fires, so the card is claimed again. Continuity is journal-based — the interrupted message transcript is not replayed, the run's journal and plan are what survive.",
-      annotations: { readOnlyHint: false, destructiveHint: false },
-      inputSchema: {
-        canvas_id: z.string(),
-        card_id: z.string().describe('The paused card, from list_cards'),
-        agent_name: agentName,
-      },
-    },
-    async ({ canvas_id, card_id, agent_name }) => {
-      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
-      if (actions.taskCanvasId(card_id) !== canvas_id)
-        return err('not_found', `no card with id ${card_id} on this canvas`)
-      const before = actions.getTasks(canvas_id).find((t) => t.id === card_id)
-      if (!before) return err('not_found', `no card with id ${card_id} on this canvas`)
-      const wasPaused = before.pausedAt !== undefined
-      const card = actions.resumeCard(canvas_id, card_id, actorFrom(agent_name).name)
-      if (!card) return err('not_found', `no card with id ${card_id} on this canvas`)
-      return structured({
-        ok: true as const,
-        card_id: card.id,
-        resumed: wasPaused,
-        status: card.status,
-        stage: card.stage ?? 0,
-        note: wasPaused
-          ? 'the card is queued again — the next sweep claims it'
-          : 'the card was not paused; nothing changed',
-      })
-    },
-  )
-
   /* The policy may have removed tools, so the surface is smaller than the
      source declares. The endpoint builds a fresh server per POST and this one
      is not connected yet, so the notification is sent from the initialized
@@ -10248,126 +10865,6 @@ function frameIdForPath(c: Canvas, path: string | undefined): string | undefined
   const byId = c.frames.find((f) => base.endsWith(`-${f.id}`))
   if (byId) return byId.id
   return c.frames.find((f) => handoffFileName(f, c.frames) === base)?.id
-}
-
-/** The base name a frame gets in the handoff, deduped by id when two frames
- *  in the exported set share a name so neither overwrites the other. */
-function handoffFileName(frame: Frame, exported: Frame[]): string {
-  const safe = (name: string) =>
-    name
-      .replace(/[^a-z0-9-_]+/gi, '-')
-      .replace(/^-+|-+$/g, '')
-      .toLowerCase() || 'frame'
-  const base = safe(frame.name)
-  /* the set being exported, not the live canvas: a handoff pinned to a release
-     can carry frames that were renamed or deleted since */
-  const clash = exported.filter((f) => safe(f.name) === base)
-  return clash.length > 1 ? `${base}-${frame.id}` : base
-}
-
-/** Everything a developer needs from a canvas, as repository files: each
- *  frame's document, its React component and its build spec, the design system
- *  in three forms, and the assets that could travel as text.
- *
- *  Rendering is required (JSX and specs come from the browser), so this is
- *  async; a frame that cannot be rendered still ships its HTML and says so. */
-async function designHandoffFiles(
-  c: Canvas,
-  opts: { frames?: Frame[]; pageId?: string; tokens?: DesignTokens } = {},
-): Promise<{ path: string; content: string }[]> {
-  const tokens = opts.tokens ?? c.tokens
-  const frames = (opts.frames ?? c.frames.filter((f) => !f.demo)).filter(
-    (f) => opts.pageId === undefined || f.pageId === opts.pageId,
-  )
-  const notes: string[] = []
-  const perFrame: { path: string; content: string }[] = []
-
-  for (const frame of frames) {
-    const name = handoffFileName(frame, frames)
-    const assets = rewriteAssetUrls(frame.html, './')
-    perFrame.push({ path: `design/${name}.html`, content: assets.html })
-    for (const url of assets.external) {
-      if (!notes.includes(url)) notes.push(url)
-    }
-    try {
-      const react = await htmlToReact(frame.html, { name: frame.name, tokens, frameId: frame.id })
-      perFrame.push({ path: `design/${name}.jsx`, content: rewriteAssetUrls(react.jsx, './').html })
-    } catch {
-      notes.push(`no React component for design/${name}.html: the frame could not be rendered`)
-    }
-    try {
-      const probe = await probeFrame(frame)
-      const [report] = await persist.listFrameReviews(frame.id, 1)
-      perFrame.push({ path: `design/${name}.spec.md`, content: specMd(frame, report, probe, tokens) })
-    } catch {
-      notes.push(`no spec for design/${name}.html: the frame could not be rendered to measure it`)
-    }
-  }
-
-  /* assets that are text (SVG, CSS) travel with the branch; binary ones cannot
-     go through the commit API as text, so they are named for the developer */
-  const binaries: string[] = []
-  for (const id of [...new Set(frames.flatMap((f) => [...assets.extractAssetIds(f.html)]))]) {
-    const asset = await assets.getCanvasAsset(c.id, id)
-    if (!asset) {
-      notes.push(`asset ${id} could not be read and is not in this handoff`)
-      continue
-    }
-    const file = asset.url.replace(/^\/a\//, '')
-    const text = decodeText(asset.data)
-    if (text === undefined) {
-      binaries.push(`design/assets/${file}`)
-      continue
-    }
-    perFrame.push({ path: `design/assets/${file}`, content: text })
-  }
-
-  return [
-    ...perFrame,
-    ...(tokens
-      ? [
-          { path: 'design/tokens.css', content: cssForTokens(tokens) },
-          { path: 'design/tokens.dtcg.json', content: tokensDtcg(tokens) },
-          { path: 'design/tailwind.css', content: tailwindThemeCss(tokens) },
-        ]
-      : []),
-    {
-      path: 'design/DESIGN.md',
-      content: designMd(tokens, c, (frame) => `design/${handoffFileName(frame, frames)}.html`),
-    },
-    { path: 'design/AGENTS.md', content: agentsMd(c, `${PUBLIC_ORIGIN}/mcp`) },
-    {
-      path: 'design/README.md',
-      content: [
-        '# Design handoff',
-        '',
-        `Exported from doop canvas \`${c.id}\` (${c.name}).`,
-        '',
-        'Each `design/*.html` is a self-contained frame document; open it in a browser to see the design.',
-        'The matching `.jsx` is the same design as a React component and `.spec.md` is its build spec:',
-        'measurements, the type ramp, the colors, the structure outline and the verification report it passed.',
-        '`tokens.dtcg.json` is the design system in W3C Design Tokens form; `DESIGN.md` is the same system in prose.',
-        '',
-        ...(binaries.length
-          ? [
-              'These image assets could not be committed as text — add them next to the frames at the same path:',
-              ...binaries.map((path) => `- ${path}`),
-              '',
-            ]
-          : []),
-        ...(notes.length
-          ? ['Third-party URLs these frames load (not bundled):', ...notes.map((url) => `- ${url}`), '']
-          : []),
-      ].join('\n'),
-    },
-  ]
-}
-
-/** The asset's bytes as text, or undefined when they are not valid UTF-8 —
- *  which is what decides whether a file can go through the commit API. */
-function decodeText(data: Buffer): string | undefined {
-  const text = data.toString('utf8')
-  return text.includes('\uFFFD') ? undefined : text
 }
 
 /** Stateless streamable-HTTP MCP endpoint. `opts.readonly` builds the

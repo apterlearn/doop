@@ -81,6 +81,30 @@ export interface FrameReview {
   reviewedBy: string
 }
 
+/** One frame's row in a canvas-wide sweep: the verdict the per-frame review
+ *  gate gave it, and how many findings it carried. */
+export interface CanvasReviewFrame {
+  frameId: string
+  name: string
+  /** `stale` is a stored report that no longer describes the frame and could
+   *  not be re-run; `skipped` is a frame with nothing to fall back on */
+  verdict: 'pass' | 'fail' | 'stale' | 'skipped'
+  blocking: number
+  advisory: number
+  reason?: string
+}
+
+/** The canvas-level sweep: the per-frame `review_frame` gate aggregated over
+ *  every frame a canvas holds, so a human about to ship a whole design asks
+ *  one question — does this canvas pass? — and gets one verdict with a row
+ *  per frame, rather than a frame id per call. */
+export interface CanvasReviewSummary {
+  verdict: 'pass' | 'fail'
+  totals: { pass: number; fail: number; stale: number; skipped: number }
+  frames: CanvasReviewFrame[]
+  durationMs: number
+}
+
 /** A step of an agent's published plan. */
 export interface PlanStep {
   id: string
@@ -324,6 +348,23 @@ export interface Canvas {
   approvalTools?: string[]
 }
 
+/** A frozen snapshot of a canvas: what a handoff link, a pinned gallery
+ *  listing, or a restore reads. Frames are a projection — id, name and size
+ *  only — so a release list never ships a canvas's documents; `url` is the
+ *  public `/p/<canvas>/<release>` link the frozen snapshot renders at. The
+ *  server's `persist.CanvasRelease` carries the frame HTML and tokens and is
+ *  deliberately not this shape. */
+export interface CanvasRelease {
+  id: string
+  canvasId: string
+  name: string
+  /** the public preview link for this frozen snapshot */
+  url: string
+  frames: { id: string; name: string; width: number; height: number }[]
+  createdAt: number
+  createdBy: string
+}
+
 export type ReviewPolicy = 'off' | 'destructive' | 'all_writes'
 
 /* ---- design memory ---- */
@@ -435,6 +476,38 @@ export interface FrameProposal {
   resolutionNote?: string
 }
 
+/** What a canvas-level proposal changes: the design tokens, one guideline doc,
+ *  the responsive breakpoints, or the page set. */
+export type CanvasProposalKind = 'tokens' | 'guidelines' | 'breakpoints' | 'pages'
+
+/** A canvas-level change an agent proposed while the canvas is in review mode —
+ *  the frame-proposal path's counterpart for everything that is not a frame.
+ *  Nothing touches the canvas until a human accepts; accepting applies the
+ *  payload through the ordinary setters, so the change versions, broadcasts
+ *  and logs exactly like a human edit. `before` is the canvas value at propose
+ *  time, so the reviewer sees the change against what it replaces. */
+export interface CanvasProposal {
+  id: string
+  canvasId: string
+  kind: CanvasProposalKind
+  /** the change to apply on accept, shaped per kind: `tokens` carries the
+   *  whole DesignTokens (null clears them); `guidelines` a
+   *  `{ name, markdown }`; `breakpoints` the `{ name, min_width }[]` list
+   *  (empty clears them); `pages` a `{ op, ... }` page operation. */
+  payload: unknown
+  /** the canvas value this was proposed against: the tokens object, that
+   *  doc's markdown, the breakpoint list, or the page list (null = none) */
+  before: unknown
+  proposedBy: string
+  proposedByUser: string
+  status: 'pending' | 'accepted' | 'rejected' | 'withdrawn'
+  /** why a human rejected it (or their note on accept), so the agent can fix
+   *  the right thing instead of guessing */
+  resolutionNote?: string
+  createdAt: number
+  resolvedAt?: number
+}
+
 /** A blocking question an agent asked via ask_human. Open questions surface
  *  on the canvas and in the Review tab; the agent receives the answer inside
  *  its wait (or on its next tool result when it timed out and moved on). */
@@ -466,21 +539,23 @@ export interface AgentQuestion {
   expiresAt: number
 }
 
-/** One step of a resident agent's run: a model turn, a tool call, a status
- *  line, an error, or a stop. The Run tab replays these so a human can see
- *  what the agent actually did. */
+/** One step of an agent's run timeline: a tool call the agent made over MCP.
+ *  The MCP surface records one event per tool call and nothing else; the
+ *  timeline is read back through `get_run_events` and the run-events route so a
+ *  client can see what the agent actually did. */
 export interface RunEvent {
   id: string
   canvasId: string
   runId: string
   agentName: string
   at: number
-  kind: 'turn' | 'tool' | 'status' | 'error' | 'stop'
-  /** tool name for kind 'tool' */
+  /** always 'tool' — the one kind the MCP surface records */
+  kind: 'tool'
+  /** the tool the agent called */
   name?: string
   ok?: boolean
   ms?: number
-  /** one-line result/turn summary (≤200 chars) */
+  /** one-line result summary (≤200 chars) */
   summary?: string
   /** the frame this step wrote, when it wrote one */
   frameId?: string
@@ -488,34 +563,6 @@ export interface RunEvent {
    *  makes a step diffable against its predecessor with diff_frame */
   beforeVersionId?: string
   afterVersionId?: string
-}
-
-/** What an agent did on one past run — the resident's cross-run memory. */
-export interface RunJournal {
-  id: string
-  canvasId: string
-  agentName: string
-  cardId?: string
-  /** the run's own id in the run timeline (runLog) — how a run is resolved
-   *  back to the frames it changed */
-  runId?: string
-  summary: string
-  /** JSON string of what the run touched (frames, guides read) */
-  decisions?: string
-  /** the frames the run changed, each with the version it started from and the
-   *  one it produced — the run's revertible change set */
-  frames?: { frameId: string; name: string; beforeVersionId?: string; afterVersionId?: string }[]
-  /** when the run's first turn started and when it stopped; both absent on a
-   *  journal written before these were recorded */
-  startedAt?: number
-  endedAt?: number
-  /** model turns taken, tool calls made, tokens spent and the money those
-   *  tokens cost (`null` when no price is known for the model) */
-  turns?: number
-  toolCalls?: number
-  tokens?: number
-  costUsd?: number | null
-  at: number
 }
 
 /** What wakes an agent parked in wait_for_events / ask_human. */
@@ -633,7 +680,7 @@ export interface AgentTask {
   attachments?: string[]
   /** index into pipeline of the stage that is queued or running right now */
   stage?: number
-  /** structured board cards the resident runner dispatches on, instead of
+  /** structured board cards an MCP agent dispatches on, instead of
    *  handing the title to the chat agent. Absent on prompt cards. */
   kind?: RepoCardKind
   payload?: RepoCardPayload
@@ -651,11 +698,6 @@ export interface AgentTask {
   targetSelector?: string
   /** page the target frame lives on, so the agent needs no lookup to reach it */
   targetPageId?: string
-  /** a human paused this card's run: the run was aborted and the card is
-   *  skipped by the sweep until explicitly resumed. Not terminal like
-   *  cancelledAt — a resume is one click, not a metered retry. */
-  pausedAt?: number
-  pausedBy?: string
   /** queue ordering: higher first; then position; then arrival */
   priority?: number
   position?: number
@@ -666,21 +708,6 @@ export interface AgentTask {
   /** the sweep must not start this card before this time; unset means it is
    *  due as soon as it reaches the front of the queue */
   scheduledAt?: number
-  /** what the card's run cost, as the provider reported it */
-  usage?: TaskUsage
-}
-
-/** Provider-reported token usage for one card's run. */
-export interface TaskUsage {
-  input: number
-  output: number
-  cacheRead: number
-  cacheWrite: number
-  model?: string
-  /** what those tokens cost in USD, priced from `model` by modelPrices.ts;
-   *  null (or absent, on usage recorded before prices existed) means the
-   *  model had no known price — no cost, never a guessed one */
-  costUsd?: number | null
 }
 
 export type RepoCardKind = 'sketch' | 'design-system'
@@ -714,7 +741,7 @@ export interface TaskFeedback {
   canvasId: string
   /** whose work the feedback is about (the task's agent), not who must handle it */
   agentName: string
-  /** the resident agent this is routed to; unset = open to any agent */
+  /** the agent this is routed to; unset = open to any agent */
   targetAgent?: string
   from: string
   /** account id of the human who left it — decides which model credential runs it */
@@ -728,16 +755,16 @@ export interface TaskFeedback {
   /** the account that agent's token belonged to — what stops an agent on
    *  another account from inheriting a claim by typing the same name */
   claimedByOwner?: string
-  /** resident Doop finished handling this feedback */
+  /** the agent that claimed it finished handling this feedback */
   completedAt?: number
-  /** unsuccessful resident-agent attempt; never retried automatically */
+  /** unsuccessful agent attempt; never retried automatically */
   failedAt?: number
   failureReason?: string
 }
 
 /** A comment pinned to a specific element inside a frame. Comments that
- *  mention @Doop are routed to the resident agent; others are notes for
- *  the humans in the room. */
+ *  @mention a role on the card (or a connected agent by name) are routed to
+ *  that agent; others are notes for the humans in the room. */
 export interface ElementComment {
   id: string
   canvasId: string
@@ -755,9 +782,9 @@ export interface ElementComment {
   fromUserId?: string
   text: string
   at: number
-  /** true when the text @mentions a resident agent — that agent picks it up */
+  /** true when the text @mentions an agent — that agent picks it up */
   forAgent?: boolean
-  /** which resident agent was mentioned; defaults to Doop */
+  /** which agent was mentioned; defaults to Doop */
   targetAgent?: string
   claimedBy?: string
   /** the account that agent's token belonged to — see TaskFeedback.claimedByOwner */
@@ -820,6 +847,9 @@ export type ServerMessage =
       selfColor: string
       /** pending agent frame-change proposals awaiting review */
       frameProposals: FrameProposal[]
+      /** pending agent canvas-level proposals awaiting review (tokens, a
+       *  guideline doc, the breakpoints, the page set) */
+      canvasProposals?: CanvasProposal[]
       /** open agent questions awaiting a human answer */
       questions: AgentQuestion[]
       /** whether agent frame writes must be approved before they land */
@@ -878,9 +908,12 @@ export type ServerMessage =
   /** an agent proposed a frame change (review mode), or it was resolved */
   | { type: 'frameProposal'; proposal: FrameProposal }
   | { type: 'frameProposal:deleted'; proposalId: string }
+  /** an agent proposed a canvas-level change (tokens, a guideline doc, the
+   *  breakpoints, the pages) under review mode, or it was resolved */
+  | { type: 'canvasProposal'; proposal: CanvasProposal }
   /** an agent asked a question, or a human answered it */
   | { type: 'question'; question: AgentQuestion }
-  /** a resident agent emitted a run-timeline event (tool call, turn, stop) */
+  /** an MCP agent recorded a tool call on the canvas run timeline */
   | { type: 'run:event'; event: RunEvent }
   /** review mode was toggled */
   | { type: 'canvas:reviewMode'; reviewMode: boolean; actor: Actor }

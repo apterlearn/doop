@@ -16,7 +16,6 @@ vi.mock('../server/db/persist.ts', () => ({
   getNotificationPrefs: async () => new Map(),
   saveNotificationPref: () => {},
   pruneRunEvents: () => {},
-  saveJournal: () => {},
   saveRunEvent: () => {},
   saveQuestion: () => {},
   saveFrameProposal: () => {},

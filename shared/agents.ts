@@ -1,6 +1,7 @@
 /**
- * The resident design team. Every board card names one or more of these
- * roles; the card walks them in order, one stage at a time.
+ * The design team a board card names. Every card lists one or more of these
+ * roles and walks them in order, one stage at a time; a connected MCP agent
+ * takes whichever stage is queued.
  *
  * A role IS an agent identity: `name` is what shows up in presence, in the
  * activity feed and in @mentions, and colorFor(name) gives it its colour, so

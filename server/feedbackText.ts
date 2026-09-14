@@ -1,10 +1,9 @@
 /**
  * The one wording for "a human asked you for something".
  *
- * Feedback reaches an agent by two routes: an external MCP agent is told on its
- * next tool result (the pull channel), and a resident run is told between turns
- * (the push channel). Both must read the same, or an agent that has seen one
- * will not recognize the other as the same instruction.
+ * Feedback reaches an agent one way: an MCP agent is told on its next tool
+ * result — MCP is pull-based, so there is no channel between turns. One
+ * wording, so an agent that has seen the block once recognizes it next time.
  */
 export interface PendingFeedbackLine {
   from: string
@@ -13,9 +12,9 @@ export interface PendingFeedbackLine {
   about?: string
 }
 
-/** How the receiving surface's tools are named in the block. The resident loop
- *  registers a different set from the MCP surface, and telling an agent to call
- *  a tool it does not have is a turn wasted on a failed call. */
+/** How the MCP surface's tools are named in the block. The names are a
+ *  parameter (defaulting to the MCP set), so the block never tells an agent to
+ *  call a tool it does not have — that is a turn wasted on a failed call. */
 export interface FeedbackToolNames {
   /** the call(s) that find and read the frame the feedback is about */
   locate: string
@@ -37,11 +36,11 @@ export function feedbackAbout(input: { taskStatus?: string; mine: boolean; agent
   return ` (about ${whose} work: “${input.taskStatus}”)`
 }
 
-/** The message shape the resident loop keeps: an Anthropic conversation. The
- *  content is opaque here because this module only ever appends a text block
- *  to it — the loop owns the block types. */
+/** The message shape an agent's conversation keeps: an Anthropic conversation.
+ *  The content is opaque here because this module only ever appends a text block
+ *  to it — the caller owns the block types. */
 export interface LoopMessage {
-  /** the SDK's own role union, so the loop's message array is assignable here
+  /** the SDK's own role union, so the caller's message array is assignable here
    *  without a cast; this module only ever pushes `user` */
   role: 'user' | 'assistant' | 'system'
   content: string | unknown[]
@@ -49,10 +48,10 @@ export interface LoopMessage {
 
 /** Put the feedback block in front of the model on the very next turn.
  *
- *  It rides with the message the loop is about to send: after a turn that used
- *  tools, that message is the tool results, and the protocol requires those to
- *  be answered before anything else — a second user message in a row would
- *  break the alternation the Messages API expects. */
+ *  It rides with the message the caller is about to send: after a turn that
+ *  used tools, that message is the tool results, and the protocol requires
+ *  those to be answered before anything else — a second user message in a row
+ *  would break the alternation the Messages API expects. */
 export function injectFeedback(messages: LoopMessage[], block: string): void {
   const last = messages[messages.length - 1]
   if (last?.role === 'user') {

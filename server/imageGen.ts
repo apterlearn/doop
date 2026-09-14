@@ -3,7 +3,7 @@ import type { ModelAccount } from './modelAccounts.ts'
 
 /**
  * Image generation for design agents: the provider behind the generate_image
- * tool in mcp.ts and resident.ts. Search (server/imageSearch.ts) finds a photo
+ * tool in mcp.ts. Search (server/imageSearch.ts) finds a photo
  * that already exists; this makes one that does not.
  *
  * The credential comes from the same place a model turn's does: the caller's
@@ -53,11 +53,11 @@ export function imageProvider(): 'openai' | 'none' {
 }
 
 /**
- * Resolve the credential for one caller. A connected account wins outright,
- * the same way pickModel (server/agentModel.ts) prefers it: someone who has
- * just linked their own key expects the very next call to run on it. Only the
- * `openai-key` kind is usable — a ChatGPT OAuth token is not accepted by the
- * Images API — and the server key is the fallback, not the default.
+ * Resolve the credential for one caller. A connected account wins outright:
+ * someone who has just linked their own key expects the very next call to run
+ * on it. Only the `openai-key` kind is usable — a ChatGPT OAuth token is not
+ * accepted by the Images API — and the server key is the fallback, not the
+ * default.
  */
 export async function resolveImageCredential(payerId?: string): Promise<ImageCredential | null> {
   if (payerId) {

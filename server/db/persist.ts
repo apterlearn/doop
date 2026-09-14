@@ -14,6 +14,7 @@ import type {
   AgentQuestion,
   AgentTask,
   Canvas,
+  CanvasProposal,
   Component,
   DesignDecision,
   ElementComment,
@@ -30,7 +31,6 @@ import type {
   RepoCardKind,
   RepoCardPayload,
   RunEvent,
-  RunJournal,
   TaskFeedback,
   UserMemory,
 } from '../../shared/types.ts'
@@ -276,8 +276,9 @@ export async function getFrameVersion(versionId: string): Promise<FrameVersion |
 }
 
 /* Verification reports: append-only, capped per frame. Written from the
-   review_frame tool and the resident gate, read by the checks panel and by
-   the gate itself when it decides whether a delivery may complete. */
+   review_frame and review_canvas tools, read by the checks panel and by the
+   completion gate (complete_card, hand_back) when it decides whether a
+   delivery may complete. */
 const MAX_FRAME_REVIEWS = 20
 
 export async function saveFrameReview(review: FrameReview): Promise<void> {
@@ -659,7 +660,7 @@ export function saveProposal(canvasId: string, p: MemoryProposal) {
   )
 }
 
-/* ---- review mode, questions, run timeline, journals, notification prefs ---- */
+/* ---- review mode, questions, run timeline, notification prefs ---- */
 
 export function saveFrameProposal(canvasId: string, p: FrameProposal) {
   const row = {
@@ -699,6 +700,75 @@ export function saveFrameProposal(canvasId: string, p: FrameProposal) {
         },
       }),
   )
+}
+
+function toCanvasProposal(row: typeof t.canvasProposals.$inferSelect): CanvasProposal {
+  return {
+    id: row.id,
+    canvasId: row.canvasId,
+    kind: row.kind as CanvasProposal['kind'],
+    payload: row.payload,
+    before: row.before,
+    proposedBy: row.proposedBy,
+    proposedByUser: row.proposedByUser,
+    status: row.status as CanvasProposal['status'],
+    ...(row.resolutionNote != null ? { resolutionNote: row.resolutionNote } : {}),
+    createdAt: row.createdAt,
+    ...(row.resolvedAt != null ? { resolvedAt: row.resolvedAt } : {}),
+  }
+}
+
+/** Persist a canvas-level proposal (and, through the same upsert, the
+ *  resolution the accept/reject path writes onto it). */
+export async function saveCanvasProposal(p: CanvasProposal): Promise<void> {
+  const row = {
+    id: p.id,
+    canvasId: p.canvasId,
+    kind: p.kind,
+    payload: (p.payload ?? null) as object | null,
+    before: (p.before ?? null) as object | null,
+    proposedBy: p.proposedBy,
+    proposedByUser: p.proposedByUser,
+    status: p.status,
+    resolutionNote: p.resolutionNote ?? null,
+    createdAt: p.createdAt,
+    resolvedAt: p.resolvedAt ?? null,
+  }
+  await db
+    .insert(t.canvasProposals)
+    .values(row)
+    .onConflictDoUpdate({
+      target: t.canvasProposals.id,
+      set: { status: row.status, resolutionNote: row.resolutionNote, resolvedAt: row.resolvedAt },
+    })
+}
+
+/** A canvas's proposals, newest first — cold path, read from the DB. */
+export async function listCanvasProposals(
+  canvasId: string,
+  opts: { status?: CanvasProposal['status'] } = {},
+): Promise<CanvasProposal[]> {
+  const rows = await db
+    .select()
+    .from(t.canvasProposals)
+    .where(
+      opts.status
+        ? and(eq(t.canvasProposals.canvasId, canvasId), eq(t.canvasProposals.status, opts.status))
+        : eq(t.canvasProposals.canvasId, canvasId),
+    )
+    .orderBy(desc(t.canvasProposals.createdAt))
+  return rows.map(toCanvasProposal)
+}
+
+/** Record a proposal's resolution without re-writing the row's payload. */
+export async function resolveCanvasProposal(
+  id: string,
+  patch: { status: CanvasProposal['status']; note?: string; resolvedAt: number },
+): Promise<void> {
+  await db
+    .update(t.canvasProposals)
+    .set({ status: patch.status, resolutionNote: patch.note ?? null, resolvedAt: patch.resolvedAt })
+    .where(eq(t.canvasProposals.id, id))
 }
 
 export function saveQuestion(q: AgentQuestion) {
@@ -747,22 +817,6 @@ export function saveRunEvent(e: RunEvent) {
       ok: e.ok ?? null,
       ms: e.ms ?? null,
       summary: e.summary ?? null,
-    }),
-  )
-}
-
-export function saveJournal(j: RunJournal) {
-  swallow(
-    db.insert(t.runJournals).values({
-      id: j.id,
-      canvasId: j.canvasId,
-      agentName: j.agentName,
-      cardId: j.cardId ?? null,
-      runId: j.runId ?? null,
-      summary: j.summary,
-      decisions: j.decisions ?? null,
-      frames: j.frames ?? null,
-      at: j.at,
     }),
   )
 }
@@ -911,16 +965,6 @@ function parseHandback(raw: string | null): Pick<AgentTask, 'handback'> {
   }
 }
 
-function parseUsage(raw: string | null): Pick<AgentTask, 'usage'> {
-  if (!raw) return {}
-  try {
-    const parsed = JSON.parse(raw) as AgentTask['usage']
-    return parsed ? { usage: parsed } : {}
-  } catch {
-    return {}
-  }
-}
-
 export function saveTask(canvasId: string, task: AgentTask) {
   const row = {
     id: task.id,
@@ -948,13 +992,10 @@ export function saveTask(canvasId: string, task: AgentTask) {
     targetFrameIds: task.targetFrameIds?.join(',') ?? null,
     targetSelector: task.targetSelector ?? null,
     targetPageId: task.targetPageId ?? null,
-    pausedAt: task.pausedAt ?? null,
-    pausedBy: task.pausedBy ?? null,
     priority: task.priority ?? null,
     position: task.position ?? null,
     stageSummary: task.stageSummary ?? null,
     handback: task.handback ? JSON.stringify(task.handback) : null,
-    usage: task.usage ? JSON.stringify(task.usage) : null,
   }
   swallow(
     db
@@ -975,13 +1016,10 @@ export function saveTask(canvasId: string, task: AgentTask) {
           /* a stop lands on an already-inserted row, so it must be updatable */
           cancelledAt: row.cancelledAt,
           cancelledBy: row.cancelledBy,
-          pausedAt: row.pausedAt,
-          pausedBy: row.pausedBy,
           priority: row.priority,
           position: row.position,
           stageSummary: row.stageSummary,
           handback: row.handback,
-          usage: row.usage,
         },
       }),
   )
@@ -1116,12 +1154,14 @@ export interface Hydrated {
   plans: Map<string, Map<string, AgentPlan>>
   /** canvasId -> proposals, newest first */
   frameProposals: Map<string, FrameProposal[]>
+  /** canvasId -> canvas-level proposals (tokens, guidelines, breakpoints,
+   *  pages), newest first — the review queue must survive a restart, or a
+   *  pending proposal would be un-resolvable */
+  canvasProposals: Map<string, CanvasProposal[]>
   /** canvasId -> questions, newest first */
   questions: Map<string, AgentQuestion[]>
   /** canvasId -> run events, newest first */
   runEvents: Map<string, RunEvent[]>
-  /** canvasId -> journals, newest first */
-  journals: Map<string, RunJournal[]>
   /** userId -> wants email on agent events */
   notificationPrefs: Map<string, boolean>
   /** the canvas component library, keyed by canvas — absent on a hydrate
@@ -1149,9 +1189,9 @@ export async function hydrate(): Promise<Hydrated> {
     pageRows,
     planRows,
     frameProposalRows,
+    canvasProposalRows,
     questionRows,
     runEventRows,
-    journalRows,
     notificationRows,
     componentRows,
     userMemoryRows,
@@ -1170,9 +1210,9 @@ export async function hydrate(): Promise<Hydrated> {
     db.select().from(t.pages).orderBy(t.pages.position),
     db.select().from(t.agentPlans),
     db.select().from(t.frameProposals).orderBy(desc(t.frameProposals.at)),
+    db.select().from(t.canvasProposals).orderBy(desc(t.canvasProposals.createdAt)),
     db.select().from(t.agentQuestions).orderBy(desc(t.agentQuestions.at)),
     db.select().from(t.runEvents).orderBy(desc(t.runEvents.at)),
-    db.select().from(t.runJournals).orderBy(desc(t.runJournals.at)),
     db.select().from(t.notificationPrefs),
     db.select().from(t.components),
     db.select().from(t.userMemory).orderBy(desc(t.userMemory.createdAt)),
@@ -1322,13 +1362,10 @@ export async function hydrate(): Promise<Hydrated> {
       ...(row.targetFrameIds ? { targetFrameIds: row.targetFrameIds.split(',').filter(Boolean) } : {}),
       ...(row.targetSelector != null ? { targetSelector: row.targetSelector } : {}),
       ...(row.targetPageId != null ? { targetPageId: row.targetPageId } : {}),
-      ...(row.pausedAt != null ? { pausedAt: row.pausedAt } : {}),
-      ...(row.pausedBy != null ? { pausedBy: row.pausedBy } : {}),
       ...(row.priority != null ? { priority: row.priority } : {}),
       ...(row.position != null ? { position: row.position } : {}),
       ...(row.stageSummary != null ? { stageSummary: row.stageSummary } : {}),
       ...parseHandback(row.handback),
-      ...parseUsage(row.usage),
       ...repoCardFields(row.kind, row.payload),
     })
     tasks.set(row.canvasId, list)
@@ -1338,8 +1375,10 @@ export async function hydrate(): Promise<Hydrated> {
   for (const row of feedbackRows) {
     const list = feedback.get(row.canvasId) ?? []
     if (list.length >= LOG_CAP) continue
-    /* only resident agents run in-process; feedback claimed by an outside MCP
-       agent may still be in flight elsewhere, so it is left alone */
+    /* feedback claimed by a pipeline role is run in this process: a claim
+       still open at boot means that run died. Work claimed by any other name
+       belongs to an outside agent, which may still be working elsewhere, so
+       it is left alone. */
     const interrupted =
       roleByAgentName(row.claimedBy ?? undefined) != null &&
       row.deliveredAt != null &&
@@ -1498,6 +1537,14 @@ export async function hydrate(): Promise<Hydrated> {
     frameProposals.set(row.canvasId, list)
   }
 
+  const canvasProposals = new Map<string, CanvasProposal[]>()
+  for (const row of canvasProposalRows) {
+    const list = canvasProposals.get(row.canvasId) ?? []
+    if (list.length >= LOG_CAP) continue
+    list.push(toCanvasProposal(row))
+    canvasProposals.set(row.canvasId, list)
+  }
+
   const questions = new Map<string, AgentQuestion[]>()
   for (const row of questionRows) {
     const list = questions.get(row.canvasId) ?? []
@@ -1548,30 +1595,6 @@ export async function hydrate(): Promise<Hydrated> {
     runEvents.set(row.canvasId, list)
   }
 
-  const journals = new Map<string, RunJournal[]>()
-  for (const row of journalRows) {
-    const list = journals.get(row.canvasId) ?? []
-    if (list.length >= LOG_CAP) continue
-    list.push({
-      id: row.id,
-      canvasId: row.canvasId,
-      agentName: row.agentName,
-      ...(row.cardId != null ? { cardId: row.cardId } : {}),
-      ...(row.runId != null ? { runId: row.runId } : {}),
-      summary: row.summary,
-      ...(row.decisions != null ? { decisions: row.decisions } : {}),
-      ...(row.frames ? { frames: row.frames } : {}),
-      ...(row.startedAt != null ? { startedAt: row.startedAt } : {}),
-      ...(row.endedAt != null ? { endedAt: row.endedAt } : {}),
-      ...(row.turns != null ? { turns: row.turns } : {}),
-      ...(row.toolCalls != null ? { toolCalls: row.toolCalls } : {}),
-      ...(row.tokens != null ? { tokens: row.tokens } : {}),
-      ...(row.costUsd != null ? { costUsd: row.costUsd } : {}),
-      at: row.at,
-    })
-    journals.set(row.canvasId, list)
-  }
-
   const notificationPrefs = new Map<string, boolean>(notificationRows.map((r) => [r.userId, r.agentEmail]))
 
   const components = new Map<string, Component[]>()
@@ -1619,9 +1642,9 @@ export async function hydrate(): Promise<Hydrated> {
     proposals,
     plans,
     frameProposals,
+    canvasProposals,
     questions,
     runEvents,
-    journals,
     notificationPrefs,
     components,
     userMemory,

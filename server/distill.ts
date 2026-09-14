@@ -11,8 +11,8 @@ import * as actions from './actions.ts'
  *
  * Event-driven, not scheduled: captureDecision pokes maybeDistill, so quiet
  * canvases cost nothing. Enabled when ANTHROPIC_API_KEY is set; silently
- * disabled otherwise, like the resident agents — unless a connected MCP client
- * declares the `sampling` capability, in which case its model stands in and a
+ * disabled otherwise — unless a connected MCP client declares the `sampling`
+ * capability, in which case its model stands in and a
  * self-hosted instance with no server key still learns from feedback.
  */
 

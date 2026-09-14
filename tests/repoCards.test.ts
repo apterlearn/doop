@@ -1,14 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { RepoScreenRef } from '../shared/types.ts'
 
-/* Same stubs as residentQueue.test.ts: the queue mirrors into Postgres and
-   broadcasts; a unit test only cares about the cards themselves. */
+/* The queue mirrors into Postgres and broadcasts; a unit test only cares about
+   the cards themselves. */
 vi.mock('../server/db/persist.ts', () => ({
   getUserEmail: async () => undefined,
   getNotificationPrefs: async () => new Map(),
   saveNotificationPref: () => {},
   pruneRunEvents: () => {},
-  saveJournal: () => {},
   saveRunEvent: () => {},
   saveQuestion: () => {},
   saveFrameProposal: () => {},
@@ -50,8 +49,7 @@ const AGENT = roleName(DEFAULT_ROLE_ID)
  * The GitHub import queues one structured card per screen (plus the
  * design-system extraction) instead of landing outline frames. These tests
  * pin what the import route relies on: ordering, de-duplication against cards
- * already on the board, and that the cards claim like any other board card
- * while carrying what the runner needs.
+ * already on the board, and the payload a card carries.
  */
 
 const button: RepoScreenRef = {
@@ -100,9 +98,8 @@ describe('addRepoCards', () => {
       importId: cards[0]!.payload!.importId,
       screen: button,
     })
-    /* oldest first is how the sweep works a queue */
+    /* oldest first is the order the queue is worked in */
     expect(cards[0]!.startedAt).toBeLessThan(cards[2]!.startedAt)
-    expect(actions.pendingWorkAgents(canvasId)).toEqual([AGENT])
   })
 
   it('does not queue a screen that is already waiting or in flight from the same connection', () => {
@@ -128,22 +125,6 @@ describe('addRepoCards', () => {
       'user-1',
     )
     expect(fresh.map((c) => c.kind)).toEqual(['sketch'])
-  })
-
-  it('claims like any board card and keeps its payload through the claim', () => {
-    actions.addRepoCards(
-      canvasId,
-      { connectionId: 'conn-1', repo: 'acme/app', screens: [button], designSystem: false },
-      'kevin',
-      'user-1',
-    )
-    expect(actions.nextWorkPayer(canvasId, AGENT)).toBe('user-1')
-    const claimed = actions.takeQueuedCardsFor(canvasId, AGENT, 'user-1')
-    expect(claimed).toHaveLength(1)
-    expect(claimed[0]!.agentName).toBe(AGENT)
-    expect(claimed[0]!.kind).toBe('sketch')
-    expect(claimed[0]!.payload?.screen?.sourcePath).toBe('src/ui/Button.tsx')
-    expect(actions.takeQueuedCardsFor(canvasId, AGENT, 'user-1')).toHaveLength(0)
   })
 })
 

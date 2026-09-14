@@ -3,8 +3,8 @@
  *
  * Agents branch on `code`, not on prose: a `conflict` is retried after a
  * re-read, a `rate_limited` after a wait, a `forbidden` never. The human
- * message stays verbatim inside the JSON payload so existing readers (and the
- * resident prompt guidance that quotes these strings) keep working.
+ * message stays verbatim inside the JSON payload so existing readers keep
+ * working.
  */
 export type McpErrorCode =
   | 'not_found'

@@ -44,7 +44,7 @@ function positiveInt(raw: string | undefined, fallback: number): number {
  *  holding the browser hostage. Override with DOOP_RENDERS_PER_MIN. */
 export const RENDERS_PER_MIN = positiveInt(process.env.DOOP_RENDERS_PER_MIN, 60)
 
-/** Photo search burns the shared Pexels quota (200 req/hour on the free tier). */
+/** Photo search burns the shared Pexels quota (200 req/hour on Pexels' free plan). */
 export const SEARCHES_PER_MIN = 12
 
 /** Image generation is the one call that spends money per result and takes

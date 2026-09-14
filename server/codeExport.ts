@@ -1,8 +1,14 @@
-import type { DesignTokens, Frame, FrameReview } from '../shared/types.ts'
-import type { Probe } from './domProbe.ts'
+import type { Component, DesignTokens, Frame, FrameReview } from '../shared/types.ts'
+import type { CanvasRelease } from './db/persist.ts'
+import type { McpErrorCode } from './mcpErrors.ts'
+import { probeFrame, type Probe } from './domProbe.ts'
 import { loadFramePage } from './screenshot.ts'
 import { frameSha } from './review.ts'
 import { cssForTokens } from '../shared/tokens.ts'
+import { store } from './store.ts'
+import * as actions from './actions.ts'
+import * as assets from './assets.ts'
+import * as persist from './db/persist.ts'
 
 /**
  * Design → code handoff.
@@ -41,20 +47,34 @@ export function componentName(name: string): string {
 /* ------------------------------------------------------------------ */
 /* Tokens as portable code                                             */
 
-/** The tokens as a Tailwind v4 `@theme` block. Same naming as
- *  `cssForTokens` (shared/tokens.ts), the one other place a token becomes a
- *  custom property, except spacing, which Tailwind namespaces `--spacing-*`
- *  where the paste-into-a-frame block uses `--space-*`. */
+/** The tokens as a Tailwind v4 `@theme` block. Two spellings ship on purpose.
+ *
+ *  Tailwind's own namespaces come first (`--spacing-*`, `--font-weight-*`) so
+ *  the utilities resolve: `gap-8`, `font-semibold`.
+ *
+ *  Then the doop render-path spellings as aliases with the same literal value
+ *  (`--space-*`, `--weight-*`) — the names `cssForTokens` (shared/tokens.ts)
+ *  injects into every frame at render time. A frame is authored against those
+ *  names, so without the alias `var(--space-8)` resolves on the canvas and
+ *  falls back to nothing the moment the same design is consumed as this theme.
+ *  Same tokens, two consumers, so both names exist; every other namespace
+ *  already agrees between the two. */
 export function tailwindThemeCss(tokens: DesignTokens): string {
   const lines: string[] = []
   for (const [name, value] of Object.entries(tokens.colors ?? {})) lines.push(`  --color-${name}: ${value.trim()};`)
   for (const [key, value] of Object.entries(tokens.fonts ?? {}))
     if (value) lines.push(`  --font-${key}: ${value.trim()};`)
-  for (const value of tokens.spacing ?? []) lines.push(`  --spacing-${value}: ${value}px;`)
+  for (const value of tokens.spacing ?? []) {
+    lines.push(`  --spacing-${value}: ${value}px;`)
+    lines.push(`  --space-${value}: ${value}px;`)
+  }
   for (const value of tokens.radii ?? []) lines.push(`  --radius-${value}: ${value}px;`)
   for (const [index, value] of (tokens.shadows ?? []).entries()) lines.push(`  --shadow-${index + 1}: ${value.trim()};`)
   for (const value of tokens.type?.size ?? []) lines.push(`  --text-${value}: ${value}px;`)
-  for (const value of tokens.type?.weight ?? []) lines.push(`  --font-weight-${value}: ${value};`)
+  for (const value of tokens.type?.weight ?? []) {
+    lines.push(`  --font-weight-${value}: ${value};`)
+    lines.push(`  --weight-${value}: ${value};`)
+  }
   for (const value of tokens.type?.leading ?? []) lines.push(`  --leading-${value}: ${value};`)
   return `@theme {\n${lines.join('\n')}\n}`
 }
@@ -212,17 +232,38 @@ function mdSection(title: string, body: string[]): string {
   return `## ${title}\n\n${body.join('\n')}\n`
 }
 
+/** One entry of the canvas's component library, as DESIGN.md lists it: what the
+ *  component is, how big it is, how widely the canvas uses it, and where its
+ *  code was written in this export. */
+export interface DesignComponent {
+  name: string
+  description?: string
+  width: number
+  height: number
+  /** frames on the canvas holding an instance of it */
+  instanceCount?: number
+  /** where its React component landed in the export */
+  path?: string
+}
+
 /** DESIGN.md: the canvas's design system as a document a designer or an agent
  *  reads before touching the work. Section order is fixed.
  *
  *  `framePath` names where each frame's document was written in the export the
  *  reader is holding: the layouts differ (`design/<name>.html`, `frames/<name>`),
  *  so the caller supplies it rather than the document guessing a path that does
- *  not exist. */
+ *  not exist.
+ *
+ *  `library` is the canvas's component library: a reader building from this
+ *  document inherits the components the canvas already reuses, not only its
+ *  layouts. `canvas.breakpoints` are the widths the canvas declares it designs
+ *  for — without them the layout section describes sizes but not the widths
+ *  the design is meant to hold at. */
 export function designMd(
   tokens: DesignTokens | undefined,
-  canvas: { name: string; frames: Frame[] },
+  canvas: { name: string; frames: Frame[]; breakpoints?: { name: string; min_width: number }[] },
   framePath?: (frame: Frame) => string,
+  library?: DesignComponent[],
 ): string {
   const frames = canvas.frames.filter((f) => !f.demo)
   const colors = Object.entries(tokens?.colors ?? {})
@@ -250,14 +291,36 @@ export function designMd(
     ...(frames.length
       ? [`- Frame sizes: ${frames.map((f) => `${Math.round(f.width)}x${Math.round(f.height)}`).join(', ')}`]
       : []),
+    ...(canvas.breakpoints?.length
+      ? [`- Breakpoints: ${canvas.breakpoints.map((b) => `${b.name} from ${b.min_width}px`).join(', ')}`]
+      : []),
   ]
 
   const elevation = (tokens?.shadows ?? []).map((value, index) => `- shadow ${index + 1}: \`${value}\``)
   const shapes = (tokens?.radii ?? []).map((value) => `- radius ${value}px`)
-  const components = frames.map((f) => {
+  const frameLines = frames.map((f) => {
     const path = framePath?.(f)
     return `- **${f.name}** — ${Math.round(f.width)}x${Math.round(f.height)}${path ? `; source: \`${path}\`` : ''}`
   })
+  /* the library's pieces and the layouts are both reusable design, but they are
+     read for different reasons — one to drop in, one to lay out — so a canvas
+     that has a library gets them as two lists and a canvas that has none reads
+     exactly as it did before */
+  const libraryLines = (library ?? []).map((entry) => {
+    const meta = [`${Math.round(entry.width)}x${Math.round(entry.height)}`]
+    if (entry.instanceCount !== undefined) meta.push(`${entry.instanceCount} instance(s)`)
+    const name = `- **${entry.name}**${entry.description ? ` — ${entry.description}` : ''}`
+    const source = entry.path ? `; source: \`${entry.path}\`` : ''
+    return `${name} (${meta.join(', ')})${source}`
+  })
+  const components = libraryLines.length
+    ? [
+        'Components in the library:',
+        '',
+        ...libraryLines,
+        ...(frameLines.length ? ['', 'Frames (the layouts):', '', ...frameLines] : []),
+      ]
+    : frameLines
 
   const rules = [
     '- Use the tokens above. A color, size, radius or shadow that is not on these scales is drift: the checks flag it and the delivery gate can refuse it.',
@@ -998,5 +1061,251 @@ async function bodyOf(frame: Frame): Promise<string> {
     })) as string
   } finally {
     await loaded.close()
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* The handoff: a canvas as the files a repository holds               */
+
+/** The canonical public origin, mirrored from `auth.ts` rather than imported:
+ *  auth.ts builds the whole better-auth stack when it loads, and these helpers
+ *  are imported by unit tests that never start a server. githubApp.ts mirrors
+ *  the same constant for the same reason. */
+const PUBLIC_ORIGIN = process.env.BETTER_AUTH_URL || 'http://localhost:4300'
+
+/** A handoff that cannot be built at all: no such canvas, or a release that is
+ *  not this canvas's. `code` is what `mcpErrors.codeFor` reads, so the tool
+ *  that called this answers with the same `not_found` the inline lookup did. */
+export class HandoffError extends Error {
+  readonly code: McpErrorCode
+
+  constructor(message: string, code: McpErrorCode = 'not_found') {
+    super(message)
+    this.name = 'HandoffError'
+    this.code = code
+  }
+}
+
+/** A path-safe base name: `Hero — pricing / v2` -> `hero-pricing-v2`. */
+function slug(name: string, fallback: string): string {
+  const cleaned = name.replace(/[^a-z0-9-_]+/gi, '-').replace(/^-+|-+$/g, '')
+  return cleaned.toLowerCase() || fallback
+}
+
+/** The base name a frame gets in the handoff, deduped by id when two frames
+ *  in the exported set share a name so neither overwrites the other. */
+export function handoffFileName(frame: Frame, exported: Frame[]): string {
+  const base = slug(frame.name, 'frame')
+  /* the set being exported, not the live canvas: a handoff pinned to a release
+     can carry frames that were renamed or deleted since */
+  const clash = exported.filter((f) => slug(f.name, 'frame') === base)
+  return clash.length > 1 ? `${base}-${frame.id}` : base
+}
+
+/** The same naming for the component library: two entries called "Button"
+ *  would otherwise write to the same file. */
+function componentFileName(component: Component, exported: Component[]): string {
+  const base = slug(component.name, 'component')
+  const clash = exported.filter((c) => slug(c.name, 'component') === base)
+  return clash.length > 1 ? `${base}-${component.id}` : base
+}
+
+/** The asset's bytes as text, or undefined when they are not valid UTF-8 —
+ *  which is what decides whether a file can go through the commit API. */
+function decodeText(data: Buffer): string | undefined {
+  const text = data.toString('utf8')
+  return text.includes('\uFFFD') ? undefined : text
+}
+
+/** Everything a repository needs from a canvas: the frame documents, their
+ *  React components and build specs, the component library, the design system
+ *  in three forms, and the assets that could travel as text. */
+export interface HandoffBundle {
+  /** the repository files, keyed by the path they are written to */
+  files: { path: string; content: string }[]
+  /** what the export could not carry: third-party URLs, frames that would not
+   *  render, assets that could not be read. README.md says the same, for a
+   *  reader who never sees this object. */
+  notes: string[]
+  /** the pull request this file set is meant to be opened as */
+  pr: { title: string; body: string }
+}
+
+/** A canvas as the file set of a design handoff — the same documents
+ *  `open_pull_request` commits, built without a GitHub connection so any
+ *  surface can produce them.
+ *
+ *  Rendering is required (JSX and specs come from the browser), so this is
+ *  async; a frame or component that cannot be rendered still ships what it has
+ *  and says so in `notes` rather than failing the handoff.
+ *
+ *  `opts.releaseId` exports the frozen release — its frames and its tokens —
+ *  instead of the live canvas, so a handoff matches the link that was sent.
+ *  `opts.pageId` narrows the export to one page. */
+export async function handoffFiles(
+  canvasId: string,
+  opts: { releaseId?: string; pageId?: string } = {},
+): Promise<HandoffBundle> {
+  const canvas = store.getCanvas(canvasId)
+  if (!canvas) throw new HandoffError(`no canvas with id ${canvasId}`)
+
+  let release: CanvasRelease | undefined
+  if (opts.releaseId) {
+    release = await persist.getRelease(opts.releaseId)
+    if (!release || release.canvasId !== canvasId) throw new HandoffError(`no release ${opts.releaseId} on this canvas`)
+  }
+
+  /* a release that froze no tokens of its own falls back to the canvas's, the
+     way the inline handoff did: an old release is not a reason to ship no
+     design system */
+  const tokens = release?.tokens ?? canvas.tokens
+  /* a release handoff carries the frozen frames; the live path drops demo
+     frames, which are product content rather than the canvas's own work */
+  const source = release ? persist.releaseFrames(release) : canvas.frames.filter((f) => !f.demo)
+  const frames = source.filter((f) => opts.pageId === undefined || f.pageId === opts.pageId)
+  const notes: string[] = []
+  const files: { path: string; content: string }[] = []
+
+  for (const frame of frames) {
+    const name = handoffFileName(frame, frames)
+    const linked = rewriteAssetUrls(frame.html, './')
+    files.push({ path: `design/${name}.html`, content: linked.html })
+    for (const url of linked.external) {
+      if (!notes.includes(url)) notes.push(url)
+    }
+    try {
+      const react = await htmlToReact(frame.html, { name: frame.name, tokens, frameId: frame.id })
+      files.push({ path: `design/${name}.jsx`, content: rewriteAssetUrls(react.jsx, './').html })
+    } catch {
+      notes.push(`no React component for design/${name}.html: the frame could not be rendered`)
+    }
+    try {
+      const probe = await probeFrame(frame)
+      const [report] = await persist.listFrameReviews(frame.id, 1)
+      files.push({ path: `design/${name}.spec.md`, content: specMd(frame, report, probe, tokens) })
+    } catch {
+      notes.push(`no spec for design/${name}.html: the frame could not be rendered to measure it`)
+    }
+  }
+
+  /* assets that are text (SVG, CSS) travel with the branch; binary ones cannot
+     go through the commit API as text, so they are named for the developer */
+  const binaries: string[] = []
+  for (const id of [...new Set(frames.flatMap((f) => [...assets.extractAssetIds(f.html)]))]) {
+    const asset = await assets.getCanvasAsset(canvasId, id)
+    if (!asset) {
+      notes.push(`asset ${id} could not be read and is not in this handoff`)
+      continue
+    }
+    const file = asset.url.replace(/^\/a\//, '')
+    const text = decodeText(asset.data)
+    if (text === undefined) {
+      binaries.push(`design/assets/${file}`)
+      continue
+    }
+    files.push({ path: `design/assets/${file}`, content: text })
+  }
+
+  /* the component library is the canvas's reusable design, so it ships as code
+     too — one React component per entry, named the way the frames are */
+  const library = store.listComponents(canvasId)
+  const instances = new Map<string, number>(
+    actions.listComponentSummaries(canvasId).map((entry) => [entry.id, entry.instanceCount]),
+  )
+  const design: DesignComponent[] = []
+  for (const component of library) {
+    const path = `design/components/${componentFileName(component, library)}.jsx`
+    const instanceCount = instances.get(component.id)
+    design.push({
+      name: component.name,
+      ...(component.description ? { description: component.description } : {}),
+      width: component.width,
+      height: component.height,
+      ...(instanceCount === undefined ? {} : { instanceCount }),
+      path,
+    })
+    try {
+      const react = await htmlToReact(component.html, { name: component.name, tokens })
+      /* a component sits one directory below the assets it references */
+      files.push({ path, content: rewriteAssetUrls(react.jsx, '../').html })
+    } catch {
+      notes.push(`no React component for ${path}: the library entry could not be rendered`)
+    }
+  }
+  /* a release freezes the frames and the tokens, not the library: say so rather
+     than let a reader take today's components for the released design */
+  if (release && library.length) {
+    notes.push('the component library is not part of a release: it is the canvas’s library today')
+  }
+
+  files.push(
+    ...(tokens
+      ? [
+          { path: 'design/tokens.css', content: cssForTokens(tokens) },
+          { path: 'design/tokens.dtcg.json', content: tokensDtcg(tokens) },
+          { path: 'design/tailwind.css', content: tailwindThemeCss(tokens) },
+        ]
+      : []),
+    {
+      path: 'design/DESIGN.md',
+      /* the exported set, not the live canvas: a DESIGN.md that lists frames the
+         reader does not have in front of them describes a different handoff */
+      content: designMd(
+        tokens,
+        { name: canvas.name, frames, ...(canvas.breakpoints ? { breakpoints: canvas.breakpoints } : {}) },
+        (frame) => `design/${handoffFileName(frame, frames)}.html`,
+        design,
+      ),
+    },
+    { path: 'design/AGENTS.md', content: agentsMd(canvas, `${PUBLIC_ORIGIN}/mcp`) },
+    {
+      path: 'design/README.md',
+      content: [
+        '# Design handoff',
+        '',
+        `Exported from doop canvas \`${canvas.id}\` (${canvas.name}).`,
+        ...(release ? [`This is the frozen release \`${release.id}\` (“${release.name}”).`] : []),
+        '',
+        'Each `design/*.html` is a self-contained frame document; open it in a browser to see the design.',
+        'The matching `.jsx` is the same design as a React component and `.spec.md` is its build spec:',
+        'measurements, the type ramp, the colors, the structure outline and the verification report it passed.',
+        ...(library.length
+          ? ['`design/components/*.jsx` is the canvas component library, one React component per entry.']
+          : []),
+        '`tokens.dtcg.json` is the design system in W3C Design Tokens form; `DESIGN.md` is the same system in prose.',
+        '`tailwind.css` is the same tokens as a Tailwind v4 `@theme` block — it carries both Tailwind’s own',
+        'namespaces and the `--space-*`/`--weight-*` names frames are authored against.',
+        '',
+        ...(binaries.length
+          ? [
+              'These image assets could not be committed as text — add them next to the frames at the same path:',
+              ...binaries.map((path) => `- ${path}`),
+              '',
+            ]
+          : []),
+        ...(notes.length ? ['Notes:', ...notes.map((note) => `- ${note}`), ''] : []),
+      ].join('\n'),
+    },
+  )
+
+  const preview = release ? `${PUBLIC_ORIGIN}/p/${canvasId}/${release.id}` : undefined
+  return {
+    files,
+    notes,
+    pr: {
+      title: `Design handoff: ${canvas.name}`,
+      body: [
+        `Design handoff for **${canvas.name}** (\`${canvasId}\`).`,
+        '',
+        `${frames.length} frame(s) exported${release ? ` from the frozen release “${release.name}”` : ''}.`,
+        ...(opts.pageId ? [`One page only: \`${opts.pageId}\`.`] : []),
+        ...(preview ? ['', `Preview: ${preview}`] : []),
+        '',
+        'Files:',
+        ...files.map((file) => `- \`${file.path}\``),
+        ...(notes.length ? ['', 'Notes:', ...notes.map((note) => `- ${note}`)] : []),
+        '',
+      ].join('\n'),
+    },
   }
 }

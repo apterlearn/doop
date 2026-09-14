@@ -4,7 +4,7 @@
  * landing pages WITH visual thumbnails plus pre-distilled style facts — a
  * north-star mood line, a named palette, and the fonts in use.
  *
- * Powers the search_inspiration tool in mcp.ts and resident.ts. Keyless, same
+ * Powers the search_inspiration tool in mcp.ts. Keyless, same
  * API the validated scripts/refero-extract.ts pipeline uses. Results are
  * INSPIRATION to look at and adapt in a brief — never imagery to embed in
  * frames (the screenshots are other companies' copyrighted pages).

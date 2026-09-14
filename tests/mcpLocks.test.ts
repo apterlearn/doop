@@ -5,7 +5,6 @@ import * as actions from '../server/actions.ts'
 import { buildMcpServer } from '../server/mcp.ts'
 import { store } from '../server/store.ts'
 import * as frameLocks from '../server/frameLocks.ts'
-import * as resident from '../server/resident.ts'
 import type { Canvas, ServerMessage } from '../shared/types.ts'
 
 /* Frame locks: two agents on one canvas, each a real MCP server over its own
@@ -16,7 +15,6 @@ vi.mock('../server/db/persist.ts', () => ({
   getNotificationPrefs: async () => new Map(),
   saveNotificationPref: () => {},
   pruneRunEvents: () => {},
-  saveJournal: () => {},
   saveRunEvent: () => {},
   saveQuestion: () => {},
   saveFrameProposal: () => {},
@@ -47,48 +45,6 @@ vi.mock('../server/db/persist.ts', () => ({
   getFrameVersion: async () => undefined,
   listGuidelineVersions: async () => [],
   flush: async () => {},
-}))
-
-/* The resident team is a second writer on the same canvas, so the file drives
-   one real run: the model is stubbed to write the frame, then park, so the
-   test can watch the lock from the outside while the run is genuinely live. */
-let residentGate: { promise: Promise<void>; release: () => void } | null = null
-/* the gate parks one turn only: later turns of the same run must not block */
-let residentGateUsed = false
-
-vi.mock('../server/agentModel.ts', () => ({
-  ModelAuthError: class ModelAuthError extends Error {},
-  pickModel: async () => ({
-    provider: 'anthropic',
-    label: 'test model',
-    userId: 'user-1',
-    run: async (req: { messages: { role: string; content: unknown }[] }) => {
-      const usage = { input: 10, output: 5, cacheRead: 0, cacheWrite: 0 }
-      if (req.messages.length === 1) {
-        return {
-          content: [
-            { type: 'text' as const, text: 'working' },
-            {
-              type: 'tool_use' as const,
-              id: 'tu1',
-              name: 'set_frame_html',
-              input: {
-                frame_id: 'f-locks',
-                html: '<!doctype html><html><head><style>h1{color:#111}</style></head><body><h1>resident version</h1></body></html>',
-              },
-            },
-          ],
-          stop_reason: 'tool_use',
-          usage,
-        }
-      }
-      if (residentGate && !residentGateUsed) {
-        residentGateUsed = true
-        await residentGate.promise
-      }
-      return { content: [{ type: 'text' as const, text: 'done' }], stop_reason: 'end_turn', usage }
-    },
-  }),
 }))
 
 const OWNER_ID = 'locks-owner'
@@ -154,19 +110,9 @@ function seedCanvas(): Canvas {
    appears (or never clears) is worse than no lock at all. */
 let room: ServerMessage[] = []
 
-function deferred() {
-  let release!: () => void
-  const promise = new Promise<void>((resolve) => {
-    release = resolve
-  })
-  return { promise, release }
-}
-
 beforeEach(() => {
   vi.restoreAllMocks()
   frameLocks.clearLocks()
-  residentGate = null
-  residentGateUsed = false
   room = []
   actions.wire(
     (canvasId, msg) => room.push(msg),
@@ -369,57 +315,5 @@ describe('frame locking between agents', () => {
     } finally {
       await a.close()
     }
-  })
-
-  it('has a resident run take the frame’s lock, and hold it against another agent', async () => {
-    const a = await connect()
-    try {
-      actions.addQueuedCard(CANVAS_ID, 'Restyle the hero', 'alice', undefined, undefined, 'alice')
-      residentGate = deferred()
-      resident.onFeedback(CANVAS_ID)
-      /* the write landed, so the run is holding the frame and parked on its
-         next turn — the moment a second agent would collide */
-      await vi.waitFor(() => expect(store.getFrame(FRAME_ID)!.html).toContain('resident version'))
-
-      expect(frameLocks.activeLocks().find((l) => l.frameId === FRAME_ID)?.agentName).toBe('Doop')
-      expect(room.filter((m) => m.type === 'frame:lock').at(-1)).toEqual({
-        type: 'frame:lock',
-        frameId: FRAME_ID,
-        holder: { name: 'Doop', color: expect.any(String), kind: 'agent' },
-      })
-
-      const blocked = await callTool(a.client, 'set_frame_html', {
-        frame_id: FRAME_ID,
-        html: '<h1>from A</h1>',
-        agent_name: 'AgentA',
-      })
-      expect(blocked.isError).toBe(true)
-      expect(blocked.parsed.error).toMatchObject({ code: 'conflict', holder: 'Doop' })
-      expect(store.getFrame(FRAME_ID)!.html).toContain('resident version')
-
-      /* and the run gives it back when it ends, so the frame is not held by a
-         finished run */
-      room = []
-      residentGate.release()
-      await vi.waitFor(() => expect(frameLocks.activeLocks()).toEqual([]))
-      expect(room.filter((m) => m.type === 'frame:lock')).toContainEqual({
-        type: 'frame:lock',
-        frameId: FRAME_ID,
-        holder: null,
-      })
-    } finally {
-      await a.close()
-    }
-  })
-
-  it('records what the run changed, keyed by the run, when it ends', async () => {
-    actions.addQueuedCard(CANVAS_ID, 'Restyle the hero', 'alice', undefined, undefined, 'alice')
-    resident.onFeedback(CANVAS_ID)
-    /* the lock is released in the run's teardown, after its journal is written */
-    await vi.waitFor(() => expect(frameLocks.activeLocks()).toEqual([]))
-
-    const journal = actions.getRunJournals(CANVAS_ID, 'Doop')[0]!
-    expect(journal.runId).toBeTruthy()
-    expect(journal.frames).toEqual([{ frameId: FRAME_ID, name: 'Hero' }])
   })
 })

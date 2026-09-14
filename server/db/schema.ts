@@ -216,9 +216,6 @@ export const tasks = pgTable(
     targetSelector: text('target_selector'),
     /** page the target frame lives on, so the agent needs no lookup to reach it */
     targetPageId: text('target_page_id'),
-    /** a human paused this card's run — skipped until explicitly resumed */
-    pausedAt: bigint('paused_at', { mode: 'number' }),
-    pausedBy: text('paused_by'),
     /** queue ordering: higher priority first, then position, then arrival */
     priority: integer('priority'),
     position: integer('position'),
@@ -514,13 +511,6 @@ export const activity = pgTable(
   (t) => [index('activity_canvas_idx').on(t.canvasId)],
 )
 
-/* free-tier metering: how many resident-team tasks each user has initiated */
-export const residentUsage = pgTable('resident_usage', {
-  userId: text('user_id').primaryKey(),
-  used: integer('used').notNull().default(0),
-  updatedAt: bigint('updated_at', { mode: 'number' }).notNull(),
-})
-
 /** A user's own model subscription, connected so the Doop Agent keeps running
  *  once their free tasks are gone. Today that is ChatGPT (OAuth against
  *  auth.openai.com, refreshed here) or a plain OpenAI API key — `kind` says
@@ -600,6 +590,36 @@ export const frameProposals = pgTable(
   (t) => [index('frame_proposals_canvas_idx').on(t.canvasId)],
 )
 
+/** A canvas-level change an agent proposed while the canvas is in review mode
+ *  — the frame-proposal path's counterpart for everything that is not a frame:
+ *  the design tokens, a guideline doc, the breakpoint list, the pages. Nothing
+ *  touches the canvas until a human accepts; the accept then applies the
+ *  payload through the ordinary setters, so it versions, broadcasts and logs
+ *  exactly like a human edit. `before` is the value at propose time, so a
+ *  reviewer sees the change against what it replaces. */
+export const canvasProposals = pgTable(
+  'canvas_proposals',
+  {
+    id: text('id').primaryKey(),
+    canvasId: text('canvas_id').notNull(),
+    /** 'tokens' | 'guidelines' | 'breakpoints' | 'pages' */
+    kind: text('kind').notNull(),
+    /** the change to apply on accept, shaped per kind (see shared/types.ts);
+     *  a `tokens` proposal clears the canvas with a JSON null */
+    payload: jsonb('payload'),
+    /** the canvas value the proposal was made against; null = there was none */
+    before: jsonb('before'),
+    proposedBy: text('proposed_by').notNull(),
+    proposedByUser: text('proposed_by_user').notNull(),
+    status: text('status').notNull().default('pending'),
+    /** the reviewer's note, on a reject (why) or an accept (what they changed) */
+    resolutionNote: text('resolution_note'),
+    createdAt: bigint('created_at', { mode: 'number' }).notNull(),
+    resolvedAt: bigint('resolved_at', { mode: 'number' }),
+  },
+  (t) => [index('canvas_proposals_canvas_idx').on(t.canvasId)],
+)
+
 /** A blocking question an agent asked a human via ask_human. */
 export const agentQuestions = pgTable(
   'agent_questions',
@@ -629,7 +649,7 @@ export const agentQuestions = pgTable(
   (t) => [index('agent_questions_canvas_idx').on(t.canvasId)],
 )
 
-/** One step of a resident agent run — the Run tab's timeline. */
+/** One step of an agent's run — the Run tab's timeline. */
 export const runEvents = pgTable(
   'run_events',
   {
@@ -651,35 +671,6 @@ export const runEvents = pgTable(
     afterVersionId: text('after_version_id'),
   },
   (t) => [index('run_events_canvas_idx').on(t.canvasId)],
-)
-
-/** What an agent did on its last runs — the resident's cross-run memory. */
-export const runJournals = pgTable(
-  'run_journals',
-  {
-    id: text('id').primaryKey(),
-    canvasId: text('canvas_id').notNull(),
-    agentName: text('agent_name').notNull(),
-    cardId: text('card_id'),
-    /** the run's id in the run timeline (runLog) */
-    runId: text('run_id'),
-    summary: text('summary').notNull(),
-    decisions: text('decisions'),
-    /** the run's revertible change set: frame, name, and the versions it
-     *  started from and produced */
-    frames:
-      jsonb('frames').$type<{ frameId: string; name: string; beforeVersionId?: string; afterVersionId?: string }[]>(),
-    /** when the run's first turn started and when it stopped */
-    startedAt: bigint('started_at', { mode: 'number' }),
-    endedAt: bigint('ended_at', { mode: 'number' }),
-    /** model turns taken, tool calls made, tokens spent and what they cost */
-    turns: integer('turns'),
-    toolCalls: integer('tool_calls'),
-    tokens: integer('tokens'),
-    costUsd: doublePrecision('cost_usd'),
-    at: bigint('at', { mode: 'number' }).notNull(),
-  },
-  (t) => [index('run_journals_canvas_idx').on(t.canvasId)],
 )
 
 /** Per-user email notification preference for agent events. */
@@ -718,8 +709,8 @@ export const components = pgTable(
 )
 
 /** What one user has taught doop about their taste, carried across every
- *  canvas they own (the resident prompt and the MCP guide both read it).
- *  Capped per user at write time. */
+ *  canvas they own (the MCP memory tools read it). Capped per user at write
+ *  time. */
 export const userMemory = pgTable(
   'user_memory',
   {
@@ -733,42 +724,4 @@ export const userMemory = pgTable(
     createdAt: bigint('created_at', { mode: 'number' }).notNull(),
   },
   (t) => [index('user_memory_user_idx').on(t.userId)],
-)
-
-/** A resident agent run, persisted so a restart can resume it instead of
- *  failing every claimed card. The transcript itself lives in run_steps;
- *  this row is the run's identity and status. */
-export const runs = pgTable(
-  'runs',
-  {
-    id: text('id').primaryKey(),
-    canvasId: text('canvas_id').notNull(),
-    agentName: text('agent_name').notNull(),
-    /** JSON array of the task/card ids the run is working */
-    cardIds: jsonb('card_ids').$type<string[]>(),
-    model: text('model'),
-    /** 'running' | 'done' | 'failed' | 'cancelled' */
-    status: text('status').notNull(),
-    startedAt: bigint('started_at', { mode: 'number' }).notNull(),
-    updatedAt: bigint('updated_at', { mode: 'number' }).notNull(),
-  },
-  (t) => [index('runs_canvas_idx').on(t.canvasId)],
-)
-
-/** One transcript entry of a run, in order — what replayInterruptedRuns
- *  rehydrates the model loop from. */
-export const runSteps = pgTable(
-  'run_steps',
-  {
-    id: text('id').primaryKey(),
-    runId: text('run_id').notNull(),
-    /** dense 0..n-1 position within the run's transcript */
-    seq: integer('seq').notNull(),
-    /** 'assistant' | 'user' (the tool-result turn) */
-    role: text('role').notNull(),
-    /** the message payload as it was pushed into the loop */
-    payload: jsonb('payload').notNull(),
-    createdAt: bigint('created_at', { mode: 'number' }).notNull(),
-  },
-  (t) => [index('run_steps_run_idx').on(t.runId)],
 )

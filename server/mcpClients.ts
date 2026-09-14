@@ -25,9 +25,9 @@ export function touchClient(clientId: string): void {
  *  Grouping is per client, not per token row: better-auth's refresh-token
  *  rotation inserts a new oauth_access_token row without deleting the old one,
  *  so one connection legitimately owns several rows. Expired rows still yield
- *  an entry (with liveTokens: 0) so a client that connected once stays
- *  revocable — and so this list agrees with allowance.hasOwnAgent, which counts
- *  expired rows as proof of a connection. */
+ *  an entry (with liveTokens: 0) so a client that connected once stays listed
+ *  and revocable: the revoke route is keyed by client id, and an entry that
+ *  vanished with its last token could never be cut off. */
 export function groupClients(
   tokens: { clientId: string; expiresAt: Date | null }[],
   names: Map<string, string>,

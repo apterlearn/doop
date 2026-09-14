@@ -14,7 +14,15 @@ import * as frameLocks from './frameLocks.ts'
 import * as notifications from './notifications.ts'
 import { getImage, renderHtmlPreview } from './previews.ts'
 import { diffFrames } from './visualDiff.ts'
-import type { AgentQuestion, DesignTokens, FrameProposal } from '../shared/types.ts'
+import type {
+  AgentQuestion,
+  Canvas,
+  CanvasProposal,
+  CanvasRelease,
+  DesignTokens,
+  Frame,
+  FrameProposal,
+} from '../shared/types.ts'
 
 import { canAccessCanvas, hasDurableCanvasAccess, isAdmin } from './access.ts'
 import { auth, initAuth, syncAdmins, getUserName, loadOidcConfig, PUBLIC_ORIGIN, loginProvidersConfig } from './auth.ts'
@@ -25,16 +33,30 @@ import * as demo from './demo.ts'
 import { closeDb, db, initDb } from './db/index.ts'
 import * as authSchema from './db/auth-schema.ts'
 import * as persist from './db/persist.ts'
-import { htmlBundle } from './codeExport.ts'
+import {
+  agentsMd,
+  designMd,
+  handoffFileName,
+  handoffFiles,
+  htmlBundle,
+  rewriteAssetUrls,
+  tailwindThemeCss,
+  tokensDtcg,
+  tokensJson,
+} from './codeExport.ts'
+import { buildZip } from './zip.ts'
+import { reviewCanvas } from './canvasReview.ts'
+import { commentPullRequest, commitToBranch, ensurePullRequest } from './githubWrite.ts'
+import { nanoid } from 'nanoid'
+import { cssForTokens } from '../shared/tokens.ts'
 import { SNAPSHOT_CSP } from './snapshotCsp.ts'
 import { frameSha, reviewFrame, reviewToRecord } from './review.ts'
 import { handleMcpRequest } from './mcp.ts'
 import { groupClients } from './mcpClients.ts'
-/* static, not dynamic: nothing imports this entrypoint, so there is no cycle,
-   and the canceller must be referenceable when actions is wired below */
-import { cancelCanvasRuns, onFeedback, resumeInterruptedRuns } from './resident.ts'
 import {
   getAsset,
+  getCanvasAsset,
+  extractAssetIds,
   reconcileAssetRefs,
   beginTicketUpload,
   endTicketUpload,
@@ -47,11 +69,8 @@ import * as storage from './storage.ts'
 import * as github from './github.ts'
 import * as githubApp from './githubApp.ts'
 import { seed } from './seed.ts'
-import * as allowance from './allowance.ts'
 import * as modelAccounts from './modelAccounts.ts'
-import { serverTierInfo } from './agentModel.ts'
 import { AGENT_MODELS } from './openaiAgent.ts'
-import { mentionedRole } from '../shared/agents.ts'
 import { colorFor } from '../shared/types.ts'
 import type { FrameLockHolder } from '../shared/types.ts'
 import type { CanvasFocus, ClientMessage, Presence, ServerMessage } from '../shared/types.ts'
@@ -96,26 +115,6 @@ actions.hydrateLogs(data)
 actions.hydrateUserMemory([...(data.userMemory?.values() ?? [])].flat())
 store.initComponents([...(data.components?.values() ?? [])].flat())
 seed()
-
-/* A run that was live when the process died has its transcript on disk: resume
-   it before anything else touches the board, so the cards it claimed come back
-   under the same run instead of being failed as interrupted. */
-resumeInterruptedRuns()
-  .then((n) => n && console.log(`[resident] resumed ${n} interrupted run(s)`))
-  .catch((e) => console.error('[resident] resume failed', e))
-
-/* Never-attempted queued cards get their first pickup after boot. Hydration
-   marks interrupted claimed cards as failed, so they are excluded until a
-   human explicitly retries them. */
-{
-  const pending = [...data.tasks.entries()]
-    .filter(([, list]) => list.some((t) => t.queuedBy && !t.agentName && !t.endedAt && !t.cancelledAt))
-    .map(([canvasId]) => canvasId)
-  pending.forEach((canvasId, i) => {
-    setTimeout(() => onFeedback(canvasId), 5_000 + i * 30_000)
-  })
-  if (pending.length) console.log(`[resident] ${pending.length} canvas(es) with new queued cards — starting after boot`)
-}
 
 /* asset bookkeeping (no deletion): every upload records its canvas, and
    asset_refs tracks which frames reference which assets — kept in sync on
@@ -265,7 +264,6 @@ setInterval(() => {
       if (now - p.lastSeen > (p.status || p.waiting ? 60_000 : 20_000)) {
         byName.delete(key)
         broadcast(canvasId, { type: 'presence:leave', clientId: p.clientId })
-        actions.endAgentTasks(canvasId, p.name) // an agent that went silent is no longer "working on" anything
       }
     }
   }
@@ -290,7 +288,7 @@ export function markAgentWaiting(canvasId: string, agentName: string, waiting: b
   }
 }
 
-actions.wire(broadcast, agentTouch, cancelCanvasRuns, markAgentWaiting)
+actions.wire(broadcast, agentTouch, markAgentWaiting)
 
 /* Presence lives here (agentPresences), the MCP surface lives in mcp.ts, and
    neither may import the other: the reader is handed over at boot so
@@ -691,14 +689,6 @@ function requireFrame(req: express.Request, res: express.Response, frameId: stri
 app.use('/api/admin', adminRouter)
 app.use('/api/community', communityRouter)
 
-/* free-tier meter for the resident team: {used, limit, connected, byoModel} */
-app.get('/api/agent-allowance', (req, res) => {
-  allowance
-    .getAllowance(req.user!.id)
-    .then((a) => res.json(a))
-    .catch(() => res.status(500).json({ error: 'allowance unavailable' }))
-})
-
 /* ---- the MCP clients a user has connected.
 
    The token IS the credential, so deleting the rows is the whole revocation:
@@ -736,8 +726,9 @@ app.delete('/api/mcp-agents/:clientId', async (req, res) => {
   res.json({ ok: true, revoked: revoked.length })
 })
 
-/* ---- the user's own model account: what keeps the Doop Agent running once
-   the free tasks are gone. Tokens live server-side and are never returned. */
+/* ---- the user's own model account: what the server-side model work runs on
+   (image generation, repository recon, distillation). Tokens live server-side
+   and are never returned. */
 
 /* Every route that returns an account status returns the SAME shape: the
    client re-renders straight from the response, so dropping the model list on
@@ -870,16 +861,27 @@ app.get('/api/canvases/:id', (req, res) => {
 })
 
 /* Community gallery listing — the owner's call alone, like link access.
-   PUT both lists and re-describes; DELETE takes it down. */
-app.put('/api/canvases/:id/publish', (req, res) => {
+   PUT both lists and re-describes; DELETE takes it down. `releaseId` pins the
+   listing to a frozen release (null clears the pin), so what a visitor sees
+   stops moving when the canvas does. */
+app.put('/api/canvases/:id/publish', async (req, res) => {
   const c = requireCanvas(req, res, req.params.id)
   if (!c) return
   const listing = parseListing(req.body)
   if (typeof listing === 'string') return res.status(400).json({ error: listing })
-  const result = publishCanvas(c, listing, { id: req.user!.id, name: req.user!.name })
+  const pinned = req.body?.releaseId
+  if (pinned !== undefined && pinned !== null && typeof pinned !== 'string')
+    return res.status(400).json({ error: 'releaseId must be a release id, or null to unpin' })
+  let release: { id: string; frames: Frame[] } | undefined
+  if (typeof pinned === 'string') {
+    const found = await persist.getRelease(pinned)
+    if (!found || found.canvasId !== c.id) return res.status(404).json({ error: 'no such release on this canvas' })
+    release = { id: found.id, frames: persist.releaseFrames(found) }
+  }
+  const result = publishCanvas(c, listing, { id: req.user!.id, name: req.user!.name }, release)
   if (!result.ok) return res.status(result.status).json({ error: result.error })
-  const { publishedAt, description, category } = result.canvas
-  res.json({ publishedAt, description, category })
+  const { publishedAt, description, category, publishedReleaseId } = result.canvas
+  res.json({ publishedAt, description, category, releaseId: publishedReleaseId ?? null })
 })
 
 app.delete('/api/canvases/:id/publish', (req, res) => {
@@ -888,6 +890,266 @@ app.delete('/api/canvases/:id/publish', (req, res) => {
   const result = unpublishCanvas(c, { id: req.user!.id, name: req.user!.name })
   if (!result.ok) return res.status(result.status).json({ error: result.error })
   res.json({ ok: true })
+})
+
+/* ---- releases: the frozen snapshots a handoff link points at ----
+   Frames are a projection — id, name and size only — because a list route
+   must never ship a canvas's documents (they can be megabytes each); the
+   snapshot itself lives in the release row and renders at /p/<canvas>/<release>. */
+
+const releaseView = (release: persist.CanvasRelease): CanvasRelease => ({
+  id: release.id,
+  canvasId: release.canvasId,
+  name: release.name,
+  url: `${PUBLIC_ORIGIN}/p/${release.canvasId}/${release.id}`,
+  frames: release.frames.map((frame) => ({
+    id: frame.id,
+    name: frame.name,
+    width: frame.width,
+    height: frame.height,
+  })),
+  createdAt: release.createdAt,
+  createdBy: release.createdBy,
+})
+
+app.get('/api/canvases/:id/releases', async (req, res) => {
+  const c = requireCanvas(req, res, req.params.id)
+  if (!c) return
+  res.json({ releases: (await persist.listReleases(c.id)).map(releaseView) })
+})
+
+/** Freeze the canvas as it is now — the same snapshot the MCP create_release
+ *  tool writes, so a release made in the UI and one made by an agent are the
+ *  same artifact. */
+app.post('/api/canvases/:id/releases', async (req, res) => {
+  const c = requireCanvas(req, res, req.params.id)
+  if (!c) return
+  const frames = c.frames.filter((frame) => !frame.demo)
+  if (!frames.length)
+    return res.status(400).json({ error: 'add a frame before releasing — there is nothing to freeze' })
+  const label = typeof req.body?.name === 'string' ? req.body.name.trim().slice(0, 120) : ''
+  const release: persist.CanvasRelease = {
+    id: nanoid(10),
+    canvasId: c.id,
+    name: label || `Release ${new Date().toISOString().slice(0, 10)}`,
+    frames: frames.map((frame) => ({
+      id: frame.id,
+      name: frame.name,
+      width: frame.width,
+      height: frame.height,
+      x: frame.x,
+      y: frame.y,
+      html: frame.html,
+      ...(frame.pageId ? { pageId: frame.pageId } : {}),
+    })),
+    ...(c.tokens ? { tokens: c.tokens } : {}),
+    createdAt: Date.now(),
+    createdBy: req.user!.name,
+  }
+  await persist.saveRelease(release)
+  actions.logActivity(c.id, resolveActorFromReq(req), `released “${release.name}” (${release.frames.length} frames)`)
+  res.json(releaseView(release))
+})
+
+/** Put a release's frames back on the live canvas, as ordinary edits: every
+ *  write goes through the same actions a human edit does, so the restore is
+ *  logged, streamed to the room and reversible frame by frame. Frames that no
+ *  longer exist are recreated; frames added since are left alone. */
+app.post('/api/canvases/:id/releases/:releaseId/restore', async (req, res) => {
+  const c = requireCanvas(req, res, req.params.id)
+  if (!c) return
+  const release = await persist.getRelease(req.params.releaseId)
+  if (!release || release.canvasId !== c.id) return res.status(404).json({ error: 'release not found' })
+  const actor = resolveActorFromReq(req)
+  let restored = 0
+  try {
+    for (const snapshot of release.frames) {
+      const live = store.getFrame(snapshot.id)
+      if (!live) {
+        actions.createFrame(
+          c.id,
+          {
+            name: snapshot.name,
+            html: snapshot.html,
+            width: snapshot.width,
+            height: snapshot.height,
+            ...(snapshot.pageId ? { pageId: snapshot.pageId } : {}),
+          },
+          actor,
+        )
+        restored += 1
+        continue
+      }
+      if (live.html === snapshot.html) continue
+      actions.updateFrame(
+        snapshot.id,
+        { html: snapshot.html, name: snapshot.name, width: snapshot.width, height: snapshot.height },
+        actor,
+      )
+      restored += 1
+    }
+  } catch (e) {
+    /* a locked frame or a review-mode refusal: nothing was half-applied that a
+       human cannot see in the activity feed, and the reason is theirs to read */
+    return res.status(409).json({ error: e instanceof Error ? e.message : 'the restore was refused' })
+  }
+  if (restored === 0) return res.status(409).json({ error: 'every frame already matches this release' })
+  actions.logActivity(c.id, actor, `restored “${release.name}” (${restored} frames)`)
+  res.json({ ok: true })
+})
+
+/* ---- ship: the download the Export button hands a human, and the design
+   opened as a pull request against a connected repo ---- */
+
+/** The canvas as one archive: every frame's document, a single-page render of
+ *  all of them, the design system in three forms and the assets the frames
+ *  reference, so the download renders offline. */
+async function canvasArchive(canvas: Canvas): Promise<Buffer> {
+  const frames = canvas.frames.filter((frame) => !frame.demo)
+  const tokens = canvas.tokens
+  const bundle = await htmlBundle(frames, tokens)
+  const bundled: { name: string; content: Buffer }[] = []
+  for (const id of [...new Set(frames.flatMap((frame) => [...extractAssetIds(frame.html)]))]) {
+    const asset = await getCanvasAsset(canvas.id, id)
+    if (asset) bundled.push({ name: `assets/${asset.url.replace(/^\/a\//, '')}`, content: asset.data })
+  }
+  return buildZip([
+    { name: 'canvas.html', content: rewriteAssetUrls(bundle.html, '').html },
+    ...(bundle.fontsCss ? [{ name: 'fonts.css', content: bundle.fontsCss }] : []),
+    ...bundled,
+    ...(tokens
+      ? [
+          { name: 'tokens.css', content: cssForTokens(tokens) },
+          { name: 'tokens.json', content: tokensJson(tokens) },
+          { name: 'tokens.dtcg.json', content: tokensDtcg(tokens) },
+          { name: 'tailwind.css', content: tailwindThemeCss(tokens) },
+        ]
+      : []),
+    {
+      name: 'DESIGN.md',
+      content: designMd(tokens, canvas, (frame) => `frames/${handoffFileName(frame, frames)}.html`),
+    },
+    { name: 'AGENTS.md', content: agentsMd(canvas, `${PUBLIC_ORIGIN}/mcp`) },
+    ...frames.map((frame) => ({
+      name: `frames/${handoffFileName(frame, frames)}.html`,
+      content: rewriteAssetUrls(frame.html, '../').html,
+    })),
+  ])
+}
+
+/** The same archive the MCP `code` export returns: the repository file set
+ *  open_pull_request commits — documents, React components, build specs, the
+ *  component library and the design system. */
+async function codeArchive(canvas: Canvas): Promise<Buffer> {
+  const handoff = await handoffFiles(canvas.id)
+  return buildZip(handoff.files.map((file) => ({ name: file.path, content: file.content })))
+}
+
+app.post('/api/canvases/:id/export', async (req, res) => {
+  const c = requireCanvas(req, res, req.params.id)
+  if (!c) return
+  const format = req.body?.format
+  if (format !== 'zip' && format !== 'code') return res.status(400).json({ error: 'format must be "zip" or "code"' })
+  if (!c.frames.some((frame) => !frame.demo))
+    return res.status(400).json({ error: 'this canvas has no frames to export' })
+  try {
+    const archive = format === 'code' ? await codeArchive(c) : await canvasArchive(c)
+    /* stored exactly as the MCP export stores it: an asset row plus the public
+       /a/<id>.<ext> URL the download button opens */
+    const asset = await createAsset(archive, { canvasId: c.id, ownerId: req.user!.id, uploadedBy: req.user!.name })
+    res.json({ url: `${PUBLIC_ORIGIN}/a/${asset.id}.${asset.ext}` })
+  } catch (e) {
+    res.status(500).json({ error: e instanceof Error ? e.message : 'the export failed' })
+  }
+})
+
+/** Open the handoff pull request: commit the exported file set to a branch of
+ *  a connected repo and open (or find) the pull request for it. The same two
+ *  halves the MCP open_pull_request tool runs, on the connection the canvas
+ *  has for that repo. */
+app.post('/api/canvases/:id/pull-request', async (req, res) => {
+  const c = requireCanvas(req, res, req.params.id)
+  if (!c) return
+  const repo = typeof req.body?.repo === 'string' ? req.body.repo.trim() : ''
+  if (!repo) return res.status(400).json({ error: 'repo is required — connect the repository first' })
+  const base = typeof req.body?.base === 'string' ? req.body.base.trim() : ''
+  const message = typeof req.body?.message === 'string' ? req.body.message.trim().slice(0, 200) : ''
+  const head = `doop/${c.id}`
+  try {
+    const handoff = await handoffFiles(c.id)
+    const connections = await github.listConnections(c.id)
+    const baseRef = base || connections.find((conn) => conn.repo.toLowerCase() === repo.toLowerCase())?.branch || 'main'
+    const commit = await commitToBranch({
+      repo,
+      baseRef,
+      headRef: head,
+      files: handoff.files,
+      message: message || handoff.pr.title,
+      canvasId: c.id,
+    })
+    const pull = await ensurePullRequest({
+      repo,
+      baseRef,
+      headRef: head,
+      title: message || handoff.pr.title,
+      body: handoff.pr.body,
+      canvasId: c.id,
+    })
+    actions.logActivity(c.id, resolveActorFromReq(req), `opened pull request #${pull.number} on ${repo}`)
+    res.json({ url: pull.url, number: pull.number, commit: commit.commitSha })
+  } catch (e) {
+    res.status(400).json({ error: e instanceof Error ? e.message : 'the handoff failed' })
+  }
+})
+
+/** Push the canvas's later changes onto the pull request already open: commit
+ *  again onto the same branch and say so in the conversation. A canvas with no
+ *  open pull request for that branch pair is a 404 — this updates, it does not
+ *  open. */
+app.post('/api/canvases/:id/pull-request/update', async (req, res) => {
+  const c = requireCanvas(req, res, req.params.id)
+  if (!c) return
+  const repo = typeof req.body?.repo === 'string' ? req.body.repo.trim() : ''
+  if (!repo) return res.status(400).json({ error: 'repo is required' })
+  const message = typeof req.body?.message === 'string' ? req.body.message.trim().slice(0, 200) : ''
+  const head = `doop/${c.id}`
+  try {
+    const handoff = await handoffFiles(c.id)
+    const connections = await github.listConnections(c.id)
+    const baseRef =
+      (typeof req.body?.base === 'string' ? req.body.base.trim() : '') ||
+      connections.find((conn) => conn.repo.toLowerCase() === repo.toLowerCase())?.branch ||
+      'main'
+    const line = message || `Design update: ${c.name}`
+    const commit = await commitToBranch({
+      repo,
+      baseRef,
+      headRef: head,
+      files: handoff.files,
+      message: line,
+      canvasId: c.id,
+    })
+    const pull = await ensurePullRequest({
+      repo,
+      baseRef,
+      headRef: head,
+      title: handoff.pr.title,
+      body: handoff.pr.body,
+      canvasId: c.id,
+    })
+    if (pull.created)
+      return res.status(404).json({ error: `no pull request was open for ${head} → ${baseRef} on ${repo}` })
+    await commentPullRequest({
+      repo,
+      prNumber: pull.number,
+      body: [line, '', handoff.pr.body, '', `Committed \`${commit.commitSha.slice(0, 7)}\` to \`${head}\`.`].join('\n'),
+      canvasId: c.id,
+    })
+    actions.logActivity(c.id, resolveActorFromReq(req), `updated pull request #${pull.number} on ${repo}`)
+    res.json({ url: pull.url, number: pull.number, commit: commit.commitSha })
+  } catch (e) {
+    res.status(400).json({ error: e instanceof Error ? e.message : 'the pull request update failed' })
+  }
 })
 
 /* A release is a frozen artifact: the URL a handoff link points at. No
@@ -1230,15 +1492,9 @@ app.post('/api/canvases/:id/github/:connId/import', async (req, res) => {
     const outcome = await withConnectionLock(conn.id, async () => {
       /* nothing new to queue (all rejected, or already on the board) costs nothing */
       if (!actions.planRepoCards(c.id, input).length) return { cards: [] as string[] }
-      /* the import is the Doop Agent's work, card by card — same gate as a card
-         typed on the board: a free task, or the requester's own model account */
-      const gate = await allowance.consumeResidentTask(req.user!.id)
-      if (!gate.ok) return { limit: gate }
       const cards = actions.addRepoCards(c.id, input, req.user!.name, req.user!.id)
       return { cards: cards.map((card) => card.id) }
     })
-    if (outcome.limit)
-      return res.status(403).json({ error: 'resident_limit', used: outcome.limit.used, limit: outcome.limit.limit })
     res.json({ cards: outcome.cards, rejected })
   } catch (e) {
     res.status(400).json({ error: e instanceof Error ? e.message : 'import failed' })
@@ -1442,6 +1698,65 @@ app.delete('/api/canvases/:id/frame-proposals/:pid', (req, res) => {
   res.json(proposal)
 })
 
+/* ---- canvas-level review mode: the proposals that change the canvas itself
+   (tokens, a guide doc, the breakpoints, the page set), and the canvas-wide
+   verification sweep. */
+
+/** Pending agent canvas-level proposals. Owner-gated resolution mirrors the
+ *  frame-proposal pair below, and the MCP resolve_canvas_proposal tool. */
+app.get('/api/canvases/:id/canvas-proposals', async (req, res) => {
+  if (!requireCanvas(req, res, req.params.id)) return
+  const status = typeof req.query.status === 'string' ? (req.query.status as CanvasProposal['status']) : undefined
+  res.json({ proposals: await persist.listCanvasProposals(req.params.id, status ? { status } : {}) })
+})
+
+/** Accept or reject a canvas-level proposal (owner-only — it changes the
+ *  canvas's shared design system, not one frame). Accepting applies the
+ *  payload through the ordinary setters, so the change versions, broadcasts
+ *  and logs exactly like a human edit. */
+app.post('/api/canvases/:id/canvas-proposals/:proposalId', async (req, res) => {
+  const c = requireCanvas(req, res, req.params.id)
+  if (!c) return
+  if (c.ownerId !== req.user!.id)
+    return res.status(403).json({ error: 'only the owner can resolve a canvas-level proposal' })
+  const note = typeof req.body?.note === 'string' ? req.body.note : undefined
+  try {
+    const proposal = await actions.resolveCanvasProposal(c.id, req.params.proposalId, {
+      accept: !!req.body?.accept,
+      ...(note ? { note } : {}),
+      actor: { userId: req.user!.id, agentName: req.user!.name },
+    })
+    res.json(proposal)
+  } catch (e) {
+    res.status(404).json({ error: e instanceof Error ? e.message : 'proposal not found' })
+  }
+})
+
+/* A sweep renders every unverified frame on the canvas, so it is the heaviest
+   check the UI can ask for: a tighter budget than the per-frame route. */
+const canvasReviewHits = new Map<string, number[]>()
+
+/** Run the canvas-wide verification sweep now, on a human's word: one verdict
+ *  with a row per frame, and a stored report per frame it actually checked. */
+app.post('/api/canvases/:id/reviews', async (req, res) => {
+  const c = requireCanvas(req, res, req.params.id)
+  if (!c) return
+  const hits = (canvasReviewHits.get(req.user!.id) ?? []).filter((t) => Date.now() - t < 60_000)
+  if (hits.length >= 3) return res.status(429).json({ error: 'too many sweeps, wait a minute' })
+  hits.push(Date.now())
+  canvasReviewHits.set(req.user!.id, hits)
+  try {
+    const summary = await reviewCanvas(c.id, {
+      actor: { userId: req.user!.id, agentName: req.user!.name },
+    })
+    actions.logActivity(c.id, resolveActorFromReq(req), `ran the canvas sweep — ${summary.verdict}`)
+    res.json(summary)
+  } catch (e) {
+    console.error('[canvas-reviews] failed', e)
+    res.status(503).json({ error: e instanceof Error ? e.message : 'the sweep failed' })
+  }
+})
+
 /** Agent questions (ask_human): answer or read them. */
 app.get('/api/canvases/:id/questions', (req, res) => {
   if (!requireCanvas(req, res, req.params.id)) return
@@ -1504,81 +1819,6 @@ app.get('/api/canvases/:id/run-events', (req, res) => {
   res.json(runLog.getRunEvents(req.params.id, { runId, limit: Math.min(500, Number(req.query.limit) || 200) }))
 })
 
-/** What a run did: the journals for this canvas, newest first, optionally
- *  narrowed to one agent. The client reads duration, turns, tool calls, tokens
- *  and cost off these — the same record revert_run resolves a run from. */
-app.get('/api/canvases/:id/run-journals', (req, res) => {
-  if (!requireCanvas(req, res, req.params.id)) return
-  const agentName = typeof req.query.agent === 'string' ? req.query.agent : undefined
-  const limit = Math.min(100, Number(req.query.limit) || 20)
-  const journals = agentName
-    ? actions.getRunJournals(req.params.id, agentName, limit)
-    : actions.listRunJournals(req.params.id, limit)
-  res.json(journals)
-})
-
-/** How long after a run a frame may still be reverted: a write within this
- *  window of the journal is the run's own tail, not someone's later work.
- *  Shared with the revert_run tool, which applies the same rule. */
-const REVERT_RUN_GRACE_MS = 5_000
-
-/** Undo everything one run changed. A frame someone else has edited since the
- *  run, or that no longer exists, is skipped and reported rather than
- *  clobbered — the same rule the revert_run tool applies. */
-app.post('/api/canvases/:id/runs/:runId/revert', async (req, res) => {
-  if (!requireCanvas(req, res, req.params.id)) return
-  const actor = resolveActorFromReq(req)
-  const journal = actions.getRunJournalBy(req.params.id, { runId: req.params.runId })
-  if (!journal) return res.status(404).json({ error: 'no run journal for that run' })
-  const reverted: string[] = []
-  const skipped: { frame_id: string; reason: string }[] = []
-  for (const entry of journal.frames ?? []) {
-    if (!entry.beforeVersionId) {
-      skipped.push({ frame_id: entry.frameId, reason: 'no starting version was recorded for this frame' })
-      continue
-    }
-    const frame = store.getFrame(entry.frameId)
-    if (!frame || frame.canvasId !== req.params.id) {
-      skipped.push({ frame_id: entry.frameId, reason: 'the frame no longer exists' })
-      continue
-    }
-    if (frame.updatedAt > journal.at + REVERT_RUN_GRACE_MS) {
-      skipped.push({
-        frame_id: entry.frameId,
-        reason: `changed after the run by ${frame.updatedBy} — reverting would discard that work`,
-      })
-      continue
-    }
-    try {
-      const restored = await actions.revertFrame(entry.frameId, entry.beforeVersionId, actor)
-      if (!restored) {
-        skipped.push({ frame_id: entry.frameId, reason: 'the recorded version is no longer stored' })
-        continue
-      }
-      reverted.push(entry.frameId)
-    } catch (e) {
-      if (!(e instanceof frameLocks.FrameLockedError)) throw e
-      skipped.push({ frame_id: entry.frameId, reason: `still locked by ${e.holder.agentName}` })
-    }
-  }
-  res.json({ reverted, skipped })
-})
-
-/** Pause a live agent run (the card stays open, skipped by the sweep). */
-app.post('/api/canvases/:id/agents/pause', (req, res) => {
-  if (!requireCanvas(req, res, req.params.id)) return
-  const agentName = String(req.body?.agent_name ?? '')
-  if (!agentName) return res.status(400).json({ error: 'agent_name is required' })
-  res.json({ paused: actions.pauseAgentWork(req.params.id, agentName, req.user!.name) })
-})
-
-app.post('/api/canvases/:id/cards/:cardId/resume', (req, res) => {
-  if (!requireCanvas(req, res, req.params.id)) return
-  const card = actions.resumeCard(req.params.id, req.params.cardId, req.user!.name)
-  if (!card) return res.status(404).json({ error: 'card not found' })
-  res.json(card)
-})
-
 /** Queue ordering: an explicit order rewrite, or a single card's priority. */
 app.post('/api/canvases/:id/cards/reorder', (req, res) => {
   if (!requireCanvas(req, res, req.params.id)) return
@@ -1619,7 +1859,7 @@ app.get('/api/frames/:frameId/reviews', async (req, res) => {
 })
 
 /* Checks are three renders each, so this budget is the preview route's shape
-   at a smaller allowance — enough for a reviewer working through a canvas,
+   at a tighter rate — enough for a reviewer working through a canvas,
    not enough to hold the shared browser hostage. */
 const frameReviewHits = new Map<string, number[]>()
 
@@ -1852,17 +2092,9 @@ app.delete('/api/frames/:id', (req, res) => {
   res.json({ ok: true })
 })
 
-app.post('/api/frames/:id/comments', async (req, res) => {
+app.post('/api/frames/:id/comments', (req, res) => {
   if (!requireFrame(req, res, req.params.id)) return
   const { selector, snippet, text, stableKey } = req.body ?? {}
-  /* a comment that @mentions a resident agent is a new command to the team,
-     so it's metered like a card; plain comments and replies stay free */
-  if (mentionedRole(String(text ?? ''))) {
-    const gate = await allowance.consumeResidentTask(req.user!.id)
-    if (!gate.ok) {
-      return res.status(403).json({ error: 'resident_limit', used: gate.used, limit: gate.limit })
-    }
-  }
   const comment = actions.addElementComment(
     req.params.id,
     {
@@ -1878,21 +2110,13 @@ app.post('/api/frames/:id/comments', async (req, res) => {
   res.json(comment)
 })
 
-app.post('/api/comments/:id/replies', async (req, res) => {
+app.post('/api/comments/:id/replies', (req, res) => {
   const found = actions.findComment(req.params.id)
   if (!found) return res.status(404).json({ error: 'comment not found' })
   if (!requireCanvas(req, res, found.canvasId)) return
   const text = String(req.body?.text ?? '')
   if (!text.trim() || !actions.openThread(req.params.id)) {
     return res.status(404).json({ error: 'thread resolved or empty text' })
-  }
-  /* same rule as a fresh comment: only an @mention costs a resident task */
-  let gate: Awaited<ReturnType<typeof allowance.consumeResidentTask>> | undefined
-  if (mentionedRole(text)) {
-    gate = await allowance.consumeResidentTask(req.user!.id)
-    if (!gate.ok) {
-      return res.status(403).json({ error: 'resident_limit', used: gate.used, limit: gate.limit })
-    }
   }
   const reply = actions.replyToComment(
     req.params.id,
@@ -1901,13 +2125,6 @@ app.post('/api/comments/:id/replies', async (req, res) => {
     req.user!.id,
   )
   if (!reply) {
-    /* the thread closed while the meter was being written: give the task
-       back — a failed refund is logged, never turned into a 500 */
-    if (gate) {
-      await allowance.refundResidentTask(gate, req.user!.id).catch((err) => {
-        console.error(`[comments] could not refund a resident task for ${req.user!.id}:`, err)
-      })
-    }
     return res.status(409).json({ error: 'thread resolved meanwhile' })
   }
   res.json(reply)
@@ -1920,14 +2137,10 @@ app.post('/api/comments/:id/resolve', (req, res) => {
   res.json(actions.resolveComment(req.params.id, actions.resolveActor({ name: req.user!.name, kind: 'user' })))
 })
 
-app.post('/api/comments/:id/retry', async (req, res) => {
+app.post('/api/comments/:id/retry', (req, res) => {
   const found = actions.findComment(req.params.id)
   if (!found) return res.status(404).json({ error: 'comment not found' })
   if (!requireCanvas(req, res, found.canvasId)) return
-  const gate = await allowance.consumeResidentTask(req.user!.id)
-  if (!gate.ok) {
-    return res.status(403).json({ error: 'resident_limit', used: gate.used, limit: gate.limit })
-  }
   res.json(actions.retryComment(req.params.id, req.user!.name))
 })
 
@@ -2048,10 +2261,6 @@ app.post('/api/canvases/:id/cards', async (req, res) => {
   if (!requireCanvas(req, res, req.params.id)) return
   const title = String(req.body?.title ?? '').trim()
   if (!title) return res.status(400).json({ error: 'empty title' })
-  const gate = await allowance.consumeResidentTask(req.user!.id)
-  if (!gate.ok) {
-    return res.status(403).json({ error: 'resident_limit', used: gate.used, limit: gate.limit })
-  }
   const card = actions.addQueuedCard(
     req.params.id,
     title,
@@ -2092,40 +2301,28 @@ app.post('/api/canvases/:canvasId/cards/:id/done', (req, res) => {
   res.json(card)
 })
 
-app.post('/api/canvases/:canvasId/cards/:id/retry', async (req, res) => {
+app.post('/api/canvases/:canvasId/cards/:id/retry', (req, res) => {
   if (!requireCanvas(req, res, req.params.canvasId)) return
-  const gate = await allowance.consumeResidentTask(req.user!.id)
-  if (!gate.ok) {
-    return res.status(403).json({ error: 'resident_limit', used: gate.used, limit: gate.limit })
-  }
   const card = actions.retryCard(req.params.canvasId, req.params.id, req.user!.name)
   if (!card) return res.status(404).json({ error: 'card not found' })
   res.json(card)
 })
 
-app.post('/api/tasks/:id/feedback', async (req, res) => {
+app.post('/api/tasks/:id/feedback', (req, res) => {
   const canvasId = actions.taskCanvasId(req.params.id)
   if (!canvasId) return res.status(404).json({ error: 'task not found' })
   if (!requireCanvas(req, res, canvasId)) return
   const text = String(req.body?.text ?? '').trim()
   if (!text) return res.status(400).json({ error: 'empty text' })
-  const gate = await allowance.consumeResidentTask(req.user!.id)
-  if (!gate.ok) {
-    return res.status(403).json({ error: 'resident_limit', used: gate.used, limit: gate.limit })
-  }
   const fb = actions.addTaskFeedback(req.params.id, req.user!.name, text, req.user!.id)
   if (!fb) return res.status(404).json({ error: 'task not found or empty text' })
   res.json(fb)
 })
 
-app.post('/api/feedback/:id/retry', async (req, res) => {
+app.post('/api/feedback/:id/retry', (req, res) => {
   const found = actions.findFeedback(req.params.id)
   if (!found) return res.status(404).json({ error: 'feedback not found' })
   if (!requireCanvas(req, res, found.canvasId)) return
-  const gate = await allowance.consumeResidentTask(req.user!.id)
-  if (!gate.ok) {
-    return res.status(403).json({ error: 'resident_limit', used: gate.used, limit: gate.limit })
-  }
   res.json(actions.retryTaskFeedback(req.params.id, req.user!.name))
 })
 
@@ -2286,6 +2483,7 @@ wss.on('connection', (ws, upgradeReq) => {
         proposals: actions.getProposals(msg.canvasId),
         plans: actions.getPlans(msg.canvasId),
         frameProposals: actions.getFrameProposals(msg.canvasId),
+        canvasProposals: await persist.listCanvasProposals(msg.canvasId, { status: 'pending' }),
         questions: actions.getQuestions(msg.canvasId),
         reviewMode: !!canvas.reviewMode,
         reviewPolicy: canvas.reviewPolicy ?? (canvas.reviewMode ? 'all_writes' : 'off'),
@@ -2297,17 +2495,12 @@ wss.on('connection', (ws, upgradeReq) => {
         serverBuild: BUILD_ID,
       })
       /* An admin looking at a canvas must not act on it. Announcing presence
-         would impersonate the owner in the room; maybePlay would have the
-         demo agent perform on an untouched signup canvas; the card kick would
-         start the resident agent working. All three are things the owner's
-         own visit is supposed to trigger, not a support session. */
+         would impersonate the owner in the room, and maybePlay would have the
+         demo agent perform on an untouched signup canvas. Both are things the
+         owner's own visit is supposed to trigger, not a support session. */
       if (silent) return
       broadcast(msg.canvasId, { type: 'presence:join', presence }, presence.clientId)
       demo.maybePlay(msg.canvasId) // first visit to a fresh signup canvas: the demo agent performs
-      /* Start never-attempted cards. Failed/interrupted cards are excluded. */
-      if (actions.getTasks(msg.canvasId).some((t) => t.queuedBy && !t.agentName && !t.endedAt && !t.cancelledAt)) {
-        onFeedback(msg.canvasId)
-      }
       return
     }
 
@@ -2385,13 +2578,4 @@ server.listen(PORT, () => {
   console.log(`⟡ doop server     http://localhost:${PORT}`)
   console.log(`⟡ mcp endpoint      http://localhost:${PORT}/mcp`)
   console.log(`⟡ websocket         ws://localhost:${PORT}/ws`)
-  /* The Doop Agent failing silently is the one "why is nothing happening?"
-     a self-hoster cannot debug from the UI — board cards and @mentions just
-     sit there. Say so at boot, not only when the first card is queued. */
-  const tier = serverTierInfo()
-  console.log(
-    tier.ready
-      ? `⟡ doop agent        on — free tier on this server’s ${tier.provider === 'azure' ? 'Azure OpenAI deployment' : 'Anthropic key'}, then each user’s own model account`
-      : `⟡ doop agent        no server ${tier.provider === 'azure' ? 'Azure config' : 'key'} — runs only for users who connect their own ChatGPT subscription or OpenAI key (${tier.provider === 'azure' ? 'set the AZURE_OPENAI_* vars' : 'set ANTHROPIC_API_KEY'} for a free tier; agents connected over MCP work regardless)`,
-  )
 })

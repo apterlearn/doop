@@ -267,8 +267,8 @@ describe('design sync ingest', () => {
   })
 })
 
-/* Pure formatter — what MCP get_canvas and the resident team read as flow
-   context. No server needed. */
+/* Pure formatter — what MCP get_canvas reads as flow context. No server
+   needed. */
 describe('describeSyncFlow', () => {
   const frame = (id: string, name: string): Frame =>
     ({

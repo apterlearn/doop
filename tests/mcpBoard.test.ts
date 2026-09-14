@@ -8,13 +8,12 @@ import type { Canvas, Frame } from '../shared/types.ts'
 
 /* Board-card MCP tools (list_cards, take_card, complete_card) run against the
    real actions machinery — persist + broadcasts are stubbed, the card queue
-   state is real. The resident runner's model calls never enter the picture. */
+   state is real. No model calls enter the picture. */
 vi.mock('../server/db/persist.ts', () => ({
   getUserEmail: async () => undefined,
   getNotificationPrefs: async () => new Map(),
   saveNotificationPref: () => {},
   pruneRunEvents: () => {},
-  saveJournal: () => {},
   saveRunEvent: () => {},
   saveQuestion: () => {},
   saveFrameProposal: () => {},
@@ -166,7 +165,7 @@ describe('board card MCP tools', () => {
   it('list_cards returns open unclaimed cards with brief and frames, hiding claimed and closed ones', async () => {
     const open = queueCard('Design a pricing page')
     const other = queueCard('Second card')
-    actions.claimCard(CANVAS_ID, other.id, 'Doop') // claimed by the resident role
+    actions.claimCard(CANVAS_ID, other.id, 'Doop') // claimed by another agent
     actions.completeCard(CANVAS_ID, other.id)
 
     const { client, close } = await connect()

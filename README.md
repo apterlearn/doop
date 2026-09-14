@@ -23,10 +23,10 @@ activity feed.
 
 - **Design with agents, not prompts-and-refresh** — connect Claude Code (or any MCP client) once,
   then watch it sketch, stream and self-review designs on your canvas, next to your cursor.
-- **A built-in Doop Agent** — queue a card or @mention a role and it designs on its own, no client
-  to connect. Runs on the server's `ANTHROPIC_API_KEY` for a handful of free tasks, then on the
-  **ChatGPT subscription** (or OpenAI key) each user connects ([setup](#the-doop-agent)); the
-  first-canvas welcome performance is scripted and runs without any of it.
+- **No model of its own** — doop runs no agent on the server, so there is no server key to fund and
+  no per-task meter. Connect an MCP client and it picks up cards, comments and feedback on its own
+  model ([setup](#models-doop-runs-no-agent-of-its-own)); the first-canvas welcome performance is
+  scripted and runs without any of it.
 - **True multiplayer** — live cursors, presence, per-frame editing indicators, undo/redo, comments
   pinned to elements, and an activity feed, all over one WebSocket room.
 - **Design memory** — pin exemplar frames, capture decisions, and let the distiller propose durable
@@ -52,9 +52,9 @@ lockfile); the server itself runs on Node.
 
 Everything works with no configuration: data persists to an embedded Postgres (PGlite) in `data/pg`,
 and every optional integration (SMTP, stock photos, object storage, analytics) degrades gracefully
-until its variable in [.env.example](.env.example) is set. The one you will most likely want is
-`ANTHROPIC_API_KEY`, which turns on the built-in [Doop Agent](#the-doop-agent) — agents you connect
-yourself over MCP need no key.
+until its variable in [.env.example](.env.example) is set. No key is needed to design — the agents you
+connect over MCP bring their own model; `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` only turn on the two
+server-side model calls ([image generation and the distiller](#models-doop-runs-no-agent-of-its-own)).
 
 Or self-host the production build with Docker:
 
@@ -87,71 +87,56 @@ the frame chip, the working strip, and the task in the Agents panel.
 
 ## Watch an agent design
 
-The first canvas after signup comes with a performance: the Doop Agent streams a welcome
-design in while you watch — status in the working strip, a task in the panel, a pulsing border on
-the frame it's building.
+The first canvas after signup comes with a performance: a scripted welcome design streams into a
+frame while you watch — status in the working strip, a task in the panel, a pulsing border on the
+frame it's building.
 
 <p align="center">
-  <img src=".github/assets/agent-live.png" alt="The Doop Agent streaming a design into a frame, live — working status, agent task panel and pulsing frame border" width="100%">
+  <img src=".github/assets/agent-live.png" alt="A design streaming into a frame, live — working status, agent task panel and pulsing frame border" width="100%">
 </p>
 
 That welcome performance is **scripted** (`server/demo.ts`) — a pre-authored frame replayed through
-the same machinery real agents use, so it runs with no configuration at all. The Doop Agent proper
-needs a key.
+the same machinery real agents use, so it runs with no configuration at all. Real work comes from an
+agent you connect.
 
-## The Doop Agent
+## Models: doop runs no agent of its own
 
-Doop ships a built-in design team that lives in the server and picks work up on its own: queue a
-board card, `@mention` a role on an element comment, or leave feedback on a task, and it runs
-without a human in the loop. Roles (Doop builds; specialists own one pass each — UX, copy, brand,
-accessibility) are defined in [`shared/agents.ts`](shared/agents.ts), and a card can be routed
-through several in order.
+Agents bring their own model. You connect an MCP client — [CC], Codex, or anything else that speaks
+MCP — and it picks up board cards, element comments and task feedback and designs on your
+subscription. There is no server-side agent, no per-task meter and no server key to fund: a queued
+card waits for whichever agent claims it, and the roles it can be routed through are defined in
+[`shared/agents.ts`](shared/agents.ts).
 
-The server pays for the free tier, on Anthropic by default:
+Two server-side features do call a provider, each only when its key is set:
 
-```bash
-ANTHROPIC_API_KEY=sk-ant-...   # in .env, or the environment of your deployment
-```
-
-Same key gates the **guideline distiller** ([`server/distill.ts`](server/distill.ts)), which proposes
-durable style rules from your canvas.
-
-The free tier can run on **Azure OpenAI** instead — useful when your organisation's credits or
-compliance rules live there:
+- **Image generation** (`generate_image`) uses `OPENAI_API_KEY`, or the [OI] API key a caller
+  connected in Settings — a connected account wins over the server's.
+- **The guideline distiller** ([`server/distill.ts`](server/distill.ts)) proposes durable style rules
+  from your canvas on `ANTHROPIC_API_KEY` — or, with no server key, on the model of the connected MCP
+  client, borrowed through MCP sampling. The same key gates background auto-tagging.
 
 ```bash
-DOOP_AGENT_PROVIDER=azure
-AZURE_OPENAI_ENDPOINT=https://my-resource.openai.azure.com
-AZURE_OPENAI_API_KEY=...
-AZURE_OPENAI_DEPLOYMENT=my-deployment
+ANTHROPIC_API_KEY=sk-ant-...   # the distiller + background auto-tagging
+OPENAI_API_KEY=sk-...          # image generation
 ```
 
-The distiller stays on `ANTHROPIC_API_KEY` either way and quietly turns off without it.
+Everything else works with no configuration at all.
 
-### Past the free tasks: connect your own ChatGPT
+### Model accounts
 
-When a user's `RESIDENT_TASK_LIMIT` free tasks are gone, they don't lose the agent — they connect a
-model account and the Doop Agent keeps running on it. **A connected account takes over immediately**,
-from the very next task: the free tier is a trial that gets people here, not a balance to spend down
-first, and connecting stops costing the server anything from that moment. The connection is
-account-level, so it lives at **/settings** (Home → Settings); the free-tier wall links there rather
-than carrying its own copy, and "Connect an AI agent" on a canvas stays about MCP clients only. Two
-kinds of account:
+Settings (Home → Settings) holds the model account a server-side feature bills instead of the
+server's own key. Two kinds:
 
-- **ChatGPT subscription** — OAuth against `auth.openai.com`, then inference through the Codex
-  backend that Plus/Pro/Business plans include. Tokens live in `model_accounts` and never reach a
-  browser.
-- **OpenAI API key** — pay-as-you-go on the user's own OpenAI account, no subscription involved.
+- **[OI] API key** — pay-as-you-go on the user's own account; `generate_image` prefers it over the
+  server key when the caller has one connected.
+- **ChatGPT subscription** — OAuth against `auth.openai.com`, then the Codex backend that
+  Plus/Pro/Business plans include. Tokens live in `model_accounts` and never reach a browser.
 
-Azure OpenAI is deliberately _not_ a connectable account kind: a user-supplied endpoint would be a
-URL the server fetches with the run's full context — an SSRF vector — so Azure stays a server-level
-provider only.
-
-Either way the user picks their **model tier** in Settings — `gpt-5.6-sol` (flagship),
-`gpt-5.6-terra` (the default workhorse) or `gpt-5.6-luna` (cheap and fast). They are paying for it,
-so the choice is theirs; `DOOP_AGENT_OPENAI_MODEL` only sets the default they start on. Note that
-`gpt-5.4` and `gpt-5.4-mini` retire from ChatGPT-authenticated Codex on **31 August 2026**, so
-pinning a 5.4 id via that env var will break the subscription path after that date.
+An account also records a **model tier** — `gpt-5.6-sol` (flagship), `gpt-5.6-terra` (the default
+workhorse) or `gpt-5.6-luna` (cheap and fast); `DOOP_AGENT_OPENAI_MODEL` only sets the default a user
+starts on. Note that `gpt-5.4` and `gpt-5.4-mini` retire from ChatGPT-authenticated Codex on
+**31 August 2026**, so pinning a 5.4 id via that env var will break the subscription path after that
+date.
 
 OpenAI registers no redirect URI for a hosted app, so connecting ChatGPT takes one of three shapes
 and Doop picks the cheapest one available:
@@ -172,43 +157,17 @@ exchange.
 > suspended. The API-key path is the fully supported alternative and shares all the same code.
 > `CHATGPT_CONNECT_DISABLED=1` switches the subscription path off and leaves the key path.
 
-Runs are attributed to the human whose card, comment or feedback they picked up, so the person who
-asked for the work is the person whose account runs it. The translation between the agent's
-Anthropic-shaped loop and OpenAI's Responses API lives in
-[`server/openaiAgent.ts`](server/openaiAgent.ts); which credential a run gets is decided in
-[`server/agentModel.ts`](server/agentModel.ts).
+The keys and knobs that remain:
 
-**With no server key and no connected account** the Doop Agent is off, and it fails quietly by
-design — queued cards and `@mentions` simply wait for some agent to claim them. The startup banner
-tells you which state you're in.
+| Variable                   | Default         | What it does                                                    |
+| -------------------------- | --------------- | --------------------------------------------------------------- |
+| `ANTHROPIC_API_KEY`        | _unset_         | The distiller's key, and background auto-tagging                |
+| `OPENAI_API_KEY`           | _unset_         | Image generation, and the fallback when no account is connected |
+| `DOOP_DISTILL_MODEL`       | _unset_         | Model the distiller judges with                                 |
+| `DOOP_AGENT_OPENAI_MODEL`  | `gpt-5.6-terra` | Default model tier a connected account starts on                |
+| `CHATGPT_CONNECT_DISABLED` | _unset_         | `1` hides the ChatGPT flow, leaving the API-key path            |
 
-**All of this is separate from connecting your own agent.** Claude Code and any other MCP client
-authenticate over OAuth and drive the canvas from outside, on your own subscription — never metered.
-Three paths, same canvas: the Doop Agent on our key (free tier), the Doop Agent on your key, or your
-own agent over MCP.
-
-| Variable                        | Default                     | What it does                                                                         |
-| ------------------------------- | --------------------------- | ------------------------------------------------------------------------------------ |
-| `DOOP_AGENT_PROVIDER`           | `anthropic`                 | What the free tier runs on: `anthropic` \| `azure`                                   |
-| `ANTHROPIC_API_KEY`             | _unset_                     | Pays for the free Doop Agent tier (default provider) and the distiller               |
-| `AZURE_OPENAI_ENDPOINT`         | _unset_                     | The free tier's Azure OpenAI resource, when `DOOP_AGENT_PROVIDER=azure`              |
-| `AZURE_OPENAI_API_KEY`          | _unset_                     | A key of that resource                                                               |
-| `AZURE_OPENAI_DEPLOYMENT`       | _unset_                     | The deployment the free tier runs on                                                 |
-| `AZURE_OPENAI_API_VERSION`      | _unset_                     | Pins an `api-version` query parameter; the v1 surface needs none                     |
-| `AZURE_OPENAI_REASONING_EFFORT` | _unset_                     | Reasoning effort on Azure runs; unset sends none (non-reasoning-safe)                |
-| `RESIDENT_TASK_LIMIT`           | `0`                         | Free Doop Agent tasks per account; `0` means a connected account from the first task |
-| `DOOP_AGENT_MODEL`              | `claude-opus-5`             | Model for the Doop Agent on the server's Anthropic key                               |
-| `DOOP_AGENT_OPENAI_MODEL`       | `gpt-5.6-terra`             | Default tier on a user's account; each user can pick another in Settings             |
-| `CHATGPT_CONNECT_DISABLED`      | _unset_                     | `1` hides the ChatGPT flow, leaving the API-key path                                 |
-| `DOOP_DISTILL_MODEL`            | `claude-haiku-4-5-20251001` | Model for the guideline distiller                                                    |
-
-`RESIDENT_TASK_LIMIT` is the free-tier meter. By default it is `0`: the Doop Agent only runs once
-the user connects a model account (their ChatGPT subscription or an OpenAI key) — a connected
-account is never metered. Connecting your own MCP agent does not lift the meter: it runs on your
-model when _it_ designs, but resident tasks still bill a credential. Set the limit above 0 to
-grant that many free tasks on the server's key; everything that triggers resident work counts,
-including feedback and retries. There is no "unlimited" value: self-hosting with your own key, set
-it to a large number, since you're paying Anthropic directly either way.
+Every other optional integration has its own section in [.env.example](.env.example).
 
 ## Accounts
 
@@ -424,7 +383,7 @@ Steering happens at three layers (the same architecture paper.design uses, plus 
 | `create_canvas`           | Create a new design canvas.                                                                                                                                                                                                                                                                                                                                               |
 | `create_component`        | Save a reusable component on this canvas’s library: self-contained markup you will insert into frames (insert_component) and keep in sync across them (update_component propagates).                                                                                                                                                                                      |
 | `create_page`             | Create a new page on a canvas.                                                                                                                                                                                                                                                                                                                                            |
-| `create_release`          | Snapshot every frame as it is right now and return a public, permanent preview URL (/p/<canvas>/<release>).                                                                                                                                                                                                                                                               |
+| `create_release`          | Snapshot every frame as it is right now and return a public, permanent preview URL (/p/<canvas>/<release>). Refuses a canvas whose frames are not currently verified — `review_canvas` clears it, `force: true` overrides.                                                                                                                                                |
 | `delete_canvas`           | Permanently delete this canvas with its frames, pages, guides, references, cards and comments (owner-only).                                                                                                                                                                                                                                                               |
 | `delete_component`        | Remove a component from the library (confirm: true).                                                                                                                                                                                                                                                                                                                      |
 | `delete_page`             | Deletes the page AND every frame on it.                                                                                                                                                                                                                                                                                                                                   |
@@ -439,11 +398,12 @@ Steering happens at three layers (the same architecture paper.design uses, plus 
 | `list_components`         | List the canvas’s reusable components — saved pieces (a nav bar, a pricing card) that can be inserted into any frame with insert_component and updated once for every instance with update_component.                                                                                                                                                                     |
 | `list_guidelines`         | List a canvas's style guides (named markdown guidelines — brand rules, style recipes) with one-line summaries.                                                                                                                                                                                                                                                            |
 | `list_releases`           | Every frozen release of this canvas, newest first, with the public preview URL for each.                                                                                                                                                                                                                                                                                  |
-| `publish_canvas`          | Publish this canvas to the Doop community gallery with a short description and a shelf.                                                                                                                                                                                                                                                                                   |
+| `publish_canvas`          | Publish this canvas to the Doop community gallery with a short description and a shelf. Refuses a canvas whose frames are not currently verified — `review_canvas` clears it, `force: true` overrides.                                                                                                                                                                    |
 | `rename_canvas`           | Rename this canvas (owner-only).                                                                                                                                                                                                                                                                                                                                          |
 | `rename_page`             | Rename a page.                                                                                                                                                                                                                                                                                                                                                            |
 | `rename_release`          | Relabel a frozen release (owner-only) — the label a handoff URL is listed under.                                                                                                                                                                                                                                                                                          |
-| `restore_release`         | Write a release’s frames back onto the live canvas, as ordinary edits: each frame is written through the same path as any other edit, so the restore is logged, streamed to the room and reversible frame by frame with get_frame_history + revert_frame.                                                                                                                 |
+| `replace_in_frames`       | Rename a string across a whole canvas in one call — literal or regex, optionally narrowed by frame ids or page — reporting per frame how many matches it held and whether the replacement landed (a locked frame is stepped over, not blocking the sweep). Rehearse with `dry_run`.                                                                                       |
+| `restore_release`         | Write a release’s frames back onto the live canvas, as ordinary edits: each frame is written through the same path as any other edit, so the restore is logged, streamed to the room and reversible frame by frame with get_frame_history + revert_frame. Refuses a canvas whose frames are not currently verified — `review_canvas` clears it, `force: true` overrides.  |
 | `save_decision`           | Record a design decision your human made while talking to YOU — style feedback you carried out ("rounder corners", "less purple, more white and blue", "stop using italic serif").                                                                                                                                                                                        |
 | `search_components`       | Find saved components by name or description — "pricing", "nav", "testimonial".                                                                                                                                                                                                                                                                                           |
 | `set_breakpoints`         | Declare the widths this canvas designs for, by name (e.g. mobile at 390, desktop at 1280).                                                                                                                                                                                                                                                                                |
@@ -516,25 +476,26 @@ Steering happens at three layers (the same architecture paper.design uses, plus 
 | `check_brand_compliance`  | Check a rendered frame against the brand rules a style guide declares in its "## Brand rules" section — palette, forbidden colors, licensed fonts, logo presence, minimum contrast.                                                                                                                                                                                       |
 | `diff_frame`              | Measure how far a frame's CURRENT render is from another one, and see WHERE: a magenta-marked image plus the changed-pixel ratio.                                                                                                                                                                                                                                         |
 | `fix_frame_tokens`        | Fix the values a frame drifts off the canvas tokens: a fresh lint runs, every finding within the fix tolerance is rewritten to its token (var(--color-ink), var(--space-8) — values the render resolves), and the result is applied with the element editor and written through updateFrame.                                                                              |
+| `fix_frame_a11y`          | Repair the accessibility and content findings that need no judgement — the document language, a missing or empty title, controls with no hover or focus rule — through the ordinary frame write; every other finding comes back in `skipped` with the decision it needs named. Rehearse with `dry_run`, restrict with `only`.                                             |
 | `get_motion_context`      | What a frame does over time, which no screenshot shows: the keyframes and media queries its stylesheet declares, which elements run transitions or animations and for how long, and whether it honors reduced motion.                                                                                                                                                     |
 | `get_token_usage`         | Per-element account of which design tokens a rendered frame actually uses, and where it drifts off them: the token (or raw value) behind each element’s color, background, font, radius and spacing, plus the off-token findings the lint reports — value, nearest token, and how far away it is.                                                                         |
 | `lint_frame`              | Check the RENDERED frame for values that drift off the canvas's design tokens: colors that are not one of them, fonts outside the token set, and radii or spacing off the declared scales.                                                                                                                                                                                |
 | `ready_for_review`        | Run the full quality gate on a frame — token conformance, accessibility, layout and content checks at mobile, tablet and desktop widths — and RECORD the result against the exact document it checked.                                                                                                                                                                    |
 | `review_frame`            | The full quality gate in one call: design-token lint, accessibility audit, and layout analysis (overflow, clipping, overlap, truncation) at mobile, tablet and desktop widths in a single render batch.                                                                                                                                                                   |
+| `review_canvas`           | The canvas-wide verification sweep: one verdict for the whole design with a row per frame (verdict, blocking and advisory counts, why a frame could not be checked). Reuses stored reports that are still current; every ship path asks for it.                                                                                                                           |
+| `list_canvas_proposals`   | The canvas-level change proposals and their status — the tokens, a guide doc, the breakpoints or the page set — newest first, with the payload and what it replaces.                                                                                                                                                                                                      |
 | `list_change_proposals`   | List the frame-change proposals on this canvas and their status — pending, accepted, rejected, withdrawn, or stale (the frame moved on after you proposed).                                                                                                                                                                                                               |
+| `propose_canvas_change`   | Propose a change to the canvas itself (kind: tokens, guidelines, breakpoints or pages) without touching it — the review-mode counterpart of set_tokens / set_guidelines / set_breakpoints / the page tools.                                                                                                                                                               |
 | `propose_frame_create`    | Propose creating a new frame without touching the canvas — the review-mode counterpart of create_frame.                                                                                                                                                                                                                                                                   |
 | `propose_frame_delete`    | Propose deleting a frame without touching the canvas — the review-mode counterpart of delete_frame.                                                                                                                                                                                                                                                                       |
 | `propose_frame_html`      | Propose a full replacement design for a frame WITHOUT touching the canvas.                                                                                                                                                                                                                                                                                                |
 | `rebase_proposal`         | Re-apply a stale patch-mode proposal onto the frame as it stands now: the edits are re-run against the current HTML, the proposal’s base is refreshed and it goes back to pending for review.                                                                                                                                                                             |
 | `resolve_frame_proposal`  | Accept or reject a pending frame-change proposal.                                                                                                                                                                                                                                                                                                                         |
 | `resolve_frame_proposals` | Resolve up to 50 frame-change proposals in one call — clear a review queue after reading them.                                                                                                                                                                                                                                                                            |
+| `resolve_canvas_proposal` | Accept or reject a pending canvas-level proposal (owner-only). Accepting applies the payload through the ordinary setters, so the change versions, broadcasts and logs like a human edit.                                                                                                                                                                                 |
 | `withdraw_proposal`       | Withdraw your own pending frame-change proposal (for example when you notice a better approach before the human reviews it).                                                                                                                                                                                                                                              |
 | `get_plan`                | Every plan published on this canvas, newest first — your own and any other agent working here.                                                                                                                                                                                                                                                                            |
-| `get_run_changes`         | A run's change set: the frames it touched, each with the version it started from and the one it produced, plus the run's summary and the decisions it recorded.                                                                                                                                                                                                           |
 | `get_run_events`          | The run timeline, newest first: one entry per model turn, tool call, status line, error and stop, with its agent, outcome and duration.                                                                                                                                                                                                                                   |
-| `pause_work`              | Pause an agent's live run without losing its card: the model call aborts, its frame locks are released, and the card goes back to the queue paused instead of failed — resume_work re-claims it, and the run's journal carries the context forward.                                                                                                                       |
-| `resume_work`             | Resume a card a human (or pause_work) paused: the pause clears and the canvas's resident sweep re-fires, so the card is claimed again.                                                                                                                                                                                                                                    |
-| `revert_run`              | Put every frame a run changed back to the version it started from — the run-level undo, for a redesign that went wrong.                                                                                                                                                                                                                                                   |
 | `set_plan`                | Record the steps you intend to work through, in order, so the human watching can see the plan and a later session (or a compacted context) can pick up where you left off.                                                                                                                                                                                                |
 | `stop_work`               | Stop an agent's work on a canvas — for when a run is going wrong: a redesign that drifted from the brief, work on the wrong frame, or an agent looping.                                                                                                                                                                                                                   |
 | `update_plan_step`        | Mark a plan step active when you start it, done when it is finished, blocked when you cannot continue.                                                                                                                                                                                                                                                                    |
@@ -548,13 +509,16 @@ Steering happens at three layers (the same architecture paper.design uses, plus 
 | `search_inspiration`      | Search a curated gallery of real, well-designed live websites by category and SEE thumbnails of each, with pre-distilled style facts (one-line mood north star, named palette, fonts).                                                                                                                                                                                    |
 | `view_website`            | Read-only inspection of a public web page: acquires its current HTML and returns a locally rendered desktop screenshot plus visible text without changing the canvas.                                                                                                                                                                                                     |
 | `wait_for_jobs`           | Block until every named job settles (done or failed) or the timeout runs out — whichever first — then read each job’s state in one result instead of polling get_job in a loop.                                                                                                                                                                                           |
-| `export_canvas`           | Hand a canvas to a human's machine in one piece.                                                                                                                                                                                                                                                                                                                          |
+| `export_canvas`           | Hand a canvas to a human's machine in one piece: `manifest`, `html`, `tokens`, a `zip` archive of every frame's source (returned as a public `zip_url`), or `code` — the developer handoff (documents, React components, build specs, design system) as a file manifest plus the same stored archive.                                                                     |
 | `get_pull_request_review` | Read what a reviewer said on a pull request this canvas opened: the conversation, the inline comments (with the file and line they are attached to) and the review verdicts.                                                                                                                                                                                              |
+| `diff_release`            | What changed since a frozen release: per frame, whether it moved and how — a pixel ratio when both versions render at one size, a line diff when they do not — plus the frames added or removed since.                                                                                                                                                                    |
 | `hand_back`               | Give a board card back to an agent with the specialty it needs (e.g. the copywriter or the layout specialist) instead of fixing it outside your lane.                                                                                                                                                                                                                     |
 | `import_code`             | Turn an HTML document (or fragment) into a frame on this canvas — the counterpart of export_frame.                                                                                                                                                                                                                                                                        |
-| `open_pull_request`       | Hand the design to a developer: write the exported frames (design/<frame-name>.html, tokens.css, README) to a branch in a connected GitHub repo and open a pull request.                                                                                                                                                                                                  |
-| `get_agents`              | The resident design team this canvas can be worked by, and who is live on it right now: the roles with what each one is for, the ready-made pipelines (an ordered list of role ids), and every agent currently present on the canvas.                                                                                                                                     |
-| `get_capabilities`        | Which optional integrations are actually configured on this server (screenshot renderer, image/icon/logo search, website capture, model accounts for the resident agent, GitHub), plus the current size and rate limits.                                                                                                                                                  |
+| `open_pull_request`       | Hand the design to a developer: write the exported frames (design/<frame-name>.html, its React component, its build spec, the design system) to a branch in a connected GitHub repo and open a pull request. Refuses a canvas whose frames are not currently verified — `review_canvas` clears it, `force: true` overrides.                                               |
+| `update_pull_request`     | Re-commit the canvas onto the branch a previous handoff opened and comment the summary on its pull request — the "send the client an update" path. Refuses with `not_found` when no pull request is open for that branch pair.                                                                                                                                            |
+| `comment_pull_request`    | Say something on a pull request this canvas opened: a conversation comment, or — with `in_reply_to` — an answer on one of the inline review comments, so the reply stays attached to the file and line it is about.                                                                                                                                                       |
+| `get_agents`              | The design roles this canvas can be worked by, and who is live on it right now: the roles with what each one is for, the ready-made pipelines (an ordered list of role ids), and every MCP agent currently present on the canvas.                                                                                                                                         |
+| `get_capabilities`        | Which optional integrations are actually configured on this server (screenshot renderer, image/icon/logo search, website capture, GitHub), plus the current size and rate limits.                                                                                                                                                                                         |
 | `get_guide`               | Read the Doop agent guide: mandatory review checkpoints, the streaming workflow, frame sizing, design-quality doctrine, and multiplayer etiquette.                                                                                                                                                                                                                        |
 | `get_memory`              | What the connected account has taught Doop about its taste, kept across canvases: preferences, brand rules and working workflows.                                                                                                                                                                                                                                         |
 | `remember`                | Teach Doop something durable about this account that outlives the canvas: a styling preference ("likes generous whitespace"), a brand rule ("never use pure black"), a workflow ("wants mobile-first drafts first").                                                                                                                                                      |

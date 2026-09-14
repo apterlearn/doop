@@ -41,7 +41,8 @@ export function parseToolPolicy(env: NodeJS.ProcessEnv): ToolPolicy {
   }
 }
 
-/** The policy for this process, parsed once like RESIDENT_TASK_LIMIT. */
+/** The policy for this process, parsed once at module load like every other
+ *  env-derived constant here — not re-read per request. */
 export const TOOL_POLICY: ToolPolicy = parseToolPolicy(process.env)
 
 /**

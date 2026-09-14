@@ -1,0 +1,1 @@
+ALTER TABLE "canvas_proposals" ALTER COLUMN "payload" DROP NOT NULL;

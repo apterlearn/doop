@@ -10,51 +10,63 @@ import { buildMcpServer } from '../server/mcp.ts'
 import { store } from '../server/store.ts'
 import { findBrowserPath } from '../server/screenshot.ts'
 import { buildZip } from '../server/zip.ts'
-import { componentName } from '../server/codeExport.ts'
+import { componentName, handoffFiles } from '../server/codeExport.ts'
 import { initDb, closeDb } from '../server/db/index.ts'
+import * as persist from '../server/db/persist.ts'
+import type { CanvasRelease } from '../server/db/persist.ts'
 import type { Canvas, Frame } from '../shared/types.ts'
 
 /* Handoff: the archive is verified by unzipping it with the system tool (a ZIP
    that only our own reader accepts is not a ZIP), the React conversion against
    a real render, and the manifest without a browser. */
 
-vi.mock('../server/db/persist.ts', () => ({
-  getUserEmail: async () => undefined,
-  getNotificationPrefs: async () => new Map(),
-  saveNotificationPref: () => {},
-  pruneRunEvents: () => {},
-  saveJournal: () => {},
-  saveRunEvent: () => {},
-  saveQuestion: () => {},
-  saveFrameProposal: () => {},
-  hydrate: () => {},
-  saveCanvas: () => {},
-  saveCanvasCopy: () => {},
-  saveFrame: () => {},
-  deleteFrame: () => {},
-  savePage: () => {},
-  deletePage: () => {},
-  setFramePage: () => {},
-  saveTask: () => {},
-  deleteTask: () => {},
-  saveFeedback: () => {},
-  saveComment: () => {},
-  saveActivity: () => {},
-  saveDecision: () => {},
-  saveProposal: () => {},
-  saveGuideline: () => {},
-  saveGuidelineVersion: () => {},
-  deleteGuideline: () => {},
-  saveMember: () => {},
-  deleteMember: () => {},
-  saveReference: () => {},
-  deleteReference: () => {},
-  deleteCanvas: () => {},
-  savePlan: () => {},
-  deletePlan: () => {},
-  /* the export reads a frame's newest verification report into its spec */
-  listFrameReviews: async () => [],
-}))
+vi.mock('../server/db/persist.ts', async () => {
+  /* The release accessors keep their real implementation: the handoff tests
+     seed a release in the database and read it back, so a stub would only
+     prove the stub. Every other write stays a no-op — the store persists
+     fire-and-forget, and that must not reach the test's database. */
+  const actual = await vi.importActual<typeof persist>('../server/db/persist.ts')
+  return {
+    getUserEmail: async () => undefined,
+    getNotificationPrefs: async () => new Map(),
+    saveNotificationPref: () => {},
+    pruneRunEvents: () => {},
+    saveRunEvent: () => {},
+    saveQuestion: () => {},
+    saveFrameProposal: () => {},
+    hydrate: () => {},
+    saveCanvas: () => {},
+    saveCanvasCopy: () => {},
+    saveFrame: () => {},
+    saveComponent: () => {},
+    deleteFrame: () => {},
+    savePage: () => {},
+    deletePage: () => {},
+    setFramePage: () => {},
+    saveTask: () => {},
+    deleteTask: () => {},
+    saveFeedback: () => {},
+    saveComment: () => {},
+    saveActivity: () => {},
+    saveDecision: () => {},
+    saveProposal: () => {},
+    saveGuideline: () => {},
+    saveGuidelineVersion: () => {},
+    deleteGuideline: () => {},
+    saveMember: () => {},
+    deleteMember: () => {},
+    saveReference: () => {},
+    deleteReference: () => {},
+    deleteCanvas: () => {},
+    savePlan: () => {},
+    deletePlan: () => {},
+    /* the export reads a frame's newest verification report into its spec */
+    listFrameReviews: async () => [],
+    saveRelease: actual.saveRelease,
+    getRelease: actual.getRelease,
+    releaseFrames: actual.releaseFrames,
+  }
+})
 
 const OWNER_ID = 'export-owner'
 const CANVAS_ID = 'c-export'
@@ -473,6 +485,149 @@ describe.skipIf(!findBrowserPath())('code handoff over real renders', () => {
       await close()
     }
   }, 30_000)
+})
+
+describe('handoffFiles', () => {
+  it('refuses a canvas that is not there, and a release that is not its own', async () => {
+    const frames = seedCanvas([page('<main><h1>A</h1></main>')])
+    await expect(handoffFiles('not-a-canvas')).rejects.toMatchObject({ code: 'not_found' })
+    await expect(handoffFiles(frames[0]!.canvasId, { releaseId: 'not-a-release' })).rejects.toMatchObject({
+      code: 'not_found',
+    })
+  })
+
+  it('leaves out the frames of a page that was not asked for', async () => {
+    /* nothing on the requested page, so nothing renders and this needs no
+       browser: what it proves is the filter and that the handoff is still a
+       handoff without frames */
+    const frames = seedCanvas([page('<main><h1>One</h1></main>'), page('<main><h1>Two</h1></main>')])
+    const bundle = await handoffFiles(frames[0]!.canvasId, { pageId: 'p-somewhere-else' })
+    expect(bundle.files.map((file) => file.path).filter((path) => path.startsWith('design/frame-'))).toEqual([])
+    expect(bundle.files.map((file) => file.path)).toContain('design/DESIGN.md')
+    expect(bundle.pr.body).toContain('0 frame(s) exported')
+  })
+})
+
+/* The JSX and the specs come from a real render, so the file set itself is only
+   asserted when a browser exists; the naming and the refusal paths above are
+   not. */
+describe.skipIf(!findBrowserPath())('handoffFiles over real renders', () => {
+  it('writes the design/ file set, with the canvas library and what it designs for', async () => {
+    const frames = seedCanvas([page('<main><h1>One</h1></main>'), page('<main><h1>Two</h1></main>')])
+    const canvasId = frames[0]!.canvasId
+    const alice = actions.resolveActor({ name: 'alice', kind: 'user' })
+    store.setTokens(
+      canvasId,
+      {
+        colors: { ink: '#111110' },
+        spacing: [4, 8],
+        type: { size: [16], weight: [600], leading: [1.5] },
+        updatedAt: 0,
+        updatedBy: 'alice',
+      },
+      'alice',
+    )
+    store.setBreakpoints(
+      canvasId,
+      [
+        { name: 'mobile', min_width: 390 },
+        { name: 'desktop', min_width: 1280 },
+      ],
+      'alice',
+    )
+    actions.createComponent(
+      canvasId,
+      {
+        name: 'Pricing card',
+        description: 'The plan tile',
+        html: page('<div class="card">Card</div>'),
+        width: 320,
+        height: 480,
+      },
+      alice,
+    )
+
+    const bundle = await handoffFiles(canvasId)
+    const paths = bundle.files.map((file) => file.path)
+    expect(paths).toEqual(
+      expect.arrayContaining([
+        'design/frame-0.html',
+        'design/frame-0.jsx',
+        'design/frame-0.spec.md',
+        'design/frame-1.html',
+        'design/frame-1.jsx',
+        'design/frame-1.spec.md',
+        'design/components/pricing-card.jsx',
+        'design/tokens.css',
+        'design/tokens.dtcg.json',
+        'design/tailwind.css',
+        'design/DESIGN.md',
+        'design/AGENTS.md',
+        'design/README.md',
+      ]),
+    )
+    const byPath = new Map<string, string>(bundle.files.map((entry) => [entry.path, entry.content]))
+    expect(byPath.get('design/frame-0.html')).toContain('<h1>One</h1>')
+    expect(byPath.get('design/frame-0.jsx')).toContain('export function Frame0')
+    expect(byPath.get('design/frame-0.spec.md')).toContain('# Frame 0 — build spec')
+    /* the exported theme carries the names a frame is authored against */
+    expect(byPath.get('design/tailwind.css')).toContain('--space-8: 8px;')
+    expect(byPath.get('design/tailwind.css')).toContain('--weight-600: 600;')
+    /* DESIGN.md says what the canvas reuses and what it designs for */
+    const design = byPath.get('design/DESIGN.md')!
+    expect(design).toContain('## Components')
+    expect(design).toContain('Pricing card')
+    expect(design).toContain('`design/components/pricing-card.jsx`')
+    expect(design).toContain('Breakpoints: mobile from 390px, desktop from 1280px')
+    expect(bundle.pr.title).toBe('Design handoff: Export test')
+    expect(bundle.pr.body).toContain(canvasId)
+    expect(bundle.pr.body).toContain('2 frame(s) exported')
+    expect(bundle.pr.body).toContain('`design/components/pricing-card.jsx`')
+  }, 60_000)
+
+  it('exports the frozen release instead of the live edits', async () => {
+    const frames = seedCanvas([page('<main><h1>One</h1></main>')])
+    const canvasId = frames[0]!.canvasId
+    const alice = actions.resolveActor({ name: 'alice', kind: 'user' })
+    const release: CanvasRelease = {
+      id: 'rel-export-1',
+      canvasId,
+      name: 'v1',
+      frames: [
+        {
+          id: frames[0]!.id,
+          name: 'Home',
+          width: 1440,
+          height: 900,
+          x: 0,
+          y: 0,
+          html: page('<main><h1>Frozen</h1></main>'),
+        },
+      ],
+      tokens: { colors: { ink: '#000000' }, updatedAt: 0, updatedBy: 'alice' },
+      createdAt: Date.now(),
+      createdBy: 'alice',
+    }
+    await persist.saveRelease(release)
+    /* the canvas moves on after the release: a rename, an edit, a new palette */
+    actions.updateFrame(frames[0]!.id, { name: 'Live edit', html: page('<main><h1>Live edit</h1></main>') }, alice)
+    store.setTokens(canvasId, { colors: { ink: '#ffffff' }, updatedAt: 0, updatedBy: 'alice' }, 'alice')
+
+    const bundle = await handoffFiles(canvasId, { releaseId: release.id })
+    const paths = bundle.files.map((file) => file.path)
+    expect(paths).toContain('design/home.html')
+    expect(paths).not.toContain('design/live-edit.html')
+    const html = bundle.files.find((file) => file.path === 'design/home.html')!.content
+    expect(html).toContain('Frozen')
+    expect(html).not.toContain('Live edit')
+    /* the tokens as they were frozen, not the canvas's current ones */
+    const tokensCss = bundle.files.find((file) => file.path === 'design/tokens.css')!.content
+    expect(tokensCss).toContain('--color-ink: #000000;')
+    expect(tokensCss).not.toContain('#ffffff')
+    /* and the PR body points at the link a reviewer was sent */
+    expect(bundle.pr.body).toContain(`/p/${canvasId}/${release.id}`)
+    expect(bundle.pr.body).toContain('frozen release')
+  }, 60_000)
 })
 
 describe('MCP resources', () => {

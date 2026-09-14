@@ -13,7 +13,6 @@ vi.mock('../server/db/persist.ts', () => ({
   getNotificationPrefs: async () => new Map(),
   saveNotificationPref: () => {},
   pruneRunEvents: () => {},
-  saveJournal: () => {},
   saveRunEvent: () => {},
   saveQuestion: () => {},
   saveFrameProposal: () => {},
@@ -245,7 +244,7 @@ describe('@mentions of connected agents', () => {
     actions.wirePresence((canvasId) => (canvasId === CANVAS.id ? [{ name, lastSeen: Date.now() }] : []))
   }
 
-  it('routes the comment to a connected agent that is not a resident role', async () => {
+  it('routes the comment to a connected agent that is not a pipeline role', async () => {
     withPresentAgent('OutsideAgent')
     const { client, close } = await connect()
     try {

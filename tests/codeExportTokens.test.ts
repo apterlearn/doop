@@ -39,6 +39,7 @@ const TOKENS: DesignTokens = {
   spacing: [4, 8, 16],
   radii: [8, 16],
   shadows: ['0 1px 2px rgba(0,0,0,.2)', '0 8px 24px rgba(0,0,0,.15)'],
+  type: { size: [14, 16, 32], weight: [400, 600], leading: [1.25, 1.5] },
   updatedAt: 1_700_000_000_000,
   updatedBy: 'test',
 }
@@ -69,6 +70,29 @@ describe('tailwindThemeCss', () => {
     expect(css).toContain('--radius-16: 16px;')
     expect(css).toContain('--shadow-1: 0 1px 2px rgba(0,0,0,.2);')
     expect(css).toContain('--shadow-2: 0 8px 24px rgba(0,0,0,.15);')
+  })
+
+  it('carries the render-path spellings as aliases so a frame var() resolves', () => {
+    const css = tailwindThemeCss(TOKENS)
+    const valueOf = (name: string) => {
+      const line = css.split('\n').find((candidate) => candidate.startsWith(`  ${name}: `))
+      return line?.slice(`  ${name}: `.length, -1)
+    }
+    /* Tailwind's own namespaces, so gap-8 / font-semibold resolve */
+    for (const size of TOKENS.spacing!) {
+      expect(valueOf(`--spacing-${size}`)).toBe(`${size}px`)
+      expect(valueOf(`--space-${size}`)).toBe(`${size}px`)
+    }
+    for (const weight of TOKENS.type!.weight!) {
+      expect(valueOf(`--font-weight-${weight}`)).toBe(String(weight))
+      expect(valueOf(`--weight-${weight}`)).toBe(String(weight))
+    }
+    /* the same literal values under the names cssForTokens injects into every
+       frame — var(--space-8) in a frame resolves against this theme */
+    expect(css).toContain('--space-8: 8px;')
+    expect(css).toContain('--spacing-8: 8px;')
+    expect(css).toContain('--weight-600: 600;')
+    expect(css).toContain('--font-weight-600: 600;')
   })
 
   it('renders an empty block when the canvas has no tokens', () => {
@@ -447,6 +471,33 @@ describe('designMd', () => {
     expect(doc).toContain('Inter')
     expect(doc).toContain('1440x900')
     expect(doc).toContain('`design/home.html`')
+  })
+
+  it('carries the declared breakpoints and the library the export ships', () => {
+    const withBreakpoints = {
+      ...canvas,
+      breakpoints: [
+        { name: 'mobile', min_width: 390 },
+        { name: 'desktop', min_width: 1280 },
+      ],
+    }
+    const doc = designMd(TOKENS, withBreakpoints, (frame) => `design/${frame.name.toLowerCase()}.html`, [
+      {
+        name: 'Pricing card',
+        description: 'The plan tile',
+        width: 320,
+        height: 480,
+        instanceCount: 3,
+        path: 'design/components/pricing-card.jsx',
+      },
+    ])
+    /* the widths the canvas designs for, next to the sizes it uses */
+    expect(doc).toContain('- Breakpoints: mobile from 390px, desktop from 1280px')
+    /* the library is what a reader drops in; the frames are what they lay out */
+    expect(doc).toContain(
+      '- **Pricing card** — The plan tile (320x480, 3 instance(s)); source: `design/components/pricing-card.jsx`',
+    )
+    expect(doc).toContain('- **Home** — 1440x900; source: `design/home.html`')
   })
 
   it('names no source path when the caller does not know where the frame was written', () => {

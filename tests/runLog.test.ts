@@ -3,12 +3,11 @@ import { forgetCanvas, getRunEvents, pruneOlderThan, record } from '../server/ru
 import type { RunEvent } from '../shared/types.ts'
 
 /**
- * The run timeline is what answers "what did the agent actually do": the
- * resident loop records a row per model turn, tool call, status line, error
- * and stop. The per-canvas ring is the read path — the DB write is
- * fire-and-forget and absent without a booted server — so these cases drive
- * the module directly, with a fresh canvas id per case because the ring is
- * module state.
+ * The run timeline is what answers "what did the agent actually do": one row
+ * per MCP tool call, recorded as an agent works. The per-canvas ring is the
+ * read path — the DB write is fire-and-forget and absent without a booted
+ * server — so these cases drive the module directly, with a fresh canvas id
+ * per case because the ring is module state.
  */
 
 let canvasId = ''
@@ -56,7 +55,7 @@ describe('record / getRunEvents', () => {
 
   it('honours an explicit timestamp instead of stamping the record time', () => {
     const at = Date.now() - 5_000
-    const event = record({ canvasId, runId: 'run-1', agentName: 'Doop Agent', kind: 'turn', at })
+    const event = record({ canvasId, runId: 'run-1', agentName: 'Doop Agent', kind: 'tool', at })
     expect(event.at).toBe(at)
     expect(getRunEvents(canvasId)[0]?.at).toBe(at)
   })
@@ -106,9 +105,16 @@ describe('forgetCanvas / pruneOlderThan', () => {
   })
 
   it('keeps events newer than the cutoff', () => {
-    record({ canvasId, runId: 'run-1', agentName: 'Doop Agent', kind: 'tool', at: Date.now() - 60_000 })
-    record({ canvasId, runId: 'run-1', agentName: 'Doop Agent', kind: 'status' })
+    record({
+      canvasId,
+      runId: 'run-1',
+      agentName: 'Doop Agent',
+      kind: 'tool',
+      summary: 'old',
+      at: Date.now() - 60_000,
+    })
+    record({ canvasId, runId: 'run-1', agentName: 'Doop Agent', kind: 'tool', summary: 'fresh' })
     pruneOlderThan(30_000)
-    expect(getRunEvents(canvasId).map((e) => e.kind)).toEqual(['status'])
+    expect(getRunEvents(canvasId).map((e) => e.summary)).toEqual(['fresh'])
   })
 })

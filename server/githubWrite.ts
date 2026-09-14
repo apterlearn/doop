@@ -6,13 +6,14 @@ import type { GithubConnection } from './github.ts'
 import type { McpErrorCode } from './mcpErrors.ts'
 
 /**
- * The write side of the GitHub surface: commit a set of files to a branch and
- * open a pull request — the handoff step that turns a canvas export into
- * something a repository can review. Read-only repo access lives in
- * github.ts (import source); this module only ever adds commits and PRs, so
- * every failure it reports is one of three things the caller can act on:
- * no connection configured, credential lacking the write scopes, or GitHub
- * refusing the request.
+ * The write side of the GitHub surface: commit a set of files to a branch,
+ * open a pull request, and answer the review on it — the handoff step that
+ * turns a canvas export into something a repository can review, and the way
+ * the reviewer's feedback gets a reply. Read-only repo access lives in
+ * github.ts (import source); this module only ever adds commits, pull requests
+ * and comments, so every failure it reports is one of three things the caller
+ * can act on: no connection configured, credential lacking the write scopes,
+ * or GitHub refusing the request.
  *
  * Credentials are reused from the existing connection rows (github.ts): an
  * App installation mints a short-lived token through githubApp, a fine-grained
@@ -213,30 +214,35 @@ async function refCommit(token: string, repo: string, branch: string): Promise<s
   }
 }
 
-/** A pull request for this head/base pair already exists on a re-run: report
- *  that one instead of failing the handoff. */
-async function openPullRequest(
+/** Open the pull request for `headRef` → `baseRef`, or report the one that is
+ *  already open for that pair: a re-run of a handoff updates the same pull
+ *  request instead of failing because it exists. `created` says which of the
+ *  two happened, so a caller can tell "opened" from "found". */
+async function ensurePullRequestCore(
   token: string,
   repo: string,
-  input: { branch: string; base: string; message: string },
-): Promise<PullResponse> {
-  const title = input.message.split('\n')[0]?.trim() || 'Design update from Doop'
+  input: { baseRef: string; headRef: string; title: string; body: string },
+): Promise<{ number: number; url: string; created: boolean }> {
   try {
-    return await ghRequest<PullResponse>(token, 'POST', `/repos/${repo}/pulls`, {
-      title,
-      head: input.branch,
-      base: input.base,
-      body: input.message,
+    const pull = await ghRequest<PullResponse>(token, 'POST', `/repos/${repo}/pulls`, {
+      title: input.title,
+      head: input.headRef,
+      base: input.baseRef,
+      body: input.body,
     })
+    return { number: pull.number, url: pull.html_url, created: true }
   } catch (error) {
+    /* GitHub answers a duplicate with 422 and no body worth reading: look the
+       open pull request up by its head/base pair and report that one. */
     if (!(error instanceof GithubWriteError) || error.status !== 422) throw error
     const owner = repo.split('/')[0] ?? ''
     const existing = await ghRequest<PullResponse[]>(
       token,
       'GET',
-      `/repos/${repo}/pulls?head=${encodeURIComponent(`${owner}:${input.branch}`)}&base=${encodeURIComponent(input.base)}&state=open`,
+      `/repos/${repo}/pulls?head=${encodeURIComponent(`${owner}:${input.headRef}`)}&base=${encodeURIComponent(input.baseRef)}&state=open`,
     )
-    if (existing.length > 0) return existing[0]!
+    const [found] = existing
+    if (found) return { number: found.number, url: found.html_url, created: false }
     throw error
   }
 }
@@ -363,21 +369,18 @@ export async function readPullRequest(
   }
 }
 
-/** Commit `files` to `branch` (creating it from `base` when missing) and open
- *  a pull request against `base`. */
-export async function commitFiles(input: CommitFilesInput): Promise<CommitFilesResult> {
-  const repo = normalizeRepo(input.repo)
-  const branch = input.branch.trim()
-  if (!branch) throw new GithubWriteError(0, 'branch is required', { code: 'invalid_input' })
-  if (input.files.length === 0) throw new GithubWriteError(0, 'no files to commit', { code: 'invalid_input' })
-  if (input.files.some((file) => !file.path || file.path.startsWith('/')))
+/** The file set every commit path must carry: a handoff of nothing, or of a
+ *  path GitHub cannot place inside the repository, is a caller mistake. */
+function assertCommitFiles(files: { path: string; content: string }[]): void {
+  if (files.length === 0) throw new GithubWriteError(0, 'no files to commit', { code: 'invalid_input' })
+  if (files.some((file) => !file.path || file.path.startsWith('/')))
     throw new GithubWriteError(0, 'file paths must be relative repository paths', { code: 'invalid_input' })
+}
 
-  const conn = await connectionFor(repo, input.canvasId)
-  /* The connection's branch is the repo's default branch unless the user
-     pinned another one when connecting — never a hard-coded "main". */
-  const base = input.base?.trim() || conn.branch || 'main'
-  if (branch === base)
+/** A pull request needs two distinct refs: committing onto the base branch is
+ *  a push, not a handoff. */
+function assertDistinctRefs(baseRef: string, headRef: string): void {
+  if (baseRef === headRef)
     throw new GithubWriteError(
       0,
       'branch must differ from base — committing to the base branch directly is not a pull request',
@@ -385,9 +388,19 @@ export async function commitFiles(input: CommitFilesInput): Promise<CommitFilesR
         code: 'invalid_input',
       },
     )
-  const token = await credentialFor(conn)
-  const baseCommit = await refCommit(token, repo, base)
-  if (!baseCommit) throw new GithubWriteError(404, `base branch "${base}" not found in ${repo}`, { path: 'refs/heads' })
+}
+
+/** The git half of the handoff: blobs → tree → commit → ref, with no pull
+ *  request. It takes the token rather than resolving a connection so a caller
+ *  that already holds one (commitFiles) looks its credential up only once. */
+async function commitToBranchCore(
+  token: string,
+  repo: string,
+  input: { baseRef: string; headRef: string; files: { path: string; content: string }[]; message: string },
+): Promise<{ commitSha: string; branch: string }> {
+  const baseCommit = await refCommit(token, repo, input.baseRef)
+  if (!baseCommit)
+    throw new GithubWriteError(404, `base branch "${input.baseRef}" not found in ${repo}`, { path: 'refs/heads' })
   /* base_tree needs a tree sha; the commit object carries it next to the sha
      we already resolved */
   const baseCommitInfo = await ghRequest<{ tree: { sha: string } }>(
@@ -414,15 +427,140 @@ export async function commitFiles(input: CommitFilesInput): Promise<CommitFilesR
     parents: [baseCommit],
   })
 
-  const existing = await refCommit(token, repo, branch)
+  const existing = await refCommit(token, repo, input.headRef)
   if (existing) {
     /* a re-run on the same branch: fast-forward it onto the new commit rather
        than rebuilding the branch from base and losing the earlier commits */
-    await ghRequest(token, 'PATCH', `/repos/${repo}/git/refs/heads/${refPath(branch)}`, { sha: commit.sha })
+    await ghRequest(token, 'PATCH', `/repos/${repo}/git/refs/heads/${refPath(input.headRef)}`, { sha: commit.sha })
   } else {
-    await ghRequest(token, 'POST', `/repos/${repo}/git/refs`, { ref: `refs/heads/${branch}`, sha: commit.sha })
+    await ghRequest(token, 'POST', `/repos/${repo}/git/refs`, { ref: `refs/heads/${input.headRef}`, sha: commit.sha })
   }
+  return { commitSha: commit.sha, branch: input.headRef }
+}
 
-  const pull = await openPullRequest(token, repo, { branch, base, message: input.message })
-  return { branch, commit: commit.sha, url: pull.html_url }
+export interface CommitToBranchInput {
+  /** "owner/name", as stored on the connection */
+  repo: string
+  /** the branch the commit is based on — resolved to a tree, never written */
+  baseRef: string
+  /** the branch to commit to — created from `baseRef` when it does not exist */
+  headRef: string
+  files: { path: string; content: string }[]
+  message: string
+  /** narrows the credential lookup to the connections of one canvas */
+  canvasId?: string
+}
+
+/** Commit `files` to `headRef` (creating it from `baseRef` when missing) and
+ *  stop there — the pull request is `ensurePullRequest`'s job, so an export
+ *  step can put a commit on a branch without one. */
+export async function commitToBranch(input: CommitToBranchInput): Promise<{ commitSha: string; branch: string }> {
+  const repo = normalizeRepo(input.repo)
+  const baseRef = input.baseRef.trim()
+  const headRef = input.headRef.trim()
+  if (!headRef) throw new GithubWriteError(0, 'branch is required', { code: 'invalid_input' })
+  if (!baseRef) throw new GithubWriteError(0, 'base branch is required', { code: 'invalid_input' })
+  assertDistinctRefs(baseRef, headRef)
+  assertCommitFiles(input.files)
+  const conn = await connectionFor(repo, input.canvasId)
+  const token = await credentialFor(conn)
+  return commitToBranchCore(token, repo, { baseRef, headRef, files: input.files, message: input.message })
+}
+
+export interface EnsurePullRequestInput {
+  /** "owner/name", as stored on the connection */
+  repo: string
+  /** the branch the pull request merges into */
+  baseRef: string
+  /** the branch holding the commits */
+  headRef: string
+  title: string
+  body: string
+  /** narrows the credential lookup to the connections of one canvas */
+  canvasId?: string
+}
+
+/** Open the pull request for `headRef` → `baseRef`. A pull request already open
+ *  for that pair is reported with `created: false` instead of failing, so a
+ *  re-run (or an update on top of an earlier handoff) keeps one pull request. */
+export async function ensurePullRequest(
+  input: EnsurePullRequestInput,
+): Promise<{ number: number; url: string; created: boolean }> {
+  const repo = normalizeRepo(input.repo)
+  const baseRef = input.baseRef.trim()
+  const headRef = input.headRef.trim()
+  if (!headRef) throw new GithubWriteError(0, 'branch is required', { code: 'invalid_input' })
+  if (!baseRef) throw new GithubWriteError(0, 'base branch is required', { code: 'invalid_input' })
+  assertDistinctRefs(baseRef, headRef)
+  const conn = await connectionFor(repo, input.canvasId)
+  const token = await credentialFor(conn)
+  return ensurePullRequestCore(token, repo, { baseRef, headRef, title: input.title, body: input.body })
+}
+
+/** Commit `files` to `branch` (creating it from `base` when missing) and open
+ *  a pull request against `base` — the two halves above, composed. Both halves
+ *  run on the one connection resolved here: resolving again could hand the
+ *  commit and the pull request different credentials. */
+export async function commitFiles(input: CommitFilesInput): Promise<CommitFilesResult> {
+  const repo = normalizeRepo(input.repo)
+  const branch = input.branch.trim()
+  if (!branch) throw new GithubWriteError(0, 'branch is required', { code: 'invalid_input' })
+  assertCommitFiles(input.files)
+
+  const conn = await connectionFor(repo, input.canvasId)
+  /* The connection's branch is the repo's default branch unless the user
+     pinned another one when connecting — never a hard-coded "main". */
+  const base = input.base?.trim() || conn.branch || 'main'
+  assertDistinctRefs(base, branch)
+  const token = await credentialFor(conn)
+  const commit = await commitToBranchCore(token, repo, {
+    baseRef: base,
+    headRef: branch,
+    files: input.files,
+    message: input.message,
+  })
+  const pull = await ensurePullRequestCore(token, repo, {
+    baseRef: base,
+    headRef: branch,
+    /* the commit message's first line is the pull request title */
+    title: input.message.split('\n')[0]?.trim() || 'Design update from Doop',
+    body: input.message,
+  })
+  return { branch, commit: commit.commitSha, url: pull.url }
+}
+
+export interface CommentPullRequestInput {
+  /** "owner/name", as stored on the connection */
+  repo: string
+  prNumber: number
+  body: string
+  /** answer this inline review comment instead of adding to the conversation */
+  inReplyTo?: number
+  /** narrows the credential lookup to the connections of one canvas */
+  canvasId?: string
+}
+
+interface CommentResponse {
+  id: number
+}
+
+/** Say something back on a handoff pull request: a comment in the conversation,
+ *  or — with `inReplyTo` — an answer on one of the inline review comments, which
+ *  is what keeps a reviewer's thread attached to the file and line it is about. */
+export async function commentPullRequest(input: CommentPullRequestInput): Promise<{ commentId: number }> {
+  const repo = normalizeRepo(input.repo)
+  if (!Number.isInteger(input.prNumber) || input.prNumber <= 0)
+    throw new GithubWriteError(0, 'prNumber must be a pull request number', { code: 'invalid_input' })
+  if (!input.body.trim()) throw new GithubWriteError(0, 'comment body is required', { code: 'invalid_input' })
+  if (input.inReplyTo !== undefined && (!Number.isInteger(input.inReplyTo) || input.inReplyTo <= 0))
+    throw new GithubWriteError(0, 'inReplyTo must be a comment id', { code: 'invalid_input' })
+  const conn = await connectionFor(repo, input.canvasId)
+  const token = await credentialFor(conn)
+  /* the conversation lives on the issue behind the pull request; a reply has to
+     go through the pull request's own comment thread to stay inline */
+  const path = input.inReplyTo
+    ? `/repos/${repo}/pulls/${input.prNumber}/comments/${input.inReplyTo}/replies`
+    : `/repos/${repo}/issues/${input.prNumber}/comments`
+  const created = await ghRequest<CommentResponse>(token, 'POST', path, { body: input.body })
+  return { commentId: created.id }
 }

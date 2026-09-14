@@ -10,7 +10,6 @@ vi.mock('../server/db/persist.ts', () => ({
   getNotificationPrefs: async () => new Map(),
   saveNotificationPref: () => {},
   pruneRunEvents: () => {},
-  saveJournal: () => {},
   saveRunEvent: () => {},
   saveQuestion: () => {},
   saveFrameProposal: () => {},
@@ -58,7 +57,7 @@ beforeEach(() => {
 })
 
 describe('queue priority', () => {
-  it('claims higher-priority cards first, then position order', () => {
+  it('orders the queue by priority, then position', () => {
     const low = actions.addQueuedCard(canvas.id, 'low', 'owner', undefined, undefined, OWNER_ID)!
     const high = actions.addQueuedCard(canvas.id, 'high', 'owner', undefined, undefined, OWNER_ID)!
     const mid = actions.addQueuedCard(canvas.id, 'mid', 'owner', undefined, undefined, OWNER_ID)!
@@ -66,8 +65,7 @@ describe('queue priority', () => {
     actions.setCardPriority(canvas.id, high.id, 5)
     actions.setCardPriority(canvas.id, mid.id, 1)
 
-    const claimed = actions.takeQueuedCardsFor(canvas.id, 'Doop', OWNER_ID)
-    expect(claimed.map((c) => c.status)).toEqual(['high', 'mid', 'low'])
+    expect(actions.queuedCards(canvas.id).map((c) => c.status)).toEqual(['high', 'mid', 'low'])
   })
 
   it('reorder rewrites position among equal-priority cards', () => {
@@ -76,19 +74,8 @@ describe('queue priority', () => {
     const c = actions.addQueuedCard(canvas.id, 'third', 'owner', undefined, undefined, OWNER_ID)!
 
     actions.reorderCards(canvas.id, [c.id, a.id, b.id])
-    const claimed = actions.takeQueuedCardsFor(canvas.id, 'Doop', OWNER_ID)
-    expect(claimed.map((x) => x.status)).toEqual(['third', 'first', 'second'])
-  })
 
-  it('paused cards are skipped until resumed', () => {
-    const card = actions.addQueuedCard(canvas.id, 'pausable', 'owner', undefined, undefined, OWNER_ID)!
-    actions.claimCard(canvas.id, card.id, 'Doop')
-    expect(actions.pauseAgentWork(canvas.id, 'Doop', 'owner')).toBe(1)
-    expect(actions.takeQueuedCardsFor(canvas.id, 'Doop', OWNER_ID)).toHaveLength(0)
-
-    const resumed = actions.resumeCard(canvas.id, card.id, 'owner')
-    expect(resumed?.pausedAt).toBeUndefined()
-    expect(actions.takeQueuedCardsFor(canvas.id, 'Doop', OWNER_ID).map((c) => c.status)).toEqual(['pausable'])
+    expect(actions.queuedCards(canvas.id).map((x) => x.status)).toEqual(['third', 'first', 'second'])
   })
 })
 

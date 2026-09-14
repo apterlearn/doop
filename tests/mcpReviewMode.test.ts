@@ -4,31 +4,60 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import * as actions from '../server/actions.ts'
 import { buildMcpServer } from '../server/mcp.ts'
 import { store } from '../server/store.ts'
-import type { Canvas, Frame } from '../shared/types.ts'
+import type { Canvas, CanvasProposal, Frame } from '../shared/types.ts'
 
 /* Review-mode MCP tools run against the real actions machinery: persist and
-   broadcasts are stubbed, the proposal/queue state is real. */
-vi.mock('../server/db/persist.ts', () => ({
-  getUserEmail: async () => undefined,
-  getNotificationPrefs: async () => new Map(),
-  saveNotificationPref: () => {},
-  pruneRunEvents: () => {},
-  saveJournal: () => {},
-  saveRunEvent: () => {},
-  saveQuestion: () => {},
-  saveFrameProposal: () => {},
-  saveTask: () => {},
-  saveFeedback: () => {},
-  saveComment: () => {},
-  saveActivity: () => {},
-  saveDecision: () => {},
-  saveProposal: () => {},
-  deleteTask: () => {},
-  saveFrame: () => {},
-  deleteFrame: () => {},
-  saveCanvas: () => {},
-  savePage: () => {},
-}))
+   broadcasts are stubbed, the proposal/queue state is real. Canvas-level
+   proposals are the one thing the actions layer reads back through persist, so
+   the stub keeps them in an array — the row's semantics (upsert on save,
+   resolve in place) without a database. */
+vi.mock('../server/db/persist.ts', () => {
+  const canvasProposals: CanvasProposal[] = []
+  return {
+    getUserEmail: async () => undefined,
+    getNotificationPrefs: async () => new Map(),
+    saveNotificationPref: () => {},
+    pruneRunEvents: () => {},
+    saveRunEvent: () => {},
+    saveQuestion: () => {},
+    saveFrameProposal: () => {},
+    saveTask: () => {},
+    saveFeedback: () => {},
+    saveComment: () => {},
+    saveActivity: () => {},
+    saveDecision: () => {},
+    saveProposal: () => {},
+    deleteTask: () => {},
+    saveFrame: () => {},
+    deleteFrame: () => {},
+    saveCanvas: () => {},
+    savePage: () => {},
+    saveCanvasProposal: async (proposal: CanvasProposal) => {
+      const at = canvasProposals.findIndex((row) => row.id === proposal.id)
+      if (at === -1) canvasProposals.push({ ...proposal })
+      else canvasProposals[at] = { ...canvasProposals[at]!, ...proposal }
+    },
+    listCanvasProposals: async (canvasId: string, opts: { status?: CanvasProposal['status'] } = {}) =>
+      canvasProposals
+        .filter((row) => row.canvasId === canvasId && (opts.status === undefined || row.status === opts.status))
+        .sort((a, b) => b.createdAt - a.createdAt),
+    resolveCanvasProposal: async (
+      id: string,
+      patch: { status: CanvasProposal['status']; note?: string; resolvedAt: number },
+    ) => {
+      const row = canvasProposals.find((proposal) => proposal.id === id)
+      if (!row) return
+      row.status = patch.status
+      if (patch.note) row.resolutionNote = patch.note
+      row.resolvedAt = patch.resolvedAt
+    },
+    /* the ship gate reads the newest stored review per frame; nothing is
+       verified here, which is the state the gate refuses */
+    listFrameReviews: async () => [],
+    saveFrameReview: () => {},
+    saveRelease: () => {},
+  }
+})
 
 const OWNER_ID = 'owner-1'
 
@@ -37,8 +66,6 @@ let frame: Frame
 
 function wireBroadcasts() {
   actions.wire(
-    () => {},
-    () => {},
     () => {},
     () => {},
   )
@@ -317,6 +344,158 @@ describe('review mode', () => {
     const human = actions.resolveActor({ name: 'alice', kind: 'user', ownerId: OWNER_ID })
     const updated = actions.updateFrame(frame.id, { html: '<html><body><p>human</p></body></html>' }, human)
     expect(updated?.html).toContain('human')
+  })
+})
+
+describe('canvas-level proposals', () => {
+  const ownerActor = () => actions.resolveActor({ name: 'owner', kind: 'user', ownerId: OWNER_ID })
+
+  it('propose → list → resolve over MCP', async () => {
+    actions.setCanvasReviewMode(canvas.id, true, ownerActor())
+    const { client, close } = await connect()
+    try {
+      const proposed = await callTool(client, 'propose_canvas_change', {
+        canvas_id: canvas.id,
+        kind: 'tokens',
+        payload: { colors: { ink: '#111111' } },
+        summary: 'one ink, on the record',
+        agent_name: 'ux lead',
+      })
+      expect(proposed.isError).toBeFalsy()
+      const {
+        proposal_id: proposalId,
+        kind,
+        status,
+      } = proposed.parsed as {
+        proposal_id: string
+        kind: string
+        status: string
+      }
+      expect(kind).toBe('tokens')
+      expect(status).toBe('pending')
+      /* nothing touched the canvas yet — that is the whole point of the queue */
+      expect(store.getCanvas(canvas.id)?.tokens).toBeUndefined()
+
+      const listed = await callTool(client, 'list_canvas_proposals', {
+        canvas_id: canvas.id,
+        status: 'pending',
+        agent_name: 'ux lead',
+      })
+      const { proposals } = listed.parsed as {
+        proposals: { proposal_id: string; kind: string; before: unknown; resolution_note?: string }[]
+      }
+      expect(proposals.map((entry) => entry.proposal_id)).toEqual([proposalId])
+      expect(proposals[0]!.kind).toBe('tokens')
+      expect(proposals[0]!.before).toBeNull()
+
+      const resolved = await callTool(client, 'resolve_canvas_proposal', {
+        canvas_id: canvas.id,
+        proposal_id: proposalId,
+        action: 'accept',
+        note: 'good call',
+        agent_name: 'owner',
+      })
+      expect(resolved.isError).toBeFalsy()
+      expect((resolved.parsed as { status: string }).status).toBe('accepted')
+      /* accepting applied it through the ordinary setter */
+      expect(store.getCanvas(canvas.id)?.tokens).toMatchObject({ colors: { ink: '#111111' } })
+
+      const after = await callTool(client, 'list_canvas_proposals', {
+        canvas_id: canvas.id,
+        status: 'accepted',
+        agent_name: 'ux lead',
+      })
+      const accepted = (after.parsed as { proposals: { proposal_id: string; resolution_note?: string }[] }).proposals
+      expect(accepted).toHaveLength(1)
+      expect(accepted[0]!.resolution_note).toBe('good call')
+
+      /* a resolved proposal is not a replayable command */
+      const again = await callTool(client, 'resolve_canvas_proposal', {
+        canvas_id: canvas.id,
+        proposal_id: proposalId,
+        action: 'reject',
+        agent_name: 'owner',
+      })
+      expect(again.isError).toBe(true)
+      expect((again.parsed as { error: { code: string } }).error.code).toBe('not_found')
+    } finally {
+      await close()
+    }
+  })
+
+  it('refuses a canvas-level proposal while review mode is off', async () => {
+    const { client, close } = await connect()
+    try {
+      const res = await callTool(client, 'propose_canvas_change', {
+        canvas_id: canvas.id,
+        kind: 'breakpoints',
+        payload: [{ name: 'mobile', min_width: 390 }],
+        agent_name: 'ux lead',
+      })
+      expect(res.isError).toBe(true)
+      expect((res.parsed as { error: { code: string } }).error.code).toBe('unsupported')
+      expect(store.getCanvas(canvas.id)?.breakpoints).toBeUndefined()
+    } finally {
+      await close()
+    }
+  })
+
+  it('rejects a payload its kind could not apply', async () => {
+    actions.setCanvasReviewMode(canvas.id, true, ownerActor())
+    const { client, close } = await connect()
+    try {
+      const res = await callTool(client, 'propose_canvas_change', {
+        canvas_id: canvas.id,
+        kind: 'tokens',
+        payload: { colors: { ink: 'not-a-colour' } },
+        agent_name: 'ux lead',
+      })
+      expect(res.isError).toBe(true)
+      expect((res.parsed as { error: { code: string } }).error.code).toBe('invalid_input')
+    } finally {
+      await close()
+    }
+  })
+})
+
+describe('the ship gate', () => {
+  it('refuses an unverified canvas, and force: true ships it anyway', async () => {
+    const { client, close } = await connect()
+    try {
+      /* the seeded frame has never been reviewed, so the canvas is not
+         verified end to end — whoever wrote the frame */
+      const refused = await callTool(client, 'publish_canvas', {
+        canvas_id: canvas.id,
+        category: 'website',
+        agent_name: 'ux lead',
+      })
+      expect(refused.isError).toBe(true)
+      const refusal = refused.parsed as { error: { code: string; message: string; frames?: { name: string }[] } }
+      expect(refusal.error.code).toBe('conflict')
+      expect(refusal.error.message).toContain('review_canvas')
+      expect(refusal.error.message).toContain('force: true')
+      expect(refusal.error.frames?.map((entry) => entry.name)).toEqual(['Hero'])
+      expect(store.getCanvas(canvas.id)?.publishedAt).toBeUndefined()
+
+      const forced = await callTool(client, 'publish_canvas', {
+        canvas_id: canvas.id,
+        category: 'website',
+        force: true,
+        agent_name: 'ux lead',
+      })
+      expect(forced.isError, forced.raw).toBeFalsy()
+      expect(store.getCanvas(canvas.id)?.publishedAt).toBeDefined()
+
+      /* the gate is on every ship path, not just this one */
+      const release = await callTool(client, 'create_release', {
+        canvas_id: canvas.id,
+        agent_name: 'ux lead',
+      })
+      expect(release.isError).toBe(true)
+      expect((release.parsed as { error: { code: string } }).error.code).toBe('conflict')
+    } finally {
+      await close()
+    }
   })
 })
 

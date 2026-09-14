@@ -7,16 +7,15 @@ import * as runLog from '../server/runLog.ts'
 import { store } from '../server/store.ts'
 import type { Canvas, ServerMessage } from '../shared/types.ts'
 
-/* A connected MCP agent works on the same canvas as the resident team, and the
-   Run tab is where a human watches what an agent did. Its calls have to land on
-   that timeline, attributed to the agent that made them. */
+/* A connected MCP agent works on a shared canvas, and the Run tab is where a
+   human watches what it did. Its calls have to land on that timeline,
+   attributed to the agent that made them. */
 
 vi.mock('../server/db/persist.ts', () => ({
   getUserEmail: async () => undefined,
   getNotificationPrefs: async () => new Map(),
   saveNotificationPref: () => {},
   pruneRunEvents: () => {},
-  saveJournal: () => {},
   saveRunEvent: () => {},
   saveQuestion: () => {},
   saveFrameProposal: () => {},

@@ -4,7 +4,14 @@ import path from 'node:path'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import { closeDb, db, initDb } from '../server/db/index.ts'
 import { githubConnections } from '../server/db/schema.ts'
-import { commitFiles, GithubWriteError, readPullRequest } from '../server/githubWrite.ts'
+import {
+  commentPullRequest,
+  commitFiles,
+  commitToBranch,
+  ensurePullRequest,
+  GithubWriteError,
+  readPullRequest,
+} from '../server/githubWrite.ts'
 
 /**
  * The PR handoff: the credential has to come from the calling canvas's own
@@ -78,6 +85,22 @@ function stubGithub(baseBranch = 'master'): Call[] {
 
 const FILES = [{ path: 'design/home.html', content: '<h1>hi</h1>' }]
 
+/** A GitHub that answers every call with `respond`'s payload, recording them —
+ *  for the endpoints a test drives on their own rather than the whole commit
+ *  pipeline `stubGithub` replays. */
+function stubGithubEndpoints(respond: (call: Call) => { status?: number; payload: unknown }): Call[] {
+  const calls: Call[] = []
+  vi.stubGlobal('fetch', async (url: string, init: RequestInit = {}) => {
+    const method = init.method ?? 'GET'
+    const body = init.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : undefined
+    const call = { method, url, body }
+    calls.push(call)
+    const { status = 200, payload } = respond(call)
+    return new Response(JSON.stringify(payload), { status, headers: { 'content-type': 'application/json' } })
+  })
+  return calls
+}
+
 afterEach(() => {
   vi.unstubAllGlobals()
   return db.delete(githubConnections)
@@ -148,6 +171,82 @@ describe('open_pull_request base branch', () => {
     await expect(
       commitFiles({ repo: 'acme/app', branch: 'doop/c-handoff', files: FILES, message: 'x', canvasId: 'c-handoff' }),
     ).rejects.toMatchObject({ code: 'not_found', message: /not found/ })
+  })
+})
+
+/* The handoff split in two: a commit a caller can make without opening a pull
+   request, and the pull request a re-run finds instead of duplicating. */
+describe('commitToBranch', () => {
+  it('commits the files to the branch without opening a pull request', async () => {
+    await db.insert(githubConnections).values(connection())
+    const calls = stubGithub()
+    const result = await commitToBranch({
+      repo: 'acme/app',
+      baseRef: 'master',
+      headRef: 'doop/c-handoff',
+      files: FILES,
+      message: 'Design update',
+      canvasId: 'c-handoff',
+    })
+    expect(result).toEqual({ commitSha: 'new-commit', branch: 'doop/c-handoff' })
+    expect(calls.find((c) => c.url.endsWith('/git/commits'))?.body).toMatchObject({ message: 'Design update' })
+    expect(calls.find((c) => c.url.endsWith('/git/refs'))?.body).toMatchObject({
+      ref: 'refs/heads/doop/c-handoff',
+      sha: 'new-commit',
+    })
+    expect(calls.some((c) => c.url.endsWith('/pulls'))).toBe(false)
+  })
+})
+
+describe('ensurePullRequest', () => {
+  it('reports a freshly created pull request as created', async () => {
+    await db.insert(githubConnections).values(connection())
+    const calls = stubGithubEndpoints(() => ({
+      status: 201,
+      payload: { number: 7, html_url: 'https://github.com/acme/app/pull/7' },
+    }))
+    const result = await ensurePullRequest({
+      repo: 'acme/app',
+      baseRef: 'master',
+      headRef: 'doop/c-handoff',
+      title: 'Design update',
+      body: 'Design update\n\nSecond paragraph.',
+      canvasId: 'c-handoff',
+    })
+    expect(result).toEqual({ number: 7, url: 'https://github.com/acme/app/pull/7', created: true })
+    expect(calls).toEqual([
+      {
+        method: 'POST',
+        url: 'https://api.github.com/repos/acme/app/pulls',
+        body: {
+          title: 'Design update',
+          head: 'doop/c-handoff',
+          base: 'master',
+          body: 'Design update\n\nSecond paragraph.',
+        },
+      },
+    ])
+  })
+
+  it('finds the pull request GitHub already has instead of failing the re-run', async () => {
+    await db.insert(githubConnections).values(connection())
+    const calls = stubGithubEndpoints((call) =>
+      call.method === 'POST'
+        ? { status: 422, payload: { message: 'A pull request already exists for acme:doop/c-handoff.' } }
+        : { payload: [{ number: 9, html_url: 'https://github.com/acme/app/pull/9' }] },
+    )
+    const result = await ensurePullRequest({
+      repo: 'acme/app',
+      baseRef: 'master',
+      headRef: 'doop/c-handoff',
+      title: 'Design update',
+      body: 'Design update',
+      canvasId: 'c-handoff',
+    })
+    expect(result).toEqual({ number: 9, url: 'https://github.com/acme/app/pull/9', created: false })
+    expect(calls[1]?.url).toBe(
+      'https://api.github.com/repos/acme/app/pulls?head=acme%3Adoop%2Fc-handoff&base=master&state=open',
+    )
   })
 })
 
@@ -226,5 +325,50 @@ describe('get_pull_request_review', () => {
   it('rejects a pull number that is not a number', async () => {
     await db.insert(githubConnections).values(connection())
     await expect(readPullRequest('acme/app', 0, 'c-handoff')).rejects.toThrow(/pull request number/)
+  })
+})
+
+/* The other direction of that loop: the agent answers the reviewer, and the
+   answer lands in the thread the comment lives in rather than beside it. */
+describe('commentPullRequest', () => {
+  it('posts a comment into the pull request conversation', async () => {
+    await db.insert(githubConnections).values(connection())
+    const calls = stubGithubEndpoints(() => ({ status: 201, payload: { id: 41 } }))
+    const result = await commentPullRequest({
+      repo: 'acme/app',
+      prNumber: 7,
+      body: 'Fixed the hero height',
+      canvasId: 'c-handoff',
+    })
+    expect(result).toEqual({ commentId: 41 })
+    expect(calls).toEqual([
+      {
+        method: 'POST',
+        url: 'https://api.github.com/repos/acme/app/issues/7/comments',
+        body: { body: 'Fixed the hero height' },
+      },
+    ])
+  })
+
+  it('answers an inline comment on the pull request’s own thread', async () => {
+    await db.insert(githubConnections).values(connection())
+    const calls = stubGithubEndpoints(() => ({ status: 201, payload: { id: 42 } }))
+    await commentPullRequest({
+      repo: 'acme/app',
+      prNumber: 7,
+      body: 'Good catch — the hero is 480px now',
+      inReplyTo: 314,
+      canvasId: 'c-handoff',
+    })
+    expect(calls[0]?.url).toBe('https://api.github.com/repos/acme/app/pulls/7/comments/314/replies')
+    expect(calls[0]?.body).toEqual({ body: 'Good catch — the hero is 480px now' })
+  })
+
+  it('reports a missing pull request as not_found', async () => {
+    await db.insert(githubConnections).values(connection())
+    stubGithubEndpoints(() => ({ status: 404, payload: { message: 'Not Found' } }))
+    await expect(
+      commentPullRequest({ repo: 'acme/app', prNumber: 7, body: 'hello', canvasId: 'c-handoff' }),
+    ).rejects.toMatchObject({ code: 'not_found', status: 404 })
   })
 })

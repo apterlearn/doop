@@ -212,7 +212,6 @@ describe('get_capabilities catalogues the registered surface', () => {
         'delete_page',
         'delete_element',
         'revert_frame',
-        'revert_run',
         'restore_release',
         'unpublish_canvas',
         'withdraw_proposal',

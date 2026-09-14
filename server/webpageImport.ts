@@ -17,18 +17,17 @@ export interface ImportedWebpageFrame {
   frame: Frame | undefined
 }
 
-/** Find an earlier snapshot of the same requested URL. Resident pipeline
- *  stages use this to reuse source material instead of adding megabyte-scale
- *  duplicates on every stage or retry. */
+/** Find an earlier snapshot of the same requested URL, so a repeat import can
+ *  reuse source material instead of adding a megabyte-scale duplicate. */
 export function findImportedWebpageFrame(frames: Frame[], rawUrl: string): Frame | undefined {
   const source = normalizeImportUrl(rawUrl).href
   return frames.find((frame) => importedPageSource(frame.html) === source)
 }
 
 /** Shared agent-facing wrapper around the browser/UI importer. Keeping the
- *  page-to-frame mapping here ensures resident and connected agents create the
- *  exact same editable source artifact. Dependencies are injectable for a
- *  bounded unit test without launching Chrome or writing to the store. */
+ *  page-to-frame mapping here means every path that imports a page for an agent
+ *  creates the exact same editable source artifact. Dependencies are injectable
+ *  for a bounded unit test without launching Chrome or writing to the store. */
 export async function createImportedWebpageFrame(
   input: {
     canvasId: string

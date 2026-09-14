@@ -9,6 +9,9 @@ export const GUIDE_TOPICS = [
   'doop-instructions',
   'streaming',
   'review',
+  'verify',
+  'ship',
+  'board',
   'images',
   'redesign',
   'components',
@@ -25,6 +28,9 @@ const TOPIC_SECTIONS: Record<GuideTopic, string[]> = {
   'doop-instructions': [],
   streaming: ['Streaming — how to write designs', 'Frames and HTML'],
   review: ['Review checkpoints — MANDATORY', 'Design tokens — the values every frame shares'],
+  verify: ['Verify — the sweep, the fixers and the diffs'],
+  ship: ['Ship — releases, the handoff and the gate'],
+  board: ['The board — cards, feedback and comments'],
   images: ['Images — search first, then upload'],
   redesign: ['Redesigns — audit first, then two drafts'],
   components: ['Components — reuse before you author'],
@@ -34,9 +40,8 @@ const TOPIC_SECTIONS: Record<GuideTopic, string[]> = {
   memory: ['Memory across canvases'],
 }
 
-/** The taste doctrine every design surface shares. The MCP guide serves it to
- *  external agents and the resident system prompt embeds it verbatim, so the
- *  two cannot drift apart. */
+/** The taste doctrine every design surface shares. DOOP_GUIDE embeds it, so
+ *  every agent that loads the guide — whole or by topic — reads the same text. */
 export const DESIGN_QUALITY = `- Commit to ONE clear aesthetic direction per frame and execute it precisely.
   Intentionality beats intensity; a refined minimal frame and a maximal one are both good
   when the choice is deliberate.
@@ -65,9 +70,8 @@ export const DESIGN_QUALITY = `- Commit to ONE clear aesthetic direction per fra
   that fit the product's audience instead of inventing "Acme" or "Globex". No gray
   tiles, no "LOGO" text, no initials-in-a-circle, no hand-drawn brand marks.`
 
-/** The brief-first ritual with its inspiration-retrieval mandate. Shared by the
- *  MCP guide and the resident system prompt (both toolsets expose
- *  search_inspiration, set_status and save_decision) so the ritual cannot drift. */
+/** The brief-first ritual with its inspiration-retrieval mandate. DOOP_GUIDE
+ *  embeds it, so the ritual is one text rather than a copy per surface. */
 export const DESIGN_BRIEF = `Before creating frames on a canvas whose style is not already established, commit to a
 brief. It is part of the deliverable, not private scratch work:
 
@@ -105,18 +109,25 @@ your edits render for them the moment you make them, your presence appears under
 agent_name, and every action lands in a visible activity feed. Work like a considerate
 colleague, not a batch job.
 
-## The Doop Agent
+## Roles and pipelines
 
-Every canvas has a built-in Doop Agent: a set of roles that live in the server and pick
-work up on their own. Humans queue board cards addressed to them, and can route a card
-through several in order — design, then copy, then brand, then accessibility:
+Work on a canvas is organised by roles, and every board card names a pipeline: an ordered
+list of roles the card should pass through — design, then copy, then brand, then
+accessibility:
 
 ${AGENT_ROLES.map((r) => `- **${r.name}** (@${r.id}) — ${r.blurb}`).join('\n')}
 
-They only take work addressed to them: a board card at their stage, an element comment
-that @mentions them, or feedback on a task they ran. Anything left unaddressed is open
-to you. If a human asks you for something one of these roles owns, just do it — the
-routing is for their benefit, not a lock on your work.
+No agent lives in the server. The roles are the board's routing vocabulary and the
+pipelines are how a human says who should work a card next; the agents that actually do
+the work are MCP clients like you, connected to this canvas. Nothing claims a card for
+you — you pick one up with take_card (see the board section below), and the pipeline is
+a label on the card, not a lock on your work. If a human asks you for something one of
+these roles owns, just do it.
+
+Who is on the canvas right now — and what each connected agent is working on — comes from
+get_agents. What any of them has actually done comes from get_run_events: one entry per
+tool call, newest first, with the agent, the outcome and the duration. Read it before
+you pick up work someone else may have started, and after a run you want to audit.
 
 Use get_comments({ canvas_id }) to read element-pinned comments and replies, including
 their frame, selector, snippet, author, thread links, and claim/failure/resolution state.
@@ -162,8 +173,7 @@ and picking it up assigns it to you. When you see one:
 ## Board cards — work humans queued for you
 
 Humans queue work as board cards: each card's text is the full brief, queued by a named
-human. The resident Doop Agent team picks their cards up automatically; you pick yours up
-explicitly:
+human. No agent in the server picks them up — you claim yours explicitly:
 
 - list_cards({ canvas_id }) shows every open card — its title IS the prompt, with who
   queued it, any reference-image attachment frame ids, and the target frame ids the card
@@ -178,6 +188,33 @@ explicitly:
 
 A card you cannot finish stays in progress; tell humans why via set_status or a comment
 and let them stop or retry it.
+
+## The board — cards, feedback and comments
+
+The board is the human→agent channel, and it is the whole of it: no server-side agent
+picks work up, so everything addressed to you arrives because a call of yours went out.
+
+- **Cards** — list_cards shows what is open (title is the brief, plus who queued it,
+  the target frames, a target selector and any attachment frames); take_card claims one
+  and hands you the brief; complete_card closes it with a one-line summary; hand_back
+  passes it to the specialty that owns it (the copywriter, the layout specialist) with
+  a note instead of fixing it outside your lane; retry_card re-queues a failed one;
+  create_card queues work yourself, the way a human does.
+- **Feedback** — humans reply to a task and the reply arrives INSIDE your tool results
+  as a HUMAN FEEDBACK block, attributed and addressed to whoever picks it up first.
+  get_feedback claims any open ones explicitly; retry_feedback re-delivers one that
+  never reached an agent. A human's note outranks your todo list — address it first.
+- **Comments** — element-pinned notes: get_comments reads them (frame, selector,
+  snippet, thread, claim state), reply_to_comment answers in-thread, resolve_comment
+  closes one once the design actually addresses it, add_comment pins a new question to
+  an element. Reading comments never claims work.
+- **Waiting** — wait_for_events parks until something on the canvas needs you: task
+  feedback, a comment, a stop, an answer to your question, or a new card. It returns a
+  cursor, so pass it back on the next wait instead of polling. ask_human is the other
+  wait: one blocking question to the humans on the canvas, answered inside the call or
+  left open for get_answers. Neither is a loop — park, then work.
+- **Status** — set_status is the narration humans see live next to your name. It is not
+  optional politeness: it is how a person watching tells "thinking" from "stuck".
 
 ## Plan your run — set_plan
 
@@ -231,6 +268,41 @@ humans watching lose work they may have been reacting to. If you have already ma
 worse, undo_last_change puts it back the way it was before your last write, and
 revert_frame restores any specific saved version instead of rebuilding it by hand.
 
+## Verify — the sweep, the fixers and the diffs
+
+Three widths of checking, and they answer different questions:
+
+- **review_frame** is the per-frame gate: token lint, accessibility and layout at
+  mobile, tablet and desktop plus every breakpoint the canvas declares, in one render
+  batch. **ready_for_review** runs the same checks and RECORDS the report against the
+  exact document it checked. That stored, current, passing report is what every
+  delivery path reads — complete_card, hand_back and each ship path refuse a frame
+  whose newest report does not describe what the frame holds now.
+- **review_canvas** is the canvas-wide sweep: one verdict for the whole design, a row
+  per frame with its blocking and advisory counts and the reason a frame could not be
+  checked. A frame whose stored report is still current costs no render, so a second
+  sweep is cheap. Run it before a release or a handoff, and after a pass that touched
+  many frames. review_frame remains the gate for one frame you just changed.
+- **audit_frame**, **lint_frame**, **check_brand_compliance**, **get_frame_content**
+  and **get_motion_context** are the single-concern reads for the detail behind a
+  failing row; **get_token_usage** is the per-element account of token drift.
+
+Two fixers repair what a check finds. Both write through the ordinary frame write —
+locks, version history and review mode all apply — and both rehearse with dry_run:
+
+- **fix_frame_tokens** rewrites off-token colors, fonts, radii and spacing to their
+  tokens (restrict with only, from lint_frame's rule ids).
+- **fix_frame_a11y** repairs the findings that need no judgement: the document
+  language, a missing or empty title, controls with no hover or focus rule. Everything
+  else comes back in \`skipped\` with the decision it needs named — alt text, form
+  labels, contrast and tap targets are content judgements, not repairs.
+
+Diffs answer "what moved": **diff_frame** compares the current render against a saved
+version, a pinned reference, another frame or a live URL; **diff_release** compares the
+whole canvas against a frozen release, per frame, as a pixel ratio when both versions
+render at one size and a line diff when they do not, plus what was added or removed
+since. Reach for them instead of re-reading a whole design to spot a change.
+
 ## Design brief — before your first frame
 
 ${DESIGN_BRIEF}
@@ -283,8 +355,8 @@ on it; a canvas always keeps at least one page.
 
 Frames whose HTML carries a "doop-github-screen" marker meta were imported from a
 connected GitHub repository: repo HTML as-is, or a screen that exists in that repo only
-as code (a Next.js page, a Storybook story, a component) sketched by Doop from its
-source. The marker records the repo, the route and the source file path.
+as code (a Next.js page, a Storybook story, a component) designed from its source by an
+agent. The marker records the repo, the route and the source file path.
 
 If you have that repository available (checked out locally, or reachable through your
 own tools), you are the best agent to improve such a frame: read the screen's source
@@ -542,8 +614,48 @@ for an attachment). The export_frame tool returns the same URLs on demand. Use i
 image and upload it wherever they need (a CMS media library, a social post, an og:image).
 The URL re-renders on change, so an embedded link stays current as the frame iterates.
 
-## Multiplayer etiquette
+## Ship — releases, the handoff and the gate
 
+Shipping is the step that leaves your hands: a release is frozen, a pull request goes to
+a developer, a listing goes to strangers. Four moves, and every one of them is checked.
+
+- **create_release** freezes every frame as it is right now and returns
+  \`/p/<canvas>/<release>\` — a public, permanent preview that later edits, renames and
+  deletions never change. That URL is what you send a client, attach to a pull request
+  (open_pull_request accepts release_id) or point a gallery listing at.
+  **list_releases** finds an earlier one, **rename_release** relabels one,
+  **delete_release** removes one (owner-only, confirm: true, and not while a listing is
+  pinned to it), and **restore_release** writes a release's frames back onto the live
+  canvas as ordinary, undoable edits.
+- **export_canvas** hands the design to a machine. \`zip\` is one archive of every frame's
+  source, a single-page render of all of them, the design system and the assets they
+  reference — it is stored and you get back \`zip_url\`, a public download; fetch that
+  instead of carrying base64 through your context. \`code\` is the developer handoff — each
+  frame's document, its React component and build spec, the component library and the
+  design system — returned as a file manifest plus the same stored archive.
+  \`manifest\`, \`html\` and \`tokens\` are the lighter forms.
+- **open_pull_request** writes that file set to a branch (default \`doop/<canvas-id>\`) of
+  a connected GitHub repo and opens the pull request, with the handoff's own title and
+  body unless you pass \`message\`. **update_pull_request** re-commits the canvas onto the
+  same branch and comments the summary on the pull request that is already open (it
+  refuses with not_found when there is none — this updates, it does not open).
+  **comment_pull_request** answers the conversation or, with \`in_reply_to\`, an inline
+  review comment. **get_pull_request_review** reads the thread first and tells you which
+  frame each \`design/<frame>.html\` comment is about, so a reviewer's note becomes a frame
+  you can edit. **publish_canvas** lists the design in the community gallery, optionally
+  pinned to a release; **unpublish_canvas** takes it down.
+- **diff_release** says what moved since the release you sent — per frame, how much and
+  where — so an update note is written from evidence rather than memory.
+
+**The gate.** open_pull_request, publish_canvas, create_release and restore_release check
+the WHOLE canvas, not just your own frames: every non-demo frame must hold a current
+passing review, or the call is refused with \`conflict\`, naming the frames and the reason
+for each. Run **review_canvas** to clear it — it reuses the reports that are still
+current and re-checks the rest. \`force: true\` bypasses the gate on each of them; use it
+only when a human has told you to ship anyway, and say plainly in your summary and your
+set_status that unverified frames went out unchecked.
+
+## Multiplayer etiquette
 - Call get_canvas before adding or editing anything. Note each frame's updatedBy and
   updatedAt: a frame touched seconds ago by someone else is probably mid-edit — do not
   edit or delete another actor's frame unless asked to (human feedback you picked up
