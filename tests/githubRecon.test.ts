@@ -1,11 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import {
-  designSystemSlug,
-  extractHtml,
-  nextRepoFramePosition,
-  resolveImport,
-  treeExcerpt,
-} from '../server/githubRecon.ts'
+import { extractHtml, nextRepoFramePosition, resolveImport, treeExcerpt } from '../server/githubRecon.ts'
 import { wrapGeneratedHtml } from '../server/github.ts'
 
 /** The reconstruction pass's pure core: import resolution against a repo
@@ -191,11 +185,5 @@ describe('nextRepoFramePosition', () => {
   it('only counts frames from the same connection as siblings', () => {
     const frames = [marked(120, 120, 640, 420, 'other-conn')]
     expect(nextRepoFramePosition(frames, CONN, 640)).toEqual({ x: 840, y: 120 })
-  })
-})
-
-describe('designSystemSlug', () => {
-  it('names the guide after the repository', () => {
-    expect(designSystemSlug('acme/Web.App')).toBe('web-app-design-system')
   })
 })

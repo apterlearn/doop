@@ -1,7 +1,7 @@
 /**
- * The design team a board card names. Every card lists one or more of these
- * roles and walks them in order, one stage at a time; a connected MCP agent
- * takes whichever stage is queued.
+ * The design roles work is organised by. A human @mentions one in an element
+ * comment and a connected MCP agent working that role picks the note up; a
+ * role is routing vocabulary, not a running agent.
  *
  * A role IS an agent identity: `name` is what shows up in presence, in the
  * activity feed and in @mentions, and colorFor(name) gives it its colour, so

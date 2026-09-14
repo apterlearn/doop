@@ -10,12 +10,12 @@ import type { Frame } from '../shared/types.ts'
 /**
  * GitHub repo as an import source — a ONE-TIME, CODE-ONLY job: connect a
  * repo (GitHub App install or fine-grained PAT), let doop enumerate its
- * screens from framework routing conventions, and queue the selected ones as
- * cards on the board. An MCP agent works the cards one by one
- * (server/githubRecon.ts): repo HTML lands as-is, and a screen that only
- * exists as code is designed from its source. Nothing in this flow touches
- * the live site — capturing deployed pages belongs to the website importer,
- * and logged-in screens to the design-sync snippet.
+ * screens from framework routing conventions, and import the selected ones as
+ * frames (server/githubRecon.ts): repo HTML lands as-is, and a screen that
+ * only exists as code comes back to the caller as needing an agent to design
+ * it from its source. Nothing in this flow touches the live site — capturing
+ * deployed pages belongs to the website importer, and logged-in screens to
+ * the design-sync snippet.
  *
  * Provenance follows the design-sync pattern: a marker meta stamped into the
  * frame HTML (`doop-github-screen`), no frame column. The marker carries the
@@ -500,7 +500,7 @@ export function matchSelection(manifest: RepoScreen[], raw: unknown): { screens:
   return { screens, rejected }
 }
 
-/** A card from this connection just landed a frame — the modal's "last
+/** A repo import from this connection just landed frames — the modal's "last
  *  synced" reads it. Fire-and-forget. */
 export function markSynced(connectionId: string): void {
   db.update(githubConnections)

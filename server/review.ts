@@ -12,9 +12,10 @@ import { VIEWPORTS } from './screenshot.ts'
 /**
  * The whole verification story for one frame, in one call: the token lint, the
  * accessibility audit, the layout checks and the content checks, at every
- * viewport the design has to survive. The completion gate behind complete_card
- * and hand_back reads the verdict; a human reading the review panel reads the
- * per-viewport detail — both from the same renders, so they can never disagree.
+ * viewport the design has to survive. The ship gate behind open_pull_request,
+ * publish_canvas and the release tools reads the verdict; a human reading the
+ * review panel reads the per-viewport detail — both from the same renders, so
+ * they can never disagree.
  *
  * A report is only evidence about the document it was made from, so it carries
  * the hash of that HTML. The gate compares it against the frame's current HTML

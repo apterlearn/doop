@@ -116,7 +116,7 @@ export function takeExpired(now = Date.now()): FrameLock[] {
 }
 
 /** Thrown by the shared mutation layer when a write hits someone else's lock,
- *  so both the MCP surface and the board's own routes report it the same way. */
+ *  so the MCP surface and the REST routes report it the same way. */
 export class FrameLockedError extends Error {
   readonly holder: FrameLock
   constructor(holder: FrameLock) {

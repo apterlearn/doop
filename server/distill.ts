@@ -104,7 +104,7 @@ Rewrite it as ONE short, general style preference for this project's design memo
 export function maybeDistill(canvasId: string) {
   if (!enabled() || running.has(canvasId)) return
   if (actions.undistilledDecisions(canvasId).length === 0) return
-  /* one open proposal at a time — a stack of pending cards reads as spam */
+  /* one open proposal at a time — a stack of pending proposals reads as spam */
   if (actions.getProposals(canvasId).some((p) => p.status === 'pending')) return
   running.add(canvasId)
   distill(canvasId)

@@ -261,15 +261,6 @@ function isCompact(screen: RepoScreenRef): boolean {
   return screen.kind === 'component' || screen.kind === 'story'
 }
 
-/** Slug of the guideline a repo's design-system card writes. */
-export function designSystemSlug(repo: string): string {
-  return `${repo
-    .split('/')
-    .pop()!
-    .toLowerCase()
-    .replace(/[^a-z0-9-]+/g, '-')}-design-system`
-}
-
 /** Land one frame for a screen at the connection's next grid slot. */
 function placeRepoFrame(
   canvasId: string,

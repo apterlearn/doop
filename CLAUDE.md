@@ -8,8 +8,8 @@ https://github.com/kgoedecke/doop
 Doop is the open-source alternative to Paper.design: a multiplayer design canvas for humans and AI
 agents. Every design lives on a shareable Canvas (`/c/<id>`) holding Frames - artboards that
 render real HTML in sandboxed iframes. People edit in the browser; AI agents edit through the
-built-in MCP server, streaming designs in live. Everyone sees cursors, presence, frame edits, agent
-status, and an activity feed in realtime over one WebSocket room per canvas.
+built-in MCP server, streaming designs in live. Everyone sees cursors, presence, frame edits and an
+activity feed in realtime over one WebSocket room per canvas.
 
 ## Tech stack
 
