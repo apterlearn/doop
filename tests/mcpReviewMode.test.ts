@@ -615,11 +615,35 @@ describe('wait_for_events', () => {
     expect(comment?.targetAgent).toBe('Accessibility')
 
     const parsed = (await pending).parsed as {
+      cursor: number
       timed_out: boolean
       events: { kind: string; summary: string }[]
     }
     expect(parsed.timed_out, 'a role mention must wake the agent working that role').toBe(false)
     expect(parsed.events.map((e) => [e.kind, e.summary])).toContainEqual(['comment', text])
+
+    /* The other half: the SAME agent, parked on the same canvas with no role,
+       must sleep through the same kind of note. That is what makes the case
+       above evidence for `role` rather than for some looser matching — and it
+       is the guard against a future change that wakes everyone. */
+    const cursor1 = parsed.cursor ?? cursor0.cursor
+    const blind = callTool(client, 'wait_for_events', {
+      canvas_id: canvas.id,
+      cursor: cursor1,
+      timeout_seconds: 5,
+      agent_name: 'Claude',
+    })
+    const text2 = '@a11y and the focus ring on the button'
+    const second = actions.addElementComment(
+      frame.id,
+      { selector: 'h1', snippet: '<h1>Hi</h1>', text: text2 },
+      actions.resolveActor({ name: 'alice', kind: 'user', ownerId: OWNER_ID }),
+    )
+    expect(second?.targetAgent).toBe('Accessibility')
+
+    const blindParsed = (await blind).parsed as { timed_out: boolean; events: unknown[] }
+    expect(blindParsed.timed_out, 'without a role the note is not addressed to this agent').toBe(true)
+    expect(blindParsed.events).toEqual([])
     await close()
   })
 
