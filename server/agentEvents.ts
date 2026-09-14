@@ -1,3 +1,4 @@
+import { roleById, roleByAgentName } from '../shared/agents.ts'
 import type { AgentEvent, AgentEventKind } from '../shared/types.ts'
 
 /**
@@ -13,13 +14,48 @@ import type { AgentEvent, AgentEventKind } from '../shared/types.ts'
 
 const MAX_EVENTS = 200
 
-interface Waiter {
+interface Waiter extends WaiterIdentity {
   canvasId: string
-  agentName: string
   cursor: number
   kinds?: AgentEventKind[]
   resolve: (events: AgentEvent[]) => void
   timer: NodeJS.Timeout
+}
+
+/** Who a parked agent is, for deciding whether an event is addressed to it. */
+export interface WaiterIdentity {
+  agentName: string
+  /** the role the agent is working, as an id or a name */
+  role?: string
+}
+
+/** Every spelling that addresses this agent: its own name, and the role it
+ *  works.
+ *
+ *  A comment's target is either a role NAME (`@a11y` stores "Accessibility",
+ *  so the note goes to whoever works that role) or an agent's own name
+ *  (`@Claude`). Matching on the agent name alone leaves a parked agent asleep
+ *  through a role mention — and `wait_for_events` is the only channel that
+ *  reaches it between calls. */
+function namesFor(who: WaiterIdentity): string[] {
+  const asRole = (v: string | undefined) => (v ? (roleById(v) ?? roleByAgentName(v)) : undefined)
+  const out = new Set<string>()
+  if (who.agentName) out.add(who.agentName.toLowerCase())
+  /* an agent whose own name IS a role ("a11y", "Accessibility") is addressed
+     by that role's name too */
+  for (const role of [asRole(who.agentName), asRole(who.role)]) {
+    if (!role) continue
+    out.add(role.name.toLowerCase())
+    out.add(role.id.toLowerCase())
+  }
+  return [...out]
+}
+
+/** Does this event address this agent? An event with no target reaches
+ *  everyone. */
+export function addressedTo(event: AgentEvent, who: WaiterIdentity): boolean {
+  if (!event.targetAgent) return true
+  return namesFor(who).includes(event.targetAgent.toLowerCase())
 }
 
 const log = new Map<string, AgentEvent[]>() // canvasId -> events (oldest first)
@@ -51,10 +87,9 @@ export function push(canvasId: string, event: { kind: AgentEventKind; targetAgen
       if (waiter.canvasId !== canvasId) continue
       if (waiter.cursor >= full.seq) continue
       if (waiter.kinds && !waiter.kinds.includes(full.kind)) continue
-      /* an event addressed to a specific agent only wakes that agent
-         (case-insensitive: 'ux lead' and 'UX Lead' are the same role) */
-      if (full.targetAgent && waiter.agentName && full.targetAgent.toLowerCase() !== waiter.agentName.toLowerCase())
-        continue
+      /* an event addressed to a specific agent only wakes that agent — by its
+         own name, or by the role it works */
+      if (!addressedTo(full, waiter)) continue
       settle(waiter, matching(canvasId, waiter))
     }
   } catch (err) {
@@ -67,8 +102,7 @@ function matching(canvasId: string, waiter: Waiter): AgentEvent[] {
   return list.filter((e) => {
     if (e.seq <= waiter.cursor) return false
     if (waiter.kinds && !waiter.kinds.includes(e.kind)) return false
-    if (e.targetAgent && waiter.agentName && e.targetAgent.toLowerCase() !== waiter.agentName.toLowerCase())
-      return false
+    if (!addressedTo(e, waiter)) return false
     return true
   })
 }
@@ -93,11 +127,12 @@ export function since(canvasId: string, from: number): AgentEvent[] {
  *  Resolves with [] on timeout — the caller reports `timed_out`, not an error. */
 export function wait(
   canvasId: string,
-  opts: { agentName: string; cursor: number; timeoutMs: number; kinds?: AgentEventKind[] },
+  opts: WaiterIdentity & { cursor: number; timeoutMs: number; kinds?: AgentEventKind[] },
 ): Promise<AgentEvent[]> {
   const immediate = matching(canvasId, {
     canvasId,
     agentName: opts.agentName,
+    ...(opts.role ? { role: opts.role } : {}),
     cursor: opts.cursor,
     kinds: opts.kinds,
     resolve: () => {},
@@ -108,6 +143,7 @@ export function wait(
     const waiter: Waiter = {
       canvasId,
       agentName: opts.agentName,
+      ...(opts.role ? { role: opts.role } : {}),
       cursor: opts.cursor,
       kinds: opts.kinds,
       resolve,
@@ -115,13 +151,6 @@ export function wait(
     }
     waiters.add(waiter)
   })
-}
-
-/** Is there anything an agent would care about right now? */
-export function hasPending(canvasId: string, agentName: string, from = 0): boolean {
-  return (log.get(canvasId) ?? []).some(
-    (e) => e.seq > from && (!e.targetAgent || e.targetAgent.toLowerCase() === agentName.toLowerCase()),
-  )
 }
 
 /** Drop a canvas's buffered events (canvas deleted). */

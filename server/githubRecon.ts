@@ -1,8 +1,6 @@
-import { createAsset } from './assets.ts'
 import * as actions from './actions.ts'
 import { store } from './store.ts'
 import {
-  fetchRepoBinary,
   fetchRepoFile,
   fetchTreePaths,
   githubFrameMarker,
@@ -14,10 +12,10 @@ import type { Actor, Frame, RepoScreenRef } from '../shared/types.ts'
 
 /**
  * Reading a connected GitHub repository: the source closure a screen is
- * designed from, the tree the designer investigates, the repo's real assets,
- * and where an imported frame lands. A repo import lands its static screens
- * as frames; a screen that exists only as code comes back as its source
- * closure, for an agent to design from through import_repo_screen.
+ * designed from, the tree the designer investigates, and where an imported
+ * frame lands. A repo import lands its static screens as frames; a screen
+ * that exists only as code comes back as its source closure, for an agent to
+ * design from through import_repo_screen.
  *
  * This is the one-time, code-only contract: everything the model sees comes
  * from the repository. Nothing here touches the live site.
@@ -71,7 +69,7 @@ export function resolveImport(spec: string, fromPath: string, paths: Set<string>
 const IMPORT_RE = /import\s[^'"]*?['"]([^'"]+)['"]|from\s+['"]([^'"]+)['"]/g
 
 /** Collect the screen's bounded source closure as prompt-ready sections. */
-export async function collectClosure(
+async function collectClosure(
   conn: GithubConnection,
   screen: RepoScreenRef,
   paths: string[],
@@ -191,37 +189,6 @@ export function extractHtml(blocks: { type: string; text?: string }[]): { html: 
   if (!html) throw new Error('the model returned no HTML document')
   const height = Math.min(8000, Math.max(480, Number(html.match(/doop-height:\s*(\d+)/)?.[1]) || 900))
   return { html, height }
-}
-
-const REPO_REF_RE = /(["'(])repo:([^"')\s]+)(["')])/g
-const MAX_TRANSPLANTED_ASSETS = 12
-const TRANSPARENT_PX = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'
-/* same env read as server/auth.ts — asset URLs must be absolute inside
-   sandboxed frame iframes */
-const ORIGIN = process.env.BETTER_AUTH_URL || 'http://localhost:4300'
-
-/** Transplant the repository's real image assets: every src="repo:<path>"
- *  the model emitted is fetched through the connection and re-hosted in
- *  doop's asset store, so private-repo logos and screenshots render for
- *  every viewer. Unresolvable refs collapse to a transparent pixel rather
- *  than a broken image. */
-export async function resolveRepoAssets(conn: GithubConnection, html: string, pathSet: Set<string>): Promise<string> {
-  const wanted = [...new Set([...html.matchAll(REPO_REF_RE)].map((m) => m[2]!))]
-    .filter((p) => pathSet.has(p))
-    .slice(0, MAX_TRANSPLANTED_ASSETS)
-  const urls = new Map<string, string>()
-  for (const p of wanted) {
-    try {
-      const asset = await createAsset(await fetchRepoBinary(conn, p), {
-        canvasId: conn.canvasId,
-        uploadedBy: 'Doop',
-      })
-      urls.set(p, `${ORIGIN}/a/${asset.id}.${asset.ext}`)
-    } catch (err) {
-      console.error(`[github-recon] asset ${p} failed`, err)
-    }
-  }
-  return html.replace(REPO_REF_RE, (_full, pre, p, post) => pre + (urls.get(p) ?? TRANSPARENT_PX) + post)
 }
 
 /* ------------------------------------------------------------------ */

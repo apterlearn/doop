@@ -7796,7 +7796,7 @@ export function buildMcpServer(
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
       title: 'Wait for human events',
       description:
-        'Block until something on this canvas needs you: a comment (a human @mentioning a role, replying to you, or claiming your note), an answer to your question, a proposal of yours being resolved, or a human taking over a frame you were streaming into. Pass the cursor from your previous call to only see newer events; an empty cursor means everything pending. Between tasks, call this instead of ending your session — it also keeps your presence alive so the humans see you connected. Resolves on the first event or on timeout (whichever comes first); a timeout is normal, just call again.',
+        'Block until something on this canvas needs you: a comment (a human @mentioning a role, replying to you, or claiming your note), an answer to your question, a proposal of yours being resolved, or a human taking over a frame you were streaming into. Pass the cursor from your previous call to only see newer events; an empty cursor means everything pending. Between tasks, call this instead of ending your session — it also keeps your presence alive so the humans see you connected. Resolves on the first event or on timeout (whichever comes first); a timeout is normal, just call again. Pass `role` for the role you work: humans address work by @mentioning a role, and without it you will sleep through notes meant for you (notes that @mention your agent_name reach you either way).',
       inputSchema: {
         canvas_id: z.string(),
         cursor: z
@@ -7804,6 +7804,12 @@ export function buildMcpServer(
           .optional()
           .describe('Cursor from your previous wait_for_events (or get 0 for "everything pending")'),
         timeout_seconds: z.number().min(5).max(120).optional().describe('How long to block, default 60'),
+        role: z
+          .string()
+          .optional()
+          .describe(
+            'The role you are working, as an id or a name (e.g. "a11y" or "Accessibility"). Humans address work by @mentioning a role, so pass this or you will sleep through notes meant for you. Notes that @mention your agent_name by name reach you either way.',
+          ),
         agent_name: agentName,
       },
       outputSchema: {
@@ -7812,8 +7818,11 @@ export function buildMcpServer(
         events: z.array(z.object({ seq: z.number(), kind: z.string(), at: z.number(), summary: z.string() })),
       },
     },
-    async ({ canvas_id, cursor, timeout_seconds, agent_name }) => {
+    async ({ canvas_id, cursor, timeout_seconds, role, agent_name }) => {
       if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      const wanted = role ? (roleById(role) ?? roleByAgentName(role)) : undefined
+      if (role && !wanted)
+        return err('invalid_input', `no role "${role}" — the roles are ${AGENT_ROLES.map((r) => r.id).join(', ')}`)
       const actor = actorFrom(agent_name)
       /* while parked the agent is legitimately idle: the 60s parked TTL
          applies, not the 20s idle sweep, and presence stays live */
@@ -7821,10 +7830,9 @@ export function buildMcpServer(
       actions.markAgentWaiting(canvas_id, actor.name, true)
       const from = cursor ?? agentEvents.cursor(canvas_id)
       const timeoutMs = Math.min(120, Math.max(5, timeout_seconds ?? 60)) * 1000
-      const events = await agentEvents.wait(canvas_id, { agentName: actor.name, cursor: from, timeoutMs })
-      const visible = events
-        .filter((e) => !e.targetAgent || e.targetAgent.toLowerCase() === actor.name.toLowerCase())
-        .slice(-20)
+      const me = { agentName: actor.name, ...(wanted ? { role: wanted.id } : {}) }
+      const events = await agentEvents.wait(canvas_id, { ...me, cursor: from, timeoutMs })
+      const visible = events.filter((e) => agentEvents.addressedTo(e, me)).slice(-20)
       const summarized = visible.map((e) => {
         const d = (e.data ?? {}) as Record<string, unknown>
         const summary =
