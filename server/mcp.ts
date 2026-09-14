@@ -2160,22 +2160,19 @@ export function buildMcpServer(
       inputSchema: { canvas_id: z.string(), agent_name: agentName.optional() },
       outputSchema: {
         roles: z.array(z.object({ id: z.string(), name: z.string(), blurb: z.string() })),
-        connected: z.array(
-          z.object({ agent: z.string(), owner: z.string().optional(), working_on: z.string().optional() }),
-        ),
+        connected: z.array(z.object({ agent: z.string(), owner: z.string().optional() })),
       },
     },
     async ({ canvas_id, agent_name }) => {
       if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
       arrive(canvas_id, agent_name)
       /* Presence is the whole record of who is here: an agent is named by the
-         calls it makes and the status its client reports. Deduped by name, so
-         the canvas shows one worker per name. */
-      const connected = new Map<string, { agent: string; owner?: string; working_on?: string }>()
+         calls it makes. Deduped by name, so the canvas shows one worker per
+         name. */
+      const connected = new Map<string, { agent: string; owner?: string }>()
       for (const p of actions.listAgentPresence(canvas_id)) {
         const entry = connected.get(p.name) ?? { agent: p.name }
         if (!entry.owner && p.owner) entry.owner = p.owner
-        if (!entry.working_on && p.status) entry.working_on = p.status
         connected.set(p.name, entry)
       }
       return structured({
@@ -7818,7 +7815,7 @@ export function buildMcpServer(
     async ({ canvas_id, cursor, timeout_seconds, agent_name }) => {
       if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
       const actor = actorFrom(agent_name)
-      /* while parked the agent is legitimately idle: the 60s status TTL
+      /* while parked the agent is legitimately idle: the 60s parked TTL
          applies, not the 20s idle sweep, and presence stays live */
       actions.heartbeatAgent(canvas_id, actor)
       actions.markAgentWaiting(canvas_id, actor.name, true)
@@ -9794,7 +9791,7 @@ export function buildMcpServer(
     {
       title: 'Delete a canvas',
       description:
-        'Permanently delete this canvas with its frames, pages, guides, references, cards and comments (owner-only). Irreversible: pass confirm: true. Take a release first (create_release) if you may need the design again.',
+        'Permanently delete this canvas with its frames, pages, guides, references and comments (owner-only). Irreversible: pass confirm: true. Take a release first (create_release) if you may need the design again.',
       annotations: { readOnlyHint: false, destructiveHint: true },
       inputSchema: {
         canvas_id: z.string(),

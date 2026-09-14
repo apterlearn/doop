@@ -140,9 +140,6 @@ function handle(msg: ServerMessage) {
     case 'focus':
       s.setFocus(msg.clientId, { frameId: msg.frameId, selector: msg.selector, pageId: msg.pageId })
       break
-    case 'status':
-      s.setStatus(msg.clientId, msg.status)
-      break
     case 'comment':
       s.upsertComment(msg.comment)
       break

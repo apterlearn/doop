@@ -192,8 +192,8 @@ function broadcast(canvasId: string, msg: ServerMessage, excludeClientId?: strin
 /* Agents show up in presence while they are actively calling tools. */
 interface AgentPresence extends Presence {
   lastSeen: number
-  /** set by wait_for_events: the agent is parked but alive, so the 60s
-   *  status TTL applies instead of the 20s idle sweep */
+  /** set by wait_for_events: the agent is parked but alive, so the 60s TTL
+   *  applies instead of the 20s idle sweep */
   waiting?: boolean
 }
 const agentPresences = new Map<string, Map<string, AgentPresence>>() // canvasId -> name -> presence
@@ -204,14 +204,7 @@ const agentPresences = new Map<string, Map<string, AgentPresence>>() // canvasId
 type Focus = Omit<CanvasFocus, 'clientId' | 'name'>
 const focusByCanvas = new Map<string, Map<string, Focus>>() // canvasId -> clientId -> focus
 
-function agentTouch(
-  canvasId: string,
-  agentName: string,
-  frameId?: string | null,
-  status?: string | null,
-  owner?: string,
-  ownerId?: string,
-) {
+function agentTouch(canvasId: string, agentName: string, frameId?: string | null, owner?: string, ownerId?: string) {
   /* presence is keyed by account + name: an agent name is free text, so two
      accounts both running the same name are two agents, not one flickering one */
   const key = `${ownerId ?? ''}::${agentName}`
@@ -235,23 +228,10 @@ function agentTouch(
   if (frameId !== undefined && frameId !== null) p.waiting = false
   if (owner && !p.owner) p.owner = owner
   if (frameId !== undefined) p.activeFrameId = frameId
-  let statusChanged = false
-  if (status !== undefined) {
-    const next = status?.trim() || undefined
-    if (p.status !== next) {
-      p.status = next
-      statusChanged = true
-    }
-  }
   if (isNew) {
     broadcast(canvasId, { type: 'presence:join', presence: p })
-  } else {
-    if (frameId !== undefined) {
-      broadcast(canvasId, { type: 'editing', clientId: p.clientId, frameId: p.activeFrameId ?? null })
-    }
-    if (statusChanged) {
-      broadcast(canvasId, { type: 'status', clientId: p.clientId, status: p.status ?? null })
-    }
+  } else if (frameId !== undefined) {
+    broadcast(canvasId, { type: 'editing', clientId: p.clientId, frameId: p.activeFrameId ?? null })
   }
 }
 
@@ -265,9 +245,9 @@ setInterval(() => {
   const now = Date.now()
   for (const [canvasId, byName] of agentPresences) {
     for (const [key, p] of byName) {
-      /* an agent with a posted status — or one parked in wait_for_events —
-         is alive between calls, not gone: keep it on screen longer */
-      if (now - p.lastSeen > (p.status || p.waiting ? 60_000 : 20_000)) {
+      /* an agent parked in wait_for_events is alive between calls, not gone:
+         keep it on screen longer */
+      if (now - p.lastSeen > (p.waiting ? 60_000 : 20_000)) {
         byName.delete(key)
         broadcast(canvasId, { type: 'presence:leave', clientId: p.clientId })
       }
@@ -298,12 +278,11 @@ actions.wire(broadcast, agentTouch, markAgentWaiting)
 
 /* Presence lives here (agentPresences), the MCP surface lives in mcp.ts, and
    neither may import the other: the reader is handed over at boot so
-   get_agents can list an agent that has only posted a status. */
+   get_agents can list who is here. */
 actions.wirePresence((canvasId) =>
   [...(agentPresences.get(canvasId)?.values() ?? [])].map((p) => ({
     name: p.name,
     ...(p.owner ? { owner: p.owner } : {}),
-    status: p.status ?? null,
     frameId: p.activeFrameId ?? null,
     ...(p.waiting ? { waiting: true } : {}),
     lastSeen: p.lastSeen,

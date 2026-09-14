@@ -44,7 +44,6 @@ type AgentTouch = (
   canvasId: string,
   agentName: string,
   frameId?: string | null,
-  status?: string | null,
   owner?: string,
   ownerId?: string,
 ) => void
@@ -69,7 +68,6 @@ export function wire(b: Broadcast, t: AgentTouch, w?: MarkWaiting) {
 export interface AgentPresenceEntry {
   name: string
   owner?: string
-  status?: string | null
   frameId?: string | null
   waiting?: boolean
   lastSeen: number
@@ -343,12 +341,12 @@ function assertAgentWriteAllowed(
 }
 
 function touch(canvasId: string, actor: Actor, frameId?: string | null) {
-  if (actor.kind === 'agent') agentTouch(canvasId, actor.name, frameId, undefined, actor.owner, actor.ownerId)
+  if (actor.kind === 'agent') agentTouch(canvasId, actor.name, frameId, actor.owner, actor.ownerId)
 }
 
-/** Refresh an agent's presence without changing its frame or status. A model
- *  turn can stay silent longer than the presence TTL, so a long-running agent
- *  beats this on a timer for as long as it is actually alive. */
+/** Refresh an agent's presence without changing its frame. A model turn can
+ *  stay silent longer than the presence TTL, so a long-running agent beats
+ *  this on a timer for as long as it is actually alive. */
 export function heartbeatAgent(canvasId: string, actor: Actor) {
   touch(canvasId, actor)
 }

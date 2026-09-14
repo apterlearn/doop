@@ -18,7 +18,6 @@ function Avatar({
   name,
   color = 'var(--ink)',
   kind = 'user',
-  status,
   owner,
   stacked = false,
   className,
@@ -27,7 +26,6 @@ function Avatar({
   name: string
   color?: string
   kind?: 'user' | 'agent'
-  status?: string
   owner?: string
   /* overlapping row of presences rather than a single standalone avatar */
   stacked?: boolean
@@ -45,7 +43,7 @@ function Avatar({
         className,
       )}
       style={{ background: tile, color: tile }}
-      title={`${name}${kind === 'agent' ? (owner ? ` (${owner}'s agent)` : ' (agent)') : ''}${status ? ` — ${status}` : ''}`}
+      title={`${name}${kind === 'agent' ? (owner ? ` (${owner}'s agent)` : ' (agent)') : ''}`}
       {...props}
     >
       <span className="grid place-items-center text-white">

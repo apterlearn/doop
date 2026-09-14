@@ -137,7 +137,6 @@ interface State {
   ): void
   setCursor(clientId: string, x: number, y: number): void
   setEditing(clientId: string, frameId: string | null): void
-  setStatus(clientId: string, status: string | null): void
   setActivity(items: ActivityItem[]): void
   pushActivity(item: ActivityItem): void
   setComments(comments: ElementComment[]): void
@@ -344,14 +343,6 @@ export const useStore = create<State>((set, get) => ({
       const p = s.presences[clientId]
       if (!p) return {}
       return { presences: { ...s.presences, [clientId]: { ...p, activeFrameId: frameId, lastSeen: Date.now() } } }
-    }),
-  setStatus: (clientId, status) =>
-    set((s) => {
-      const p = s.presences[clientId]
-      if (!p) return {}
-      return {
-        presences: { ...s.presences, [clientId]: { ...p, status: status ?? undefined, lastSeen: Date.now() } },
-      }
     }),
   setActivity: (activity) => set({ activity }),
   pushActivity: (item) =>

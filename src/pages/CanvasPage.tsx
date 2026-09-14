@@ -419,15 +419,7 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
               <Avatar name={me.name} kind="user" stacked />
             </Button>
             {others.map((p) => (
-              <Avatar
-                key={p.clientId}
-                name={p.name}
-                color={p.color}
-                kind={p.kind}
-                status={p.status}
-                owner={p.owner}
-                stacked
-              />
+              <Avatar key={p.clientId} name={p.name} color={p.color} kind={p.kind} owner={p.owner} stacked />
             ))}
           </div>
           <BarDivider />
@@ -499,15 +491,7 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
           >
             <Avatar name={me.name} kind="user" stacked />
             {others.map((p) => (
-              <Avatar
-                key={p.clientId}
-                name={p.name}
-                color={p.color}
-                kind={p.kind}
-                status={p.status}
-                owner={p.owner}
-                stacked
-              />
+              <Avatar key={p.clientId} name={p.name} color={p.color} kind={p.kind} owner={p.owner} stacked />
             ))}
           </div>
           <Button

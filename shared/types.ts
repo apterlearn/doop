@@ -587,8 +587,6 @@ export interface Presence {
   kind: ActorKind
   cursor?: { x: number; y: number }
   activeFrameId?: string | null
-  /** one-line "what I'm working on right now", when the agent posts one */
-  status?: string
   /** for agents: whose token they connected with */
   owner?: string
   /** when this client last did anything on the canvas. A live connection that
@@ -725,7 +723,6 @@ export type ServerMessage =
   | { type: 'presence:leave'; clientId: string }
   | { type: 'cursor'; clientId: string; x: number; y: number }
   | { type: 'editing'; clientId: string; frameId: string | null }
-  | { type: 'status'; clientId: string; status: string | null }
   | { type: 'comment'; comment: ElementComment }
   | { type: 'frame:drag'; clientId: string; frameId: string; x: number; y: number; width: number; height: number }
   | { type: 'frame:created'; frame: Frame; actor: Actor }

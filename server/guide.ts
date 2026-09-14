@@ -122,10 +122,11 @@ your work up yourself with claim_comment (see the comments section below) instea
 waiting to be assigned. If a human asks you for something one of these roles owns, just
 do it.
 
-Who is on the canvas right now, and what each connected agent says it is working on,
-comes from get_agents. What any of them has actually done comes from get_run_events: one
-entry per tool call, newest first, with the agent, the outcome and the duration. Read it
-before you pick up work someone else may have started, and after a run you want to audit.
+Who is on the canvas right now comes from get_agents: the roles work is organised by,
+and every agent currently present. What any of them has actually done comes from
+get_run_events: one entry per tool call, newest first, with the agent, the outcome and
+the duration. Read it before you pick up work someone else may have started, and after a
+run you want to audit.
 
 ## Comments — how humans ask you for work
 
