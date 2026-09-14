@@ -7,7 +7,7 @@ import * as thumbs from './thumbs.ts'
 import { colorFor } from '../shared/types.ts'
 import { validateTokens } from './tokenCss.ts'
 import { stripTokenStyle } from '../shared/tokens.ts'
-import { DEFAULT_ROLE_ID, mentionedAgent, mentionedRole, roleByAgentName, roleName } from '../shared/agents.ts'
+import { DEFAULT_ROLE_ID, mentionedAgent, mentionedRole, roleFor, roleName } from '../shared/agents.ts'
 import { MAX_FRAME_HTML_BYTES } from './limits.ts'
 import { insertElement, updateElements } from './elementEdit.ts'
 import { decodeEscapedHtml, looksEscapedHtml, repairEscapedHtml } from './escapedHtml.ts'
@@ -726,7 +726,12 @@ export function takeAgentCommentsFor(
   ownerId?: string,
   role?: string,
 ): ElementComment[] {
-  const addressed = role ?? roleByAgentName(agentName)?.name ?? agentName
+  /* Resolve BOTH sides to a role name through the shared resolver: a comment's
+     target is a role name (`@a11y` stores "Accessibility"), while an agent may
+     name itself by role id ("a11y"), by role name, or by a name of its own.
+     Resolving only the caller's side here (and differently) is what let an
+     agent be woken by a mention it could never claim. */
+  const addressed = roleFor(role)?.name ?? roleFor(agentName)?.name ?? agentName
   const pending = (commentLog.get(canvasId) ?? []).filter(
     (c) =>
       c.forAgent &&

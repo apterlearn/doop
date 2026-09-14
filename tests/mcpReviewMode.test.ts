@@ -108,13 +108,18 @@ async function callTool(client: Client, name: string, args: Record<string, unkno
     isError?: boolean
   }
   const raw = result.content?.find((b) => b.type === 'text')?.text ?? ''
+  /* every text block, joined — a nudge rides alongside the data block */
+  const allText = (result.content ?? [])
+    .filter((b) => b.type === 'text')
+    .map((b) => b.text ?? '')
+    .join('\n')
   let parsed: unknown = raw
   try {
     parsed = JSON.parse(raw)
   } catch {
     /* plain text result */
   }
-  return { parsed, raw, isError: result.isError }
+  return { parsed, raw, allText, isError: result.isError }
 }
 
 describe('review mode', () => {
@@ -586,7 +591,7 @@ describe('wait_for_events', () => {
      times out while the note meant for it sits unread. The test above passes
      on the name-IS-a-role compat path, so it would stay green even if `role`
      were dropped from the tool entirely — this is the coverage for it. */
-  it('wakes an agent that parked under the role it works', { timeout: 30000 }, async () => {
+  it('wakes an agent that parked under the role it works', { timeout: 45000 }, async () => {
     const { client, close } = await connect()
     const cursor0 = (
       await callTool(client, 'wait_for_events', {
@@ -626,7 +631,7 @@ describe('wait_for_events', () => {
        must sleep through the same kind of note. That is what makes the case
        above evidence for `role` rather than for some looser matching — and it
        is the guard against a future change that wakes everyone. */
-    const cursor1 = parsed.cursor ?? cursor0.cursor
+    const cursor1 = parsed.cursor
     const blind = callTool(client, 'wait_for_events', {
       canvas_id: canvas.id,
       cursor: cursor1,
@@ -641,9 +646,29 @@ describe('wait_for_events', () => {
     )
     expect(second?.targetAgent).toBe('Accessibility')
 
-    const blindParsed = (await blind).parsed as { timed_out: boolean; events: unknown[] }
+    const blindResult = await blind
+    const blindParsed = blindResult.parsed as { timed_out: boolean; events: unknown[] }
     expect(blindParsed.timed_out, 'without a role the note is not addressed to this agent').toBe(true)
     expect(blindParsed.events).toEqual([])
+    /* and the timeout says why, instead of letting the agent park forever */
+    expect(blindResult.allText).toContain('without a role')
+    expect(blindResult.allText).toContain('a11y')
+    await close()
+  })
+
+  /* An agent whose own name IS a role is already correctly parked, so it must
+     keep its ordinary quiet timeout — no nudge pushing it to pass a role it
+     does not need. The matcher wakes it on role mentions either way. */
+  it('stays quiet for an agent whose name is already a role', { timeout: 20000 }, async () => {
+    const { client, close } = await connect()
+    const res = await callTool(client, 'wait_for_events', {
+      canvas_id: canvas.id,
+      timeout_seconds: 5,
+      agent_name: 'ux lead',
+    })
+    const parsed = res.parsed as { timed_out: boolean }
+    expect(parsed.timed_out).toBe(true)
+    expect(res.allText).not.toContain('without a role')
     await close()
   })
 

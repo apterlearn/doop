@@ -449,6 +449,29 @@ describe('claim_comment and fail_comment', () => {
     }
   })
 
+  /* A solo worker often connects NAMED after the role it works. It is woken by
+     role mentions (the matcher resolves both spellings), so it must be able to
+     claim them too — resolving the caller's identity by display name alone left
+     it woken but unable to take the note, silently, on every comment. */
+  it('lets an agent named after a role claim that role’s notes', async () => {
+    const note = actions.addElementComment(
+      FRAME.id,
+      { selector: '.hero h1', snippet: '<h1>Hi</h1>', text: '@a11y the tap targets are small' },
+      actions.resolveActor({ name: 'alice', kind: 'user' }),
+    )!
+    expect(note.targetAgent).toBe('Accessibility')
+    const { client, close } = await connect()
+    try {
+      /* no role argument: the agent's own name IS the role id */
+      const claimed = await call(client, 'claim_comment', { canvas_id: CANVAS.id, agent_name: 'a11y' })
+      const parsed = JSON.parse(claimed.raw) as { comments: ElementComment[] }
+      expect(parsed.comments.map((c) => c.id)).toEqual([note.id])
+      expect(actions.findComment(note.id)?.claimedBy).toBe('a11y')
+    } finally {
+      await close()
+    }
+  })
+
   it('refuses a role that does not exist, naming the real ones', async () => {
     const { client, close } = await connect()
     try {

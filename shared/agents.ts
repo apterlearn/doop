@@ -83,6 +83,18 @@ export function roleByAgentName(name: string | undefined): AgentRole | undefined
   return name ? byName.get(name.toLowerCase()) : undefined
 }
 
+/** Resolve a role from anything that names one — an id (`a11y`) or a display
+ *  name (`Accessibility`, `ux lead`).
+ *
+ *  ONE resolver on purpose. Identity is resolved on two sides — the claim
+ *  (`takeAgentCommentsFor`) and the wake (`agentEvents.namesFor`) — and when
+ *  they disagreed an agent could be woken by a role mention and still never
+ *  claim it: silently, on every note, forever. */
+export function roleFor(value: string | undefined | null): AgentRole | undefined {
+  if (!value) return undefined
+  return roleById(value) ?? roleByAgentName(value)
+}
+
 export function roleName(id: string | undefined): string {
   return roleById(id)?.name ?? roleById(DEFAULT_ROLE_ID)!.name
 }

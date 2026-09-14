@@ -69,7 +69,7 @@ import { discoverSitePages, importPage, normalizeImportUrl, type DiscoveredSite 
 import { cancelJob, getJob, jobProgress, recordUnit, startJob, waitForJobs } from './jobs.ts'
 import { websiteAccessErrorMessage } from './websiteAccess.ts'
 import { htmlSha, reportIsCurrent, reviewFrame, reviewToRecord } from './review.ts'
-import { AGENT_ROLES, roleByAgentName, roleById } from '../shared/agents.ts'
+import { AGENT_ROLES, roleFor } from '../shared/agents.ts'
 import { parseListing, publishCanvas, unpublishCanvas } from './community.ts'
 import { COMMUNITY_CATEGORIES } from '../shared/types.ts'
 import { sanitizeImportedHtml } from './sanitizeHtml.ts'
@@ -2245,7 +2245,7 @@ export function buildMcpServer(
     },
     async ({ canvas_id, agent_name, role }) => {
       if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
-      const wanted = role ? (roleById(role) ?? roleByAgentName(role)) : undefined
+      const wanted = roleFor(role)
       if (role && !wanted)
         return err('invalid_input', `no role "${role}" — the roles are ${AGENT_ROLES.map((r) => r.id).join(', ')}`)
       arrive(canvas_id, agent_name)
@@ -7820,7 +7820,7 @@ export function buildMcpServer(
     },
     async ({ canvas_id, cursor, timeout_seconds, role, agent_name }) => {
       if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
-      const wanted = role ? (roleById(role) ?? roleByAgentName(role)) : undefined
+      const wanted = roleFor(role)
       if (role && !wanted)
         return err('invalid_input', `no role "${role}" — the roles are ${AGENT_ROLES.map((r) => r.id).join(', ')}`)
       const actor = actorFrom(agent_name)
@@ -7845,6 +7845,18 @@ export function buildMcpServer(
       })
       actions.markAgentWaiting(canvas_id, actor.name, false)
       const newCursor = summarized.length ? summarized[summarized.length - 1]!.seq : from
+      /* A quiet timeout is the one place the role mistake goes silent: an
+         agent that parked with only its own name gets nothing back and parks
+         again, forever, while notes addressed to its role sit unread. Say so
+         once — but only when NOTHING about this agent resolves to a role, so
+         an agent that passed role, or whose own name is already a role, keeps
+         its ordinary quiet timeout. Uses the same resolver as the matcher, so
+         the message can never contradict who actually gets woken. */
+      if (summarized.length === 0 && !wanted && !roleFor(actor.name))
+        return structuredWithNudge(
+          { cursor: newCursor, timed_out: true, events: [] },
+          `Nothing arrived in ${Math.round(timeoutMs / 1000)}s — and you parked without a role, so notes @mentioning a role did not reach you. Humans address work to roles: pass role: "<id>" (one of ${AGENT_ROLES.map((r) => r.id).join(', ')}) to be woken for the role you work.`,
+        )
       return structured({
         cursor: newCursor,
         timed_out: summarized.length === 0,

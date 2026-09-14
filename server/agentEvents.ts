@@ -1,4 +1,4 @@
-import { roleById, roleByAgentName } from '../shared/agents.ts'
+import { roleFor } from '../shared/agents.ts'
 import type { AgentEvent, AgentEventKind } from '../shared/types.ts'
 
 /**
@@ -38,12 +38,11 @@ export interface WaiterIdentity {
  *  through a role mention — and `wait_for_events` is the only channel that
  *  reaches it between calls. */
 function namesFor(who: WaiterIdentity): string[] {
-  const asRole = (v: string | undefined) => (v ? (roleById(v) ?? roleByAgentName(v)) : undefined)
   const out = new Set<string>()
   if (who.agentName) out.add(who.agentName.toLowerCase())
   /* an agent whose own name IS a role ("a11y", "Accessibility") is addressed
      by that role's name too */
-  for (const role of [asRole(who.agentName), asRole(who.role)]) {
+  for (const role of [roleFor(who.agentName), roleFor(who.role)]) {
     if (!role) continue
     out.add(role.name.toLowerCase())
     out.add(role.id.toLowerCase())
