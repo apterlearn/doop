@@ -2259,11 +2259,20 @@ export function buildMcpServer(
         actor.ownerId,
         wanted ? wanted.name : undefined,
       )
-      if (comments.length === 0)
+      if (comments.length === 0) {
+        /* Say which identity was actually searched, and push the role argument
+           ONLY at an agent that has no role at all. An agent named after a role
+           is already claiming that role's notes — telling it to "pass role"
+           would be advice it cannot act on, and "by name" would be false. Same
+           resolver the claim itself uses, so the message cannot contradict it. */
+        const searching = wanted ?? roleFor(actor.name)
         return structuredWithNudge(
           { comments },
-          `Nothing is addressed to ${wanted ? `the ${wanted.name} role` : `${actor.name} by name`} right now. Humans address work by @mentioning a role, so pass role: "<id>" (one of ${AGENT_ROLES.map((r) => r.id).join(', ')}) to take the notes for the role you work — or read what is waiting with get_comments.`,
+          searching
+            ? `Nothing is addressed to the ${searching.name} role right now — you are already taking that role's notes. Read what is waiting with get_comments.`
+            : `Nothing is addressed to ${actor.name} by name right now. Humans address work by @mentioning a role, so pass role: "<id>" (one of ${AGENT_ROLES.map((r) => r.id).join(', ')}) to take the notes for the role you work — or read what is waiting with get_comments.`,
         )
+      }
       return structured({ comments })
     },
   )

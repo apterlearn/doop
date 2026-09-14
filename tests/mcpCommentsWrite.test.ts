@@ -467,6 +467,15 @@ describe('claim_comment and fail_comment', () => {
       const parsed = JSON.parse(claimed.raw) as { comments: ElementComment[] }
       expect(parsed.comments.map((c) => c.id)).toEqual([note.id])
       expect(actions.findComment(note.id)?.claimedBy).toBe('a11y')
+
+      /* The empty second call must not tell it to "pass role": its name already
+         resolves to the role it just claimed under, so "nothing is addressed to
+         a11y by name" would be false and the advice unusable. */
+      const again = await call(client, 'claim_comment', { canvas_id: CANVAS.id, agent_name: 'a11y' })
+      expect(JSON.parse(again.raw)).toEqual({ comments: [] })
+      const nudge = (again.result.content ?? []).map((b) => b.text ?? '').join('\n')
+      expect(nudge).not.toContain('by name')
+      expect(nudge).toContain('Accessibility')
     } finally {
       await close()
     }
