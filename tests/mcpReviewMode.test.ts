@@ -580,4 +580,59 @@ describe('wait_for_events', () => {
     expect(parsed.cursor).toBeGreaterThan(cursor0.cursor)
     await close()
   })
+
+  /* The realistic shape: an MCP agent has a name of its own and works a role.
+     Humans address work to ROLES, so without the role argument the parked call
+     times out while the note meant for it sits unread. The test above passes
+     on the name-IS-a-role compat path, so it would stay green even if `role`
+     were dropped from the tool entirely — this is the coverage for it. */
+  it('wakes an agent that parked under the role it works', { timeout: 30000 }, async () => {
+    const { client, close } = await connect()
+    const cursor0 = (
+      await callTool(client, 'wait_for_events', {
+        canvas_id: canvas.id,
+        timeout_seconds: 5,
+        agent_name: 'Claude',
+        role: 'a11y',
+      })
+    ).parsed as { cursor: number; timed_out: boolean }
+    expect(cursor0.timed_out).toBe(true)
+
+    const pending = callTool(client, 'wait_for_events', {
+      canvas_id: canvas.id,
+      cursor: cursor0.cursor,
+      timeout_seconds: 10,
+      agent_name: 'Claude',
+      role: 'a11y',
+    })
+    /* the human clicked @a11y, which stores the role's NAME — not "Claude" */
+    const text = '@a11y check the heading contrast'
+    const comment = actions.addElementComment(
+      frame.id,
+      { selector: 'h1', snippet: '<h1>Hi</h1>', text },
+      actions.resolveActor({ name: 'alice', kind: 'user', ownerId: OWNER_ID }),
+    )
+    expect(comment?.targetAgent).toBe('Accessibility')
+
+    const parsed = (await pending).parsed as {
+      timed_out: boolean
+      events: { kind: string; summary: string }[]
+    }
+    expect(parsed.timed_out, 'a role mention must wake the agent working that role').toBe(false)
+    expect(parsed.events.map((e) => [e.kind, e.summary])).toContainEqual(['comment', text])
+    await close()
+  })
+
+  it('refuses a role that does not exist', { timeout: 20000 }, async () => {
+    const { client, close } = await connect()
+    const res = await callTool(client, 'wait_for_events', {
+      canvas_id: canvas.id,
+      timeout_seconds: 5,
+      agent_name: 'Claude',
+      role: 'wizard',
+    })
+    expect(res.isError).toBe(true)
+    expect(res.raw).toContain('wizard')
+    await close()
+  })
 })

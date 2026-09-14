@@ -366,21 +366,6 @@ export async function fetchTreePaths(conn: GithubConnection): Promise<string[]> 
 
 const MAX_FILE_BYTES = 1_500_000
 
-/** Raw bytes of a repo file — image assets the reconstruction transplants
- *  into doop's asset store so private-repo logos/screenshots render for
- *  every canvas viewer. */
-export async function fetchRepoBinary(conn: GithubConnection, path: string): Promise<Buffer> {
-  const res = await gh(
-    await connectionAuth(conn),
-    `/repos/${conn.repo}/contents/${path.split('/').map(encodeURIComponent).join('/')}?ref=${encodeURIComponent(conn.branch)}`,
-    'application/vnd.github.raw+json',
-  )
-  if (!res.ok) throw new Error(`could not read ${path} (${res.status})`)
-  const buf = Buffer.from(await res.arrayBuffer())
-  if (buf.length > MAX_FILE_BYTES) throw new Error(`${path} exceeds the 1.5 MB asset limit`)
-  return buf
-}
-
 export async function fetchRepoFile(conn: GithubConnection, path: string): Promise<string> {
   const res = await gh(
     await connectionAuth(conn),
