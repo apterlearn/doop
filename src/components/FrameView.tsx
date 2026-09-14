@@ -46,23 +46,21 @@ const EDITOR_CHIP =
 const EL_TOOLBAR_BTN = 'rounded-[7px] px-2 py-1 text-xs'
 
 /* A stream's end is information: the viewer is told whether the design was
-   delivered, the agent went quiet, someone took the frame over, or a human
-   stopped the work. A takeover is the one case that is about the agent that
-   was streaming — a human's edit cut its stream — so it names it. */
+   delivered, the agent went quiet, someone took the frame over, or the agent
+   replaced its own document. A takeover is the one case that is about the
+   agent that was streaming — a human's edit cut its stream — so it names it. */
 function streamEndLabel(name: string, reason: StreamEndReason): string {
   if (reason === 'done') return '✓ finished designing'
   if (reason === 'idle') return 'stream ended (agent silent)'
   if (reason === 'replaced') return 'stream ended'
-  if (reason === 'taken over') return `${name}'s stream was cut`
-  return `stream ended (${reason})`
+  return `${name}'s stream was cut`
 }
 
 function streamEndTitle(name: string, reason: StreamEndReason): string {
   if (reason === 'done') return `${name} finished designing`
   if (reason === 'idle') return `${name} stopped responding mid-stream — its next write resumes the design`
-  if (reason === 'taken over') return `someone else edited this frame while ${name} was streaming`
   if (reason === 'replaced') return `${name} replaced the document it was streaming into`
-  return `${name}'s work was stopped`
+  return `someone else edited this frame while ${name} was streaming`
 }
 
 /* Figma-style ⌥⇧-drag duplicate cursor: a doubled pointer, hotspot on the
@@ -762,21 +760,6 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
                   <AgentIcon name={stream.name} size={9} color="#fff" />
                   {stream.name} is designing
                   <span className="after:content-['…'] after:[animation:ellipsis_1.2s_steps(4)_infinite]" />
-                  {stream.isAgent && (
-                    <Tooltip label={`Stop ${stream.name}`} side="top">
-                      <button
-                        type="button"
-                        aria-label={`Stop ${stream.name}`}
-                        className="-mr-0.5 ml-0.5 grid size-[13px] flex-none cursor-pointer place-items-center rounded-full bg-white/25 leading-none hover:bg-white/40"
-                        onClick={(e) => {
-                          e.stopPropagation()
-                          api.stopAgentWork(frame.canvasId, stream.name).catch(console.error)
-                        }}
-                      >
-                        <span className="block size-[7px] rounded-[1px] bg-white" />
-                      </button>
-                    </Tooltip>
-                  )}
                 </span>
               )}
               {!stream && endNotice && (
@@ -1189,8 +1172,8 @@ function CommentComposer({
   const taRef = useRef<HTMLTextAreaElement>(null)
   useEffect(() => taRef.current?.focus(), [])
   const send = () => text.trim() && onSubmit(text)
-  /* @mention a role on the card, or a connected agent by name, to route the
-     comment to it; without one the comment is a note for the humans in the
+  /* @mention a role in the comment, or a connected agent by name, to route it
+     to that role; without one the comment is a note for the humans in the
      room. Agents connected over MCP are addressable by name too, so the pills
      list them beside the roles — derived from the stable presences map, as
      everywhere else here. */
@@ -1302,7 +1285,7 @@ function CommentThread({
       .catch(() => setFailed(true))
       .finally(() => setSending(false))
   }
-  /* the same resolution the server does on submit: a role on the card, or a
+  /* the same resolution the server does on submit: a role in the comment, or a
      connected agent's own name — a reply to either is a request to it */
   const mentioned = mentionedRole(reply)
   const presences = useStore((s) => s.presences)

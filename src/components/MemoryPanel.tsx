@@ -43,8 +43,9 @@ function slugify(title: string): string {
 }
 
 /** The Memory tab in the side panel: the canvas's design brain. References
- *  (pinned exemplar frames), Rules (the style guides), Decisions (captured
- *  feedback) — plus pending distiller proposals to accept or dismiss. */
+ *  (pinned exemplar frames), Rules (the style guides), Decisions (what the
+ *  humans and agents settled on) — plus pending distiller proposals to accept
+ *  or dismiss. */
 export function MemoryPanel() {
   const canvasId = useStore((s) => s.canvas?.id)
   const docs = useStore((s) => s.canvas?.guidelines ?? [])
@@ -76,8 +77,8 @@ export function MemoryPanel() {
               <b>Rules</b> — style guides agents read before designing. Write them, or let them grow.
             </li>
             <li className="text-[12px] leading-[1.5] text-ink-soft">
-              <b>Decisions</b> — feedback you give agents is captured here automatically once it’s addressed. When a
-              preference keeps recurring, Doop suggests adding it to your rules.
+              <b>Decisions</b> — a resolved @mention comment, or a preference an agent reports, is captured here
+              automatically. When a preference keeps recurring, Doop suggests adding it to your rules.
             </li>
           </ul>
         </div>

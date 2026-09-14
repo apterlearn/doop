@@ -1,6 +1,5 @@
 import type {
   ActivityItem,
-  AgentPlan,
   AgentQuestion,
   Canvas,
   CanvasMeta,
@@ -92,12 +91,14 @@ export interface RepoManifest {
   truncated: boolean
 }
 
-/** An import queues board cards — nothing lands on the canvas until the
- *  Doop Agent finishes each one. `rejected` lists selections the server no
- *  longer finds in the repo manifest. */
+/** An import lands frames on the canvas directly. `needsAgent` lists the
+ *  screens Doop cannot import as source — they need an agent to design them
+ *  from the repo. `rejected` lists selections the server no longer finds in
+ *  the repo manifest, or whose import threw. */
 export interface GithubImportResult {
-  cards: string[]
+  imported: { id: string; name: string }[]
   rejected: string[]
+  needsAgent: string[]
 }
 
 export interface DiscoveredPage {
@@ -244,10 +245,10 @@ export const api = {
     req(`/api/canvases/${canvasId}/github/${connId}`, { method: 'DELETE' }),
   analyzeGithub: (canvasId: string, connId: string) =>
     req<RepoManifest>(`/api/canvases/${canvasId}/github/${connId}/analyze`, { method: 'POST' }),
-  importGithubScreens: (canvasId: string, connId: string, screens: RepoScreen[], designSystem = true) =>
+  importGithubScreens: (canvasId: string, connId: string, screens: RepoScreen[]) =>
     req<GithubImportResult>(`/api/canvases/${canvasId}/github/${connId}/import`, {
       method: 'POST',
-      body: JSON.stringify({ screens, design_system: designSystem }),
+      body: JSON.stringify({ screens }),
     }),
   guidelineHistory: (canvasId: string, name: string) =>
     req<{ markdown: string; savedAt: number; savedBy: string }[]>(
@@ -416,8 +417,6 @@ export const api = {
     req<{ ok: true; deletedFrameIds: string[] }>('/api/pages/' + pageId, { method: 'DELETE' }),
   duplicatePage: (pageId: string) =>
     req<{ page: Page; frames: Frame[] }>(`/api/pages/${pageId}/duplicate`, { method: 'POST' }),
-  sendTaskFeedback: (taskId: string, text: string) =>
-    req(`/api/tasks/${taskId}/feedback`, { method: 'POST', body: JSON.stringify({ text, from: getIdentity().name }) }),
   importPage: (canvasId: string, url: string) =>
     req<Frame>(`/api/canvases/${canvasId}/import`, { method: 'POST', body: JSON.stringify({ url }) }),
   discoverSitePages: (canvasId: string, url: string) =>
@@ -443,47 +442,12 @@ export const api = {
   disconnectModelAccount: () => req<ModelAccountStatus>('/api/model-account', { method: 'DELETE' }),
   setAgentModel: (model: string) =>
     req<ModelAccountStatus>('/api/model-account', { method: 'PATCH', body: JSON.stringify({ model }) }),
-  /** `target` is the element/page the card is about — the human's selection at
-   *  queue time, so "fix this element" reaches the agent as a selector. */
-  addCard: (
-    canvasId: string,
-    title: string,
-    agents: string[],
-    attachments?: string[],
-    targetFrameIds?: string[],
-    target?: { selector?: string; pageId?: string },
-  ) =>
-    req(`/api/canvases/${canvasId}/cards`, {
-      method: 'POST',
-      body: JSON.stringify({
-        title,
-        agents,
-        attachments,
-        targetFrameIds,
-        targetSelector: target?.selector,
-        targetPageId: target?.pageId,
-      }),
-    }),
-  completeCard: (canvasId: string, cardId: string) =>
-    req(`/api/canvases/${canvasId}/cards/${cardId}/done`, { method: 'POST' }),
-  retryCard: (canvasId: string, cardId: string) =>
-    req(`/api/canvases/${canvasId}/cards/${cardId}/retry`, { method: 'POST' }),
   addComment: (frameId: string, input: { selector: string; snippet: string; text: string; stableKey?: string }) =>
     req(`/api/frames/${frameId}/comments`, { method: 'POST', body: JSON.stringify(input) }),
   replyComment: (commentId: string, text: string) =>
     req(`/api/comments/${commentId}/replies`, { method: 'POST', body: JSON.stringify({ text }) }),
   resolveComment: (commentId: string) => req(`/api/comments/${commentId}/resolve`, { method: 'POST' }),
   retryComment: (commentId: string) => req(`/api/comments/${commentId}/retry`, { method: 'POST' }),
-  retryTaskFeedback: (feedbackId: string) => req(`/api/feedback/${feedbackId}/retry`, { method: 'POST' }),
-  stopAgentWork: (canvasId: string, agentName: string) =>
-    req(`/api/canvases/${canvasId}/agents/stop`, { method: 'POST', body: JSON.stringify({ agentName }) }),
-  deleteCard: (canvasId: string, cardId: string) =>
-    req(`/api/canvases/${canvasId}/cards/${cardId}`, { method: 'DELETE' }),
-  /* the queue's running order: ids in the order the cards should run */
-  reorderCards: (canvasId: string, ids: string[]) =>
-    req(`/api/canvases/${canvasId}/cards/reorder`, { method: 'POST', body: JSON.stringify({ ids }) }),
-  setCardPriority: (canvasId: string, cardId: string, priority: number) =>
-    req(`/api/canvases/${canvasId}/cards/${cardId}`, { method: 'PATCH', body: JSON.stringify({ priority }) }),
   /* ship: a downloadable archive (or the bare source), and the same design
      opened as a pull request against a connected repo */
   exportCanvas: (canvasId: string, format: 'zip' | 'code') =>
@@ -517,7 +481,6 @@ export const api = {
     }),
   restoreRelease: (canvasId: string, releaseId: string) =>
     req<{ ok: true }>(`/api/canvases/${canvasId}/releases/${releaseId}/restore`, { method: 'POST' }),
-  plans: (canvasId: string) => req<AgentPlan[]>(`/api/canvases/${canvasId}/plans`),
   listMcpAgents: () => req<ConnectedAgent[]>('/api/mcp-agents'),
   revokeMcpAgent: (clientId: string) => req(`/api/mcp-agents/${encodeURIComponent(clientId)}`, { method: 'DELETE' }),
 }

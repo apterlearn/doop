@@ -10,7 +10,7 @@ import { Tooltip } from './tooltip'
 import { XIcon } from './icons'
 
 /* The canvas rails (Activity, Inspector). On a wide screen they float over the
-   board; inside a mobile Sheet they fill it. That used to be a `.side-panel`
+   canvas; inside a mobile Sheet they fill it. That used to be a `.side-panel`
    class the page reached back through with descendant selectors — it is a prop
    now, so the panel's two shapes live in one place. */
 const panelVariants = cva('flex min-w-0 flex-col overflow-hidden bg-surface', {

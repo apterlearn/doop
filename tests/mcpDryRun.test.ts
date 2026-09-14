@@ -31,9 +31,6 @@ vi.mock('../server/db/persist.ts', () => ({
   savePage: () => {},
   deletePage: () => {},
   setFramePage: () => {},
-  saveTask: () => {},
-  deleteTask: () => {},
-  saveFeedback: () => {},
   saveComment: () => {},
   saveActivity: () => {},
   saveDecision: () => {},
@@ -46,8 +43,6 @@ vi.mock('../server/db/persist.ts', () => ({
   saveReference: () => {},
   deleteReference: () => {},
   deleteCanvas: () => {},
-  savePlan: () => {},
-  deletePlan: () => {},
   listFrameReviews: async () => [],
 }))
 
@@ -127,8 +122,6 @@ beforeEach(() => {
   broadcast = vi.fn()
   actions.wire(broadcast, () => {})
   actions.hydrateLogs({
-    tasks: new Map(),
-    feedback: new Map(),
     comments: new Map(),
     activity: new Map(),
     decisions: new Map(),

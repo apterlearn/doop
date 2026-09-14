@@ -1,9 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
-import type { CanvasReviewSummary, Frame } from '../../shared/types'
+import type { CanvasReviewSummary } from '../../shared/types'
 import { checkVerdict, useStore } from '../lib/store'
 import { api, ApiError } from '../lib/api'
 import { timeAgo } from '../lib/time'
-import { roleName } from '../../shared/agents'
 import { cn } from '@/lib/utils'
 import { Button } from './ui/button'
 import { PanelBody } from './ui/panel'
@@ -37,17 +36,6 @@ interface ReviewFinding {
   source: string
 }
 
-/** Who fixes a finding, by the domain the check filed it under. The polish
- *  pass owns the token scale, overflow and alignment; the accessibility
- *  reviewer owns a11y; wording is the copywriter's. A domain this build does
- *  not know about goes to the generalist rather than to the wrong specialist. */
-const PIPELINES: Record<string, string[]> = {
-  a11y: ['a11y'],
-  token: ['polish'],
-  layout: ['polish'],
-  content: ['copy'],
-}
-
 /** The sentence a failed request carries. The routes refuse with plain text
  *  (rate limit, renderer down), so show that rather than "429 {...}". */
 function apiMessage(err: unknown, fallback: string): string {
@@ -55,19 +43,9 @@ function apiMessage(err: unknown, fallback: string): string {
   return err instanceof ApiError ? String(err.body.error ?? err.message) : err.message
 }
 
-/** One finding, with the action that turns it into work. Blocking and
- *  advisory rows read the same; only their tone differs. */
-function FindingRow({
-  finding,
-  blocking,
-  busy,
-  onQueue,
-}: {
-  finding: ReviewFinding
-  blocking: boolean
-  busy: boolean
-  onQueue: () => void
-}) {
+/** One finding. Blocking and advisory rows read the same; only their tone
+ *  differs. */
+function FindingRow({ finding, blocking }: { finding: ReviewFinding; blocking: boolean }) {
   return (
     <li className="flex items-start gap-2 text-[11.5px] leading-[1.4]">
       <div className="min-w-0 flex-1">
@@ -79,11 +57,6 @@ function FindingRow({
         </span>
         <div className="text-ink-soft">{finding.detail}</div>
       </div>
-      {/* a finding is only useful if someone acts on it: this hands it to the
-          role that owns the domain, with the frame and the element it named */}
-      <Button variant="ghost" size="sm" className="flex-none px-2 py-0.5 text-[11px]" disabled={busy} onClick={onQueue}>
-        {busy ? 'Queueing…' : 'Queue fix'}
-      </Button>
     </li>
   )
 }
@@ -104,11 +77,7 @@ export function ChecksPanel() {
      canvas as it was, so a later edit makes it stale rather than silently
      out of date */
   const [sweep, setSweep] = useState<{ summary: CanvasReviewSummary; signature: string } | null>(null)
-  /* the finding whose card is in flight, keyed rule@selector within a frame */
-  const [queuing, setQueuing] = useState<string | null>(null)
   const [error, setError] = useState<{ key: string; message: string } | null>(null)
-  /* what the panel last did on the human's behalf — a card queued, named */
-  const [note, setNote] = useState<{ key: string; message: string } | null>(null)
   /* which frame set the reports in hand belong to: "loading" is derived from
      that rather than set before the request, so the effect never has to touch
      state synchronously */
@@ -158,7 +127,6 @@ export function ChecksPanel() {
   const runChecks = (frameId: string) => {
     setRunning(frameId)
     setError(null)
-    setNote(null)
     api
       .runFrameReviews(frameId)
       .then((report) => setFrameReview(frameId, report))
@@ -173,7 +141,6 @@ export function ChecksPanel() {
     if (!canvasId || sweeping) return
     setSweeping(true)
     setError(null)
-    setNote(null)
     api
       .runCanvasReviews(canvasId)
       .then(async (summary) => {
@@ -191,26 +158,6 @@ export function ChecksPanel() {
       })
       .catch((err: unknown) => setError({ key: 'sweep', message: apiMessage(err, 'the sweep could not run') }))
       .finally(() => setSweeping(false))
-  }
-
-  /* Queue the finding as a board card for the role that owns its domain. The
-     card carries the frame and the element the check named, so the agent
-     starts from the address rather than from a guess. */
-  const queueFix = (frame: Frame, finding: ReviewFinding) => {
-    if (!canvasId) return
-    const key = `${frame.id}:${finding.rule}:${finding.selector}`
-    const pipeline = PIPELINES[finding.source] ?? ['doop']
-    const title = `Fix ${finding.rule} on “${frame.name}”`
-    setQueuing(key)
-    setError(null)
-    setNote(null)
-    api
-      .addCard(canvasId, title, pipeline, [], [frame.id], finding.selector ? { selector: finding.selector } : undefined)
-      .then(() =>
-        setNote({ key: frame.id, message: `Card queued for ${pipeline.map(roleName).join(' → ')} — ${title}.` }),
-      )
-      .catch((err: unknown) => setError({ key: frame.id, message: apiMessage(err, 'the card could not be queued') }))
-      .finally(() => setQueuing(null))
   }
 
   if (!wanted.length) {
@@ -330,7 +277,6 @@ export function ChecksPanel() {
               </Button>
             </div>
             {error?.key === frame.id && <p className="mb-1.5 text-[11.5px] text-accent-ink">{error.message}</p>}
-            {note?.key === frame.id && <p className="mb-1.5 text-[11.5px] text-brand">{note.message}</p>}
             {report ? (
               <div className="rounded-[10px] border border-line-soft bg-white px-3 py-2.5 shadow-card">
                 <div className="text-[11.5px] text-ink-soft">
@@ -352,13 +298,7 @@ export function ChecksPanel() {
                 {blocking.length > 0 && (
                   <ul className="mt-2 flex flex-col gap-1.5">
                     {blocking.slice(0, 8).map((finding, index) => (
-                      <FindingRow
-                        key={`${finding.rule}-${finding.selector}-${index}`}
-                        finding={finding}
-                        blocking
-                        busy={queuing === `${frame.id}:${finding.rule}:${finding.selector}`}
-                        onQueue={() => queueFix(frame, finding)}
-                      />
+                      <FindingRow key={`${finding.rule}-${finding.selector}-${index}`} finding={finding} blocking />
                     ))}
                   </ul>
                 )}
@@ -376,8 +316,6 @@ export function ChecksPanel() {
                           key={`${finding.rule}-${finding.selector}-${index}`}
                           finding={finding}
                           blocking={false}
-                          busy={queuing === `${frame.id}:${finding.rule}:${finding.selector}`}
-                          onQueue={() => queueFix(frame, finding)}
                         />
                       ))}
                     </ul>

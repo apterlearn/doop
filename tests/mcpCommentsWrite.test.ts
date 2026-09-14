@@ -16,8 +16,6 @@ vi.mock('../server/db/persist.ts', () => ({
   saveRunEvent: () => {},
   saveQuestion: () => {},
   saveFrameProposal: () => {},
-  saveTask: () => {},
-  saveFeedback: () => {},
   saveComment: () => {},
   saveActivity: () => {},
   saveDecision: () => {},
@@ -92,9 +90,8 @@ beforeEach(() => {
   vi.restoreAllMocks()
   vi.spyOn(store, 'getCanvas').mockImplementation((id: string) => (id === CANVAS.id ? CANVAS : undefined))
   vi.spyOn(store, 'getFrame').mockImplementation((id: string) => (id === FRAME.id ? FRAME : undefined))
-  /* arrival and the feedback channel are not what these cases are about */
+  /* arrival is not what these cases are about */
   vi.spyOn(actions, 'heartbeatAgent').mockImplementation(() => {})
-  vi.spyOn(actions, 'takeFeedbackFor').mockReturnValue([])
 })
 
 describe('add_comment', () => {
@@ -279,6 +276,191 @@ describe('@mentions of connected agents', () => {
       const comment = JSON.parse(raw) as ElementComment
       expect(comment.forAgent).toBeUndefined()
       expect(comment.targetAgent).toBeUndefined()
+    } finally {
+      await close()
+    }
+  })
+})
+
+/* The work channel. A human @mentions a role in a note on an element; the
+   agent connected to that role takes it with claim_comment, and says so with
+   fail_comment when it cannot finish it. Both run the real actions, so the
+   claim that hands one agent a note — and hides it from the next — is the
+   thing under test. */
+describe('claim_comment and fail_comment', () => {
+  function withPresentAgent(name: string) {
+    actions.wirePresence((canvasId) => (canvasId === CANVAS.id ? [{ name, lastSeen: Date.now() }] : []))
+  }
+
+  /** A human's note @mentioning Claude, routed for real. */
+  function mentionedNote(text = '@Claude make the hero bigger'): ElementComment {
+    withPresentAgent('Claude')
+    return actions.addElementComment(
+      FRAME.id,
+      { selector: '.hero h1', snippet: '<h1>Hi</h1>', text },
+      actions.resolveActor({ name: 'alice', kind: 'user' }),
+    )!
+  }
+
+  beforeEach(() => {
+    /* the comment log is module state: each case starts with an empty canvas
+       so one test's claimed note cannot answer the next one's claim */
+    actions.hydrateLogs({
+      comments: new Map([[CANVAS.id, []]]),
+      activity: new Map(),
+      decisions: new Map(),
+      proposals: new Map(),
+    })
+  })
+
+  it('registers both as writes, claim harmless and a failure destructive', async () => {
+    const { client, close } = await connect()
+    try {
+      const { tools } = await client.listTools()
+      const byName = new Map(tools.map((tool) => [tool.name, tool]))
+      const claim = byName.get('claim_comment')
+      const fail = byName.get('fail_comment')
+      expect(claim).toBeDefined()
+      expect(fail).toBeDefined()
+      expect(claim!.annotations?.readOnlyHint).toBe(false)
+      expect(claim!.annotations?.destructiveHint).toBe(false)
+      expect(fail!.annotations?.readOnlyHint).toBe(false)
+      expect(fail!.annotations?.destructiveHint).toBe(true)
+      expect(claim!.outputSchema).toBeDefined()
+      expect(fail!.outputSchema).toBeDefined()
+      const claimSchema = claim!.inputSchema as unknown as { required?: string[] }
+      /* the claim is the call that names the role it works as — canvas_id is
+         optional on the wire, supplied by the session when it is known */
+      expect(claimSchema.required).toContain('agent_name')
+      const failSchema = fail!.inputSchema as unknown as { required?: string[] }
+      expect(failSchema.required).toEqual(expect.arrayContaining(['comment_id', 'reason']))
+    } finally {
+      await close()
+    }
+  })
+
+  it('hands the @mentioned note to the claiming agent once, and nothing on a second claim', async () => {
+    const note = mentionedNote()
+    const { client, close } = await connect()
+    try {
+      const first = await call(client, 'claim_comment', { canvas_id: CANVAS.id, agent_name: 'Claude' })
+      expect(first.result.isError).toBeFalsy()
+      const claimed = JSON.parse(first.raw) as { comments: ElementComment[] }
+      expect(claimed.comments.map((c) => c.id)).toEqual([note.id])
+      expect(claimed.comments[0]).toMatchObject({
+        text: '@Claude make the hero bigger',
+        from: 'alice',
+        selector: '.hero h1',
+      })
+      /* the pin flips to "Claude is on it" for the human watching */
+      expect(actions.findComment(note.id)?.claimedBy).toBe('Claude')
+
+      /* idempotent per note: the second agent to call gets nothing, not the
+         same work again */
+      const second = await call(client, 'claim_comment', { canvas_id: CANVAS.id, agent_name: 'Claude' })
+      expect(second.result.isError).toBeFalsy()
+      expect(JSON.parse(second.raw)).toEqual({ comments: [] })
+    } finally {
+      await close()
+    }
+  })
+
+  it('marks a claimed note failed with the reason, and it stops being claimable', async () => {
+    const note = mentionedNote()
+    const { client, close } = await connect()
+    try {
+      await call(client, 'claim_comment', { canvas_id: CANVAS.id, agent_name: 'Claude' })
+      const { result, raw } = await call(client, 'fail_comment', {
+        comment_id: note.id,
+        reason: 'the hero image is not in the asset library',
+        agent_name: 'Claude',
+      })
+
+      expect(result.isError).toBeFalsy()
+      expect(JSON.parse(raw)).toEqual({ ok: true, id: note.id, failed: true })
+      const failed = actions.findComment(note.id)!
+      expect(failed.failedAt).toBeDefined()
+      expect(failed.failureReason).toBe('the hero image is not in the asset library')
+      /* stopped, not resolved: the human reads why and can hand it back */
+      expect(failed.resolvedAt).toBeUndefined()
+      expect(actions.takeAgentCommentsFor(CANVAS.id, 'Claude')).toEqual([])
+    } finally {
+      await close()
+    }
+  })
+
+  it('refuses to fail a note that is already resolved, and an unknown id', async () => {
+    const note = mentionedNote()
+    const { client, close } = await connect()
+    try {
+      actions.resolveComment(note.id, actions.resolveActor({ name: 'Claude', kind: 'agent' }))
+      const resolved = await call(client, 'fail_comment', {
+        comment_id: note.id,
+        reason: 'too late',
+        agent_name: 'Claude',
+      })
+      expect(resolved.result.isError).toBe(true)
+      expect(resolved.raw).toContain('already resolved')
+
+      const unknown = await call(client, 'fail_comment', {
+        comment_id: 'nope',
+        reason: 'gone',
+        agent_name: 'Claude',
+      })
+      expect(unknown.result.isError).toBe(true)
+      expect(unknown.raw).toContain('no comment with id nope')
+    } finally {
+      await close()
+    }
+  })
+
+  /* The realistic flow: a human picks a role in the composer, so the note is
+     addressed to the ROLE ("Accessibility"), while the agent that works it is
+     an MCP client with a name of its own. Without the role argument the note
+     would never match and the only work channel would go dead. */
+  it('hands a role-addressed note to an agent that names the role it works', async () => {
+    const note = actions.addElementComment(
+      FRAME.id,
+      { selector: '.hero h1', snippet: '<h1>Hi</h1>', text: '@a11y the heading contrast is too low' },
+      actions.resolveActor({ name: 'alice', kind: 'user' }),
+    )!
+    /* the mention is stored as the role's name, not the agent's */
+    expect(note.targetAgent).toBe('Accessibility')
+    const { client, close } = await connect()
+    try {
+      /* an agent named "Claude" claims nothing by name alone... */
+      const byName = await call(client, 'claim_comment', { canvas_id: CANVAS.id, agent_name: 'Claude' })
+      expect(JSON.parse(byName.raw)).toEqual({ comments: [] })
+      /* ...and the empty answer says what to pass instead of dead-ending */
+      expect(byName.result.content.some((b) => /role/i.test(b.text ?? ''))).toBe(true)
+
+      /* ...but takes the note when it names the role it works */
+      const byRole = await call(client, 'claim_comment', {
+        canvas_id: CANVAS.id,
+        agent_name: 'Claude',
+        role: 'a11y',
+      })
+      const claimed = JSON.parse(byRole.raw) as { comments: ElementComment[] }
+      expect(claimed.comments.map((c) => c.id)).toEqual([note.id])
+      /* the pin credits the agent that is actually on it, not the role */
+      expect(actions.findComment(note.id)?.claimedBy).toBe('Claude')
+    } finally {
+      await close()
+    }
+  })
+
+  it('refuses a role that does not exist, naming the real ones', async () => {
+    const { client, close } = await connect()
+    try {
+      const bad = await call(client, 'claim_comment', {
+        canvas_id: CANVAS.id,
+        agent_name: 'Claude',
+        role: 'wizard',
+      })
+      expect(bad.result.isError).toBe(true)
+      expect(bad.raw).toContain('no role')
+      expect(bad.raw).toContain('wizard')
+      expect(bad.raw).toContain('a11y')
     } finally {
       await close()
     }

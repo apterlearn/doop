@@ -5,12 +5,12 @@ import * as actions from '../server/actions.ts'
 import { buildMcpServer } from '../server/mcp.ts'
 import { store } from '../server/store.ts'
 import { getStats, recordToolCall } from '../server/mcpStats.ts'
-import type { Canvas, ElementComment, ServerMessage, TaskFeedback } from '../shared/types.ts'
+import type { Canvas, ElementComment } from '../shared/types.ts'
 
-/* Agent identity: a name is free text, so the account behind it is what makes
-   two "Claude"s two agents. Everything routed by name — feedback, comments,
-   stops, presence — has to respect that, or one account's agent can read and
-   halt another's work. */
+/* Agent identity: a name is free text, so the account behind the connection is
+   what a session's work is attributed to. whoami reports it, a comment claim
+   records it, and the canvas and agent name a session remembers belong to that
+   account's session alone. */
 
 vi.mock('../server/db/persist.ts', () => ({
   getUserEmail: async () => undefined,
@@ -28,9 +28,6 @@ vi.mock('../server/db/persist.ts', () => ({
   savePage: () => {},
   deletePage: () => {},
   setFramePage: () => {},
-  saveTask: () => {},
-  deleteTask: () => {},
-  saveFeedback: () => {},
   saveComment: () => {},
   saveActivity: () => {},
   saveDecision: () => {},
@@ -43,12 +40,9 @@ vi.mock('../server/db/persist.ts', () => ({
   saveReference: () => {},
   deleteReference: () => {},
   deleteCanvas: () => {},
-  savePlan: () => {},
-  deletePlan: () => {},
 }))
 
 const OWNER_ID = 'owner-account'
-const OTHER_ID = 'other-account'
 const CANVAS_ID = 'c-identity'
 const FRAME_ID = 'f-identity'
 
@@ -89,7 +83,7 @@ async function callTool(client: Client, name: string, args: Record<string, unkno
     parsed,
     raw,
     /* every text block: the payload first, then the steering appended after it
-       (feedback, the session's substitutions, the focus nudge) */
+       (the session's substitutions, the focus nudge) */
     text: texts.join('\n'),
     isError: result.isError,
     /* the session's substitutions are merged into the typed payload, which the
@@ -98,14 +92,11 @@ async function callTool(client: Client, name: string, args: Record<string, unkno
   }
 }
 
-function seedCanvas(shareWithOther = true): Canvas {
+function seedCanvas(): Canvas {
   const canvas: Canvas = {
     id: CANVAS_ID,
     name: 'Identity',
     ownerId: OWNER_ID,
-    /* with linkAccess 'edit' the other account can reach the canvas without
-       being a member — which is exactly the case a stop must refuse */
-    ...(shareWithOther ? { memberIds: [OTHER_ID] } : { linkAccess: 'edit' as const }),
     createdAt: 0,
     updatedAt: 0,
     frames: [
@@ -139,8 +130,6 @@ beforeEach(() => {
   /* hydrateLogs only assigns the keys it is given, so the canvas is listed
      explicitly to start every test from empty logs */
   actions.hydrateLogs({
-    tasks: new Map([[CANVAS_ID, []]]),
-    feedback: new Map([[CANVAS_ID, []]]),
     comments: new Map([[CANVAS_ID, []]]),
     activity: new Map([[CANVAS_ID, []]]),
     decisions: new Map([[CANVAS_ID, []]]),
@@ -164,43 +153,6 @@ describe('agent identity is scoped to the account', () => {
     }
   })
 
-  it('does not let one account’s agent inherit feedback delivered to another’s', async () => {
-    const a = await connect('Alice', OWNER_ID)
-    const b = await connect('Bob', OTHER_ID)
-    try {
-      const fb: TaskFeedback = {
-        id: 'fb-1',
-        taskId: 'task-1',
-        canvasId: CANVAS_ID,
-        agentName: 'Claude',
-        targetAgent: 'Claude',
-        from: 'alice',
-        text: 'round the corners',
-        at: 1,
-      }
-      actions.hydrateLogs({
-        tasks: new Map([[CANVAS_ID, []]]),
-        feedback: new Map([[CANVAS_ID, [fb]]]),
-        comments: new Map(),
-        activity: new Map(),
-        decisions: new Map(),
-        proposals: new Map(),
-      })
-
-      /* Alice's Claude reads it first */
-      const first = await callTool(a.client, 'get_feedback', { canvas_id: CANVAS_ID, agent_name: 'Claude' })
-      expect(first.raw).toContain('round the corners')
-
-      /* Bob's Claude, same name, must not see the same delivery again */
-      const second = await callTool(b.client, 'get_feedback', { canvas_id: CANVAS_ID, agent_name: 'Claude' })
-      expect(second.raw).not.toContain('round the corners')
-      expect(second.isError).toBeFalsy()
-    } finally {
-      await a.close()
-      await b.close()
-    }
-  })
-
   it('records the account on a comment claim, so the pin can tell the agents apart', () => {
     const comment: ElementComment = {
       id: 'cm-1',
@@ -215,8 +167,6 @@ describe('agent identity is scoped to the account', () => {
       targetAgent: 'Claude',
     }
     actions.hydrateLogs({
-      tasks: new Map([[CANVAS_ID, []]]),
-      feedback: new Map([[CANVAS_ID, []]]),
       comments: new Map([[CANVAS_ID, [comment]]]),
       activity: new Map(),
       decisions: new Map(),
@@ -226,80 +176,6 @@ describe('agent identity is scoped to the account', () => {
     expect(claimed).toHaveLength(1)
     expect(claimed[0]!.claimedBy).toBe('Claude')
     expect(claimed[0]!.claimedByOwner).toBe(OWNER_ID)
-  })
-
-  it('refuses to stop another account’s agent, and allows the canvas owner to', async () => {
-    /* Bob is NOT a member here: he can read the canvas by link, but stopping
-       someone else's agent is a privileged act */
-    seedCanvas(false)
-    const b = await connect('Bob', OTHER_ID)
-    try {
-      /* an open status task belonging to Alice's agent */
-      actions.setAgentStatus(
-        CANVAS_ID,
-        actions.resolveActor({ name: 'Claude', kind: 'agent', owner: 'Alice', ownerId: OWNER_ID }),
-        'Sketching the hero',
-      )
-      const refused = await callTool(b.client, 'stop_work', {
-        canvas_id: CANVAS_ID,
-        target_agent: 'Claude',
-        agent_name: 'BobAgent',
-      })
-      expect(refused.isError).toBe(true)
-      expect(refused.parsed.error).toMatchObject({ code: 'forbidden' })
-      expect(actions.getTasks(CANVAS_ID).some((t) => !t.endedAt)).toBe(true)
-    } finally {
-      await b.close()
-    }
-
-    const owner = await connect('Alice', OWNER_ID)
-    try {
-      const allowed = await callTool(owner.client, 'stop_work', {
-        canvas_id: CANVAS_ID,
-        target_agent: 'Claude',
-        agent_name: 'AliceAgent',
-      })
-      expect(allowed.isError).toBeFalsy()
-      expect(allowed.parsed.ok).toBe(true)
-      expect(actions.getTasks(CANVAS_ID).every((t) => t.endedAt !== undefined)).toBe(true)
-    } finally {
-      await owner.close()
-    }
-  })
-
-  it('keys presence per account, so the same name is two agents in the room', async () => {
-    const seen: ServerMessage[] = []
-    actions.wire(
-      (_canvasId, msg) => seen.push(msg),
-      () => {},
-    )
-    const a = await connect('Alice', OWNER_ID)
-    const b = await connect('Bob', OTHER_ID)
-    try {
-      await callTool(a.client, 'set_status', { canvas_id: CANVAS_ID, status: 'Alice work', agent_name: 'Claude' })
-      await callTool(b.client, 'set_status', { canvas_id: CANVAS_ID, status: 'Bob work', agent_name: 'Claude' })
-      const tasks = actions.getTasks(CANVAS_ID)
-      /* two open tasks, both named Claude, each carrying its own account */
-      expect(tasks).toHaveLength(2)
-      expect(new Set(tasks.map((t) => t.ownerId))).toEqual(new Set([OWNER_ID, OTHER_ID]))
-      expect(tasks.every((t) => t.agentName === 'Claude')).toBe(true)
-    } finally {
-      await a.close()
-      await b.close()
-    }
-  })
-
-  it('lets a shared canvas’s agent stop its own run', async () => {
-    const b = await connect('Bob', OTHER_ID)
-    try {
-      await callTool(b.client, 'set_status', { canvas_id: CANVAS_ID, status: 'Bob work', agent_name: 'Claude' })
-      const stopped = await callTool(b.client, 'stop_work', { canvas_id: CANVAS_ID, agent_name: 'Claude' })
-      expect(stopped.isError).toBeFalsy()
-      expect(stopped.parsed.ok).toBe(true)
-      expect(actions.getTasks(CANVAS_ID).every((t) => t.endedAt !== undefined)).toBe(true)
-    } finally {
-      await b.close()
-    }
   })
 })
 
@@ -353,8 +229,8 @@ describe('sticky session context', () => {
 
       /* the write names neither: the session supplies both, and the result says
          which it used */
-      const first = await callTool(a.client, 'set_plan', {
-        steps: [{ id: 's1', text: 'Sketch the hero' }],
+      const first = await callTool(a.client, 'set_tokens', {
+        tokens: { colors: { ink: '#111110' } },
         op_id: 'identity-replay-1',
       })
       expect(first.isError).toBeFalsy()
@@ -365,8 +241,8 @@ describe('sticky session context', () => {
          a retry that said less than the call it replays would hide it exactly
          where it is easiest to miss. It reports it ONCE: the notices appended to
          a result are not part of the record it replays. */
-      const retry = await callTool(a.client, 'set_plan', {
-        steps: [{ id: 's2', text: 'Something else entirely' }],
+      const retry = await callTool(a.client, 'set_tokens', {
+        tokens: { colors: { ink: '#ff0000' } },
         op_id: 'identity-replay-1',
       })
       expect(retry.isError).toBeFalsy()
@@ -375,10 +251,10 @@ describe('sticky session context', () => {
       expect(retry.structured.used_agent_name).toBe(true)
       expect(retry.text).toContain(`using canvas ${CANVAS_ID} from this session`)
       expect(retry.text.match(/using canvas/g)).toHaveLength(1)
-      /* it really was the record: the payload is the first call's, and the plan
-         the handler would have written second never landed */
+      /* it really was the record: the payload is the first call's, and the
+         token set the handler would have written second never landed */
       expect(retry.raw).toBe(first.raw)
-      expect(actions.getPlan(CANVAS_ID, 'Claude')?.steps.map((step) => step.id)).toEqual(['s1'])
+      expect(store.getCanvas(CANVAS_ID)!.tokens!.colors).toEqual({ ink: '#111110' })
     } finally {
       await a.close()
     }
@@ -404,14 +280,14 @@ describe('sticky session context', () => {
 
   it('nudges a canvas-scoped read that resolves no agent name at all', async () => {
     /* Carol's session has never seen a name, and her own canvas is the one she
-       is reading — so the call succeeds, but the feedback channel is silent and
-       she is told how to open it */
+       is reading — so the call succeeds, but nothing is attributed to her and
+       she is told how to fix that */
     const hers = store.createCanvas('Carol canvas', 'carol-account')
     const c = await connect('Carol', 'carol-account')
     try {
       const result = await callTool(c.client, 'get_canvas', { canvas_id: hers.id })
       expect(result.isError).toBeFalsy()
-      expect(result.text).toContain('call with agent_name to receive human feedback')
+      expect(result.text).toContain('call with agent_name so this work is attributed to you')
       /* a nudge, never a refusal: the call itself still worked */
       expect((result.parsed as unknown as { id: string }).id).toBe(hers.id)
     } finally {
@@ -440,10 +316,10 @@ describe('sticky session context', () => {
   it('keeps agent_name required where the identity is the call', async () => {
     const a = await connect('Alice', OWNER_ID)
     try {
-      /* the session has a name by now, but claiming a card must still say who
-         is claiming it — a session default here would act as whoever used the
-         account last */
-      const refused = await callTool(a.client, 'take_card', { card_id: 'card-1' })
+      /* the session has a name by now, but claiming a comment must still say
+         who is claiming it — a session default here would act as whoever used
+         the account last */
+      const refused = await callTool(a.client, 'claim_comment', { canvas_id: CANVAS_ID })
       expect(refused.isError).toBe(true)
     } finally {
       await a.close()

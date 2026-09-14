@@ -5,10 +5,11 @@ import * as actions from '../server/actions.ts'
 import { buildMcpServer } from '../server/mcp.ts'
 import { store } from '../server/store.ts'
 import { clearOpIds } from '../server/opIds.ts'
-import type { AgentPlan, Canvas, ServerMessage } from '../shared/types.ts'
+import type { Canvas } from '../shared/types.ts'
 
-/* Agent plans: the record a long run (or a compacted context) reads back to
-   know where it is, and the line the Agents panel shows. */
+/* op_id idempotency: a retried create returns the record the first call made
+   instead of a second one, keyed per account so one agent cannot replay
+   another's result. */
 
 vi.mock('../server/db/persist.ts', () => ({
   getUserEmail: async () => undefined,
@@ -26,9 +27,6 @@ vi.mock('../server/db/persist.ts', () => ({
   savePage: () => {},
   deletePage: () => {},
   setFramePage: () => {},
-  saveTask: () => {},
-  deleteTask: () => {},
-  saveFeedback: () => {},
   saveComment: () => {},
   saveActivity: () => {},
   saveDecision: () => {},
@@ -41,13 +39,11 @@ vi.mock('../server/db/persist.ts', () => ({
   saveReference: () => {},
   deleteReference: () => {},
   deleteCanvas: () => {},
-  savePlan: () => {},
-  deletePlan: () => {},
 }))
 
 const OWNER_ID = 'plan-owner'
-/* a fresh canvas id per test: the action logs are module state, and a shared id
-   would let one test's plan leak into the next */
+/* a fresh canvas id per test: the op-id log is module state, and a shared id
+   would let one test's replay leak into the next */
 let CANVAS_ID = 'c-plan'
 
 interface CallResult {
@@ -94,12 +90,6 @@ function seedCanvas(): Canvas {
   return canvas
 }
 
-const steps = [
-  { id: 'tokens', text: 'Set the canvas design tokens' },
-  { id: 'hero', text: 'Build the hero frame' },
-  { id: 'review', text: 'Screenshot and fix what looks wrong' },
-]
-
 beforeEach(() => {
   vi.restoreAllMocks()
   clearOpIds()
@@ -108,177 +98,12 @@ beforeEach(() => {
     () => {},
   )
   actions.hydrateLogs({
-    tasks: new Map(),
-    feedback: new Map(),
     comments: new Map(),
     activity: new Map(),
     decisions: new Map(),
     proposals: new Map(),
   })
   seedCanvas()
-})
-
-describe('plan tools', () => {
-  it('publishes a plan, moves its steps, and reads it back', async () => {
-    const { client, close } = await connect()
-    try {
-      const created = await callTool(client, 'set_plan', { canvas_id: CANVAS_ID, steps, agent_name: 'Claude' })
-      expect(created.isError).toBeFalsy()
-      const plan = created.parsed.plan as unknown as AgentPlan
-      expect(plan.steps.map((s) => s.id)).toEqual(['tokens', 'hero', 'review'])
-      expect(plan.steps.every((s) => s.status === 'pending')).toBe(true)
-      expect(plan.agentName).toBe('Claude')
-      expect(plan.owner).toBe('Test Owner')
-
-      const active = await callTool(client, 'update_plan_step', {
-        canvas_id: CANVAS_ID,
-        step_id: 'hero',
-        status: 'active',
-        note: 'hero first, tokens after',
-        agent_name: 'Claude',
-      })
-      expect(active.isError).toBeFalsy()
-      const moved = (active.parsed.plan as unknown as AgentPlan).steps.find((s) => s.id === 'hero')!
-      expect(moved.status).toBe('active')
-      expect(moved.note).toBe('hero first, tokens after')
-
-      const read = await callTool(client, 'get_plan', { canvas_id: CANVAS_ID, agent_name: 'Claude' })
-      const plans = read.parsed.plans as unknown as AgentPlan[]
-      expect(plans).toHaveLength(1)
-      expect(plans[0]!.steps.find((s) => s.id === 'hero')!.status).toBe('active')
-    } finally {
-      await close()
-    }
-  })
-
-  it('keeps the progress of steps a re-published plan did not change', async () => {
-    const { client, close } = await connect()
-    try {
-      await callTool(client, 'set_plan', { canvas_id: CANVAS_ID, steps, agent_name: 'Claude' })
-      await callTool(client, 'update_plan_step', {
-        canvas_id: CANVAS_ID,
-        step_id: 'tokens',
-        status: 'done',
-        agent_name: 'Claude',
-      })
-
-      const republished = await callTool(client, 'set_plan', {
-        canvas_id: CANVAS_ID,
-        steps: [
-          { id: 'tokens', text: 'Set the canvas design tokens' },
-          { id: 'hero', text: 'Build the hero frame' },
-          { id: 'review', text: 'Screenshot and fix what looks wrong' },
-          { id: 'flow', text: 'Add the pricing page' },
-        ],
-        agent_name: 'Claude',
-      })
-      const plan = republished.parsed.plan as unknown as AgentPlan
-      expect(plan.steps.find((s) => s.id === 'tokens')!.status).toBe('done')
-      expect(plan.steps.find((s) => s.id === 'flow')!.status).toBe('pending')
-    } finally {
-      await close()
-    }
-  })
-
-  it('lists every agent plan on the canvas, newest first', async () => {
-    const { client, close } = await connect()
-    try {
-      await callTool(client, 'set_plan', { canvas_id: CANVAS_ID, steps, agent_name: 'Claude' })
-      await callTool(client, 'set_plan', {
-        canvas_id: CANVAS_ID,
-        steps: [{ id: 'a11y', text: 'Audit the hero' }],
-        agent_name: 'Auditor',
-      })
-      const { parsed } = await callTool(client, 'get_plan', { canvas_id: CANVAS_ID })
-      const plans = parsed.plans as unknown as AgentPlan[]
-      expect(new Set(plans.map((p) => p.agentName))).toEqual(new Set(['Auditor', 'Claude']))
-      /* both plans are on the canvas, and each carries its own steps */
-      expect(plans.find((p) => p.agentName === 'Auditor')!.steps.map((st) => st.id)).toEqual(['a11y'])
-    } finally {
-      await close()
-    }
-  })
-
-  it('rejects an empty plan, too many steps and a duplicate id', async () => {
-    const { client, close } = await connect()
-    try {
-      /* an empty plan is refused at the schema, before the handler runs */
-      const empty = (await client.callTool({
-        name: 'set_plan',
-        arguments: { canvas_id: CANVAS_ID, steps: [], agent_name: 'Claude' },
-      })) as unknown as CallResult
-      expect(empty.isError).toBe(true)
-      expect(empty.content[0]!.text).toContain('steps')
-
-      const many = (await client.callTool({
-        name: 'set_plan',
-        arguments: {
-          canvas_id: CANVAS_ID,
-          steps: Array.from({ length: 21 }, (_, i) => ({ id: `s${i}`, text: `Step ${i}` })),
-          agent_name: 'Claude',
-        },
-      })) as unknown as CallResult
-      expect(many.isError).toBe(true)
-      expect(many.content[0]!.text).toContain('steps')
-
-      const dupes = await callTool(client, 'set_plan', {
-        canvas_id: CANVAS_ID,
-        steps: [
-          { id: 'same', text: 'One' },
-          { id: 'same', text: 'Two' },
-        ],
-        agent_name: 'Claude',
-      })
-      expect(dupes.isError).toBe(true)
-      expect(String((dupes.parsed.error as unknown as { message: string }).message)).toContain('duplicate step id')
-    } finally {
-      await close()
-    }
-  })
-
-  it('reports an unknown step as not_found and a plan-less agent as empty', async () => {
-    const { client, close } = await connect()
-    try {
-      const missing = await callTool(client, 'update_plan_step', {
-        canvas_id: CANVAS_ID,
-        step_id: 'ghost',
-        status: 'done',
-        agent_name: 'Claude',
-      })
-      expect(missing.isError).toBe(true)
-      expect(missing.parsed.error).toMatchObject({ code: 'not_found' })
-
-      const none = await callTool(client, 'get_plan', { canvas_id: CANVAS_ID })
-      expect(none.parsed.plans).toEqual([])
-    } finally {
-      await close()
-    }
-  })
-
-  it('broadcasts the plan to the room', async () => {
-    const messages: ServerMessage[] = []
-    actions.wire(
-      (_canvasId, msg) => messages.push(msg),
-      () => {},
-    )
-    const { client, close } = await connect()
-    try {
-      await callTool(client, 'set_plan', { canvas_id: CANVAS_ID, steps, agent_name: 'Claude' })
-      await callTool(client, 'update_plan_step', {
-        canvas_id: CANVAS_ID,
-        step_id: 'hero',
-        status: 'active',
-        agent_name: 'Claude',
-      })
-      const planMessages = messages.filter((m) => m.type === 'plan')
-      expect(planMessages).toHaveLength(2)
-      expect((planMessages[1] as unknown as { plan: AgentPlan }).plan.steps.find((s) => s.id === 'hero')!.status).toBe(
-        'active',
-      )
-    } finally {
-      await close()
-    }
-  })
 })
 
 describe('idempotent creates', () => {

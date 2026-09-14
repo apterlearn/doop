@@ -2,9 +2,9 @@ import * as actions from './actions.ts'
 
 /**
  * The "Doop" demo agent: a scripted replay that streams a pre-authored
- * welcome frame through the SAME machinery real agents use (status → task,
- * presence, typewriter reveal, activity feed). No LLM involved — it's the
- * product demoing itself on a new user's first canvas.
+ * welcome frame through the SAME machinery real agents use (presence,
+ * typewriter reveal, activity feed). No LLM involved — it's the product
+ * demoing itself on a new user's first canvas.
  *
  * Trigger: markPending() at signup-canvas creation; maybePlay() on the
  * owner's first WebSocket join, so the show starts with an audience.
@@ -127,7 +127,6 @@ async function play(canvasId: string) {
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
   await sleep(1500) // let the room render before the show starts
-  actions.setAgentStatus(canvasId, actor, 'Sketching you a welcome…')
 
   await sleep(700)
   const frame = actions.createFrame(
@@ -145,7 +144,5 @@ async function play(canvasId: string) {
 
   /* wait for the reveal to catch up (~500 chars/s) before signing off */
   await sleep(Math.min(20_000, WELCOME_HTML.length * 2 + 3000))
-  actions.setAgentStatus(canvasId, actor, 'Done — connect your own agent next')
   await sleep(6000)
-  actions.setAgentStatus(canvasId, actor, '') // clear: completes the task, presence expires on its own
 }

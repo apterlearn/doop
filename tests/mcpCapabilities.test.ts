@@ -79,13 +79,10 @@ beforeEach(() => {
     () => {},
   )
   actions.hydrateLogs({
-    tasks: new Map(),
-    feedback: new Map(),
     comments: new Map(),
     activity: new Map(),
     decisions: new Map(),
     proposals: new Map(),
-    plans: new Map(),
   })
   canvasId = `${CANVAS_ID}-${counter}`
   const canvas: Canvas = {
@@ -177,7 +174,7 @@ describe('get_capabilities catalogues the registered surface', () => {
       expect(domainOf('upload_asset')).toBe('assets')
       expect(domainOf('import_webpage')).toBe('web')
       expect(domainOf('open_pull_request')).toBe('handoff')
-      expect(domainOf('list_cards')).toBe('board')
+      expect(domainOf('get_comments')).toBe('comments')
       expect(domainOf('get_run_events')).toBe('run')
       expect(domainOf('propose_frame_html')).toBe('review')
       expect(domainOf('get_capabilities')).toBe('discovery')
@@ -216,8 +213,6 @@ describe('get_capabilities catalogues the registered surface', () => {
         'unpublish_canvas',
         'withdraw_proposal',
         'resolve_comment',
-        /* stopping a live run is the one non-delete a client should confirm */
-        'stop_work',
       ]) {
         expect(destructive, `${name} must be marked destructive`).toContain(name)
       }
@@ -250,7 +245,7 @@ describe('get_capabilities catalogues the registered surface', () => {
       }
       /* the tools that DO change state under some arguments, named here so a
          rename or a dropped key fails loudly instead of quietly */
-      for (const name of ['extract_design_system', 'review_frame', 'get_feedback']) {
+      for (const name of ['extract_design_system', 'review_frame', 'claim_comment']) {
         expect(caps.tools.find((t) => t.name === name)!.idempotent, `${name} must be retryable`).toBe(true)
       }
       /* ...and the one write-shaped tool that must NOT be replayed: its result

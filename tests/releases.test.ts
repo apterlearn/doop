@@ -15,7 +15,13 @@ import type { Canvas, Frame } from '../shared/types.ts'
    the ones that make it trustworthy: it survives edits to the canvas, it is
    reachable by whoever holds the link, and putting it back is an ordinary edit
    that can itself be undone. Releases live in the database, so this file drives
-   the real one. */
+   the real one.
+
+   Releases, publishes and restores are SHIP paths: they refuse a canvas whose
+   frames are not verified end to end. The canvases here are deliberately
+   unverified — these tests are about what a release freezes, not about the
+   gate — so those calls pass `force: true`. The gate's refusal and its force
+   override are asserted in tests/mcpReviewMode.test.ts. */
 
 const dataRoot = mkdtempSync(path.join(tmpdir(), 'doop-releases-'))
 
@@ -91,13 +97,10 @@ beforeEach(() => {
     () => {},
   )
   actions.hydrateLogs({
-    tasks: new Map(),
-    feedback: new Map(),
     comments: new Map(),
     activity: new Map(),
     decisions: new Map(),
     proposals: new Map(),
-    plans: new Map(),
   })
   canvas = store.createCanvas(`Release ${counter}`, ownerId)
   frame = store.createFrame(canvas.id, { name: 'Hero', html: '<h1>first</h1>', width: 800, height: 600 }, 'Owner')!
@@ -108,6 +111,7 @@ describe('create_release', () => {
     const { client, close } = await connect()
     try {
       const created = await callTool(client, 'create_release', {
+        force: true,
         canvas_id: canvas.id,
         name: 'v1',
         agent_name: 'Claude',
@@ -143,7 +147,11 @@ describe('create_release', () => {
   it('names a release by date when the caller does not', async () => {
     const { client, close } = await connect()
     try {
-      const created = await callTool(client, 'create_release', { canvas_id: canvas.id, agent_name: 'Claude' })
+      const created = await callTool(client, 'create_release', {
+        force: true,
+        canvas_id: canvas.id,
+        agent_name: 'Claude',
+      })
       expect(String(created.parsed.name)).toMatch(/^Release \d{4}-\d{2}-\d{2}$/)
     } finally {
       await close()
@@ -167,13 +175,28 @@ describe('list_releases', () => {
   it('lists this canvas’s releases newest first and nobody else’s', async () => {
     const { client, close } = await connect()
     try {
-      await callTool(client, 'create_release', { canvas_id: canvas.id, name: 'older', agent_name: 'Claude' })
+      await callTool(client, 'create_release', {
+        force: true,
+        canvas_id: canvas.id,
+        name: 'older',
+        agent_name: 'Claude',
+      })
       await new Promise((resolve) => setTimeout(resolve, 2))
-      await callTool(client, 'create_release', { canvas_id: canvas.id, name: 'newer', agent_name: 'Claude' })
+      await callTool(client, 'create_release', {
+        force: true,
+        canvas_id: canvas.id,
+        name: 'newer',
+        agent_name: 'Claude',
+      })
 
       const other = store.createCanvas('Other', ownerId)
       store.createFrame(other.id, { name: 'X', html: '<p>x</p>' }, 'Owner')
-      await callTool(client, 'create_release', { canvas_id: other.id, name: 'elsewhere', agent_name: 'Claude' })
+      await callTool(client, 'create_release', {
+        force: true,
+        canvas_id: other.id,
+        name: 'elsewhere',
+        agent_name: 'Claude',
+      })
 
       const { parsed } = await callTool(client, 'list_releases', { canvas_id: canvas.id, agent_name: 'Claude' })
       const names = (parsed.releases as unknown as { name: string }[]).map((r) => r.name)
@@ -189,6 +212,7 @@ describe('release names', () => {
     const { client, close } = await connect()
     try {
       const created = await callTool(client, 'create_release', {
+        force: true,
         canvas_id: canvas.id,
         name: 'v1',
         agent_name: 'Claude',
@@ -250,6 +274,7 @@ describe('restore_release', () => {
     const { client, close } = await connect()
     try {
       const created = await callTool(client, 'create_release', {
+        force: true,
         canvas_id: canvas.id,
         name: 'v1',
         agent_name: 'Claude',
@@ -259,6 +284,7 @@ describe('restore_release', () => {
       actions.updateFrame(frame.id, { html: '<h1>ruined</h1>' }, actions.resolveActor({ name: 'alice', kind: 'user' }))
 
       const restored = await callTool(client, 'restore_release', {
+        force: true,
         canvas_id: canvas.id,
         release_id: releaseId,
         agent_name: 'Claude',
@@ -274,6 +300,7 @@ describe('restore_release', () => {
 
       /* restoring again is a no-op, and says so rather than writing */
       const again = await callTool(client, 'restore_release', {
+        force: true,
         canvas_id: canvas.id,
         release_id: releaseId,
         agent_name: 'Claude',
@@ -289,6 +316,7 @@ describe('restore_release', () => {
     const { client, close } = await connect()
     try {
       const created = await callTool(client, 'create_release', {
+        force: true,
         canvas_id: canvas.id,
         name: 'v1',
         agent_name: 'Claude',
@@ -317,11 +345,15 @@ describe('restore_release', () => {
       const other = store.createCanvas('Other', ownerId)
       store.createFrame(other.id, { name: 'X', html: '<p>x</p>' }, 'Owner')
       const created = await callTool(client, 'create_release', {
+        force: true,
         canvas_id: other.id,
         name: 'elsewhere',
         agent_name: 'Claude',
       })
       const refused = await callTool(client, 'restore_release', {
+        /* force so the gate lets the call through to the release lookup this
+           test is about — the frame here is unverified */
+        force: true,
         canvas_id: canvas.id,
         release_id: created.parsed.release_id as unknown as string,
         agent_name: 'Claude',
@@ -340,6 +372,7 @@ describe('publish_canvas', () => {
     const { client, close } = await connect()
     try {
       const published = await callTool(client, 'publish_canvas', {
+        force: true,
         canvas_id: canvas.id,
         description: 'A hero section',
         category: 'marketing',

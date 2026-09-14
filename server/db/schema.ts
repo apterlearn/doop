@@ -177,82 +177,6 @@ export const githubConnections = pgTable(
   (t) => [index('github_connections_canvas_idx').on(t.canvasId)],
 )
 
-export const tasks = pgTable(
-  'tasks',
-  {
-    id: text('id').primaryKey(),
-    canvasId: text('canvas_id').notNull(),
-    agentName: text('agent_name').notNull(),
-    owner: text('owner'),
-    ownerId: text('owner_id'),
-    color: text('color').notNull(),
-    status: text('status').notNull(),
-    startedAt: bigint('started_at', { mode: 'number' }).notNull(),
-    endedAt: bigint('ended_at', { mode: 'number' }),
-    auto: boolean('auto').notNull().default(false),
-    queuedBy: text('queued_by'),
-    claimedAt: bigint('claimed_at', { mode: 'number' }),
-    failedAt: bigint('failed_at', { mode: 'number' }),
-    failureReason: text('failure_reason'),
-    /** comma-joined agent-role ids; null for status tasks and legacy cards */
-    pipeline: text('pipeline'),
-    stage: integer('stage'),
-    /** comma-joined reference-frame ids uploaded with the prompt */
-    attachments: text('attachments'),
-    /** account id of the human who queued the card — picks the model credential */
-    queuedByUserId: text('queued_by_user_id'),
-    /** structured cards ('sketch', 'design-system'); null for prompt cards */
-    kind: text('kind'),
-    /** JSON payload of a structured card — what its runner needs, never a secret */
-    payload: text('payload'),
-    /** a human stopped this card's run (or the agent went silent) — terminal,
-     *  like ended_at: it needs an explicit retry, never an automatic one */
-    cancelledAt: bigint('cancelled_at', { mode: 'number' }),
-    cancelledBy: text('cancelled_by'),
-    /** comma-joined frame ids the card is about (the human's selection at queue
-     *  time) — the agent edits these in place instead of delivering elsewhere */
-    targetFrameIds: text('target_frame_ids'),
-    /** element selector on that frame the human pointed at — "fix THIS element" */
-    targetSelector: text('target_selector'),
-    /** page the target frame lives on, so the agent needs no lookup to reach it */
-    targetPageId: text('target_page_id'),
-    /** queue ordering: higher priority first, then position, then arrival */
-    priority: integer('priority'),
-    position: integer('position'),
-    /** the finishing agent's one-line handoff note for the next pipeline stage */
-    stageSummary: text('stage_summary'),
-    /** JSON {fromAgent, reason, at} — a specialist sent the card back a stage */
-    handback: text('handback'),
-    /** JSON {input, output, cacheRead, cacheWrite, model} for the card's run */
-    usage: text('usage'),
-    /** epoch ms before which queuedCards() skips this card — deferred work */
-    scheduledAt: bigint('scheduled_at', { mode: 'number' }),
-  },
-  (t) => [index('tasks_canvas_idx').on(t.canvasId)],
-)
-
-export const feedback = pgTable(
-  'feedback',
-  {
-    id: text('id').primaryKey(),
-    taskId: text('task_id').notNull(),
-    canvasId: text('canvas_id').notNull(),
-    agentName: text('agent_name').notNull(),
-    targetAgent: text('target_agent'),
-    fromName: text('from_name').notNull(),
-    fromUserId: text('from_user_id'),
-    text: text('text').notNull(),
-    at: bigint('at', { mode: 'number' }).notNull(),
-    deliveredAt: bigint('delivered_at', { mode: 'number' }),
-    claimedBy: text('claimed_by'),
-    claimedByOwner: text('claimed_by_owner'),
-    completedAt: bigint('completed_at', { mode: 'number' }),
-    failedAt: bigint('failed_at', { mode: 'number' }),
-    failureReason: text('failure_reason'),
-  },
-  (t) => [index('feedback_canvas_idx').on(t.canvasId)],
-)
-
 export const comments = pgTable(
   'comments',
   {
@@ -420,23 +344,6 @@ export const canvasReleases = pgTable(
     createdBy: text('created_by').notNull(),
   },
   (t) => [index('canvas_releases_canvas_idx').on(t.canvasId, t.createdAt)],
-)
-
-/** An agent's plan for one canvas: the ordered steps it is working through,
- *  so a long or compacted run can be read back and resumed. One plan per
- *  (canvas, agent) — the latest write wins. */
-export const agentPlans = pgTable(
-  'agent_plans',
-  {
-    canvasId: text('canvas_id').notNull(),
-    agentName: text('agent_name').notNull(),
-    owner: text('owner'),
-    ownerId: text('owner_id'),
-    /** JSON array of PlanStep */
-    steps: jsonb('steps').notNull(),
-    updatedAt: bigint('updated_at', { mode: 'number' }).notNull(),
-  },
-  (t) => [primaryKey({ columns: [t.canvasId, t.agentName] })],
 )
 
 /** Frames pinned to Memory as style exemplars: the HTML is a snapshot taken

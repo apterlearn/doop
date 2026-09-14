@@ -133,13 +133,10 @@ beforeEach(() => {
     () => {},
   )
   actions.hydrateLogs({
-    tasks: new Map(),
-    feedback: new Map(),
     comments: new Map(),
     activity: new Map(),
     decisions: new Map(),
     proposals: new Map(),
-    plans: new Map(),
   })
   canvasId = `c-pr-review-${counter}`
   const canvas: Canvas = {

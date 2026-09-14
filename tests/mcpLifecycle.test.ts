@@ -110,13 +110,10 @@ beforeEach(() => {
     () => {},
   )
   actions.hydrateLogs({
-    tasks: new Map(),
-    feedback: new Map(),
     comments: new Map(),
     activity: new Map(),
     decisions: new Map(),
     proposals: new Map(),
-    plans: new Map(),
   })
   canvas = store.createCanvas(`Lifecycle ${counter}`, OWNER_ID)
   frame = store.createFrame(canvas.id, { name: 'Hero', html: '<h1>hi</h1>', width: 800, height: 600 }, 'Owner')!
@@ -365,6 +362,10 @@ describe('release and asset lifecycle', () => {
     const owner = await connect('Owner', OWNER_ID)
     try {
       const created = await callTool(owner.client, 'create_release', {
+        /* releases and publishes are ship paths that refuse an unverified
+           canvas; the frames here are deliberately unverified and the gate has
+           its own coverage in tests/mcpReviewMode.test.ts */
+        force: true,
         canvas_id: canvas.id,
         name: 'v1',
         agent_name: 'Claude',
@@ -394,6 +395,7 @@ describe('release and asset lifecycle', () => {
       /* publishing pins the listing to this snapshot: deleting it would leave
          the gallery entry with nothing to show */
       const published = await callTool(owner.client, 'publish_canvas', {
+        force: true,
         canvas_id: canvas.id,
         category: 'other',
         release_id: releaseId,
@@ -430,6 +432,7 @@ describe('release and asset lifecycle', () => {
   it('refuses a release delete from a member', async () => {
     const owner = await connect('Owner', OWNER_ID)
     const created = await callTool(owner.client, 'create_release', {
+      force: true,
       canvas_id: canvas.id,
       name: 'v1',
       agent_name: 'Claude',

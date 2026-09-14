@@ -7,7 +7,7 @@ import { store } from '../server/store.ts'
 import type { Canvas, CanvasProposal, Frame } from '../shared/types.ts'
 
 /* Review-mode MCP tools run against the real actions machinery: persist and
-   broadcasts are stubbed, the proposal/queue state is real. Canvas-level
+   broadcasts are stubbed, the proposal state is real. Canvas-level
    proposals are the one thing the actions layer reads back through persist, so
    the stub keeps them in an array — the row's semantics (upsert on save,
    resolve in place) without a database. */
@@ -21,13 +21,10 @@ vi.mock('../server/db/persist.ts', () => {
     saveRunEvent: () => {},
     saveQuestion: () => {},
     saveFrameProposal: () => {},
-    saveTask: () => {},
-    saveFeedback: () => {},
     saveComment: () => {},
     saveActivity: () => {},
     saveDecision: () => {},
     saveProposal: () => {},
-    deleteTask: () => {},
     saveFrame: () => {},
     deleteFrame: () => {},
     saveCanvas: () => {},
@@ -76,13 +73,10 @@ beforeEach(() => {
   // hydrateLogs only overwrites the canvases it is given, so each case works
   // on its own canvas — a shared one would carry the previous case's state
   actions.hydrateLogs({
-    tasks: new Map(),
-    feedback: new Map(),
     comments: new Map(),
     activity: new Map(),
     decisions: new Map(),
     proposals: new Map(),
-    plans: new Map(),
   })
   wireBroadcasts()
   canvas = store.createCanvas(`review-${Math.random().toString(36).slice(2, 8)}`, OWNER_ID)
@@ -541,7 +535,7 @@ describe('ask_human', () => {
 })
 
 describe('wait_for_events', () => {
-  it('returns feedback pushed while parked, with a cursor', { timeout: 30000 }, async () => {
+  it('returns a comment pushed while parked, with a cursor', { timeout: 30000 }, async () => {
     const { client, close } = await connect()
     const cursor0 = (
       await callTool(client, 'wait_for_events', {
@@ -560,21 +554,30 @@ describe('wait_for_events', () => {
       timeout_seconds: 10,
       agent_name: 'ux lead',
     })
-    /* feedback must hang off a real claimed task: queue one, claim it as the
-       agent, then push feedback the way the API does */
-    const card = actions.addQueuedCard(canvas.id, 'make the hero bigger', 'owner', undefined, undefined, OWNER_ID)
-    actions.claimCard(canvas.id, card!.id, 'ux lead')
-    const feedback = actions.addTaskFeedback(card!.id, 'owner', 'make the hero bigger', OWNER_ID)
-    expect(feedback?.targetAgent).toBe('UX Lead')
+    /* the human's channel is a comment that @mentions the agent's role */
+    const text = '@ux lead make the hero bigger'
+    const comment = actions.addElementComment(
+      frame.id,
+      { selector: 'h1', snippet: '<h1>Hi</h1>', text },
+      actions.resolveActor({ name: 'alice', kind: 'user', ownerId: OWNER_ID }),
+    )
+    /* the mention is what routes the note to the role the parked agent fills */
+    expect(comment?.targetAgent).toBe('UX Lead')
+
     const res = await pending
-    const events = (res.parsed as { events: { kind: string; summary: string }[] }).events
-    /* the queue push and the feedback both arrive while parked — the feedback
-       event is the one addressed to this agent */
+    const parsed = res.parsed as {
+      cursor: number
+      timed_out: boolean
+      events: { seq: number; kind: string; summary: string }[]
+    }
+    /* the comment arrives while parked, and the cursor moves past it */
+    expect(parsed.timed_out).toBe(false)
     expect(
-      events.map((e) => [e.kind, e.summary]),
+      parsed.events.map((e) => [e.kind, e.summary]),
       'events seen while parked',
-    ).toContainEqual(['feedback', 'make the hero bigger'])
-    expect(events.map((e) => e.kind)).toContain('card')
+    ).toContainEqual(['comment', text])
+    expect(parsed.cursor).toBe(parsed.events[parsed.events.length - 1]!.seq)
+    expect(parsed.cursor).toBeGreaterThan(cursor0.cursor)
     await close()
   })
 })

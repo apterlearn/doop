@@ -1,9 +1,7 @@
 import { create } from 'zustand'
 import type {
   ActivityItem,
-  AgentPlan,
   AgentQuestion,
-  AgentTask,
   Canvas,
   CanvasFocus,
   CanvasProposal,
@@ -22,15 +20,14 @@ import type {
   Page,
   Presence,
   ReviewPolicy,
-  TaskFeedback,
 } from '../../shared/types'
 import type { SnapGuide } from './snap'
 
 /** Why a frame's design stream ended, as the server reports it. */
-export type StreamEndReason = 'done' | 'idle' | 'taken over' | 'stopped' | 'replaced'
+export type StreamEndReason = 'done' | 'idle' | 'taken over' | 'replaced'
 
 /** Which tab the side panel shows. */
-export type PanelTab = 'tasks' | 'activity' | 'memory' | 'tokens' | 'agents' | 'review' | 'checks' | 'components'
+export type PanelTab = 'activity' | 'memory' | 'tokens' | 'agents' | 'review' | 'checks' | 'components'
 
 export interface Viewport {
   x: number
@@ -46,19 +43,12 @@ interface State {
   focus: Record<string, Omit<CanvasFocus, 'clientId'>>
   cursors: Record<string, { x: number; y: number }>
   activity: ActivityItem[]
-  /** agent task history (newest first) — every set_status becomes a task */
-  tasks: AgentTask[]
-  /** human feedback on tasks (newest first) */
-  feedback: TaskFeedback[]
   /** element-anchored comments (newest first) */
   comments: ElementComment[]
   /** design decisions captured into Memory (newest first) */
   decisions: DesignDecision[]
   /** distiller rule proposals (newest first) */
   proposals: MemoryProposal[]
-  /** agent plans on the open canvas, newest first — each one is an agent's
-   *  published list of steps, shown alongside its live task */
-  plans: AgentPlan[]
   /** agent frame changes waiting for approval while review mode is on */
   frameProposals: FrameProposal[]
   /** agent canvas-level changes (tokens, a guideline doc, the breakpoints, the
@@ -127,8 +117,8 @@ interface State {
   /** frameId -> how the last stream into it ended, so the frame can say so
    *  instead of dropping its border unexplained */
   streamEnds: Record<string, { name: string; color: string; isAgent: boolean; reason: StreamEndReason; at: number }>
-  /** a request for the Stage to glide the camera to a frame — the prompt bar
-   *  raises it so a first deliverable streams in on-screen, never off-canvas */
+  /** a request for the Stage to glide the camera to a frame — an Activity row
+   *  and a Layers row raise it so the frame they name is in view */
   flyTo: { frameId: string; at: number } | null
   /** the page tab being viewed — every frame surface filters to it; unset
    *  means show all frames (back-compat with canvases before pages) */
@@ -150,11 +140,6 @@ interface State {
   setStatus(clientId: string, status: string | null): void
   setActivity(items: ActivityItem[]): void
   pushActivity(item: ActivityItem): void
-  setTasks(tasks: AgentTask[]): void
-  upsertTask(task: AgentTask): void
-  removeTask(taskId: string): void
-  setFeedback(feedback: TaskFeedback[]): void
-  upsertFeedback(fb: TaskFeedback): void
   setComments(comments: ElementComment[]): void
   upsertComment(c: ElementComment): void
   upsertFrame(f: Frame): void
@@ -164,8 +149,6 @@ interface State {
   /** upsert (doc set) or remove (doc null) a style guide on the open canvas */
   setGuidelineLocal(name: string, doc: GuidelineDoc | null): void
   setTokensLocal(tokens: DesignTokens | null): void
-  setPlanLocal(plan: AgentPlan): void
-  setPlans(plans: AgentPlan[]): void
   /** pin (reference set) or unpin (null) a Memory reference on the open canvas */
   setReferenceLocal(id: string, reference: MemoryReference | null): void
   setDecisions(decisions: DesignDecision[]): void
@@ -260,13 +243,10 @@ export const useStore = create<State>((set, get) => ({
   focus: {},
   cursors: {},
   activity: [],
-  tasks: [],
-  feedback: [],
   comments: [],
   decisions: [],
   proposals: [],
-  plans: [],
-  panelTab: 'tasks',
+  panelTab: 'activity',
   flyTo: null,
   frameProposals: [],
   canvasProposals: [],
@@ -376,16 +356,6 @@ export const useStore = create<State>((set, get) => ({
   setActivity: (activity) => set({ activity }),
   pushActivity: (item) =>
     set((s) => (s.activity.some((a) => a.id === item.id) ? {} : { activity: [item, ...s.activity].slice(0, 100) })),
-  setTasks: (tasks) => set({ tasks }),
-  upsertTask: (task) =>
-    set((s) => {
-      const tasks = s.tasks.some((t) => t.id === task.id)
-        ? s.tasks.map((t) => (t.id === task.id ? task : t))
-        : [task, ...s.tasks].slice(0, 100)
-      return { tasks }
-    }),
-  removeTask: (taskId) => set((s) => ({ tasks: s.tasks.filter((t) => t.id !== taskId) })),
-  setFeedback: (feedback) => set({ feedback }),
   setComments: (comments) => set({ comments }),
   upsertComment: (c) =>
     set((s) => {
@@ -393,13 +363,6 @@ export const useStore = create<State>((set, get) => ({
         ? s.comments.map((x) => (x.id === c.id ? c : x))
         : [c, ...s.comments].slice(0, 100)
       return { comments }
-    }),
-  upsertFeedback: (fb) =>
-    set((s) => {
-      const feedback = s.feedback.some((f) => f.id === fb.id)
-        ? s.feedback.map((f) => (f.id === fb.id ? fb : f))
-        : [fb, ...s.feedback].slice(0, 100)
-      return { feedback }
     }),
   upsertFrame: (f) =>
     set((s) => {
@@ -510,12 +473,6 @@ export const useStore = create<State>((set, get) => ({
       return { canvas: { ...s.canvas, guidelines: docs } }
     }),
   setTokensLocal: (tokens) => set((s) => (s.canvas ? { canvas: { ...s.canvas, tokens: tokens ?? undefined } } : {})),
-  setPlans: (plans) => set({ plans }),
-  setPlanLocal: (plan) =>
-    set((s) => {
-      const others = s.plans.filter((p) => !(p.canvasId === plan.canvasId && p.agentName === plan.agentName))
-      return { plans: [plan, ...others] }
-    }),
   setReferenceLocal: (id, reference) =>
     set((s) => {
       if (!s.canvas) return {}

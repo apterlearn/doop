@@ -43,9 +43,6 @@ vi.mock('../server/db/persist.ts', async () => {
     savePage: () => {},
     deletePage: () => {},
     setFramePage: () => {},
-    saveTask: () => {},
-    deleteTask: () => {},
-    saveFeedback: () => {},
     saveComment: () => {},
     saveActivity: () => {},
     saveDecision: () => {},
@@ -58,8 +55,6 @@ vi.mock('../server/db/persist.ts', async () => {
     saveReference: () => {},
     deleteReference: () => {},
     deleteCanvas: () => {},
-    savePlan: () => {},
-    deletePlan: () => {},
     /* the export reads a frame's newest verification report into its spec */
     listFrameReviews: async () => [],
     saveRelease: actual.saveRelease,
@@ -155,8 +150,6 @@ beforeEach(() => {
     () => {},
   )
   actions.hydrateLogs({
-    tasks: new Map(),
-    feedback: new Map(),
     comments: new Map(),
     activity: new Map(),
     decisions: new Map(),

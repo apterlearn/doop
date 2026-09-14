@@ -209,7 +209,15 @@ it.skipIf(!findBrowserPath())(
     /* the release is created by an agent over MCP, through the same OAuth path a
      real client uses */
     const token = await mcpToken(owner)
-    const created = await mcpCall(token, 'create_release', { canvas_id: canvas.id, name: 'v1', agent_name: 'Claude' })
+    /* releases ship the whole canvas, and this frame was never reviewed: force
+       keeps this test about the link. The gate has its own coverage in
+       tests/mcpReviewMode.test.ts */
+    const created = await mcpCall(token, 'create_release', {
+      force: true,
+      canvas_id: canvas.id,
+      name: 'v1',
+      agent_name: 'Claude',
+    })
     const releaseId = created.release_id as unknown as string
     expect(String(created.url)).toContain(`/p/${canvas.id}/${releaseId}`)
 
@@ -248,12 +256,15 @@ it('shows and hands out the release a listing is pinned to, not the live canvas'
   const { canvas, frame } = await canvasWithFrame(owner, 'Pinned page')
   const token = await mcpToken(owner)
   const created = await mcpCall(token, 'create_release', {
+    /* as above: the fixture canvas is deliberately unverified */
+    force: true,
     canvas_id: canvas.id,
     name: 'v1',
     agent_name: 'Claude',
   })
   const releaseId = created.release_id as unknown as string
   const published = await mcpCall(token, 'publish_canvas', {
+    force: true,
     canvas_id: canvas.id,
     description: 'A frozen hero.',
     category: 'website',

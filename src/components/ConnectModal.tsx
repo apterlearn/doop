@@ -22,9 +22,9 @@ export function ConnectModal({ canvasId, onClose }: { canvasId?: string; onClose
         <ModalTitle>Connect an AI agent</ModalTitle>
         <ModalLede>
           Any MCP-capable AI can design on this canvas. The endpoint is OAuth-protected: after adding it, trigger the
-          sign-in from your client — in Claude Code type <code>/mcp</code>, pick <strong>doop</strong> and authenticate;
-          a browser window opens to approve the connection. The agent then works <em>as yours</em>, and its tasks are
-          attributed to you.
+          sign-in from your client — in [CC] type <code>/mcp</code>, pick <strong>doop</strong> and authenticate; a
+          browser window opens to approve the connection. The agent then works <em>as yours</em>, and its changes are
+          attributed to you. Brief it by commenting on an element and @mentioning a role.
         </ModalLede>
 
         <ConnectBody canvasId={canvasId} />

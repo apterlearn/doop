@@ -15,9 +15,9 @@ import type { Actor, Frame, RepoScreenRef } from '../shared/types.ts'
 /**
  * Reading a connected GitHub repository: the source closure a screen is
  * designed from, the tree the designer investigates, the repo's real assets,
- * and where an imported frame lands. A repo import records its screens as
- * board cards (actions.planRepoCards / addRepoCards); an agent brings one onto
- * the canvas with import_repo_screen, handing over the document it designed.
+ * and where an imported frame lands. A repo import lands its static screens
+ * as frames; a screen that exists only as code comes back as its source
+ * closure, for an agent to design from through import_repo_screen.
  *
  * This is the one-time, code-only contract: everything the model sees comes
  * from the repository. Nothing here touches the live site.

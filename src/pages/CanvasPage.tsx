@@ -6,23 +6,21 @@ import {
   ApiError,
   type DiscoveredSite,
   type GithubConnectionInfo,
+  type GithubImportResult,
   type InstallationRepo,
   type RepoManifest,
   type RepoScreen,
   type SyncKeyInfo,
 } from '../lib/api'
 import { navigate } from '../App'
-import type { AgentTask } from '../../shared/types'
 import { DoopMark, Logo } from '../components/Logo'
 import { ensureTab } from '../lib/desktop'
-import { Board } from '../components/Board'
 import { PagesBar } from '../components/PagesBar'
 import { Stage } from '../components/Stage'
 import { Inspector } from '../components/Inspector'
 import { ElementPanel } from '../components/ElementPanel'
 import { ActivityPanel } from '../components/ActivityPanel'
 import { ConnectModal } from '../components/ConnectModal'
-import { PromptBar } from '../components/PromptBar'
 import { SideRail } from '../components/SideRail'
 import { LayersPanel, LayersRailToggle } from '../components/LayersPanel'
 import { Onboarding } from '../components/Onboarding'
@@ -59,15 +57,11 @@ import { Input } from '../components/ui/input'
 import { Field } from '../components/ui/field'
 import { Avatar } from '../components/ui/avatar'
 import { Checkbox, CheckboxCard } from '../components/ui/checkbox'
-import { Segmented, SegmentedItem } from '../components/ui/segmented'
 import { Toast, ToastAction } from '../components/ui/toast'
 import { Tooltip } from '../components/ui/tooltip'
 import { Note } from '../components/ui/note'
 import { Textarea } from '../components/ui/textarea'
 import { Modal, ModalActions, ModalEyebrow, ModalLede, ModalTitle } from '../components/ui/modal'
-
-/** The timestamp a task reached a terminal state, or undefined while it runs. */
-const terminalAt = (t: AgentTask) => t.cancelledAt ?? t.failedAt ?? t.endedAt
 
 const STARTER_HTML = `<!doctype html>
 <html>
@@ -104,7 +98,6 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
   const select = useStore((s) => s.select)
   const isMobile = useIsMobile()
   const [showActivity, setShowActivity] = useState(() => !window.matchMedia('(max-width: 900px)').matches)
-  const [view, setView] = useState<'canvas' | 'board'>('canvas')
   const [showConnect, setShowConnect] = useState(false)
   const [showShare, setShowShare] = useState(false)
   const [presenting, setPresenting] = useState(false)
@@ -228,52 +221,15 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
   const panelTab = useStore((s) => s.panelTab)
   const [mutedProposal, setMutedProposal] = useState<string | null>(null)
 
-  /* An agent finishing, failing or being stopped is invisible unless you happen
-     to be watching the panel — surface it as a toast that jumps to the task.
-     Keyed on the whole list, not tasks[0]: upsertTask replaces a task in place,
-     so the first entry is not "the latest" and a card further down the board
-     would never announce. */
-  const tasks = useStore((s) => s.tasks)
-  /* When this page loaded. Both "landed since you arrived" toasts share it:
+  /* When this page loaded. The "landed since you arrived" toasts share it:
      the socket delivers its history in waves, so a ref that latched on the
      first wave would announce work that ended before the page existed. */
   const loadedAt = useRef(0)
-  const [taskToast, setTaskToast] = useState<{ text: string; kind: 'finished' | 'failed' | 'stopped' } | null>(null)
-  const taskToastTimer = useRef<number | null>(null)
-  const announcedRef = useRef<Set<string> | null>(null)
-  useEffect(() => {
-    /* Only board cards are announced. A narration task also ends — every
-       set_status ends the previous one — so toasting those would fire "Agent
-       finished" each time an agent reworded what it is doing. A card an agent
-       abandoned silently (no cancelledBy) is not news either: the panel's
-       "needs retry" tag already covers it. */
-    const terminal = tasks.filter(
-      (t) => !!t.queuedBy && !!t.agentName && !!terminalAt(t) && !(t.cancelledAt && !t.cancelledBy),
-    )
-    if (!loadedAt.current) loadedAt.current = Date.now()
-    const announced = announcedRef.current ?? new Set<string>()
-    announcedRef.current = announced
-    const fresh = terminal.filter(
-      (t) => terminalAt(t)! > loadedAt.current && !announced.has(`${t.id}:${terminalAt(t)}`),
-    )
-    for (const t of fresh) announced.add(`${t.id}:${terminalAt(t)}`)
-    /* the newest transition wins if several land in one batch */
-    const task = fresh.sort((a, b) => terminalAt(b)! - terminalAt(a)!)[0]
-    if (!task) return
-    const kind = task.cancelledAt ? 'stopped' : task.failedAt ? 'failed' : 'finished'
-    const verb = kind === 'finished' ? 'finished' : kind === 'stopped' ? 'was stopped' : 'stopped short'
-    const line = task.status
-    setTaskToast({
-      text: `${task.agentName} ${verb} — ${line.length > 52 ? line.slice(0, 49) + '…' : line}`,
-      kind,
-    })
-    if (taskToastTimer.current) window.clearTimeout(taskToastTimer.current)
-    taskToastTimer.current = window.setTimeout(() => setTaskToast(null), 6000)
-  }, [tasks])
 
-  /* a question arriving in the same channel is likewise invisible: surface it
-     as its own toast in the same stack, ✕ mutes it for this session, and the
-     jump action opens the Review tab — that is where the answer box lives */
+  /* a question arriving in the same channel is invisible unless you happen to
+     be watching the panel: surface it as a toast, ✕ mutes it for this session,
+     and the jump action opens the Review tab — that is where the answer box
+     lives */
   const questions = useStore((s) => s.questions)
   const [questionToastId, setQuestionToastId] = useState<string | null>(null)
   const [mutedQuestion, setMutedQuestion] = useState<string | null>(null)
@@ -414,11 +370,11 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
     /* --app-inset is 0 normally; the impersonation shell raises it so this
        fixed layer starts below the banner instead of under it */
     <div className="fixed inset-x-0 bottom-0 top-[var(--app-inset,0px)] flex flex-col">
-      {/* Three tiers. Desktop (≥ md): one row with the full action set. Tablet
+      {/* Two tiers. Desktop (≥ md): one row with the full action set. Tablet
           (xs..md): still one row — the id badge and the text actions fold
-          into the ••• sheet so the name and the view switch keep their room.
-          Phone (< xs): two rows, the name on top, the switch and the actions
-          below it, each at its natural width. */}
+          into the ••• sheet so the name keeps its room. Phone (< xs): two
+          rows, the name on top, the actions below it at their natural
+          width. */}
       <div className="z-40 flex h-14 flex-none items-center gap-4 border-b border-line bg-surface px-4 max-md:gap-2.5 max-md:px-3 max-xs:h-[100px] max-xs:flex-wrap max-xs:content-center max-xs:gap-y-2 max-xs:py-2">
         <div className="flex min-w-0 items-center gap-1.5 max-xs:basis-full">
           <Tooltip label="All canvases" side="bottom" align="start">
@@ -442,15 +398,6 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
             </Badge>
           )}
         </div>
-        <Segmented
-          className="shrink-0 max-xs:order-2"
-          aria-label="View"
-          value={view}
-          onValueChange={(next) => setView(next as 'canvas' | 'board')}
-        >
-          <SegmentedItem value="canvas">Canvas</SegmentedItem>
-          <SegmentedItem value="board">Board</SegmentedItem>
-        </Segmented>
         <div className="ml-auto flex items-center gap-2.5 max-md:hidden">
           <Button
             variant="bare"
@@ -590,148 +537,117 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
       </div>
 
       <div className="relative flex-1 overflow-hidden">
-        {view === 'board' ? (
-          <Board canvasId={canvasId} />
-        ) : (
-          <>
-            <PagesBar />
-            <Stage onAddFrame={addFrame} />
-            <div
-              className={cn(
-                'pointer-events-none absolute top-3 right-[72px] z-30 flex flex-col items-end gap-2 transition-[right] duration-150 ease-[ease] [&>*]:pointer-events-auto max-md:top-[56px] max-md:right-2 max-md:left-2',
-                /* clear of the 300px side panel at right: 12px */
-                showActivity && 'right-[324px]',
-              )}
-            >
-              {pendingProposal && mutedProposal !== pendingProposal.id && !(showActivity && panelTab === 'memory') && (
-                <div className="flex items-center rounded-[10px] border border-brand bg-white shadow-card">
-                  <Button
-                    variant="bare"
-                    className="py-[9px] pl-3.5 pr-1 text-[12.5px] font-bold text-accent-ink hover:bg-transparent hover:text-accent-ink"
-                    onClick={() => {
-                      useStore.getState().setPanelTab('memory')
-                      setShowActivity(true)
-                    }}
-                  >
-                    <DoopMark size={12} /> Memory suggestion — review
-                  </Button>
-                  <Button
-                    variant="bare"
-                    className="py-[9px] pl-1.5 pr-2.5 text-[11px] hover:bg-transparent"
-                    title="Hide for now"
-                    onClick={() => setMutedProposal(pendingProposal.id)}
-                  >
-                    ✕
-                  </Button>
-                </div>
-              )}
-              {questionToast && mutedQuestion !== questionToast.id && !(showActivity && panelTab === 'review') && (
-                <div className="flex items-center rounded-[10px] border border-accent-ink bg-white shadow-card">
-                  <Button
-                    variant="bare"
-                    className="max-w-[300px] gap-1.5 py-[9px] pl-3.5 pr-1 text-[12.5px] font-bold text-accent-ink hover:bg-transparent hover:text-accent-ink"
-                    title={questionToast.text}
-                    onClick={() => useStore.getState().requestPanel('review')}
-                  >
-                    <ShieldIcon className="size-3 flex-none" />
-                    <span className="truncate">
-                      {questionToast.agentName} asks — {questionToast.text}
-                    </span>
-                  </Button>
-                  <Button
-                    variant="bare"
-                    className="py-[9px] pl-1.5 pr-2.5 text-[11px] hover:bg-transparent"
-                    title="Hide for now"
-                    onClick={() => setMutedQuestion(questionToast.id)}
-                  >
-                    ✕
-                  </Button>
-                </div>
-              )}
-              {proposalToast && mutedFrameProposal !== proposalToast.id && !(showActivity && panelTab === 'review') && (
-                <div className="flex items-center rounded-[10px] border border-brand bg-white shadow-card">
-                  <Button
-                    variant="bare"
-                    className="max-w-[300px] gap-1.5 py-[9px] pl-3.5 pr-1 text-[12.5px] font-bold text-brand hover:bg-transparent hover:text-brand"
-                    title={proposalToast.summary}
-                    onClick={() => useStore.getState().requestPanel('review')}
-                  >
-                    <ShieldIcon className="size-3 flex-none" />
-                    <span className="truncate">
-                      {proposalToast.agentName} proposes — {proposalToastFrame}
-                    </span>
-                  </Button>
-                  <Button
-                    variant="bare"
-                    className="py-[9px] pl-1.5 pr-2.5 text-[11px] hover:bg-transparent"
-                    title="Hide for now"
-                    onClick={() => setMutedFrameProposal(proposalToast.id)}
-                  >
-                    ✕
-                  </Button>
-                </div>
-              )}
-              {decisionToast && (
-                <Button
-                  variant="ghost"
-                  className="max-w-full items-center gap-2.5 whitespace-normal rounded-[12px] border-line bg-surface px-3.5 py-2.5 text-left shadow-pop transition-shadow hover:bg-surface hover:shadow-card sm:max-w-[320px] [&_svg]:text-accent-ink"
-                  title="Open Memory"
-                  onClick={() => {
-                    useStore.getState().setPanelTab('memory')
-                    setShowActivity(true)
-                    setDecisionToast(null)
-                  }}
-                >
-                  <BrainIcon size={17} />
-                  <span>
-                    <b className="block font-display text-[13px] font-semibold tracking-[-0.01em]">Saved to Memory</b>
-                    <span className="mt-[1px] block text-[12px] leading-[1.4] text-ink-soft">{decisionToast}</span>
-                  </span>
-                </Button>
-              )}
-              {taskToast && (
-                <Button
-                  variant="ghost"
-                  className="max-w-full items-center gap-2.5 whitespace-normal rounded-[12px] border-line bg-surface px-3.5 py-2.5 text-left shadow-pop transition-shadow hover:bg-surface hover:shadow-card sm:max-w-[320px] [&_svg]:text-accent-ink"
-                  title="Open the task"
-                  onClick={() => {
-                    useStore.getState().setPanelTab('tasks')
-                    setShowActivity(true)
-                    setTaskToast(null)
-                  }}
-                >
-                  <SparkIcon className="size-[17px]" />
-                  <span>
-                    <b className="block font-display text-[13px] font-semibold tracking-[-0.01em]">
-                      {taskToast.kind === 'finished'
-                        ? 'Agent finished'
-                        : taskToast.kind === 'stopped'
-                          ? 'Agent stopped'
-                          : 'Agent stopped short'}
-                    </b>
-                    <span className="mt-[1px] block text-[12px] leading-[1.4] text-ink-soft">{taskToast.text}</span>
-                  </span>
-                </Button>
-              )}
+        <PagesBar />
+        <Stage onAddFrame={addFrame} />
+        <div
+          className={cn(
+            'pointer-events-none absolute top-3 right-[72px] z-30 flex flex-col items-end gap-2 transition-[right] duration-150 ease-[ease] [&>*]:pointer-events-auto max-md:top-[56px] max-md:right-2 max-md:left-2',
+            /* clear of the 300px side panel at right: 12px */
+            showActivity && 'right-[324px]',
+          )}
+        >
+          {pendingProposal && mutedProposal !== pendingProposal.id && !(showActivity && panelTab === 'memory') && (
+            <div className="flex items-center rounded-[10px] border border-brand bg-white shadow-card">
+              <Button
+                variant="bare"
+                className="py-[9px] pl-3.5 pr-1 text-[12.5px] font-bold text-accent-ink hover:bg-transparent hover:text-accent-ink"
+                onClick={() => {
+                  useStore.getState().setPanelTab('memory')
+                  setShowActivity(true)
+                }}
+              >
+                <DoopMark size={12} /> Memory suggestion — review
+              </Button>
+              <Button
+                variant="bare"
+                className="py-[9px] pl-1.5 pr-2.5 text-[11px] hover:bg-transparent"
+                title="Hide for now"
+                onClick={() => setMutedProposal(pendingProposal.id)}
+              >
+                ✕
+              </Button>
             </div>
-            <PromptBar canvasId={canvasId} />
-            <Onboarding />
-            {!isMobile && (layersOpen ? <LayersPanel onAddFrame={addFrame} /> : <LayersRailToggle />)}
-            {!isMobile && selectedFrame && panelElement && !deferPanel && (
-              <ElementPanel
-                key={`${selectedFrame.id}|${panelElement.selector}`}
-                frame={selectedFrame}
-                selector={panelElement.selector}
-                className={propertiesPanelCls}
-              />
-            )}
-            {!isMobile && selectedFrame && inspectorOpen && !panelElement && !deferPanel && (
-              <Inspector frame={selectedFrame} className={propertiesPanelCls} />
-            )}
-            {!isMobile && !showActivity && <SideRail onOpen={() => setShowActivity(true)} />}
-            {!isMobile && showActivity && <ActivityPanel onClose={() => setShowActivity(false)} />}
-          </>
+          )}
+          {questionToast && mutedQuestion !== questionToast.id && !(showActivity && panelTab === 'review') && (
+            <div className="flex items-center rounded-[10px] border border-accent-ink bg-white shadow-card">
+              <Button
+                variant="bare"
+                className="max-w-[300px] gap-1.5 py-[9px] pl-3.5 pr-1 text-[12.5px] font-bold text-accent-ink hover:bg-transparent hover:text-accent-ink"
+                title={questionToast.text}
+                onClick={() => useStore.getState().requestPanel('review')}
+              >
+                <ShieldIcon className="size-3 flex-none" />
+                <span className="truncate">
+                  {questionToast.agentName} asks — {questionToast.text}
+                </span>
+              </Button>
+              <Button
+                variant="bare"
+                className="py-[9px] pl-1.5 pr-2.5 text-[11px] hover:bg-transparent"
+                title="Hide for now"
+                onClick={() => setMutedQuestion(questionToast.id)}
+              >
+                ✕
+              </Button>
+            </div>
+          )}
+          {proposalToast && mutedFrameProposal !== proposalToast.id && !(showActivity && panelTab === 'review') && (
+            <div className="flex items-center rounded-[10px] border border-brand bg-white shadow-card">
+              <Button
+                variant="bare"
+                className="max-w-[300px] gap-1.5 py-[9px] pl-3.5 pr-1 text-[12.5px] font-bold text-brand hover:bg-transparent hover:text-brand"
+                title={proposalToast.summary}
+                onClick={() => useStore.getState().requestPanel('review')}
+              >
+                <ShieldIcon className="size-3 flex-none" />
+                <span className="truncate">
+                  {proposalToast.agentName} proposes — {proposalToastFrame}
+                </span>
+              </Button>
+              <Button
+                variant="bare"
+                className="py-[9px] pl-1.5 pr-2.5 text-[11px] hover:bg-transparent"
+                title="Hide for now"
+                onClick={() => setMutedFrameProposal(proposalToast.id)}
+              >
+                ✕
+              </Button>
+            </div>
+          )}
+          {decisionToast && (
+            <Button
+              variant="ghost"
+              className="max-w-full items-center gap-2.5 whitespace-normal rounded-[12px] border-line bg-surface px-3.5 py-2.5 text-left shadow-pop transition-shadow hover:bg-surface hover:shadow-card sm:max-w-[320px] [&_svg]:text-accent-ink"
+              title="Open Memory"
+              onClick={() => {
+                useStore.getState().setPanelTab('memory')
+                setShowActivity(true)
+                setDecisionToast(null)
+              }}
+            >
+              <BrainIcon size={17} />
+              <span>
+                <b className="block font-display text-[13px] font-semibold tracking-[-0.01em]">Saved to Memory</b>
+                <span className="mt-[1px] block text-[12px] leading-[1.4] text-ink-soft">{decisionToast}</span>
+              </span>
+            </Button>
+          )}
+        </div>
+        <Onboarding />
+        {!isMobile && (layersOpen ? <LayersPanel onAddFrame={addFrame} /> : <LayersRailToggle />)}
+        {!isMobile && selectedFrame && panelElement && !deferPanel && (
+          <ElementPanel
+            key={`${selectedFrame.id}|${panelElement.selector}`}
+            frame={selectedFrame}
+            selector={panelElement.selector}
+            className={propertiesPanelCls}
+          />
         )}
+        {!isMobile && selectedFrame && inspectorOpen && !panelElement && !deferPanel && (
+          <Inspector frame={selectedFrame} className={propertiesPanelCls} />
+        )}
+        {!isMobile && !showActivity && <SideRail onOpen={() => setShowActivity(true)} />}
+        {!isMobile && showActivity && <ActivityPanel onClose={() => setShowActivity(false)} />}
       </div>
 
       {isMobile && (
@@ -845,16 +761,24 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
           }}
           onDone={(frameIds, failedCount) => {
             setShowImport(false)
-            setView('canvas')
             select(frameIds[0] ?? null)
             const imported = frameIds.length === 1 ? '1 item imported' : `${frameIds.length} items imported`
             showToast(failedCount ? `${imported} · ${failedCount} failed` : imported)
           }}
-          onQueued={(cardCount) => {
+          onImported={(result, repo) => {
             setShowImport(false)
             setGhInstallPass(null)
-            setView('board')
-            showToast(`${cardCount} ${cardCount === 1 ? 'card' : 'cards'} queued — a connected agent can claim them`)
+            select(result.imported[0]?.id ?? null)
+            const parts = [
+              result.imported.length
+                ? `${result.imported.length} frame${result.imported.length === 1 ? '' : 's'} imported from ${repo}`
+                : '',
+              result.needsAgent.length
+                ? `${result.needsAgent.length} need an agent — comment on a frame and @mention a role`
+                : '',
+              result.rejected.length ? `${result.rejected.length} skipped` : '',
+            ].filter(Boolean)
+            showToast(parts.length ? parts.join(' · ') : `Nothing new to import from ${repo}`)
           }}
         />
       )}
@@ -881,15 +805,16 @@ function ImportModal({
   installError,
   onClose,
   onDone,
-  onQueued,
+  onImported,
 }: {
   canvasId: string
   installPass: string | null
   installError: string | null
   onClose: () => void
   onDone: (frameIds: string[], failedCount: number) => void
-  /** a repo import queues cards on the board instead of landing frames */
-  onQueued: (cardCount: number) => void
+  /** a repo import lands frames directly, and reports the screens it could
+   *  not read from source so the modal can hand them to the human */
+  onImported: (result: GithubImportResult, repo: string) => void
 }) {
   const [url, setUrl] = useState('')
   const [wholeSite, setWholeSite] = useState(false)
@@ -902,7 +827,6 @@ function ImportModal({
     null,
   )
   const [repoSelected, setRepoSelected] = useState<Set<string>>(new Set())
-  const [extractSystem, setExtractSystem] = useState(true)
   const [showPages, setShowPages] = useState(false)
 
   function errorMessage(caught: unknown, fallback: string) {
@@ -988,8 +912,8 @@ function ImportModal({
 
   function openRepoReview(connection: GithubConnectionInfo, manifest: RepoManifest) {
     setRepoReview({ connection, manifest })
-    /* the design system is the default import; components and pages are
-       one click away, never silently pre-committed */
+    /* nothing is pre-committed: the human picks the components and pages
+       before anything lands */
     setRepoSelected(new Set())
     setShowPages(false)
     setError(null)
@@ -1005,27 +929,19 @@ function ImportModal({
   }
 
   async function importRepoScreens() {
-    if (!repoReview || busy || (!repoSelected.size && !extractSystem)) return
+    if (!repoReview || busy || !repoSelected.size) return
     setBusy('importing')
     setError(null)
     const screens = repoReview.manifest.screens.filter((s) => repoSelected.has(screenKey(s)))
     try {
-      const result = await api.importGithubScreens(canvasId, repoReview.connection.id, screens, extractSystem)
-      if (!result.cards.length) {
-        setError(
-          result.rejected.length
-            ? 'Those screens are no longer in the repository — re-run the scan'
-            : 'Everything you picked is already on the board',
-        )
-        setBusy(null)
-        return
-      }
+      const result = await api.importGithubScreens(canvasId, repoReview.connection.id, screens)
       posthog.capture('github_screens_imported', {
         requested_count: screens.length,
-        queued_count: result.cards.length,
+        imported_count: result.imported.length,
+        needs_agent_count: result.needsAgent.length,
         rejected_count: result.rejected.length,
       })
-      onQueued(result.cards.length)
+      onImported(result, repoReview.connection.repo)
     } catch (e) {
       setError(errorMessage(e, 'repository import failed'))
       setBusy(null)
@@ -1054,26 +970,18 @@ function ImportModal({
             <div className="flex flex-col items-start justify-between gap-2.5 sm:flex-row sm:gap-6">
               <div className="flex flex-col gap-[5px]">
                 <ModalEyebrow>Review before import</ModalEyebrow>
-                <ModalTitle>Import the design system</ModalTitle>
+                <ModalTitle>Import screens</ModalTitle>
               </div>
               <Badge className="max-w-full overflow-hidden text-ellipsis rounded-full bg-paper px-[9px] py-[5px] text-[10.5px] sm:max-w-[240px]">
                 {repoReview.connection.repo}@{repoReview.connection.branch}
               </Badge>
             </div>
             <ModalLede>
-              {repoReview.manifest.framework ? `A ${repoReview.manifest.framework} app. ` : ''}Doop distills the repo's
-              design system into a style guide pinned to this canvas — every agent follows it from then on. Each
-              component or page you pick becomes a card on the board: Doop sketches it from the source and lands it as a
-              frame. Whole pages are optional.
+              {repoReview.manifest.framework ? `A ${repoReview.manifest.framework} app. ` : ''}Each component or page
+              you pick is read from the source and lands as a frame. A screen Doop cannot read that way comes back
+              needing an agent to design it — comment on a frame and @mention a role to ask. Whole pages are optional.
             </ModalLede>
-            <CheckboxCard
-              checked={extractSystem}
-              disabled={!!busy}
-              onChange={setExtractSystem}
-              title="Extract the design system into a style guide"
-              description="Palette, type and spacing from the repo's theme — pinned to the canvas, followed by every agent."
-            />
-            <div className="mt-4 flex items-center justify-between px-[2px] pb-[9px]">
+            <div className="mt-5 flex items-center justify-between px-[2px] pb-[9px]">
               <b className="text-[12px] text-ink-soft">
                 {repoSelected.size} of {visibleScreens.length} selected
               </b>
@@ -1154,7 +1062,7 @@ function ImportModal({
             )}
             {busy === 'importing' && (
               <p className={cn(importNoteCls, 'text-accent-ink')}>
-                Doop is importing — the style guide and sketches fill in on the canvas…
+                Doop is importing — the frames fill in on the canvas…
               </p>
             )}
             {error && <p className={errorNoteCls}>{error}</p>}
@@ -1169,30 +1077,18 @@ function ImportModal({
               >
                 ← Back
               </Button>
-              <Button
-                variant="primary"
-                disabled={!!busy || (!repoSelected.size && !extractSystem)}
-                onClick={importRepoScreens}
-              >
+              <Button variant="primary" disabled={!!busy || !repoSelected.size} onClick={importRepoScreens}>
                 {busy === 'importing'
                   ? 'Importing…'
-                  : [
-                      extractSystem ? 'design system' : '',
-                      repoSelected.size
-                        ? `${repoSelected.size} ${
-                            repoSelected.size === 1
-                              ? 'component'
-                              : visibleScreens
-                                    .filter((s) => repoSelected.has(screenKey(s)))
-                                    .every((s) => s.kind === 'component' || s.kind === 'story')
-                                ? 'components'
-                                : 'screens'
-                          }`
-                        : '',
-                    ]
-                      .filter(Boolean)
-                      .join(' + ')
-                      .replace(/^./, (c) => '⤓ Import ' + c)}
+                  : `⤓ Import ${repoSelected.size} ${
+                      repoSelected.size === 1
+                        ? 'component'
+                        : visibleScreens
+                              .filter((s) => repoSelected.has(screenKey(s)))
+                              .every((s) => s.kind === 'component' || s.kind === 'story')
+                          ? 'components'
+                          : 'screens'
+                    }`}
               </Button>
             </ModalActions>
           </>

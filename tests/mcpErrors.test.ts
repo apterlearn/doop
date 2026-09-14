@@ -23,9 +23,6 @@ vi.mock('../server/db/persist.ts', () => ({
   deleteFrame: () => {},
   savePage: () => {},
   deletePage: () => {},
-  saveTask: () => {},
-  deleteTask: () => {},
-  saveFeedback: () => {},
   saveComment: () => {},
   saveActivity: () => {},
   saveDecision: () => {},
@@ -97,8 +94,6 @@ beforeEach(() => {
     () => {},
   )
   actions.hydrateLogs({
-    tasks: new Map(),
-    feedback: new Map(),
     comments: new Map(),
     activity: new Map(),
     decisions: new Map(),
@@ -189,55 +184,6 @@ describe('structured MCP errors', () => {
       expect(payload.error.message).toBe('upload rate limit — wait a minute')
     } finally {
       await close()
-    }
-  })
-
-  it('refuses every canvas-scoped call with a typed stopped error once a human stops the agent', async () => {
-    seedCanvas()
-    const { client, close } = await connect()
-    try {
-      actions.cancelAgentWork('c-errors', 'Claude', 'alice', OWNER_ID)
-      const { payload, isError } = await callTool(client, 'get_comments', {
-        canvas_id: 'c-errors',
-        agent_name: 'Claude',
-      })
-      expect(isError).toBe(true)
-      expect(payload.error.code).toBe('stopped')
-      expect(payload.error.retryable).toBe(false)
-      expect(payload.error.message).toContain('STOPPED')
-    } finally {
-      await close()
-    }
-  })
-
-  it('scopes a stop to the account it was aimed at, not the one that issued it', async () => {
-    seedCanvas()
-    /* the other account has a running agent named Claude — the canvas owner
-       names that agent when stopping it */
-    actions.setAgentStatus(
-      'c-errors',
-      { name: 'Claude', kind: 'agent', color: '#000000', owner: 'other', ownerId: 'other-owner' },
-      'designing',
-    )
-    const owner = await connect()
-    const other = await connect('other-owner')
-    try {
-      /* the canvas owner stops the OTHER account's Claude */
-      const { payload } = await callTool(owner.client, 'stop_work', {
-        canvas_id: 'c-errors',
-        target_agent: 'Claude',
-        agent_name: 'OwnerAgent',
-      })
-      expect(payload.error).toBeUndefined()
-      /* their own namesake keeps working */
-      const mine = await callTool(owner.client, 'get_comments', { canvas_id: 'c-errors', agent_name: 'Claude' })
-      expect(mine.isError).toBeFalsy()
-      const theirs = await callTool(other.client, 'get_comments', { canvas_id: 'c-errors', agent_name: 'Claude' })
-      expect(theirs.isError).toBe(true)
-      expect(theirs.payload.error.code).toBe('stopped')
-    } finally {
-      await owner.close()
-      await other.close()
     }
   })
 

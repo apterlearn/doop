@@ -7,13 +7,14 @@ import { findBrowserPath } from '../server/screenshot.ts'
 import { store } from '../server/store.ts'
 import type { Canvas, Frame } from '../shared/types.ts'
 
-/* The delivery gate. An agent that designs a frame and hands the card back
-   without checking it is the failure this catches; the check has to be tied to
-   the document it ran on, or reviewing early and editing afterwards passes. */
+/* The per-frame review report. ready_for_review renders a frame, records the
+   result against the exact document it checked and names the blocking findings
+   an agent has to fix; a report only describes the document it ran on, so a
+   re-check after an edit records a fresh one. */
 
 vi.mock('../server/db/persist.ts', () => {
-  /* reports are read back by the gate, so the store is real for those two
-     functions and inert for everything else */
+  /* the report is stored by ready_for_review, so the store is real for those
+     two functions and inert for everything else */
   const reviews = new Map<string, import('../shared/types.ts').FrameReview[]>()
   return {
     getUserEmail: async () => undefined,
@@ -31,9 +32,6 @@ vi.mock('../server/db/persist.ts', () => {
     savePage: () => {},
     deletePage: () => {},
     setFramePage: () => {},
-    saveTask: () => {},
-    deleteTask: () => {},
-    saveFeedback: () => {},
     saveComment: () => {},
     saveActivity: () => {},
     saveDecision: () => {},
@@ -135,17 +133,6 @@ function seedFrame(html: string, updatedBy = 'Claude'): Frame {
   return frame
 }
 
-/** A card claimed by the agent, so complete_card has something to complete. */
-/* queuing the same title twice returns the existing card, so each test needs
-   its own: the card log is module state shared across tests in this file */
-let cardSeq = 0
-function seedCard(agentName = 'Claude') {
-  cardSeq += 1
-  const card = actions.addQueuedCard(CANVAS_ID, `Pricing page ${cardSeq}`, 'alice', undefined, undefined, 'alice')!
-  actions.claimCard(CANVAS_ID, card.id, agentName)
-  return card
-}
-
 beforeEach(() => {
   actions.wire(
     () => {},
@@ -154,61 +141,16 @@ beforeEach(() => {
     () => {},
   )
   actions.hydrateLogs({
-    tasks: new Map(),
-    feedback: new Map(),
     comments: new Map(),
     activity: new Map(),
     decisions: new Map(),
     proposals: new Map(),
-    plans: new Map(),
   })
 })
 
-describe('the delivery gate', () => {
-  it('refuses a card whose frames the agent never checked', async () => {
-    seedFrame(CLEAN)
-    const card = seedCard()
-    const { client, close } = await connect()
-    try {
-      const { parsed, isError } = await callTool(client, 'complete_card', {
-        card_id: card.id,
-        agent_name: 'Claude',
-      })
-      expect(isError).toBe(true)
-      expect((parsed.error as unknown as { code: string }).code).toBe('conflict')
-      expect((parsed.error as unknown as { message: string }).message).toContain('never reviewed')
-      expect((parsed.error as unknown as { message: string }).message).toContain('ready_for_review')
-      /* the card is still open: a refused delivery is not a completion */
-      expect(actions.getTasks(CANVAS_ID).find((t) => t.id === card.id)?.endedAt).toBeUndefined()
-    } finally {
-      await close()
-    }
-  })
-
-  it('refuses a hand-back on the same grounds', async () => {
-    seedFrame(CLEAN)
-    const card = seedCard()
-    const { client, close } = await connect()
-    try {
-      const { parsed, isError } = await callTool(client, 'hand_back', {
-        canvas_id: CANVAS_ID,
-        card_id: card.id,
-        to_agent: 'Copywriter',
-        reason: 'copy needs work',
-        agent_name: 'Claude',
-      })
-      expect(isError).toBe(true)
-      expect((parsed.error as unknown as { code: string }).code).toBe('conflict')
-    } finally {
-      await close()
-    }
-  })
-})
-
-describe.skipIf(!browser)('the delivery gate over a real render', () => {
-  it('lets a card through once its frames pass', async () => {
+describe.skipIf(!browser)('the review report over a real render', () => {
+  it('passes a frame that meets the checks, with nothing blocking', async () => {
     const frame = seedFrame(CLEAN)
-    const card = seedCard()
     const { client, close } = await connect()
     try {
       const review = await callTool(client, 'ready_for_review', {
@@ -219,36 +161,36 @@ describe.skipIf(!browser)('the delivery gate over a real render', () => {
       expect(review.isError).toBeFalsy()
       expect(review.parsed.verdict).toBe('pass')
       expect(review.parsed.blocking).toEqual([])
-
-      const done = await callTool(client, 'complete_card', { card_id: card.id, agent_name: 'Claude' })
-      expect(done.isError).toBeFalsy()
     } finally {
       await close()
     }
   })
 
-  it('does not accept a report for a document that has since changed', async () => {
+  it('records a fresh report after the document changes', async () => {
     const frame = seedFrame(CLEAN)
-    const card = seedCard()
     const { client, close } = await connect()
     try {
-      await callTool(client, 'ready_for_review', {
+      const first = await callTool(client, 'ready_for_review', {
         canvas_id: CANVAS_ID,
         frame_id: frame.id,
         agent_name: 'Claude',
       })
-      /* the agent keeps working after checking — the pass no longer applies */
+      expect(first.parsed.verdict).toBe('pass')
+      /* the agent keeps working after checking — the report no longer
+         describes the document, so the next check reports the one it ran on */
       actions.updateFrame(
         frame.id,
         { html: CLEAN.replace('Simple, predictable', 'Even simpler') },
         actions.resolveActor({ name: 'Claude', kind: 'agent', ownerId: OWNER_ID }),
       )
-      const { parsed, isError } = await callTool(client, 'complete_card', {
-        card_id: card.id,
+      const again = await callTool(client, 'ready_for_review', {
+        canvas_id: CANVAS_ID,
+        frame_id: frame.id,
         agent_name: 'Claude',
       })
-      expect(isError).toBe(true)
-      expect((parsed.error as unknown as { message: string }).message).toContain('changed after its last review')
+      expect(again.isError).toBeFalsy()
+      expect(again.parsed.verdict).toBe('pass')
+      expect(again.parsed.html_sha).not.toBe(first.parsed.html_sha)
     } finally {
       await close()
     }
@@ -270,27 +212,6 @@ describe.skipIf(!browser)('the delivery gate over a real render', () => {
       for (const finding of parsed.blocking as unknown as { selector: string }[]) {
         expect(finding.selector.length).toBeGreaterThan(0)
       }
-    } finally {
-      await close()
-    }
-  })
-
-  it('keeps an unchecked frame out of the completion path even when the card is otherwise done', async () => {
-    const frame = seedFrame(BROKEN)
-    const card = seedCard()
-    const { client, close } = await connect()
-    try {
-      await callTool(client, 'ready_for_review', {
-        canvas_id: CANVAS_ID,
-        frame_id: frame.id,
-        agent_name: 'Claude',
-      })
-      const { parsed, isError } = await callTool(client, 'complete_card', {
-        card_id: card.id,
-        agent_name: 'Claude',
-      })
-      expect(isError).toBe(true)
-      expect((parsed.error as unknown as { message: string }).message).toContain('its last review failed')
     } finally {
       await close()
     }

@@ -26,9 +26,6 @@ vi.mock('../server/db/persist.ts', () => ({
   savePage: () => {},
   deletePage: () => {},
   setFramePage: () => {},
-  saveTask: () => {},
-  deleteTask: () => {},
-  saveFeedback: () => {},
   saveComment: () => {},
   saveActivity: () => {},
   saveDecision: () => {},
@@ -119,8 +116,6 @@ beforeEach(() => {
     () => {},
   )
   actions.hydrateLogs({
-    tasks: new Map(),
-    feedback: new Map(),
     comments: new Map(),
     activity: new Map(),
     decisions: new Map(),
@@ -257,22 +252,14 @@ describe('frame locking between agents', () => {
     }
   })
 
-  it('frees the frame and says so when an agent’s run tears down', async () => {
+  it('frees the frame and tells the room when the lock is taken back', async () => {
     const a = await connect()
     try {
-      /* its own agent name: stopping one is remembered for the canvas, and the
-         other tests in this file reuse AgentA */
-      await callTool(a.client, 'begin_frame_edit', { frame_id: FRAME_ID, ttl_seconds: 300, agent_name: 'AgentStop' })
-      /* an open card, so the stop is a real teardown rather than a bare call
-         into the lock module */
-      actions.setAgentStatus(
-        CANVAS_ID,
-        actions.resolveActor({ name: 'AgentStop', kind: 'agent' }),
-        'Polishing the hero',
-      )
+      await callTool(a.client, 'begin_frame_edit', { frame_id: FRAME_ID, ttl_seconds: 300, agent_name: 'AgentA' })
       room = []
-      /* what the Stop button does */
-      expect(actions.cancelAgentWork(CANVAS_ID, 'AgentStop', 'alice')).toBeGreaterThan(0)
+      /* the Take over button drops the lock wholesale, whoever holds it, and
+         the room has to hear about it or the chip stays on the frame */
+      expect(actions.releaseAllFrameLocks(FRAME_ID)).toBe(true)
       expect(room.filter((m) => m.type === 'frame:lock')).toEqual([
         { type: 'frame:lock', frameId: FRAME_ID, holder: null },
       ])

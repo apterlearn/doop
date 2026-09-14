@@ -28,9 +28,6 @@ vi.mock('../server/db/persist.ts', () => ({
   savePage: () => {},
   deletePage: () => {},
   setFramePage: () => {},
-  saveTask: () => {},
-  deleteTask: () => {},
-  saveFeedback: () => {},
   saveComment: () => {},
   saveActivity: () => {},
   saveDecision: () => {},
@@ -73,8 +70,8 @@ async function callTool(client: Client, name: string, args: Record<string, unkno
   const result = (await client.callTool({ name, arguments: args })) as unknown as CallResult
   const texts = result.content.filter((block) => block.type === 'text').map((block) => block.text ?? '')
   const raw = texts[0] ?? ''
-  /* every text block, payload first: the steering the wrapper appends (feedback,
-     session substitutions, the replay notice) rides after the payload */
+  /* every text block, payload first: the steering the wrapper appends (session
+     substitutions, the focus nudge, the replay notice) rides after the payload */
   return { parsed: JSON.parse(raw) as Record<string, never>, raw, text: texts.join('\n'), isError: result.isError }
 }
 
@@ -116,8 +113,6 @@ beforeEach(() => {
     () => {},
   )
   actions.hydrateLogs({
-    tasks: new Map(),
-    feedback: new Map(),
     comments: new Map(),
     activity: new Map(),
     decisions: new Map(),

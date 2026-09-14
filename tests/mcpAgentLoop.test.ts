@@ -11,11 +11,11 @@ import { store } from '../server/store.ts'
 import { initDb, closeDb } from '../server/db/index.ts'
 import * as persist from '../server/db/persist.ts'
 import { findBrowserPath } from '../server/screenshot.ts'
-import type { AgentPlan, CanvasView, FrameSummary, FrameVersion } from '../shared/types.ts'
+import type { CanvasView, FrameSummary, FrameVersion } from '../shared/types.ts'
 
 /* The whole agent loop, end to end, over one MCP connection:
-   read the guide → define the canvas → plan → build → measure → fix → verify →
-   revert → diff → batch → export → close out the plan.
+   read the guide → define the canvas → build → measure → fix → verify →
+   revert → diff → batch → export.
    This is the acceptance proof for the surface, so it runs against the real
    store, the real database and a real browser — nothing is stubbed except the
    model, which is not part of this loop. */
@@ -100,8 +100,6 @@ beforeEach(() => {
     () => {},
   )
   actions.hydrateLogs({
-    tasks: new Map(),
-    feedback: new Map(),
     comments: new Map(),
     activity: new Map(),
     decisions: new Map(),
@@ -110,13 +108,16 @@ beforeEach(() => {
 })
 
 describe.skipIf(!findBrowserPath())('the agent design loop, end to end', () => {
-  it('reads, plans, builds, measures, fixes, reverts, diffs, batches and exports', async () => {
+  it('reads, builds, measures, fixes, reverts, diffs, batches and exports', async () => {
     const { client, close } = await connect()
     try {
       /* ---- 1. the agent learns the workflow ---- */
       const guide = await call(client, 'get_guide', { topic: 'doop-instructions' })
       expect(textOf(guide)).toContain('Review checkpoints')
-      expect(textOf(guide)).toContain('set_plan')
+      /* the work arrives as a comment, not from a queue: the guide has to say
+         so, or an agent waits for an assignment that never comes */
+      expect(textOf(guide)).toContain('There is no board and no queue to poll')
+      expect(textOf(guide)).toContain('claim_comment')
 
       /* ---- 2. a canvas and its design system ---- */
       const created = await call(client, 'create_canvas', { name: 'Q3 dashboard', op_id: 'canvas-1' })
@@ -141,30 +142,7 @@ describe.skipIf(!findBrowserPath())('the agent design loop, end to end', () => {
           .tokens_present,
       ).toBe(true)
 
-      /* ---- 3. publish a plan, then start it ---- */
-      const plan = payload<{ plan: AgentPlan }>(
-        await call(client, 'set_plan', {
-          canvas_id: canvasId,
-          steps: [
-            { id: 'hero', text: 'Build the hero' },
-            { id: 'check', text: 'Audit and fix accessibility' },
-            { id: 'ship', text: 'Export the result' },
-          ],
-          agent_name: 'Claude',
-        }),
-      ).plan
-      expect(plan.steps.map((s) => s.status)).toEqual(['pending', 'pending', 'pending'])
-      const active = payload<{ plan: AgentPlan }>(
-        await call(client, 'update_plan_step', {
-          canvas_id: canvasId,
-          step_id: 'hero',
-          status: 'active',
-          agent_name: 'Claude',
-        }),
-      ).plan
-      expect(active.steps[0]!.status).toBe('active')
-
-      /* ---- 4. build the hero ---- */
+      /* ---- 3. build the hero ---- */
       const hero = payload<{ frame: FrameSummary }>(
         await call(client, 'create_frame', {
           canvas_id: canvasId,
@@ -194,7 +172,7 @@ describe.skipIf(!findBrowserPath())('the agent design loop, end to end', () => {
       expect(replay.frame.id).toBe(hero.id)
       expect(store.getCanvas(canvasId)!.frames).toHaveLength(1)
 
-      /* ---- 5. measure it instead of eyeballing it ---- */
+      /* ---- 4. measure it instead of eyeballing it ---- */
       const audit = payload<{
         counts: { critical: number }
         issues: { rule: string; selector: string; value?: string }[]
@@ -204,7 +182,7 @@ describe.skipIf(!findBrowserPath())('the agent design loop, end to end', () => {
       expect(contrast.value).toBe('4.48')
       expect(contrast.selector).toContain('h1')
 
-      /* ---- 6. fix the measured problem ---- */
+      /* ---- 5. fix the measured problem ---- */
       const fixed = await call(client, 'edit_frame_html', {
         frame_id: hero.id,
         old_str: 'color: #777777;',
@@ -219,14 +197,14 @@ describe.skipIf(!findBrowserPath())('the agent design loop, end to end', () => {
       expect(clean.counts.critical).toBe(0)
       expect(clean.issues).toEqual([])
 
-      /* ---- 7. and it conforms to the canvas tokens ---- */
+      /* ---- 6. and it conforms to the canvas tokens ---- */
       const lint = payload<{ tokens_present: boolean; violations: unknown[] }>(
         await call(client, 'lint_frame', { frame_id: hero.id, agent_name: 'Claude' }),
       )
       expect(lint.tokens_present).toBe(true)
       expect(lint.violations).toEqual([])
 
-      /* ---- 8. see it at a phone width ---- */
+      /* ---- 7. see it at a phone width ---- */
       const mobile = await call(client, 'get_frame_screenshot', {
         frame_id: hero.id,
         device: 'mobile',
@@ -236,7 +214,7 @@ describe.skipIf(!findBrowserPath())('the agent design loop, end to end', () => {
       const meta = await sharp(Buffer.from(image.data!, 'base64')).metadata()
       expect([meta.width, meta.height]).toEqual([390, 844])
 
-      /* ---- 9. a stale write is refused, the retry lands ---- */
+      /* ---- 8. a stale write is refused, the retry lands ---- */
       const read = payload<{ updatedAt: string }>(
         await call(client, 'get_frame', { frame_id: hero.id, agent_name: 'Claude' }),
       )
@@ -250,7 +228,7 @@ describe.skipIf(!findBrowserPath())('the agent design loop, end to end', () => {
       expect(failure(stale)?.error.code).toBe('conflict')
       expect(store.getFrame(hero.id)!.html).toBe(FIXED)
 
-      /* ---- 10. history and revert ---- */
+      /* ---- 9. history and revert ---- */
       const fresh = payload<{ updatedAt: string }>(
         await call(client, 'get_frame', { frame_id: hero.id, agent_name: 'Claude' }),
       )
@@ -272,7 +250,7 @@ describe.skipIf(!findBrowserPath())('the agent design loop, end to end', () => {
       expect(failure(reverted)).toBeUndefined()
       expect(store.getFrame(hero.id)!.html).toBe(oldest.html)
 
-      /* ---- 11. diff against a saved version ---- */
+      /* ---- 10. diff against a saved version ---- */
       const diff = payload<{ identical: boolean; against: string; diff_image_url: string }>(
         await call(client, 'diff_frame', {
           frame_id: hero.id,
@@ -284,23 +262,22 @@ describe.skipIf(!findBrowserPath())('the agent design loop, end to end', () => {
       expect(diff.against).toContain('version')
       expect(diff.diff_image_url).toMatch(/\/a\/.+\.png$/)
 
-      /* ---- 12. batch the rest of the flow ---- */
+      /* ---- 11. batch the rest of the flow ---- */
       const batch = payload<{ applied: number; failed: number; results: { ok: boolean }[] }>(
         await call(client, 'apply_ops', {
           canvas_id: canvasId,
           ops: [
             { op: 'create_frame', name: 'Pricing', html: FIXED, width: 1280, height: 800, agent_name: 'Claude' },
             { op: 'create_frame', name: 'Checkout', html: FIXED, width: 1280, height: 800, agent_name: 'Claude' },
-            { op: 'set_status', status: 'Three frames drafted', agent_name: 'Claude' },
           ],
           agent_name: 'Claude',
         }),
       )
-      expect(batch.applied).toBe(3)
+      expect(batch.applied).toBe(2)
       expect(batch.failed).toBe(0)
       expect(batch.results.every((r) => r.ok)).toBe(true)
 
-      /* ---- 13. the canvas is readable at scale, and paged ---- */
+      /* ---- 12. the canvas is readable at scale, and paged ---- */
       const list = payload<{ frames: FrameSummary[]; total: number; has_more: boolean }>(
         await call(client, 'list_frames', { canvas_id: canvasId, limit: 2, agent_name: 'Claude' }),
       )
@@ -313,7 +290,7 @@ describe.skipIf(!findBrowserPath())('the agent design loop, end to end', () => {
       expect(page2.frames).toHaveLength(1)
       expect(page2.has_more).toBe(false)
 
-      /* ---- 14. hand it off as code ---- */
+      /* ---- 13. hand it off as code ---- */
       const react = payload<{ component_name: string; jsx: string; css: string; tokens_css: string }>(
         await call(client, 'export_frame', { frame_id: hero.id, format: 'react', agent_name: 'Claude' }),
       )
@@ -326,19 +303,6 @@ describe.skipIf(!findBrowserPath())('the agent design loop, end to end', () => {
       )
       expect(bundle.frames).toHaveLength(3)
       expect(bundle.html).toContain('data-frame=')
-
-      /* ---- 15. close the plan out ---- */
-      for (const id of ['hero', 'check', 'ship']) {
-        await call(client, 'update_plan_step', {
-          canvas_id: canvasId,
-          step_id: id,
-          status: 'done',
-          agent_name: 'Claude',
-        })
-      }
-      const final = payload<{ plans: AgentPlan[] }>(await call(client, 'get_plan', { canvas_id: canvasId }))
-      expect(final.plans).toHaveLength(1)
-      expect(final.plans[0]!.steps.every((s) => s.status === 'done')).toBe(true)
 
       /* ---- the canvas is exactly what the loop left behind ---- */
       const view = payload<CanvasView>(await call(client, 'get_canvas', { canvas_id: canvasId, agent_name: 'Claude' }))

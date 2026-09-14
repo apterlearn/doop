@@ -153,13 +153,10 @@ beforeEach(() => {
     () => {},
   )
   actions.hydrateLogs({
-    tasks: new Map(),
-    feedback: new Map(),
     comments: new Map(),
     activity: new Map(),
     decisions: new Map(),
     proposals: new Map(),
-    plans: new Map(),
   })
   /* the canvas is installed directly rather than created through the store:
      the fixture needs a known id, and this keeps the fire-and-forget writes to
@@ -217,6 +214,10 @@ describe.skipIf(!findBrowserPath())('the pull request handoff', () => {
     const { client, close } = await connect()
     try {
       const opened = await callTool(client, 'open_pull_request', {
+        /* the frames here are unverified, and a pull request ships the whole
+           canvas — force lets this test be about what the handoff writes. The
+           gate's refusal and its override live in tests/mcpReviewMode.test.ts */
+        force: true,
         canvas_id: `${CANVAS_ID}-${counter}`,
         repo: REPO,
         message: 'Design handoff',

@@ -3,7 +3,7 @@ import { useStore, type PanelTab } from '../lib/store'
 import { cn } from '@/lib/utils'
 import { Button } from './ui/button'
 import { Tooltip } from './ui/tooltip'
-import { BookmarkIcon, ClientsIcon, PanelExpandRightIcon, PulseIcon, ShieldIcon, SparkIcon } from './ui/icons'
+import { BookmarkIcon, ClientsIcon, PanelExpandRightIcon, PulseIcon, ShieldIcon } from './ui/icons'
 
 /** The collapsed side panel: a column of icon buttons pinned to the top-right
  *  of the canvas while the panel is closed. Each opens the panel on its tab;
@@ -17,9 +17,6 @@ export function SideRail({ onOpen }: { onOpen: () => void }) {
     (s) =>
       s.frameProposals.filter((p) => p.status === 'pending').length +
       s.questions.filter((q) => q.status === 'open').length,
-  )
-  const working = useStore(
-    (s) => s.tasks.filter((t) => t.agentName && !t.endedAt && !t.failedAt && !t.cancelledAt).length,
   )
   const proposalPending = useStore((s) => s.proposals.some((p) => p.status === 'pending'))
 
@@ -37,18 +34,6 @@ export function SideRail({ onOpen }: { onOpen: () => void }) {
         <PanelExpandRightIcon />
       </RailControl>
       <span aria-hidden className="my-0.5 h-px w-6 bg-line-soft" />
-      <RailControl
-        label={working ? `Agents · ${working} working` : 'Agents'}
-        className={cn(working > 0 && 'bg-brand/6 text-brand')}
-        onClick={() => show('tasks')}
-      >
-        <SparkIcon className="size-4" />
-        {working > 0 && (
-          <span className="absolute -top-0.5 -right-0.5 grid h-[15px] min-w-[15px] place-items-center rounded-lg border-2 border-surface bg-brand px-[3px] font-mono text-[8px] font-medium text-white">
-            {working}
-          </span>
-        )}
-      </RailControl>
       <RailControl label="Activity" onClick={() => show('activity')}>
         <PulseIcon />
       </RailControl>

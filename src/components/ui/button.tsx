@@ -30,7 +30,8 @@ const buttonVariants = cva(
         bare: 'border-transparent bg-transparent font-semibold text-ink-soft hover:bg-line-soft hover:text-ink',
         'bare-danger': 'border-transparent bg-transparent font-semibold text-accent-ink hover:bg-accent-ink/10',
         link: 'border-transparent bg-transparent font-semibold text-ink underline-offset-4 hover:underline',
-        /* filled destructive pill — the retry affordance on failed tasks */
+        /* filled destructive pill — retrying a failed agent attempt, revoking
+           a client */
         'danger-solid': 'border-accent-ink bg-accent-ink text-white hover:border-ink hover:bg-ink',
         /* flat ink fill: compact affordances inside cards */
         solid: 'border-transparent bg-ink text-white hover:bg-ink/90 disabled:opacity-40',

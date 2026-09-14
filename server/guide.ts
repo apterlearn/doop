@@ -11,7 +11,7 @@ export const GUIDE_TOPICS = [
   'review',
   'verify',
   'ship',
-  'board',
+  'comments',
   'images',
   'redesign',
   'components',
@@ -30,7 +30,7 @@ const TOPIC_SECTIONS: Record<GuideTopic, string[]> = {
   review: ['Review checkpoints — MANDATORY', 'Design tokens — the values every frame shares'],
   verify: ['Verify — the sweep, the fixers and the diffs'],
   ship: ['Ship — releases, the handoff and the gate'],
-  board: ['The board — cards, feedback and comments'],
+  comments: ['Roles — who a human is asking for', 'Comments — how humans ask you for work'],
   images: ['Images — search first, then upload'],
   redesign: ['Redesigns — audit first, then two drafts'],
   components: ['Components — reuse before you author'],
@@ -92,9 +92,8 @@ brief. It is part of the deliverable, not private scratch work:
    hero device → one-line direction. NAME the one exemplar you are following and say
    why it won — or state that none fit and the brief derives from the design-quality
    principles alone.
-3. **Post it.** Summarize in set_status ("Designing grocery landing — candlelit mood,
-   after Oatside") and persist the full brief with save_decision so humans and later
-   agents see what you committed to.
+3. **Post it.** Persist the full brief with save_decision so humans and later agents see
+   what you committed to — the canvas Memory is where a brief outlives your context.
 
 Skip the brief only when the canvas already dictates the style — established frames,
 style guides or pinned references — or when the human handed you a complete design
@@ -109,128 +108,65 @@ your edits render for them the moment you make them, your presence appears under
 agent_name, and every action lands in a visible activity feed. Work like a considerate
 colleague, not a batch job.
 
-## Roles and pipelines
+## Roles — who a human is asking for
 
-Work on a canvas is organised by roles, and every board card names a pipeline: an ordered
-list of roles the card should pass through — design, then copy, then brand, then
-accessibility:
+A human asks for work by commenting on an element and @mentioning a role. The role is the
+routing vocabulary — design, then copy, then brand, then accessibility — and no agent is
+attached to one in the server: the agents that do the work are MCP clients like you,
+connected to this canvas.
 
 ${AGENT_ROLES.map((r) => `- **${r.name}** (@${r.id}) — ${r.blurb}`).join('\n')}
 
-No agent lives in the server. The roles are the board's routing vocabulary and the
-pipelines are how a human says who should work a card next; the agents that actually do
-the work are MCP clients like you, connected to this canvas. Nothing claims a card for
-you — you pick one up with take_card (see the board section below), and the pipeline is
-a label on the card, not a lock on your work. If a human asks you for something one of
-these roles owns, just do it.
+A note @mentioned to a role is addressed to whichever agent works that role, so you pick
+your work up yourself with claim_comment (see the comments section below) instead of
+waiting to be assigned. If a human asks you for something one of these roles owns, just
+do it.
 
-Who is on the canvas right now — and what each connected agent is working on — comes from
-get_agents. What any of them has actually done comes from get_run_events: one entry per
-tool call, newest first, with the agent, the outcome and the duration. Read it before
-you pick up work someone else may have started, and after a run you want to audit.
+Who is on the canvas right now, and what each connected agent says it is working on,
+comes from get_agents. What any of them has actually done comes from get_run_events: one
+entry per tool call, newest first, with the agent, the outcome and the duration. Read it
+before you pick up work someone else may have started, and after a run you want to audit.
 
-Use get_comments({ canvas_id }) to read element-pinned comments and replies, including
-their frame, selector, snippet, author, thread links, and claim/failure/resolution state.
-Add frame_id to focus on one frame. Resolved comments are included by default to preserve
-conversation context; include_resolved: false returns only unresolved entries. The result
-is newest first and paged — 50 at a time by default, so follow has_more / next_offset
-instead of assuming you saw every comment. It covers the retained history (up to 100
-entries per canvas). Reading comments does not claim work or resolve it; task feedback
-is separate (get_feedback).
+## Comments — how humans ask you for work
 
-## Narrate your work — set_status
+There is no board and no queue to poll: the comment on an element is the whole channel,
+and it reaches you because a call of yours went out — MCP is pull-based, so nothing is
+pushed between turns. A human's note outranks your own todo list. The lifecycle is four
+calls, in this order:
 
-People watching the canvas cannot see your reasoning, only your edits. Bridge that gap
-with set_status: a one-line, present-tense summary of what you are doing, shown live
-next to your name and logged to the activity feed.
+1. **Find.** get_comments({ canvas_id }) lists element-pinned notes and replies,
+   including their frame, selector, snippet, author, thread links, and
+   claim/failure/resolution state. Add frame_id to focus on one frame. Resolved comments
+   are included by default so complete conversations stay readable; include_resolved:
+   false returns only the open ones. Newest first and paged — 50 at a time by default, so
+   follow has_more / next_offset instead of assuming you saw every comment. The retained
+   history is up to 100 entries per canvas. Reading claims nothing.
+2. **Claim.** claim_comment({ canvas_id, agent_name, role: "a11y" }) takes the notes
+   @mentioned to that role and returns them (id, frame, selector, the human's text, who
+   wrote it); the pin flips to "you are on it" so two connected agents do not both do the
+   same note. Notes are addressed to ROLES, so pass the role you are working (doop, ux,
+   copy, brand, a11y, polish) — omit it only to match notes that @mentioned your agent_name
+   itself. It is idempotent per comment — calling it again returns nothing once a note is
+   yours — and an empty list means nothing is addressed to that role, not an error.
+3. **Do it, then answer.** Work the note like any design task (get_canvas for context,
+   edit the frame, review with get_frame_screenshot), then reply_to_comment({ comment_id,
+   text }) with what you changed. The reply inherits the thread's element anchor, so it
+   stays pinned to the thing the conversation is about.
+4. **Close.** resolve_comment({ comment_id }) once the design actually addresses the note;
+   resolving a root comment closes its whole thread. If you cannot finish it, say so with
+   fail_comment({ comment_id, reason }): the pin shows "stopped" with your reason and the
+   human can retry it, which clears the claim so any agent can pick it up again. Never
+   resolve a note you did not do — a false resolve is worse than an honest failure.
 
-- Set it when you START on something: "Designing a checkout flow, mobile-first".
-- Update it whenever your focus SHIFTS: "Reviewing the screenshot — fixing contrast".
-- Clear it (empty string) when you finish or hand off.
-- Keep it under ~80 characters and specific — "Tightening hero spacing" beats "working".
+add_comment pins a NEW note to an element; use it to ask a human a question about one
+specific element rather than burying the question in a chat message.
 
-Do not spam it: one update per phase of work, not one per tool call.
-
-## Human feedback — TOP PRIORITY
-
-Humans reply to agent tasks from the canvas UI. Each reply is an OPEN REQUEST on the
-canvas — not mail for one agent. The first agent to make an identified call picks it
-up: it arrives inside your tool results as a block starting with "HUMAN FEEDBACK",
-and picking it up assigns it to you. When you see one:
-
-- Stop and address it BEFORE continuing your own plan — a human watching the canvas
-  outranks your todo list.
-- It may concern ANOTHER agent's work (the block says whose task it was about).
-  Handle it anyway: locate the frame with get_canvas/get_frame, make the change,
-  review with get_frame_screenshot. A human request overrides the
-  don't-touch-others'-frames etiquette below.
-- Update set_status to say what you're picking up (e.g. "Addressing Kevin's feedback
-  on the pricing card").
-- Pass your agent_name on every call, including get_canvas, get_frame and
-  get_frame_screenshot — open requests can only reach agents that identify themselves.
-
-
-## Board cards — work humans queued for you
-
-Humans queue work as board cards: each card's text is the full brief, queued by a named
-human. No agent in the server picks them up — you claim yours explicitly:
-
-- list_cards({ canvas_id }) shows every open card — its title IS the prompt, with who
-  queued it, any reference-image attachment frame ids, and the target frame ids the card
-  is ABOUT (those you edit in place; attachments are source material you leave alone).
-- take_card({ card_id, agent_name }) claims one: it moves to "in progress" under your
-  name and the result delivers the brief plus the attachment images rendered inline.
-- Do the work like any design task: narrate with set_status, build/edit frames, review
-  with get_frame_screenshot.
-- complete_card({ card_id, agent_name, summary }) closes it when done — summary is a
-  one-line closing note for the activity feed ("Pricing table redesigned, dark editorial
-  style"). Only the agent that claimed a card can complete it.
-
-A card you cannot finish stays in progress; tell humans why via set_status or a comment
-and let them stop or retry it.
-
-## The board — cards, feedback and comments
-
-The board is the human→agent channel, and it is the whole of it: no server-side agent
-picks work up, so everything addressed to you arrives because a call of yours went out.
-
-- **Cards** — list_cards shows what is open (title is the brief, plus who queued it,
-  the target frames, a target selector and any attachment frames); take_card claims one
-  and hands you the brief; complete_card closes it with a one-line summary; hand_back
-  passes it to the specialty that owns it (the copywriter, the layout specialist) with
-  a note instead of fixing it outside your lane; retry_card re-queues a failed one;
-  create_card queues work yourself, the way a human does.
-- **Feedback** — humans reply to a task and the reply arrives INSIDE your tool results
-  as a HUMAN FEEDBACK block, attributed and addressed to whoever picks it up first.
-  get_feedback claims any open ones explicitly; retry_feedback re-delivers one that
-  never reached an agent. A human's note outranks your todo list — address it first.
-- **Comments** — element-pinned notes: get_comments reads them (frame, selector,
-  snippet, thread, claim state), reply_to_comment answers in-thread, resolve_comment
-  closes one once the design actually addresses it, add_comment pins a new question to
-  an element. Reading comments never claims work.
-- **Waiting** — wait_for_events parks until something on the canvas needs you: task
-  feedback, a comment, a stop, an answer to your question, or a new card. It returns a
-  cursor, so pass it back on the next wait instead of polling. ask_human is the other
-  wait: one blocking question to the humans on the canvas, answered inside the call or
-  left open for get_answers. Neither is a loop — park, then work.
-- **Status** — set_status is the narration humans see live next to your name. It is not
-  optional politeness: it is how a person watching tells "thinking" from "stuck".
-
-## Plan your run — set_plan
-
-For anything bigger than a single frame — a multi-screen flow, a redesign pass, a review
-sweep — publish the steps before you start:
-
-  set_plan({ canvas_id, steps: [{ id: "tokens", text: "Define the canvas tokens" },
-                                 { id: "hero",   text: "Build the hero" },
-                                 { id: "flow",   text: "Add pricing and checkout" },
-                                 { id: "review", text: "Screenshot, audit and fix" }] })
-
-Then keep it current with update_plan_step as you go (pending → active → done, or blocked
-with a note when you cannot continue). The human watching sees your active step next to
-your task, so they can tell the difference between "still working" and "stuck". If your
-context is compacted mid-run, or you join a canvas another agent is already working on,
-call get_plan to read back what has been done and what is next instead of guessing.
+Waiting is the other half of the channel. wait_for_events parks until something on this
+canvas needs you — a comment, an answer to your question, a proposal of yours being
+resolved, a human taking over a frame you were streaming into — and returns a cursor you
+pass back on the next call instead of polling. ask_human is the blocking question: one ask
+to the humans on the canvas, answered inside the call or left open for get_answers.
+Neither is a loop — park, then work.
 
 ## Review checkpoints — MANDATORY
 
@@ -276,8 +212,8 @@ Three widths of checking, and they answer different questions:
   mobile, tablet and desktop plus every breakpoint the canvas declares, in one render
   batch. **ready_for_review** runs the same checks and RECORDS the report against the
   exact document it checked. That stored, current, passing report is what every
-  delivery path reads — complete_card, hand_back and each ship path refuse a frame
-  whose newest report does not describe what the frame holds now.
+  delivery path reads — each ship path refuses a frame whose newest report does not
+  describe what the frame holds now.
 - **review_canvas** is the canvas-wide sweep: one verdict for the whole design, a row
   per frame with its blocking and advisory counts and the reason a frame could not be
   checked. A frame whose stored report is still current costs no render, so a second
@@ -465,8 +401,8 @@ and is relevant to your task, call get_reference for its full HTML and match its
 palette, typography, spacing and overall look — it is the ground truth for the
 canvas's style, alongside the style guides.
 
-Memory also learns from feedback. Feedback given inside Doop is captured
-automatically once addressed — but feedback your human gives YOU in
+Memory also learns from feedback. A note a human leaves as a comment is captured
+automatically once you resolve it — but feedback your human gives YOU in
 conversation is invisible to the canvas unless you report it. After you
 address design feedback from your own chat ("rounder corners", "more white
 and blue"), call save_decision with the human's words. Design taste only —
@@ -652,18 +588,19 @@ the WHOLE canvas, not just your own frames: every non-demo frame must hold a cur
 passing review, or the call is refused with \`conflict\`, naming the frames and the reason
 for each. Run **review_canvas** to clear it — it reuses the reports that are still
 current and re-checks the rest. \`force: true\` bypasses the gate on each of them; use it
-only when a human has told you to ship anyway, and say plainly in your summary and your
-set_status that unverified frames went out unchecked.
+only when a human has told you to ship anyway, and say plainly in your summary that
+unverified frames went out unchecked.
 
 ## Multiplayer etiquette
 - Call get_canvas before adding or editing anything. Note each frame's updatedBy and
   updatedAt: a frame touched seconds ago by someone else is probably mid-edit — do not
-  edit or delete another actor's frame unless asked to (human feedback you picked up
-  counts as being asked).
+  edit or delete another actor's frame unless asked to (a comment you claimed counts as
+  being asked).
 - Put new work in new frames beside existing ones; omit x/y to auto-place.
-- Never delete or rewrite a frame another agent is actively streaming into — call
-  stop_work if a run is going wrong, and let a human decide what happens to the work.
-  Deleting a frame out from under a working agent loses its work and looks like a crash.
+- Never delete or rewrite a frame another agent is actively streaming into — if a run is
+  going wrong, say so in a comment on that frame and let a human decide what happens to
+  the work. Deleting a frame out from under a working agent loses its work and looks like
+  a crash.
 - When you finish a note a human pinned to an element, answer it with reply_to_comment
   and close it with resolve_comment. Use add_comment to ask a human a question about
   one specific element instead of burying it in a chat message.

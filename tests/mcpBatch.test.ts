@@ -30,9 +30,6 @@ vi.mock('../server/db/persist.ts', () => ({
   savePage: () => {},
   deletePage: () => {},
   setFramePage: () => {},
-  saveTask: () => {},
-  deleteTask: () => {},
-  saveFeedback: () => {},
   saveComment: () => {},
   saveActivity: () => {},
   saveDecision: () => {},
@@ -45,8 +42,6 @@ vi.mock('../server/db/persist.ts', () => ({
   saveReference: () => {},
   deleteReference: () => {},
   deleteCanvas: () => {},
-  savePlan: () => {},
-  deletePlan: () => {},
 }))
 
 const OWNER_ID = 'batch-owner'
@@ -154,8 +149,6 @@ beforeEach(() => {
     () => {},
   )
   actions.hydrateLogs({
-    tasks: new Map(),
-    feedback: new Map(),
     comments: new Map(),
     activity: new Map(),
     decisions: new Map(),

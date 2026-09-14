@@ -13,7 +13,7 @@ import { store } from '../server/store.ts'
 import type { Canvas, ServerMessage } from '../shared/types.ts'
 
 /* The distiller used to need ANTHROPIC_API_KEY, so on a self-hosted instance
-   with no server key a canvas never learned from feedback even though the
+   with no server key a canvas never distilled a decision even though the
    connected client had a model. A client that declares `sampling` now stands in
    for that key: the same prompt, answered by the client's model, parsed by the
    same parser. Verified here through the real MCP surface because the wiring is

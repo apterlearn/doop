@@ -68,6 +68,7 @@ import * as backgrounds from './backgrounds.ts'
 import * as storage from './storage.ts'
 import * as github from './github.ts'
 import * as githubApp from './githubApp.ts'
+import { importRepoScreen } from './githubRecon.ts'
 import { seed } from './seed.ts'
 import * as modelAccounts from './modelAccounts.ts'
 import { AGENT_MODELS } from './openaiAgent.ts'
@@ -111,7 +112,12 @@ if (data.canvases.length === 0 && (await persist.importLegacyJson())) {
   data = await persist.hydrate()
 }
 store.init(data.canvases)
-actions.hydrateLogs(data)
+actions.hydrateLogs({
+  comments: data.comments,
+  activity: data.activity,
+  decisions: data.decisions,
+  proposals: data.proposals,
+})
 actions.hydrateUserMemory([...(data.userMemory?.values() ?? [])].flat())
 store.initComponents([...(data.components?.values() ?? [])].flat())
 seed()
@@ -825,14 +831,14 @@ app.delete('/api/model-account', async (req, res) => {
 app.get('/api/canvases', (req, res) =>
   res.json(
     store.listCanvases(req.user!.id).map((c) => {
-      /* which agents have worked on this canvas (most recent first), with
-         the user whose token they connected under and when they last worked */
-      const seen = new Map<string, { owner?: string; lastAt: number }>()
-      for (const t of actions.getTasks(c.id)) {
-        if (!t.agentName) continue // unclaimed board cards have no agent yet
-        if (!seen.has(t.agentName)) seen.set(t.agentName, { owner: t.owner, lastAt: t.startedAt })
+      /* which agents have worked on this canvas (most recent first) — the run
+         timeline is the record of agent work, newest first, so the first event
+         seen for a name is that agent's latest */
+      const seen = new Map<string, number>()
+      for (const e of runLog.getRunEvents(c.id)) {
+        if (!seen.has(e.agentName)) seen.set(e.agentName, e.at)
       }
-      return { ...c, agents: [...seen].slice(0, 8).map(([name, v]) => ({ name, owner: v.owner, lastAt: v.lastAt })) }
+      return { ...c, agents: [...seen].slice(0, 8).map(([name, lastAt]) => ({ name, lastAt })) }
     }),
   ),
 )
@@ -1474,28 +1480,34 @@ app.post('/api/canvases/:id/github/:connId/import', async (req, res) => {
   const conn = await github.getConnection(c.id, req.params.connId)
   if (!conn) return res.status(404).json({ error: 'connection not found' })
   if (!takeImportSlot(req.user!.id)) return res.status(429).json({ error: 'too many imports — wait a minute' })
-  /* design-system-only import is the headline flow now — screens optional */
-  const designSystem = req.body?.design_system !== false
   const rawScreens = Array.isArray(req.body?.screens) ? (req.body.screens as unknown[]) : []
-  if (!rawScreens.length && !designSystem)
-    return res.status(400).json({ error: 'pick components or screens, or enable the design-system extraction' })
   try {
     /* the selection is resolved against a manifest computed right now — see
        matchSelection for why the client never dictates paths */
-    const { screens, rejected } = rawScreens.length
-      ? github.matchSelection((await github.analyzeConnection(conn)).screens, rawScreens)
-      : { screens: [], rejected: [] }
-    const input = { connectionId: conn.id, repo: conn.repo, screens, designSystem }
-    /* plan → gate → queue runs one import at a time per connection, so two
-       overlapping imports of the same screens cannot both pass the plan and
-       both pay while only one queues */
+    const { screens, rejected } = github.matchSelection((await github.analyzeConnection(conn)).screens, rawScreens)
+    const actor = resolveActorFromReq(req)
+    /* one import at a time per connection: overlapping imports of the same
+       screens would both place frames at the same grid slot */
     const outcome = await withConnectionLock(conn.id, async () => {
-      /* nothing new to queue (all rejected, or already on the board) costs nothing */
-      if (!actions.planRepoCards(c.id, input).length) return { cards: [] as string[] }
-      const cards = actions.addRepoCards(c.id, input, req.user!.name, req.user!.id)
-      return { cards: cards.map((card) => card.id) }
+      const imported: { id: string; name: string }[] = []
+      const needsAgent: string[] = []
+      for (const screen of screens) {
+        try {
+          /* a static screen lands its repo HTML verbatim; one that exists only
+             as code comes back as its source closure, for an agent to design
+             from through import_repo_screen */
+          const landed = await importRepoScreen(c.id, conn, screen, actor)
+          if (landed.kind === 'frame') imported.push({ id: landed.frame.id, name: landed.frame.name })
+          else needsAgent.push(screen.title)
+        } catch {
+          /* a fetch failure on one screen must not lose the rest of the import */
+          rejected.push(screen.route || screen.sourcePath)
+        }
+      }
+      if (imported.length) github.markSynced(conn.id)
+      return { imported, needsAgent }
     })
-    res.json({ cards: outcome.cards, rejected })
+    res.json({ imported: outcome.imported, rejected, needsAgent: outcome.needsAgent })
   } catch (e) {
     res.status(400).json({ error: e instanceof Error ? e.message : 'import failed' })
   }
@@ -1764,13 +1776,6 @@ app.get('/api/canvases/:id/questions', (req, res) => {
   res.json(actions.getQuestions(req.params.id, status))
 })
 
-/** Every agent plan on this canvas, newest first — the panel's backfill for a
- *  client that joined after the plan was published. */
-app.get('/api/canvases/:id/plans', (req, res) => {
-  if (!requireCanvas(req, res, req.params.id)) return
-  res.json(actions.getPlans(req.params.id))
-})
-
 app.post('/api/canvases/:id/questions/:qid', (req, res) => {
   if (!requireCanvas(req, res, req.params.id)) return
   let question: AgentQuestion | undefined
@@ -1817,24 +1822,6 @@ app.get('/api/canvases/:id/run-events', (req, res) => {
   if (!requireCanvas(req, res, req.params.id)) return
   const runId = typeof req.query.run_id === 'string' ? req.query.run_id : undefined
   res.json(runLog.getRunEvents(req.params.id, { runId, limit: Math.min(500, Number(req.query.limit) || 200) }))
-})
-
-/** Queue ordering: an explicit order rewrite, or a single card's priority. */
-app.post('/api/canvases/:id/cards/reorder', (req, res) => {
-  if (!requireCanvas(req, res, req.params.id)) return
-  const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(String) : []
-  if (!ids.length) return res.status(400).json({ error: 'ids is required' })
-  actions.reorderCards(req.params.id, ids)
-  res.json({ ok: true })
-})
-
-app.patch('/api/canvases/:id/cards/:cardId', (req, res) => {
-  if (!requireCanvas(req, res, req.params.id)) return
-  const priority = Number(req.body?.priority)
-  if (!Number.isFinite(priority)) return res.status(400).json({ error: 'priority is required' })
-  const card = actions.setCardPriority(req.params.id, req.params.cardId, priority)
-  if (!card) return res.status(404).json({ error: 'card not found' })
-  res.json(card)
 })
 
 /** Frame version history for the Inspector's History section. */
@@ -2257,75 +2244,6 @@ app.post('/api/canvases/:id/import', async (req, res) => {
   }
 })
 
-app.post('/api/canvases/:id/cards', async (req, res) => {
-  if (!requireCanvas(req, res, req.params.id)) return
-  const title = String(req.body?.title ?? '').trim()
-  if (!title) return res.status(400).json({ error: 'empty title' })
-  const card = actions.addQueuedCard(
-    req.params.id,
-    title,
-    req.user!.name,
-    req.body?.agents,
-    req.body?.attachments,
-    req.user!.id,
-    req.body?.targetFrameIds,
-    req.body?.targetSelector,
-    req.body?.targetPageId,
-  )
-  if (!card) return res.status(404).json({ error: 'canvas not found or empty title' })
-  res.json(card)
-})
-
-/* a human stopping agent work: ends the run, stops the card, aborts the model
-   call. Deliberately unmetered — stopping spends nothing. */
-app.post('/api/canvases/:canvasId/agents/stop', (req, res) => {
-  if (!requireCanvas(req, res, req.params.canvasId)) return
-  const agentName = String(req.body?.agentName ?? '').trim()
-  if (!agentName) return res.status(400).json({ error: 'agentName required' })
-  res.json({ ok: true, stopped: actions.cancelAgentWork(req.params.canvasId, agentName, req.user!.name) })
-})
-
-/* ✕ on the board means "take this card off the board" — not "mark it done" */
-app.delete('/api/canvases/:canvasId/cards/:id', (req, res) => {
-  if (!requireCanvas(req, res, req.params.canvasId)) return
-  if (!actions.removeCard(req.params.canvasId, req.params.id, req.user!.name)) {
-    return res.status(404).json({ error: 'card not found' })
-  }
-  res.json({ ok: true })
-})
-
-app.post('/api/canvases/:canvasId/cards/:id/done', (req, res) => {
-  if (!requireCanvas(req, res, req.params.canvasId)) return
-  const card = actions.completeCard(req.params.canvasId, req.params.id)
-  if (!card) return res.status(404).json({ error: 'card not found' })
-  res.json(card)
-})
-
-app.post('/api/canvases/:canvasId/cards/:id/retry', (req, res) => {
-  if (!requireCanvas(req, res, req.params.canvasId)) return
-  const card = actions.retryCard(req.params.canvasId, req.params.id, req.user!.name)
-  if (!card) return res.status(404).json({ error: 'card not found' })
-  res.json(card)
-})
-
-app.post('/api/tasks/:id/feedback', (req, res) => {
-  const canvasId = actions.taskCanvasId(req.params.id)
-  if (!canvasId) return res.status(404).json({ error: 'task not found' })
-  if (!requireCanvas(req, res, canvasId)) return
-  const text = String(req.body?.text ?? '').trim()
-  if (!text) return res.status(400).json({ error: 'empty text' })
-  const fb = actions.addTaskFeedback(req.params.id, req.user!.name, text, req.user!.id)
-  if (!fb) return res.status(404).json({ error: 'task not found or empty text' })
-  res.json(fb)
-})
-
-app.post('/api/feedback/:id/retry', (req, res) => {
-  const found = actions.findFeedback(req.params.id)
-  if (!found) return res.status(404).json({ error: 'feedback not found' })
-  if (!requireCanvas(req, res, found.canvasId)) return
-  res.json(actions.retryTaskFeedback(req.params.id, req.user!.name))
-})
-
 app.get('/api/frames/:id/screenshot.png', async (req, res) => {
   const frame = requireFrame(req, res, req.params.id)
   if (!frame) return
@@ -2476,12 +2394,9 @@ wss.on('connection', (ws, upgradeReq) => {
         canvas,
         presences: [...others, ...agents],
         activity: actions.getActivity(msg.canvasId),
-        tasks: actions.getTasks(msg.canvasId),
-        feedback: actions.getFeedback(msg.canvasId),
         comments: actions.getComments(msg.canvasId),
         decisions: actions.getDecisions(msg.canvasId),
         proposals: actions.getProposals(msg.canvasId),
-        plans: actions.getPlans(msg.canvasId),
         frameProposals: actions.getFrameProposals(msg.canvasId),
         canvasProposals: await persist.listCanvasProposals(msg.canvasId, { status: 'pending' }),
         questions: actions.getQuestions(msg.canvasId),

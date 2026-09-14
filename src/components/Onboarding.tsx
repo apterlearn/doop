@@ -12,10 +12,9 @@ const obCopy =
   'self-start rounded-md border-line bg-paper-deep px-[9px] py-1 font-mono text-[11.5px] font-normal text-ink shadow-none hover:translate-x-0 hover:translate-y-0 hover:border-ink-soft hover:bg-paper-deep hover:shadow-none'
 
 /**
- * Getting-started checklist. No "next" buttons: each step checks itself off
- * from live canvas state (an MCP agent joining presence, its first task
- * appearing). Progress persists in localStorage so completed steps stay
- * checked across canvases and sessions.
+ * Getting-started checklist. No "next" buttons: the step checks itself off
+ * from live canvas state (an MCP agent joining presence). Progress persists in
+ * localStorage so a completed step stays checked across canvases and sessions.
  */
 
 const LS_KEY = 'doop:onboarding'
@@ -23,7 +22,6 @@ const LS_KEY = 'doop:onboarding'
 interface Progress {
   dismissed?: boolean
   connected?: boolean
-  tasked?: boolean
 }
 
 function load(): Progress {
@@ -40,83 +38,59 @@ function save(p: Progress) {
 
 export function Onboarding() {
   const isMobile = useIsMobile()
-  const tasks = useStore((s) => s.tasks)
   const presences = useStore((s) => s.presences)
   const [progress, setProgress] = useState<Progress>(load)
-  const [copied, setCopied] = useState<string | null>(null)
+  const [copied, setCopied] = useState(false)
 
-  /* live detection — flips only ever go false -> true */
-  const live = useMemo(() => {
-    /* "connected" means an agent over MCP, not the role names a card's
-       pipeline is assigned to */
-    const realAgent = (t: { agentName: string }) => t.agentName !== '' && !roleByAgentName(t.agentName)
-    const agentHere = Object.values(presences).some((p) => p.kind === 'agent' && !roleByAgentName(p.name))
-    const agentWorked = tasks.some(realAgent)
-    return { connected: agentHere || agentWorked, tasked: agentWorked }
-  }, [tasks, presences])
+  /* live detection — flips only ever go false -> true. "Connected" means an
+     agent over MCP, not the role names a comment can route to. */
+  const agentHere = useMemo(
+    () => Object.values(presences).some((p) => p.kind === 'agent' && !roleByAgentName(p.name)),
+    [presences],
+  )
 
-  /* a step, once seen live, stays done: fold the live signals into the
-     stored progress as they light up */
-  const next: Progress = {
-    ...progress,
-    connected: progress.connected || live.connected,
-    tasked: progress.tasked || live.tasked,
-  }
-  if (next.connected !== progress.connected || next.tasked !== progress.tasked) {
-    setProgress(next)
-  }
+  /* a step, once seen live, stays done: fold the live signal into the stored
+     progress as it lights up */
+  if (agentHere && !progress.connected) setProgress({ ...progress, connected: true })
 
   useEffect(() => save(progress), [progress])
 
   if (progress.dismissed) return null
-  const allDone = progress.connected && progress.tasked
 
   function dismiss() {
     setProgress({ ...progress, dismissed: true })
   }
 
-  function copy(text: string, which: string) {
+  function copy(text: string) {
     navigator.clipboard.writeText(text).then(() => {
-      setCopied(which)
-      window.setTimeout(() => setCopied(null), 1500)
+      setCopied(true)
+      window.setTimeout(() => setCopied(false), 1500)
     }, console.error)
   }
 
   const mcpCmd = `claude mcp add --transport http doop "${location.origin}/mcp"`
-  const prompt = `You are connected to Doop, a shared multiplayer design canvas, via the "doop" MCP server. Work on canvas ${location.pathname.split('/')[2] ?? ''}. Start with get_guide({ topic: "doop-instructions" }), then design something beautiful on a new frame. Stream it with append_frame_html and review your work with get_frame_screenshot.`
 
   const checklist = (
     <>
       <Step done={!!progress.connected} label="Connect your own agent">
         {!progress.connected && (
           <>
-            <Button size="sm" className={obCopy} onClick={() => copy(mcpCmd, 'cmd')}>
-              {copied === 'cmd' ? '✓ copied' : 'copy the Claude Code command'}
+            <Button size="sm" className={obCopy} onClick={() => copy(mcpCmd)}>
+              {copied ? '✓ copied' : 'copy the [CC] command'}
             </Button>
             <p className={obHint}>
-              Run it in a terminal, then inside Claude Code type <code>/mcp</code>, pick <strong>doop</strong> and
-              authenticate (a browser window opens). This step checks itself off when your agent first reads the canvas.
+              Run it in a terminal, then inside [CC] type <code>/mcp</code>, pick <strong>doop</strong> and authenticate
+              (a browser window opens). This step checks itself off when your agent first reads the canvas.
             </p>
           </>
         )}
       </Step>
 
-      <Step done={!!progress.tasked} label="Give it a task">
-        {progress.connected && !progress.tasked && (
-          <>
-            <Button size="sm" className={obCopy} onClick={() => copy(prompt, 'prompt')}>
-              {copied === 'prompt' ? '✓ copied' : 'copy a starter prompt'}
-            </Button>
-            <p className={obHint}>Paste it into your agent chat, then watch this canvas.</p>
-          </>
-        )}
-      </Step>
-
-      {allDone && (
+      {progress.connected && (
         <div className="flex flex-col gap-2.5 border-t border-line-soft pt-2.5">
           <p className="text-[12.5px] leading-[1.5] text-ink-soft">
-            That's the loop. One more trick: hover a task in the panel and reply with ↩ — your note becomes an open
-            request any agent picks up mid-flight.
+            That's the loop. To ask for work, comment on an element and <b>@mention a role</b> — a connected agent picks
+            the comment up and answers on the frame.
           </p>
           <Button className="self-start" onClick={dismiss}>
             Got it
@@ -127,7 +101,6 @@ export function Onboarding() {
   )
 
   if (isMobile) {
-    const done = [progress.connected, progress.tasked].filter(Boolean).length
     return (
       <Sheet>
         <SheetTrigger asChild>
@@ -136,7 +109,7 @@ export function Onboarding() {
             className="absolute left-3 top-3 z-30 h-10 gap-2 rounded-full bg-surface px-3 text-xs font-semibold shadow-card"
           >
             <span className="text-brand">✦</span> Getting started
-            <span className="font-mono text-[10px] text-ink-faint">{done}/2</span>
+            <span className="font-mono text-[10px] text-ink-faint">{progress.connected ? '1/1' : '0/1'}</span>
           </Button>
         </SheetTrigger>
         <SheetContent
@@ -146,7 +119,7 @@ export function Onboarding() {
           <div className="border-b border-line-soft px-5 py-4 pr-14">
             <SheetTitle className="font-display text-lg font-extrabold">Getting started</SheetTitle>
             <SheetDescription className="mt-1 text-xs text-ink-soft">
-              Two live steps to learn the human-and-agent workflow.
+              Connect your agent, then brief it in a comment.
             </SheetDescription>
           </div>
           <div className="flex flex-col gap-4 px-5 py-5">{checklist}</div>

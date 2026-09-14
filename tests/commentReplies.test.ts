@@ -11,8 +11,6 @@ vi.mock('../server/db/persist.ts', () => ({
   saveRunEvent: () => {},
   saveQuestion: () => {},
   saveFrameProposal: () => {},
-  saveTask: () => {},
-  saveFeedback: () => {},
   saveComment: () => {},
   saveActivity: () => {},
   saveDecision: () => {},
@@ -45,8 +43,6 @@ beforeEach(() => {
     () => {},
   )
   actions.hydrateLogs({
-    tasks: new Map(),
-    feedback: new Map(),
     comments: new Map([[CANVAS, []]]),
     activity: new Map(),
     decisions: new Map(),
@@ -143,5 +139,29 @@ describe('replying to a comment', () => {
     )!
     expect(fromAgent.fromKind).toBe('agent')
     expect(parent.fromKind).toBeUndefined()
+  })
+})
+
+describe('failing and retrying a claimed note', () => {
+  it('a failed note stops being claimable until a human retries it, then any agent can take it', () => {
+    const parent = root()
+    const note = actions.replyToComment(parent.id, `@${DEFAULT_ROLE_ID} bigger`, human('alice'), 'alice')!
+
+    const [claimed] = actions.takeAgentCommentsFor(CANVAS, AGENT, 'alice')
+    expect(claimed!.id).toBe(note.id)
+
+    const failed = actions.failComment(note.id, 'the asset is missing')!
+    expect(failed.failedAt).toBeDefined()
+    expect(failed.failureReason).toBe('the asset is missing')
+    /* stopped, not closed: the human reads why, and no other agent picks up
+       work that is known not to be doable */
+    expect(failed.resolvedAt).toBeUndefined()
+    expect(actions.takeAgentCommentsFor(CANVAS, AGENT, 'alice')).toEqual([])
+
+    const retried = actions.retryComment(note.id, 'alice')!
+    expect(retried.failedAt).toBeUndefined()
+    expect(retried.failureReason).toBeUndefined()
+    expect(retried.claimedBy).toBeUndefined()
+    expect(actions.takeAgentCommentsFor(CANVAS, AGENT, 'alice').map((c) => c.id)).toEqual([note.id])
   })
 })

@@ -23,9 +23,6 @@ vi.mock('../server/db/persist.ts', () => ({
   savePage: () => {},
   deletePage: () => {},
   setFramePage: () => {},
-  saveTask: () => {},
-  deleteTask: () => {},
-  saveFeedback: () => {},
   saveComment: () => {},
   saveActivity: () => {},
   saveDecision: () => {},
@@ -89,13 +86,10 @@ beforeEach(() => {
     () => {},
   )
   actions.hydrateLogs({
-    tasks: new Map(),
-    feedback: new Map(),
     comments: new Map(),
     activity: new Map(),
     decisions: new Map(),
     proposals: new Map(),
-    plans: new Map(),
   })
   seed()
 })
@@ -127,18 +121,6 @@ describe('stream end reporting', () => {
       actions.resolveActor({ name: 'Pixel', kind: 'agent' }),
     )
     expect((streamEnds()[0] as { reason?: string }).reason).toBe('taken over')
-  })
-
-  it('says the work was stopped when a human stops the agent mid-stream', () => {
-    actions.appendFrameHtml(FRAME_ID, '<section>one</section>', agent(), { start: true })
-    room = []
-    actions.cancelAgentWork(CANVAS_ID, 'Claude', 'alice')
-    /* the stop itself does not end the stream — the agent's own next write does
-       — but the reason is already recorded, so that end is not "idle" */
-    actions.updateFrame(FRAME_ID, { html: '<section>partial</section>' }, agent())
-    const ends = streamEnds()
-    expect(ends.length).toBeGreaterThan(0)
-    expect((ends[0] as { reason?: string }).reason).toBe('stopped')
   })
 
   it('says the agent went silent when its stream times out', () => {

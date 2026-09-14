@@ -6,13 +6,10 @@ import { db } from './index.ts'
 import * as t from './schema.ts'
 import { user as authUser } from './auth-schema.ts'
 import { extractAssetIds } from '../assets.ts'
-import { roleByAgentName } from '../../shared/agents.ts'
 import { isCommunityCategory } from '../../shared/types.ts'
 import type {
   ActivityItem,
-  AgentPlan,
   AgentQuestion,
-  AgentTask,
   Canvas,
   CanvasProposal,
   Component,
@@ -26,12 +23,8 @@ import type {
   GuidelineDoc,
   MemoryProposal,
   MemoryReference,
-  PlanStep,
   Page,
-  RepoCardKind,
-  RepoCardPayload,
   RunEvent,
-  TaskFeedback,
   UserMemory,
 } from '../../shared/types.ts'
 
@@ -480,30 +473,6 @@ async function appendFrameVersion(f: Frame) {
   }
 }
 
-/* Agent plans: one row per (canvas, agent), the latest write wins. */
-export function savePlan(plan: AgentPlan) {
-  const row = { ...plan, owner: plan.owner ?? null, ownerId: plan.ownerId ?? null }
-  swallow(
-    db
-      .insert(t.agentPlans)
-      .values(row)
-      .onConflictDoUpdate({
-        target: [t.agentPlans.canvasId, t.agentPlans.agentName],
-        set: { owner: row.owner, ownerId: row.ownerId, steps: row.steps, updatedAt: row.updatedAt },
-      }),
-  )
-}
-
-export function deletePlan(canvasId: string, agentName: string) {
-  swallow(
-    db.delete(t.agentPlans).where(and(eq(t.agentPlans.canvasId, canvasId), eq(t.agentPlans.agentName, agentName))),
-  )
-}
-
-export function deletePlansFor(canvasId: string) {
-  swallow(db.delete(t.agentPlans).where(eq(t.agentPlans.canvasId, canvasId)))
-}
-
 /* Design memory: single-shot writes, like guidelines. */
 export function saveReference(canvasId: string, ref: MemoryReference) {
   swallow(
@@ -913,8 +882,6 @@ export function deleteCanvas(canvasId: string) {
       )
       .then(() => db.delete(t.frames).where(eq(t.frames.canvasId, canvasId))),
   )
-  swallow(db.delete(t.tasks).where(eq(t.tasks.canvasId, canvasId)))
-  swallow(db.delete(t.feedback).where(eq(t.feedback.canvasId, canvasId)))
   swallow(db.delete(t.comments).where(eq(t.comments.canvasId, canvasId)))
   swallow(db.delete(t.activity).where(eq(t.activity.canvasId, canvasId)))
   swallow(db.delete(t.guidelines).where(eq(t.guidelines.canvasId, canvasId)))
@@ -941,130 +908,10 @@ export function deleteFrame(frameId: string) {
   swallow(db.delete(t.frameReviews).where(eq(t.frameReviews.frameId, frameId)))
 }
 
-/** Drop one card row. Used when a human removes a card from the board. */
-export function deleteTask(canvasId: string, taskId: string) {
-  swallow(db.delete(t.tasks).where(and(eq(t.tasks.canvasId, canvasId), eq(t.tasks.id, taskId))))
-}
-
-function repoCardFields(kind: string | null, payload: string | null): Pick<AgentTask, 'kind' | 'payload'> {
-  if (!kind || !payload) return {}
-  try {
-    return { kind: kind as RepoCardKind, payload: JSON.parse(payload) as RepoCardPayload }
-  } catch {
-    return {}
-  }
-}
-
-function parseHandback(raw: string | null): Pick<AgentTask, 'handback'> {
-  if (!raw) return {}
-  try {
-    const parsed = JSON.parse(raw) as AgentTask['handback']
-    return parsed ? { handback: parsed } : {}
-  } catch {
-    return {}
-  }
-}
-
-export function saveTask(canvasId: string, task: AgentTask) {
-  const row = {
-    id: task.id,
-    canvasId,
-    agentName: task.agentName,
-    owner: task.owner ?? null,
-    ownerId: task.ownerId ?? null,
-    color: task.color,
-    status: task.status,
-    startedAt: task.startedAt,
-    endedAt: task.endedAt ?? null,
-    auto: task.auto ?? false,
-    queuedBy: task.queuedBy ?? null,
-    queuedByUserId: task.queuedByUserId ?? null,
-    claimedAt: task.claimedAt ?? null,
-    failedAt: task.failedAt ?? null,
-    failureReason: task.failureReason ?? null,
-    pipeline: task.pipeline?.join(',') ?? null,
-    stage: task.stage ?? null,
-    attachments: task.attachments?.join(',') ?? null,
-    kind: task.kind ?? null,
-    payload: task.payload ? JSON.stringify(task.payload) : null,
-    cancelledAt: task.cancelledAt ?? null,
-    cancelledBy: task.cancelledBy ?? null,
-    targetFrameIds: task.targetFrameIds?.join(',') ?? null,
-    targetSelector: task.targetSelector ?? null,
-    targetPageId: task.targetPageId ?? null,
-    priority: task.priority ?? null,
-    position: task.position ?? null,
-    stageSummary: task.stageSummary ?? null,
-    handback: task.handback ? JSON.stringify(task.handback) : null,
-  }
-  swallow(
-    db
-      .insert(t.tasks)
-      .values(row)
-      .onConflictDoUpdate({
-        target: t.tasks.id,
-        set: {
-          endedAt: row.endedAt,
-          status: row.status,
-          agentName: row.agentName,
-          color: row.color,
-          claimedAt: row.claimedAt,
-          failedAt: row.failedAt,
-          failureReason: row.failureReason,
-          pipeline: row.pipeline,
-          stage: row.stage,
-          /* a stop lands on an already-inserted row, so it must be updatable */
-          cancelledAt: row.cancelledAt,
-          cancelledBy: row.cancelledBy,
-          priority: row.priority,
-          position: row.position,
-          stageSummary: row.stageSummary,
-          handback: row.handback,
-        },
-      }),
-  )
-}
-
 /** The email behind an account id, for agent-event notifications. */
 export async function getUserEmail(userId: string): Promise<string | undefined> {
   const [row] = await db.select({ email: authUser.email }).from(authUser).where(eq(authUser.id, userId)).limit(1)
   return row?.email ?? undefined
-}
-
-export function saveFeedback(fb: TaskFeedback) {
-  const row = {
-    id: fb.id,
-    taskId: fb.taskId,
-    canvasId: fb.canvasId,
-    agentName: fb.agentName,
-    targetAgent: fb.targetAgent ?? null,
-    fromName: fb.from,
-    fromUserId: fb.fromUserId ?? null,
-    text: fb.text,
-    at: fb.at,
-    deliveredAt: fb.deliveredAt ?? null,
-    claimedBy: fb.claimedBy ?? null,
-    claimedByOwner: fb.claimedByOwner ?? null,
-    completedAt: fb.completedAt ?? null,
-    failedAt: fb.failedAt ?? null,
-    failureReason: fb.failureReason ?? null,
-  }
-  swallow(
-    db
-      .insert(t.feedback)
-      .values(row)
-      .onConflictDoUpdate({
-        target: t.feedback.id,
-        set: {
-          deliveredAt: row.deliveredAt,
-          claimedBy: row.claimedBy,
-          claimedByOwner: row.claimedByOwner,
-          completedAt: row.completedAt,
-          failedAt: row.failedAt,
-          failureReason: row.failureReason,
-        },
-      }),
-  )
 }
 
 export function saveComment(c: ElementComment) {
@@ -1144,14 +991,10 @@ export async function flush(getFrame: (id: string) => Frame | undefined): Promis
 
 export interface Hydrated {
   canvases: Canvas[]
-  tasks: Map<string, AgentTask[]> // canvasId -> newest first
-  feedback: Map<string, TaskFeedback[]>
   comments: Map<string, ElementComment[]>
   activity: Map<string, ActivityItem[]>
   decisions: Map<string, DesignDecision[]>
   proposals: Map<string, MemoryProposal[]>
-  /** canvasId -> agentName -> plan */
-  plans: Map<string, Map<string, AgentPlan>>
   /** canvasId -> proposals, newest first */
   frameProposals: Map<string, FrameProposal[]>
   /** canvasId -> canvas-level proposals (tokens, guidelines, breakpoints,
@@ -1177,8 +1020,6 @@ export async function hydrate(): Promise<Hydrated> {
   const [
     canvasRows,
     frameRows,
-    taskRows,
-    feedbackRows,
     commentRows,
     activityRows,
     guidelineRows,
@@ -1187,7 +1028,6 @@ export async function hydrate(): Promise<Hydrated> {
     proposalRows,
     memberRows,
     pageRows,
-    planRows,
     frameProposalRows,
     canvasProposalRows,
     questionRows,
@@ -1198,8 +1038,6 @@ export async function hydrate(): Promise<Hydrated> {
   ] = await Promise.all([
     db.select().from(t.canvases),
     db.select().from(t.frames),
-    db.select().from(t.tasks).orderBy(desc(t.tasks.startedAt)),
-    db.select().from(t.feedback).orderBy(desc(t.feedback.at)),
     db.select().from(t.comments).orderBy(desc(t.comments.at)),
     db.select().from(t.activity).orderBy(desc(t.activity.at)),
     db.select().from(t.guidelines).orderBy(t.guidelines.name),
@@ -1208,7 +1046,6 @@ export async function hydrate(): Promise<Hydrated> {
     db.select().from(t.memoryProposals).orderBy(desc(t.memoryProposals.at)),
     db.select().from(t.canvasMembers).orderBy(t.canvasMembers.addedAt),
     db.select().from(t.pages).orderBy(t.pages.position),
-    db.select().from(t.agentPlans),
     db.select().from(t.frameProposals).orderBy(desc(t.frameProposals.at)),
     db.select().from(t.canvasProposals).orderBy(desc(t.canvasProposals.createdAt)),
     db.select().from(t.agentQuestions).orderBy(desc(t.agentQuestions.at)),
@@ -1314,98 +1151,6 @@ export async function hydrate(): Promise<Hydrated> {
   }
   const now = Date.now()
   const interruptedReason = 'The agent stopped before finishing. Retry when you are ready.'
-  const tasks = new Map<string, AgentTask[]>()
-  for (const row of taskRows) {
-    const list = tasks.get(row.canvasId) ?? []
-    /* A task still open across a restart belongs to an agent that's gone.
-       Ordinary status tasks close; claimed board cards pause in a visible
-       failed state and require a human retry. */
-    const isOpenCard = row.queuedBy != null && row.endedAt == null && row.cancelledAt == null
-    /* A cancelled card is closed work with a human decision still pending: it
-       keeps no endedAt (that would read as "done"), so it stays on the board
-       offering a retry. */
-    const isCancelledCard = row.queuedBy != null && row.endedAt == null && row.cancelledAt != null
-    /* the cap bounds history, never open work: an unfinished card older than
-       the newest hundred rows still belongs on the board (same rule as
-       actions.trimTaskLog keeps in memory) */
-    if (list.length >= LOG_CAP && !isOpenCard && !isCancelledCard) continue
-    const endedAt = isOpenCard || isCancelledCard ? undefined : (row.endedAt ?? now)
-    const interruptedCard = isOpenCard && !!row.agentName
-    const failedAt = row.failedAt ?? (interruptedCard ? now : undefined)
-    const failureReason = row.failureReason ?? (interruptedCard ? interruptedReason : undefined)
-    if (row.endedAt == null && endedAt !== undefined) {
-      swallow(db.update(t.tasks).set({ endedAt }).where(eq(t.tasks.id, row.id)))
-    }
-    if (interruptedCard && row.failedAt == null) {
-      swallow(db.update(t.tasks).set({ failedAt, failureReason }).where(eq(t.tasks.id, row.id)))
-    }
-    list.push({
-      id: row.id,
-      agentName: row.agentName,
-      ...(row.owner != null ? { owner: row.owner } : {}),
-      ...(row.ownerId != null ? { ownerId: row.ownerId } : {}),
-      color: row.color,
-      status: row.status,
-      startedAt: row.startedAt,
-      ...(endedAt !== undefined ? { endedAt } : {}),
-      ...(row.auto ? { auto: true } : {}),
-      ...(row.queuedBy != null ? { queuedBy: row.queuedBy } : {}),
-      ...(row.queuedByUserId != null ? { queuedByUserId: row.queuedByUserId } : {}),
-      ...(row.claimedAt != null ? { claimedAt: row.claimedAt } : {}),
-      ...(failedAt !== undefined ? { failedAt } : {}),
-      ...(failureReason !== undefined ? { failureReason } : {}),
-      ...(row.pipeline ? { pipeline: row.pipeline.split(',').filter(Boolean) } : {}),
-      ...(row.stage != null ? { stage: row.stage } : {}),
-      ...(row.attachments ? { attachments: row.attachments.split(',').filter(Boolean) } : {}),
-      ...(row.cancelledAt != null ? { cancelledAt: row.cancelledAt } : {}),
-      ...(row.cancelledBy != null ? { cancelledBy: row.cancelledBy } : {}),
-      ...(row.targetFrameIds ? { targetFrameIds: row.targetFrameIds.split(',').filter(Boolean) } : {}),
-      ...(row.targetSelector != null ? { targetSelector: row.targetSelector } : {}),
-      ...(row.targetPageId != null ? { targetPageId: row.targetPageId } : {}),
-      ...(row.priority != null ? { priority: row.priority } : {}),
-      ...(row.position != null ? { position: row.position } : {}),
-      ...(row.stageSummary != null ? { stageSummary: row.stageSummary } : {}),
-      ...parseHandback(row.handback),
-      ...repoCardFields(row.kind, row.payload),
-    })
-    tasks.set(row.canvasId, list)
-  }
-
-  const feedback = new Map<string, TaskFeedback[]>()
-  for (const row of feedbackRows) {
-    const list = feedback.get(row.canvasId) ?? []
-    if (list.length >= LOG_CAP) continue
-    /* feedback claimed by a pipeline role is run in this process: a claim
-       still open at boot means that run died. Work claimed by any other name
-       belongs to an outside agent, which may still be working elsewhere, so
-       it is left alone. */
-    const interrupted =
-      roleByAgentName(row.claimedBy ?? undefined) != null &&
-      row.deliveredAt != null &&
-      row.completedAt == null &&
-      row.failedAt == null
-    const failedAt = row.failedAt ?? (interrupted ? now : undefined)
-    const failureReason = row.failureReason ?? (interrupted ? interruptedReason : undefined)
-    if (interrupted) swallow(db.update(t.feedback).set({ failedAt, failureReason }).where(eq(t.feedback.id, row.id)))
-    list.push({
-      id: row.id,
-      taskId: row.taskId,
-      canvasId: row.canvasId,
-      agentName: row.agentName,
-      ...(row.targetAgent != null ? { targetAgent: row.targetAgent } : {}),
-      from: row.fromName,
-      ...(row.fromUserId != null ? { fromUserId: row.fromUserId } : {}),
-      text: row.text,
-      at: row.at,
-      ...(row.deliveredAt != null ? { deliveredAt: row.deliveredAt } : {}),
-      ...(row.claimedBy != null ? { claimedBy: row.claimedBy } : {}),
-      ...(row.claimedByOwner != null ? { claimedByOwner: row.claimedByOwner } : {}),
-      ...(row.completedAt != null ? { completedAt: row.completedAt } : {}),
-      ...(failedAt !== undefined ? { failedAt } : {}),
-      ...(failureReason !== undefined ? { failureReason } : {}),
-    })
-    feedback.set(row.canvasId, list)
-  }
 
   const comments = new Map<string, ElementComment[]>()
   for (const row of commentRows) {
@@ -1492,20 +1237,6 @@ export async function hydrate(): Promise<Hydrated> {
       ...(row.resolvedAt != null ? { resolvedAt: row.resolvedAt } : {}),
     })
     proposals.set(row.canvasId, list)
-  }
-
-  const plans = new Map<string, Map<string, AgentPlan>>()
-  for (const row of planRows) {
-    const byAgent = plans.get(row.canvasId) ?? new Map<string, AgentPlan>()
-    byAgent.set(row.agentName, {
-      canvasId: row.canvasId,
-      agentName: row.agentName,
-      ...(row.owner ? { owner: row.owner } : {}),
-      ...(row.ownerId ? { ownerId: row.ownerId } : {}),
-      steps: row.steps as PlanStep[],
-      updatedAt: row.updatedAt,
-    })
-    plans.set(row.canvasId, byAgent)
   }
 
   const frameProposals = new Map<string, FrameProposal[]>()
@@ -1634,13 +1365,10 @@ export async function hydrate(): Promise<Hydrated> {
 
   return {
     canvases,
-    tasks,
-    feedback,
     comments,
     activity,
     decisions,
     proposals,
-    plans,
     frameProposals,
     canvasProposals,
     questions,

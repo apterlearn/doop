@@ -114,12 +114,9 @@ function handle(msg: ServerMessage) {
       if (!msg.canvas.pages?.some((p) => p.id === s.activePageId)) s.setActivePage(msg.canvas.pages?.[0]?.id)
       s.setPresences(msg.presences)
       s.setActivity(msg.activity)
-      s.setTasks(msg.tasks)
-      s.setFeedback(msg.feedback)
       s.setComments(msg.comments)
       s.setDecisions(msg.decisions)
       s.setProposals(msg.proposals)
-      s.setPlans(msg.plans)
       s.setFrameProposals(msg.frameProposals)
       s.setCanvasProposals(msg.canvasProposals ?? [])
       s.setQuestions(msg.questions)
@@ -145,15 +142,6 @@ function handle(msg: ServerMessage) {
       break
     case 'status':
       s.setStatus(msg.clientId, msg.status)
-      break
-    case 'task':
-      s.upsertTask(msg.task)
-      break
-    case 'task:deleted':
-      s.removeTask(msg.taskId)
-      break
-    case 'feedback':
-      s.upsertFeedback(msg.feedback)
       break
     case 'comment':
       s.upsertComment(msg.comment)
@@ -188,9 +176,6 @@ function handle(msg: ServerMessage) {
       break
     case 'tokens':
       s.setTokensLocal(msg.tokens)
-      break
-    case 'plan':
-      s.setPlanLocal(msg.plan)
       break
     case 'reference':
       s.setReferenceLocal(msg.id, msg.reference)

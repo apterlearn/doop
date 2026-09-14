@@ -105,29 +105,6 @@ export interface CanvasReviewSummary {
   durationMs: number
 }
 
-/** A step of an agent's published plan. */
-export interface PlanStep {
-  id: string
-  text: string
-  status: 'pending' | 'active' | 'done' | 'blocked'
-  note?: string
-  updatedAt?: number
-}
-
-/** An agent's plan for one canvas — the record a resumed or compacted run
- *  reads back to know where it left off. */
-export interface AgentPlan {
-  canvasId: string
-  agentName: string
-  /** display name of the account whose token authorized the agent */
-  owner?: string
-  /** the account id behind `owner` — the half of an agent's identity that
-   *  cannot be typed by the caller, so work routing keys on it */
-  ownerId?: string
-  steps: PlanStep[]
-  updatedAt: number
-}
-
 /** What every frame-listing MCP tool returns per frame: enough to decide
  *  whether and how to read the frame, never the HTML itself. */
 export interface FrameSummary {
@@ -228,18 +205,6 @@ export interface GuidelineSummary {
   bytes: number
   updatedAt?: string
   updatedBy?: string
-}
-
-/** An open board card, as `list_cards` reports it. */
-export interface BoardCardSummary {
-  id: string
-  title: string
-  queued_by: string
-  queued_at: string
-  stage: number
-  waiting_for: string
-  attachments: string[]
-  target_frames: string[]
 }
 
 export interface CanvasMeta {
@@ -384,9 +349,9 @@ export interface MemoryReference {
   pinnedAt: number
 }
 
-/** A resolved design decision, captured automatically when an agent addresses
- *  human feedback or an @agent element comment gets resolved. Raw material
- *  the distiller condenses into rule proposals. */
+/** A resolved design decision, captured automatically when an @agent element
+ *  comment gets resolved. Raw material the distiller condenses into rule
+ *  proposals. */
 export interface DesignDecision {
   id: string
   /** the human's words — what they asked to change */
@@ -395,9 +360,9 @@ export interface DesignDecision {
    *  capture (e.g. "Prefer white and blue; no italic serif") — what the UI
    *  leads with; absent until the summarizer has run (or without an API key) */
   summary?: string
-  /** where the decision came from: task feedback, an @agent element comment,
-   *  or the human's own conversation with a connected agent (save_decision) */
-  source: 'feedback' | 'comment' | 'chat'
+  /** where the decision came from: an @agent element comment, or the human's
+   *  own conversation with a connected agent (save_decision) */
+  source: 'comment' | 'chat'
   frameId?: string
   /** the human who gave the feedback */
   from: string
@@ -567,12 +532,10 @@ export interface RunEvent {
 
 /** What wakes an agent parked in wait_for_events / ask_human. */
 export type AgentEventKind =
-  | 'feedback'
   | 'comment'
-  | 'stop'
+  | 'question'
   | 'question_answer'
   | 'frame_proposal'
-  | 'card'
   /** a human wrote to a frame an agent had just written — the agent must
    *  re-read it before its next write lands on a base it never saw */
   | 'frame_edited'
@@ -624,7 +587,7 @@ export interface Presence {
   kind: ActorKind
   cursor?: { x: number; y: number }
   activeFrameId?: string | null
-  /** one-line "what I'm working on right now" (agents set this via set_status) */
+  /** one-line "what I'm working on right now", when the agent posts one */
   status?: string
   /** for agents: whose token they connected with */
   owner?: string
@@ -647,71 +610,6 @@ export interface CanvasFocus {
   at: number
 }
 
-/** A unit of work an agent announced via set_status. A new status completes the previous task.
- *  Board cards are the same object: a human queues one (queuedBy set, agentName empty)
- *  and an agent claims it — cards stay open until explicitly completed. */
-export interface AgentTask {
-  id: string
-  /** empty string while a queued card waits for an agent */
-  agentName: string
-  /** whose token the agent connected with */
-  owner?: string
-  /** that owner's account id — what makes two agents with the same name on
-   *  different accounts different agents */
-  ownerId?: string
-  color: string
-  status: string
-  startedAt: number
-  endedAt?: number
-  /** inferred by the server from frame edits (agent never called set_status) */
-  auto?: boolean
-  /** human who queued this as a board card */
-  queuedBy?: string
-  /** account id of that human — decides which model credential runs the card */
-  queuedByUserId?: string
-  claimedAt?: number
-  /** unsuccessful agent attempt; failed work waits for an explicit human retry */
-  failedAt?: number
-  failureReason?: string
-  /** board cards: ordered agent-role ids the card walks through, one at a time.
-   *  Absent on status tasks and on cards queued before pipelines existed. */
-  pipeline?: string[]
-  /** board cards: ids of reference image frames uploaded with the prompt */
-  attachments?: string[]
-  /** index into pipeline of the stage that is queued or running right now */
-  stage?: number
-  /** structured board cards an MCP agent dispatches on, instead of
-   *  handing the title to the chat agent. Absent on prompt cards. */
-  kind?: RepoCardKind
-  payload?: RepoCardPayload
-  /** a human stopped this card's run (or the agent went silent mid-run). Terminal,
-   *  exactly like endedAt: it needs an explicit retry, never an automatic one. */
-  cancelledAt?: number
-  /** the human who stopped it; absent when the agent merely went away (TTL expiry) */
-  cancelledBy?: string
-  /** frames the human had selected when they queued the card — "make THIS
-   *  bigger", not "design something like this". Unlike attachments (reference
-   *  material the agent must leave alone), these are the card's subject and the
-   *  agent edits them in place. */
-  targetFrameIds?: string[]
-  /** element selector on that frame the human pointed at — "fix THIS element" */
-  targetSelector?: string
-  /** page the target frame lives on, so the agent needs no lookup to reach it */
-  targetPageId?: string
-  /** queue ordering: higher first; then position; then arrival */
-  priority?: number
-  position?: number
-  /** the finishing agent's one-line note handed to the next pipeline stage */
-  stageSummary?: string
-  /** a specialist sent the card back to an earlier stage, with its reason */
-  handback?: { fromAgent: string; reason: string; at: number }
-  /** the sweep must not start this card before this time; unset means it is
-   *  due as soon as it reaches the front of the queue */
-  scheduledAt?: number
-}
-
-export type RepoCardKind = 'sketch' | 'design-system'
-
 /** A screen of a connected GitHub repository, as the import manifest lists it. */
 export interface RepoScreenRef {
   kind: 'page' | 'story' | 'component' | 'static'
@@ -722,49 +620,9 @@ export interface RepoScreenRef {
   source: 'static' | 'placeholder'
 }
 
-/** What a repo card carries: enough to run it from any process, later. The
- *  connection is looked up by id at run time, so no credential is ever here. */
-export interface RepoCardPayload {
-  connectionId: string
-  repo: string
-  /** one import = one click; groups the cards it queued on the board */
-  importId: string
-  /** the screen to sketch — absent on a design-system card */
-  screen?: RepoScreenRef
-}
-
-/** Human feedback left on an agent task: an open request on the canvas that ANY
- *  agent can pick up — delivered inside the next identified agent tool result. */
-export interface TaskFeedback {
-  id: string
-  taskId: string
-  canvasId: string
-  /** whose work the feedback is about (the task's agent), not who must handle it */
-  agentName: string
-  /** the agent this is routed to; unset = open to any agent */
-  targetAgent?: string
-  from: string
-  /** account id of the human who left it — decides which model credential runs it */
-  fromUserId?: string
-  text: string
-  at: number
-  /** set once the feedback has been included in some agent's tool result */
-  deliveredAt?: number
-  /** the agent that picked it up */
-  claimedBy?: string
-  /** the account that agent's token belonged to — what stops an agent on
-   *  another account from inheriting a claim by typing the same name */
-  claimedByOwner?: string
-  /** the agent that claimed it finished handling this feedback */
-  completedAt?: number
-  /** unsuccessful agent attempt; never retried automatically */
-  failedAt?: number
-  failureReason?: string
-}
-
 /** A comment pinned to a specific element inside a frame. Comments that
- *  @mention a role on the card (or a connected agent by name) are routed to
- *  that agent; others are notes for the humans in the room. */
+ *  @mention a role (or a connected agent by name) are routed to that agent;
+ *  others are notes for the humans in the room. */
 export interface ElementComment {
   id: string
   canvasId: string
@@ -787,7 +645,8 @@ export interface ElementComment {
   /** which agent was mentioned; defaults to Doop */
   targetAgent?: string
   claimedBy?: string
-  /** the account that agent's token belonged to — see TaskFeedback.claimedByOwner */
+  /** the account that agent's token belonged to — what stops an agent on
+   *  another account from inheriting a claim by typing the same name */
   claimedByOwner?: string
   claimedAt?: number
   /** unsuccessful agent attempt; the comment remains paused until retried */
@@ -837,13 +696,9 @@ export type ServerMessage =
       canvas: Canvas
       presences: Presence[]
       activity: ActivityItem[]
-      tasks: AgentTask[]
-      feedback: TaskFeedback[]
       comments: ElementComment[]
       decisions: DesignDecision[]
       proposals: MemoryProposal[]
-      /** every agent plan published on this canvas, newest first */
-      plans: AgentPlan[]
       selfColor: string
       /** pending agent frame-change proposals awaiting review */
       frameProposals: FrameProposal[]
@@ -871,9 +726,6 @@ export type ServerMessage =
   | { type: 'cursor'; clientId: string; x: number; y: number }
   | { type: 'editing'; clientId: string; frameId: string | null }
   | { type: 'status'; clientId: string; status: string | null }
-  | { type: 'task'; task: AgentTask }
-  | { type: 'task:deleted'; taskId: string }
-  | { type: 'feedback'; feedback: TaskFeedback }
   | { type: 'comment'; comment: ElementComment }
   | { type: 'frame:drag'; clientId: string; frameId: string; x: number; y: number; width: number; height: number }
   | { type: 'frame:created'; frame: Frame; actor: Actor }
@@ -885,15 +737,14 @@ export type ServerMessage =
       active: boolean
       actor: Actor
       /** why the stream ended: the agent delivered, went silent, replaced its
-       *  own document, was taken over by another writer, or was stopped
+       *  own document, or was taken over by another writer
        *  (absent while active) */
-      reason?: 'done' | 'idle' | 'taken over' | 'stopped' | 'replaced'
+      reason?: 'done' | 'idle' | 'taken over' | 'replaced'
     }
   | { type: 'canvas:renamed'; name: string; actor: Actor }
   /** a style-guide doc was written, moved (doc set) or deleted (doc null) */
   | { type: 'guidelines'; name: string; doc: GuidelineDoc | null; actor: Actor }
   | { type: 'tokens'; tokens: DesignTokens | null; actor: Actor }
-  | { type: 'plan'; plan: AgentPlan }
   /** a frame was pinned to (reference set) or unpinned from (null) Memory */
   | { type: 'reference'; id: string; reference: MemoryReference | null; actor: Actor }
   /** a design decision was captured into Memory */

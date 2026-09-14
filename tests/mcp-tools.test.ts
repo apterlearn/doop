@@ -17,16 +17,13 @@ vi.mock('../server/db/persist.ts', async (importOriginal) => ({
   saveReference: () => {},
   deleteReference: () => {},
   deleteFrame: () => {},
-  saveTask: () => {},
   saveActivity: () => {},
   saveComponent: () => {},
-  saveFeedback: () => {},
   saveComment: () => {},
   saveQuestion: () => {},
   saveFrameProposal: () => {},
   saveProposal: () => {},
   saveDecision: () => {},
-  deleteTask: () => {},
   /* review_canvas and the ship gate read and write stored reports; the store
      and the renderer are real here, the database is not */
   saveFrameReview: () => {},
@@ -120,7 +117,7 @@ describe('MCP website tool contract', () => {
     }
   })
 
-  it('exposes the inspection, stop and comment tools with their contracts', async () => {
+  it('exposes the inspection and comment tools with their contracts', async () => {
     const server = buildMcpServer('Test Owner', 'test-owner-id')
     const client = new Client({ name: 'doop-tool-contract-test', version: '1.0.0' })
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
@@ -133,41 +130,37 @@ describe('MCP website tool contract', () => {
       const byName = new Map(tools.map((tool) => [tool.name, tool]))
       const schema = (name: string) => byName.get(name)!.inputSchema as ToolInputSchema
 
-      for (const name of [
-        'inspect_frame',
-        'get_frame_html',
-        'stop_work',
-        'add_comment',
-        'reply_to_comment',
-        'resolve_comment',
-      ]) {
+      for (const name of ['inspect_frame', 'get_frame_html', 'add_comment', 'reply_to_comment', 'resolve_comment']) {
         expect(byName.has(name), `${name} should be registered`).toBe(true)
       }
 
       /* reading a frame must never be mistaken for a mutation */
       expect(byName.get('inspect_frame')!.annotations?.readOnlyHint).toBe(true)
       expect(byName.get('get_frame_html')!.annotations?.readOnlyHint).toBe(true)
-      expect(byName.get('stop_work')!.annotations?.readOnlyHint).not.toBe(true)
+      expect(byName.get('add_comment')!.annotations?.readOnlyHint).not.toBe(true)
 
       expect(new Set(schema('get_frame_html').required)).toEqual(new Set(['frame_id']))
       expect(schema('get_frame_html').properties).toHaveProperty('query')
       expect(schema('get_frame_html').properties).toHaveProperty('limit')
 
-      /* agent_name is how human feedback reaches an agent. These reads used to
-         demand it; now the session supplies the name the agent already used, so
-         it is optional on the wire — the tools where the identity IS the call
-         still refuse without it, and a canvas-scoped read that resolves no name
-         at all is nudged (asserted in the sticky-context tests below). */
+      /* agent_name is the attribution and the address a comment is routed to.
+         These reads used to demand it; now the session supplies the name the
+         agent already used, so it is optional on the wire — the tools where the
+         identity IS the call still refuse without it, and a canvas-scoped read
+         that resolves no name at all is nudged (asserted in the sticky-context
+         tests below). */
       for (const name of ['get_frame', 'get_frame_screenshot', 'get_guidelines', 'list_guidelines', 'get_reference']) {
         expect(schema(name).properties, `${name} should declare agent_name`).toHaveProperty('agent_name')
       }
-      for (const name of ['set_status', 'get_feedback', 'take_card', 'complete_card', 'stop_work']) {
+      for (const name of ['claim_comment', 'ask_human', 'wait_for_events']) {
         expect(new Set(schema(name).required), `${name} should require agent_name`).toContain('agent_name')
       }
       /* reading comments must never claim work, so it stays canvas-only */
       expect(new Set(schema('get_comments').required)).toEqual(new Set())
 
-      expect(client.getInstructions()).toContain('call stop_work')
+      /* the instructions name the work channel (a human's note reaches an agent
+         only on a call it makes) and the tool a big frame is read with */
+      expect(client.getInstructions()).toContain('claim_comment takes the notes addressed to your role')
       expect(client.getInstructions()).toContain('inspect_frame')
     } finally {
       await client.close()
@@ -193,7 +186,6 @@ describe('MCP website tool contract', () => {
         'get_frame_html',
         'inspect_frame',
         'get_comments',
-        'list_cards',
         'list_canvases',
         'list_guidelines',
         'get_guidelines',
@@ -291,7 +283,8 @@ describe('MCP phase-0 tool contract', () => {
       expect(schema('import_webpage').properties).toHaveProperty('as_reference')
       expect(new Set(schema('import_webpage').required)).toEqual(new Set(['url']))
 
-      /* export_frame was the one read that could not carry human feedback */
+      /* export_frame is the one read that takes an agent_name: the export is
+         attributed to whoever asked for it */
       expect(schema('export_frame').properties).toHaveProperty('agent_name')
       expect(new Set(schema('export_frame').required)).toEqual(new Set(['frame_id']))
 
@@ -316,7 +309,7 @@ describe('MCP phase-0 tool contract', () => {
     }
   })
 
-  it('lists the design roles, the pipelines and who is live on the canvas', async () => {
+  it('lists the design roles and who is live on the canvas', async () => {
     const canvas = store.createCanvas('Agents', OWNER_ID)
     const { client, close } = await connect()
     try {
@@ -335,32 +328,21 @@ describe('MCP phase-0 tool contract', () => {
         name: 'Doop',
         blurb: 'Generalist designer — makes the thing',
       })
-      expect((fresh.structured.pipelines as Array<{ id: string }>).map((p) => p.id)).toEqual([
-        'solo',
-        'ship',
-        'full',
-        'audit',
-      ])
+      /* nobody has called yet: presence is the whole record of who is here */
       expect(fresh.structured.connected).toEqual([])
 
-      /* a status post is the lightest sign of life an agent can give: it must
-         be enough to appear as connected */
-      await call(client, 'set_status', { canvas_id: canvas.id, agent_name: 'Claude', status: 'Sketching a hero' })
-      const after = await call(client, 'get_agents', { canvas_id: canvas.id })
-      expect(after.structured.connected).toEqual([
-        { agent: 'Claude', owner: 'Test Owner', working_on: 'Sketching a hero' },
-      ])
-
-      /* an agent that has only ever been seen by presence — no task row —
-         still counts, and a name seen in both sources is listed once */
+      /* presence is read per name, so an agent its client reports twice is
+         listed once — with the first owner it was seen under and whatever
+         either sighting knew about its work */
       actions.wirePresence(() => [
         { name: 'Codex', owner: 'Sam', status: 'Reviewing', lastSeen: Date.now() },
         { name: 'Claude', owner: 'Sam', status: null, lastSeen: Date.now() },
+        { name: 'Claude', owner: 'Test Owner', status: 'Sketching a hero', lastSeen: Date.now() },
       ])
       const merged = await call(client, 'get_agents', { canvas_id: canvas.id })
       expect(merged.structured.connected).toEqual([
-        { agent: 'Claude', owner: 'Test Owner', working_on: 'Sketching a hero' },
         { agent: 'Codex', owner: 'Sam', working_on: 'Reviewing' },
+        { agent: 'Claude', owner: 'Sam', working_on: 'Sketching a hero' },
       ])
 
       const unknown = await call(client, 'get_agents', { canvas_id: 'nope' })
@@ -539,55 +521,6 @@ describe('MCP phase-0 tool contract', () => {
       await call(client, 'import_webpage', { canvas_id: canvas.id, url: 'https://acme.io/', agent_name: 'Claude' })
       expect(store.getCanvas(canvas.id)!.frames).toHaveLength(1)
       expect(store.getCanvas(canvas.id)!.references).toHaveLength(1)
-    } finally {
-      await close()
-    }
-  })
-
-  it('hands a card’s target element to the agent that reads the board', async () => {
-    const canvas = store.createCanvas('Targets', OWNER_ID)
-    const frame = store.createFrame(
-      canvas.id,
-      { name: 'Hero', html: '<button class="cta">Buy</button>', width: 800, height: 600 },
-      'alice',
-    )!
-    /* a real page id: the card's page is validated against the canvas, so a
-       page id from elsewhere would send the agent looking in the wrong place */
-    const pageId = store.getCanvas(canvas.id)!.pages![0]!.id
-    actions.addQueuedCard(
-      canvas.id,
-      'Make the CTA bigger',
-      'alice',
-      undefined,
-      undefined,
-      undefined,
-      [frame.id],
-      '.cta',
-      pageId,
-    )
-    const { client, close } = await connect()
-    try {
-      const listed = await call(client, 'list_cards', { canvas_id: canvas.id })
-      expect(listed.isError).toBe(false)
-      expect(listed.structured.cards).toEqual([
-        expect.objectContaining({
-          title: 'Make the CTA bigger',
-          target_frames: [frame.id],
-          /* "fix THIS element" only survives the queue if the selector travels
-             with the card — the frame id alone is not the instruction */
-          target_selector: '.cta',
-          target_page_id: pageId,
-        }),
-      ])
-
-      /* a card queued without a selection simply has neither field */
-      actions.addQueuedCard(canvas.id, 'Try a new hero', 'alice', undefined, undefined, undefined, [frame.id])
-      const again = await call(client, 'list_cards', { canvas_id: canvas.id })
-      const plain = (again.structured.cards as Array<Record<string, unknown>>).find(
-        (card) => card.title === 'Try a new hero',
-      )!
-      expect(plain).not.toHaveProperty('target_selector')
-      expect(plain).not.toHaveProperty('target_page_id')
     } finally {
       await close()
     }

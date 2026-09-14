@@ -4,19 +4,16 @@ import * as persist from './db/persist.ts'
 import { PUBLIC_ORIGIN } from './auth.ts'
 
 /**
- * Email opt-in for agent events. In-app toasts cover people already looking
- * at the canvas; this covers everyone else. Default is OFF for every user,
- * and the whole channel silently no-ops when SMTP is not configured — a
- * self-hosted instance without mail must not lose a card over it.
+ * Email opt-in for agent questions. In-app toasts cover people already
+ * looking at the canvas; this covers everyone else. Default is OFF for every
+ * user, and the whole channel silently no-ops when SMTP is not configured —
+ * a self-hosted instance without mail must not lose a question over it.
  */
 
-export type AgentEventKind = 'completed' | 'failed' | 'question' | 'stopped'
+export type AgentEventKind = 'question'
 
 const LABELS: Record<AgentEventKind, string> = {
-  completed: 'finished a card',
-  failed: 'needs your attention',
   question: 'is asking you a question',
-  stopped: 'was stopped',
 }
 
 /** Fire-and-forget: a notification must never break the action it reports. */

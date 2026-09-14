@@ -7,22 +7,13 @@ import * as thumbs from './thumbs.ts'
 import { colorFor } from '../shared/types.ts'
 import { validateTokens } from './tokenCss.ts'
 import { stripTokenStyle } from '../shared/tokens.ts'
-import {
-  DEFAULT_ROLE_ID,
-  mentionedAgent,
-  mentionedRole,
-  normalizePipeline,
-  roleByAgentName,
-  roleName,
-} from '../shared/agents.ts'
+import { DEFAULT_ROLE_ID, mentionedAgent, mentionedRole, roleByAgentName, roleName } from '../shared/agents.ts'
 import { MAX_FRAME_HTML_BYTES } from './limits.ts'
 import { insertElement, updateElements } from './elementEdit.ts'
 import { decodeEscapedHtml, looksEscapedHtml, repairEscapedHtml } from './escapedHtml.ts'
 import type {
   Actor,
   ActivityItem,
-  AgentPlan,
-  AgentTask,
   Canvas,
   CanvasFocus,
   CanvasProposal,
@@ -38,12 +29,7 @@ import type {
   GuidelineDoc,
   MemoryProposal,
   MemoryReference,
-  PlanStep,
-  RepoCardKind,
-  RepoCardPayload,
-  RepoScreenRef,
   ServerMessage,
-  TaskFeedback,
   ReviewPolicy,
   UserMemory,
 } from '../shared/types.ts'
@@ -97,8 +83,7 @@ export function wirePresence(r: PresenceReader) {
   presenceReader = r
 }
 
-/** Live agents on a canvas — including one that has only called set_status
- *  once and so has no open task row to be read from. */
+/** Live agents on a canvas, as the presence map holds them. */
 export function listAgentPresence(canvasId: string): AgentPresenceEntry[] {
   return presenceReader(canvasId)
 }
@@ -119,14 +104,11 @@ export function listCanvasFocus(canvasId: string): CanvasFocus[] {
 }
 
 /** The agent names an @mention on this canvas can address right now: the ones
- *  present (even with nothing claimed) plus the ones an open card belongs to.
- *  Matched against what is actually here, never against a name invented from
- *  the text — a typo must stay a note for the humans, not vanish into a
- *  delivery to nobody. */
+ *  present on the canvas. Matched against what is actually here, never against
+ *  a name invented from the text — a typo must stay a note for the humans, not
+ *  vanish into a delivery to nobody. */
 function liveAgentNames(canvasId: string): string[] {
-  const names = new Set(presenceReader(canvasId).map((p) => p.name))
-  for (const t of taskLog.get(canvasId) ?? []) if (t.agentName) names.add(t.agentName)
-  return [...names]
+  return presenceReader(canvasId).map((p) => p.name)
 }
 
 /** while parked in ask_human / wait_for_events the agent is alive but idle */
@@ -138,69 +120,17 @@ const activityLog = new Map<string, ActivityItem[]>() // canvasId -> items (newe
 
 /** Fill the log maps from the database at boot. */
 export function hydrateLogs(data: {
-  tasks: Map<string, AgentTask[]>
-  feedback: Map<string, TaskFeedback[]>
   comments: Map<string, ElementComment[]>
   activity: Map<string, ActivityItem[]>
   decisions: Map<string, DesignDecision[]>
   proposals: Map<string, MemoryProposal[]>
-  /** canvasId -> agentName -> plan */
-  plans?: Map<string, Map<string, AgentPlan>>
 }) {
-  for (const [canvasId, list] of data.tasks) taskLog.set(canvasId, list)
-  for (const [canvasId, list] of data.feedback) feedbackLog.set(canvasId, list)
   for (const [canvasId, list] of data.comments) commentLog.set(canvasId, list)
   for (const [canvasId, list] of data.activity) activityLog.set(canvasId, list)
   for (const [canvasId, list] of data.decisions) decisionLog.set(canvasId, list)
   for (const [canvasId, list] of data.proposals) proposalLog.set(canvasId, list)
-  for (const [canvasId, byAgent] of data.plans ?? []) planLog.set(canvasId, byAgent)
-  /* A stop is per-canvas session state like the task log: a canvas whose logs
-     were just re-read has no stop outstanding against it. */
-  for (const canvasId of data.tasks.keys()) cancellations.delete(canvasId)
   interruptedStreams.clear()
   frameEditNotices.clear()
-  failInterruptedWork()
-}
-
-/** Work that was mid-flight when the process last died (deploy, crash,
- *  dev restart): no agent will ever finish it, so at boot it becomes a
- *  visible, retryable failure instead of sitting "in progress" forever. */
-function failInterruptedWork() {
-  const reason = 'Interrupted by a server restart. Retry when you are ready.'
-  const now = Date.now()
-  for (const [canvasId, list] of taskLog) {
-    for (const t of list) {
-      /* a stopped card is a human's decision, not an interrupted run */
-      if (t.endedAt || t.failedAt || t.cancelledAt || !t.agentName) continue
-      if (t.queuedBy) {
-        /* a claimed card whose run died — retryable */
-        t.failedAt = now
-        t.failureReason = reason
-      } else {
-        /* a live status row from the dead process — just close it out */
-        t.endedAt = now
-      }
-      persist.saveTask(canvasId, t)
-    }
-  }
-  for (const [, list] of feedbackLog) {
-    for (const f of list) {
-      if (f.deliveredAt && !f.completedAt && !f.failedAt) {
-        f.failedAt = now
-        f.failureReason = reason
-        persist.saveFeedback(f)
-      }
-    }
-  }
-  for (const [, list] of commentLog) {
-    for (const c of list) {
-      if (c.claimedBy && !c.resolvedAt && !c.failedAt) {
-        c.failedAt = now
-        c.failureReason = reason
-        persist.saveComment(c)
-      }
-    }
-  }
 }
 
 export function getActivity(canvasId: string): ActivityItem[] {
@@ -417,226 +347,10 @@ function touch(canvasId: string, actor: Actor, frameId?: string | null) {
 }
 
 /** Refresh an agent's presence without changing its frame or status. A model
- *  turn can stay silent longer than the presence TTL, and expiry fails the
- *  run's claimed cards as "disconnected" — a long-running agent beats this on
- *  a timer for as long as it is actually alive. */
+ *  turn can stay silent longer than the presence TTL, so a long-running agent
+ *  beats this on a timer for as long as it is actually alive. */
 export function heartbeatAgent(canvasId: string, actor: Actor) {
   touch(canvasId, actor)
-}
-
-/** Same agent identity = same name on the same account. A task with no recorded
- *  owner is legacy work, and matches on the name alone. */
-function sameAgent(t: { agentName: string; ownerId?: string }, actor: Actor): boolean {
-  if (t.agentName !== actor.name) return false
-  if (t.ownerId === undefined) return true
-  return t.ownerId === actor.ownerId
-}
-
-/* ------------------------------------------------------------------ */
-/* Agent routing: a board card carries an ordered pipeline of roles and */
-/* is only ever visible to the role at its current stage. Feedback and  */
-/* element comments carry a target agent instead. Untargeted work stays */
-/* open to anyone — that's what outside MCP agents pick up.             */
-/* ------------------------------------------------------------------ */
-
-/** The pipeline of a card, tolerating cards queued before pipelines existed. */
-export function pipelineOf(task: AgentTask): string[] {
-  return task.pipeline?.length ? task.pipeline : [DEFAULT_ROLE_ID]
-}
-
-/* ------------------------------------------------------------------ */
-/* Agent tasks: every set_status becomes a task entry, so the client   */
-/* can show a per-agent history of work (à la Cursor's agent panel),   */
-/* not just the current status. A new status completes the previous.   */
-/* ------------------------------------------------------------------ */
-
-const taskLog = new Map<string, AgentTask[]>() // canvasId -> tasks (newest first)
-
-/** canvasId -> agentName -> the plan that agent published for this canvas */
-const planLog = new Map<string, Map<string, AgentPlan>>()
-
-export function getTasks(canvasId: string): AgentTask[] {
-  return taskLog.get(canvasId) ?? []
-}
-
-/** Which canvas a task lives on — routes that take a bare task id resolve it
- *  here so the canvas access check can run before mutating. */
-export function taskCanvasId(taskId: string): string | undefined {
-  for (const [canvasId, list] of taskLog) if (list.some((t) => t.id === taskId)) return canvasId
-  return undefined
-}
-
-/** Agent announces what it is working on right now (empty string clears it). */
-export function setAgentStatus(canvasId: string, actor: Actor, status: string) {
-  const clean = status.trim()
-  agentTouch(canvasId, actor.name, undefined, clean || null, actor.owner, actor.ownerId)
-
-  const list = taskLog.get(canvasId) ?? []
-  /* board cards stay open until explicitly completed — a status change
-     narrates work ON a card, it doesn't end it */
-  const open = list.find((t) => sameAgent(t, actor) && !t.endedAt && !t.queuedBy)
-  if (open?.status === clean) return // same status re-posted: nothing new
-  if (open) {
-    open.endedAt = Date.now()
-    persist.saveTask(canvasId, open)
-    broadcast(canvasId, { type: 'task', task: open })
-  }
-  if (clean) {
-    const task: AgentTask = {
-      id: nanoid(8),
-      agentName: actor.name,
-      owner: actor.owner,
-      ownerId: actor.ownerId,
-      color: actor.color,
-      status: clean,
-      startedAt: Date.now(),
-    }
-    list.unshift(task)
-    if (list.length > 100) list.length = 100
-    taskLog.set(canvasId, list)
-    persist.saveTask(canvasId, task)
-    broadcast(canvasId, { type: 'task', task })
-    logActivity(canvasId, actor, `is working on: ${clean}`)
-  }
-}
-
-/* ------------------------------------------------------------------ */
-/* Task feedback: humans reply to a task in the UI; the text is        */
-/* delivered to the agent inside its NEXT MCP tool result (MCP is      */
-/* pull-based — the result-nudge layer is our channel into the agent). */
-/* ------------------------------------------------------------------ */
-
-const feedbackLog = new Map<string, TaskFeedback[]>() // canvasId -> entries (newest first)
-
-export function getFeedback(canvasId: string): TaskFeedback[] {
-  return feedbackLog.get(canvasId) ?? []
-}
-
-/** Look a feedback entry up by id (it carries its canvasId) for access checks. */
-export function findFeedback(feedbackId: string): TaskFeedback | undefined {
-  for (const list of feedbackLog.values()) {
-    const fb = list.find((f) => f.id === feedbackId)
-    if (fb) return fb
-  }
-  return undefined
-}
-
-export function addTaskFeedback(
-  taskId: string,
-  from: string,
-  text: string,
-  fromUserId?: string,
-): TaskFeedback | undefined {
-  const clean = text.trim()
-  if (!clean) return undefined
-  for (const [canvasId, tasks] of taskLog) {
-    const task = tasks.find((t) => t.id === taskId)
-    if (!task) continue
-    /* a reply goes back to the agent whose work it is about — unless that was
-       an outside agent, in which case it stays open to whoever shows up */
-    const target = roleByAgentName(task.agentName)?.name
-    const fb: TaskFeedback = {
-      id: nanoid(8),
-      taskId,
-      canvasId,
-      agentName: task.agentName,
-      ...(target ? { targetAgent: target } : {}),
-      from,
-      ...(fromUserId ? { fromUserId } : {}),
-      text: clean,
-      at: Date.now(),
-    }
-    const list = feedbackLog.get(canvasId) ?? []
-    list.unshift(fb)
-    if (list.length > 100) list.length = 100
-    feedbackLog.set(canvasId, list)
-    persist.saveFeedback(fb)
-    broadcast(canvasId, { type: 'feedback', feedback: fb })
-    agentEvents.push(canvasId, { kind: 'feedback', targetAgent: fb.targetAgent, data: { text: clean, from, taskId } })
-    logActivity(
-      canvasId,
-      resolveActor({ name: from, kind: 'user' }),
-      `left feedback on ${task.agentName}’s task: “${clean}”`,
-    )
-    return fb
-  }
-  return undefined
-}
-
-/** Open feedback this agent may take: everything addressed to it, plus
- *  untargeted feedback — that part stays a canvas-level queue where the first
- *  identified agent call wins. */
-export function takeFeedbackFor(canvasId: string, agentName: string, payer?: string, ownerId?: string): TaskFeedback[] {
-  const pending = (feedbackLog.get(canvasId) ?? []).filter(
-    (f) =>
-      !f.deliveredAt &&
-      !f.failedAt &&
-      (!f.targetAgent || f.targetAgent === agentName) &&
-      (payer === undefined || (f.fromUserId ?? '') === payer) &&
-      /* an undelivered item already claimed by another account's same-named
-         agent is not ours to take */
-      (f.claimedBy === undefined || f.claimedByOwner === undefined || f.claimedByOwner === ownerId),
-  )
-  for (const f of pending) {
-    f.deliveredAt = Date.now()
-    f.claimedBy = agentName
-    f.claimedByOwner = ownerId
-    persist.saveFeedback(f)
-    broadcast(canvasId, { type: 'feedback', feedback: f }) // clients flip the entry to "picked up"
-  }
-  return pending
-}
-
-export function failTaskFeedback(feedbackId: string, reason: string): TaskFeedback | undefined {
-  for (const [canvasId, list] of feedbackLog) {
-    const feedback = list.find((f) => f.id === feedbackId)
-    if (!feedback) continue
-    feedback.failedAt = Date.now()
-    feedback.failureReason = reason
-    persist.saveFeedback(feedback)
-    broadcast(canvasId, { type: 'feedback', feedback })
-    return feedback
-  }
-  return undefined
-}
-
-export function completeTaskFeedback(feedbackId: string): TaskFeedback | undefined {
-  for (const [canvasId, list] of feedbackLog) {
-    const feedback = list.find((f) => f.id === feedbackId)
-    if (!feedback) continue
-    feedback.completedAt = Date.now()
-    delete feedback.failedAt
-    delete feedback.failureReason
-    persist.saveFeedback(feedback)
-    broadcast(canvasId, { type: 'feedback', feedback })
-    /* addressed feedback is a settled design decision — capture it into Memory */
-    captureDecision(canvasId, {
-      text: feedback.text,
-      source: 'feedback',
-      from: feedback.from,
-      agentName: feedback.claimedBy,
-    })
-    return feedback
-  }
-  return undefined
-}
-
-export function retryTaskFeedback(feedbackId: string, by: string): TaskFeedback | undefined {
-  for (const [canvasId, list] of feedbackLog) {
-    const feedback = list.find((f) => f.id === feedbackId)
-    if (!feedback) continue
-    if (!feedback.failedAt) return feedback
-    delete feedback.deliveredAt
-    delete feedback.claimedBy
-    delete feedback.completedAt
-    delete feedback.failedAt
-    delete feedback.failureReason
-    persist.saveFeedback(feedback)
-    broadcast(canvasId, { type: 'feedback', feedback })
-    logActivity(canvasId, resolveActor({ name: by, kind: 'user' }), 'retried agent feedback')
-    return feedback
-  }
-  return undefined
 }
 
 /* ------------------------------------------------------------------ */
@@ -718,9 +432,9 @@ export function askQuestion(
   questionLog.set(canvasId, list)
   persist.saveQuestion(question)
   broadcast(canvasId, { type: 'question', question })
-  /* announce the question itself (a card event): the question_answer event is
+  /* wake the asker with the question itself: the question_answer event is
      reserved for the answer, or a parked ask_human would wake immediately */
-  agentEvents.push(canvasId, { kind: 'card', targetAgent: actor.name, data: { questionId: question.id } })
+  agentEvents.push(canvasId, { kind: 'question', targetAgent: actor.name, data: { questionId: question.id } })
   /* email the opted-in humans (fire-and-forget; mail off = silently skipped) */
   import('./notifications.ts')
     .then((n) => n.notifyAgentEvent(canvasId, 'question', `${actor.name} asks: ${text}`))
@@ -999,20 +713,29 @@ export function commentThread(comment: ElementComment): ElementComment[] {
     .sort((a, b) => a.at - b.at)
 }
 
-/** Open comments @mentioning this agent, claimed by it. */
+/** Open comments @mentioning this agent, claimed by it.
+ *
+ *  A comment is addressed either to a ROLE (`@a11y` stores the role's name —
+ *  whichever agent works that role may take it) or to a connected agent by
+ *  name (`@Claude`). `role` names the role being worked; without it the agent's
+ *  own name decides, so an agent whose name IS a role keeps working, and an
+ *  outside agent matches the notes that named it. The claim is always recorded
+ *  under `agentName`, so the pin says who is really on it. */
 export function takeAgentCommentsFor(
   canvasId: string,
   agentName: string,
   payer?: string,
   ownerId?: string,
+  role?: string,
 ): ElementComment[] {
+  const addressed = role ?? roleByAgentName(agentName)?.name ?? agentName
   const pending = (commentLog.get(canvasId) ?? []).filter(
     (c) =>
       c.forAgent &&
       !c.claimedBy &&
       !c.failedAt &&
       !c.resolvedAt &&
-      (c.targetAgent ?? roleName(DEFAULT_ROLE_ID)) === agentName &&
+      (c.targetAgent ?? roleName(DEFAULT_ROLE_ID)) === addressed &&
       (payer === undefined || (c.fromUserId ?? '') === payer),
   )
   for (const c of pending) {
@@ -1085,460 +808,6 @@ export function resolveComment(commentId: string, actor: Actor): ElementComment 
   return undefined
 }
 
-/** Surface an agent's closing summary in the activity feed. */
-export function agentSummary(canvasId: string, actor: Actor, text: string) {
-  const clean = text.replace(/\s+/g, ' ').trim()
-  if (!clean) return
-  logActivity(canvasId, actor, `finished: “${clean.length > 220 ? clean.slice(0, 217) + '…' : clean}”`)
-}
-
-/** True if the agent has an explicitly announced (non-auto) task open. */
-export function hasAnnouncedTask(canvasId: string, actor: Actor): boolean {
-  return (taskLog.get(canvasId) ?? []).some((t) => sameAgent(t, actor) && !t.endedAt && !t.auto)
-}
-
-/* Agents that never call set_status still get a task inferred from what
-   they are visibly doing, so the Tasks panel is never silently empty. */
-function autoTask(canvasId: string, actor: Actor, status: string) {
-  const list = taskLog.get(canvasId) ?? []
-  if (list.some((t) => sameAgent(t, actor) && !t.endedAt)) return // any open task wins
-  const task: AgentTask = {
-    id: nanoid(8),
-    agentName: actor.name,
-    owner: actor.owner,
-    color: actor.color,
-    status,
-    startedAt: Date.now(),
-    auto: true,
-  }
-  list.unshift(task)
-  if (list.length > 100) list.length = 100
-  taskLog.set(canvasId, list)
-  persist.saveTask(canvasId, task)
-  broadcast(canvasId, { type: 'task', task })
-}
-
-function endAutoTask(canvasId: string, actor: Actor) {
-  const open = (taskLog.get(canvasId) ?? []).find((t) => sameAgent(t, actor) && !t.endedAt && t.auto)
-  if (open) {
-    open.endedAt = Date.now()
-    persist.saveTask(canvasId, open)
-    broadcast(canvasId, { type: 'task', task: open })
-  }
-}
-
-/* ------------------------------------------------------------------ */
-/* Board cards: humans queue work; agents claim it. Same AgentTask     */
-/* object — queuedBy set, agentName empty until claimed.               */
-/* ------------------------------------------------------------------ */
-
-/* canvasId -> agent name -> the stop record. Kept so the MCP result-nudge
-   layer can tell a stopped agent to stop, and so nothing re-claims the work
-   before the run has actually unwound. The record carries the account the
-   stop was aimed at; a stop recorded without one is read by any agent of that
-   name. */
-interface StopRecord {
-  at: number
-  ownerId?: string
-}
-const cancellations = new Map<string, Map<string, StopRecord>>()
-
-/** How long a stop keeps being reported to the agent it was aimed at.
- *
- *  An external MCP agent has no run we control, so the record has to age out
- *  on its own — without this, one stop would mute that agent name on this
- *  canvas forever. */
-const STOP_TTL_MS = 10 * 60_000
-
-/** True while a stop request is outstanding for this agent on this canvas. */
-export function wasStopped(canvasId: string, agentName: string, ownerId?: string): boolean {
-  const record = cancellations.get(canvasId)?.get(agentName)
-  if (!record) return false
-  if (Date.now() - record.at > STOP_TTL_MS) {
-    cancellations.get(canvasId)?.delete(agentName)
-    return false
-  }
-  /* a stop with no account behind it reaches everyone running that name; an
-     account-scoped stop reaches only its own agent */
-  if (record.ownerId === undefined || ownerId === undefined) return true
-  return record.ownerId === ownerId
-}
-
-/** Clear the record when a fresh run claims work, so a stop cannot leak into a
- *  later, unrelated session under the same agent name. */
-export function clearStop(canvasId: string, agentName: string, ownerId?: string) {
-  const byName = cancellations.get(canvasId)
-  const record = byName?.get(agentName)
-  if (!record) return
-  /* a record with no account behind it is cleared unconditionally: it owns the
-     bare name. An account-scoped agent only clears its own record. */
-  if (ownerId !== undefined && record.ownerId !== undefined && record.ownerId !== ownerId) return
-  byName!.delete(agentName)
-}
-
-/** Stop every run this agent has in flight on a canvas.
- *
- *  Open board cards go to a terminal cancelledAt (never failedAt): a human
- *  stopped this, so it needs an explicit Retry, not a failure. Open status
- *  tasks simply end. The model call is aborted if it is still streaming.
- *  Returns how many open tasks were stopped. */
-export function cancelAgentWork(canvasId: string, agentName: string, by: string, ownerId?: string): number {
-  const byName = cancellations.get(canvasId) ?? new Map<string, StopRecord>()
-  cancellations.set(canvasId, byName)
-  byName.set(agentName, { at: Date.now(), ownerId })
-  const now = Date.now()
-  let stopped = 0
-  for (const t of taskLog.get(canvasId) ?? []) {
-    if (t.agentName !== agentName || t.endedAt || t.cancelledAt) continue
-    /* a stop aimed at one account's agent must not stop another's */
-    if (t.ownerId !== undefined && t.ownerId !== ownerId) continue
-    if (t.queuedBy) {
-      /* a card the run already failed keeps its failure: that is the actionable
-         story, and rewriting it as a stop would hide why it died */
-      if (t.failedAt) continue
-      t.cancelledAt = now
-      t.cancelledBy = by
-    } else {
-      t.endedAt = now
-    }
-    persist.saveTask(canvasId, t)
-    broadcast(canvasId, { type: 'task', task: t })
-    agentEvents.push(canvasId, { kind: 'stop', targetAgent: agentName, data: { taskId: t.id, stoppedBy: by } })
-    stopped++
-  }
-  /* no work was stopped — do not abort whatever run happens to be live */
-  if (stopped > 0) {
-    /* a stopped agent's stream ends here, and the frame says why rather than
-       leaving a border that only times out */
-    for (const [frameId, state] of streams) {
-      if (state.actor.name === agentName && store.getFrame(frameId)?.canvasId === canvasId) state.endedBy = 'stopped'
-    }
-    /* a stopped run holds nothing: its frames are free for the human to edit */
-    releaseLocksForAgent(canvasId, agentName)
-    logActivity(canvasId, resolveActor({ name: by, kind: 'user' }), `stopped ${agentName}`)
-  }
-  return stopped
-}
-
-/** Stop ONE board card, leaving the agent's other work alone. Unlike
- *  cancelAgentWork this records no agent-level stop, so the agent keeps its
- *  other cards and its next call is not refused. The card is cancelled, not
- *  failed: a human can retry it from the board. */
-export function cancelCard(canvasId: string, cardId: string, by: string): AgentTask | undefined {
-  const card = (taskLog.get(canvasId) ?? []).find((t) => t.id === cardId && t.queuedBy)
-  if (!card || card.endedAt || card.cancelledAt) return card
-  card.cancelledAt = Date.now()
-  card.cancelledBy = by
-  persist.saveTask(canvasId, card)
-  broadcast(canvasId, { type: 'task', task: card })
-  /* Only the agent holding the card is told: a stop event with no target
-     wakes every parked agent on the canvas, and an unclaimed card has no one
-     to tell — the board broadcast is the whole story there. */
-  if (card.agentName)
-    agentEvents.push(canvasId, {
-      kind: 'stop',
-      targetAgent: card.agentName,
-      data: { taskId: card.id, stoppedBy: by },
-    })
-  logActivity(
-    canvasId,
-    resolveActor({ name: by, kind: 'user' }),
-    `stopped a card${card.agentName ? ` for ${card.agentName}` : ''}`,
-  )
-  return card
-}
-
-/** Take a card off the board entirely — what the ✕ means. Distinct from
- *  completeCard ("this work is done") and from cancelAgentWork (stops a run but
- *  keeps the card for a retry). */
-export function removeCard(canvasId: string, cardId: string, by: string): boolean {
-  const list = taskLog.get(canvasId) ?? []
-  const index = list.findIndex((t) => t.id === cardId && t.queuedBy)
-  if (index < 0) return false
-  const [card] = list.splice(index, 1)
-  if (card?.agentName) cancelAgentWork(canvasId, card.agentName, by)
-  persist.deleteTask(canvasId, cardId)
-  broadcast(canvasId, { type: 'task:deleted', taskId: cardId })
-  return true
-}
-
-/** A card's text is the whole prompt the agent gets — never shorten it for
- *  display here; the board clamps long headings visually. The cap only stops
- *  a pasted document from being stored, broadcast and prompted verbatim. */
-export const MAX_CARD_CHARS = 4_000
-
-export function addQueuedCard(
-  canvasId: string,
-  title: string,
-  from: string,
-  agents?: unknown,
-  attachments?: unknown,
-  fromUserId?: string,
-  targetFrameIds?: unknown,
-  targetSelector?: unknown,
-  targetPageId?: unknown,
-): AgentTask | undefined {
-  const clean = title.trim().slice(0, MAX_CARD_CHARS)
-  if (!clean || !store.getCanvas(canvasId)) return undefined
-  const pipeline = normalizePipeline(agents)
-  /* reference-image frame ids: only frames that actually live on this canvas */
-  const refs = (Array.isArray(attachments) ? attachments : [])
-    .filter((a): a is string => typeof a === 'string')
-    .filter((id, i, arr) => arr.indexOf(id) === i && store.getFrame(id)?.canvasId === canvasId)
-    .slice(0, 4)
-  /* the frames the card is ABOUT (the human's selection when they queued it) —
-     same liveness rule as the attachments, but the opposite instruction to the
-     agent: edit these in place rather than delivering elsewhere */
-  const targets = (Array.isArray(targetFrameIds) ? targetFrameIds : [])
-    .filter((a): a is string => typeof a === 'string')
-    .filter((id, i, arr) => arr.indexOf(id) === i && store.getFrame(id)?.canvasId === canvasId)
-    .slice(0, 4)
-  /* "fix THIS element": the selector only means something alongside a target
-     frame, and the page is validated like every other id — a page id from
-     another canvas would send the agent looking in the wrong place */
-  const selector = targets.length > 0 && typeof targetSelector === 'string' ? targetSelector.trim().slice(0, 300) : ''
-  const page =
-    targets.length > 0 && typeof targetPageId === 'string' && store.getPage(targetPageId)?.canvas.id === canvasId
-      ? targetPageId
-      : ''
-  const list = taskLog.get(canvasId) ?? []
-  const duplicate = list.find(
-    (t) =>
-      t.queuedBy === from &&
-      !t.endedAt &&
-      t.status === clean &&
-      pipelineOf(t).join(',') === pipeline.join(',') &&
-      (t.attachments ?? []).join(',') === refs.join(',') &&
-      (t.targetFrameIds ?? []).join(',') === targets.join(',') &&
-      (t.targetSelector ?? '') === selector &&
-      (t.targetPageId ?? '') === page,
-  )
-  if (duplicate) return duplicate
-  const card: AgentTask = {
-    id: nanoid(8),
-    agentName: '',
-    color: colorFor(from),
-    status: clean,
-    startedAt: Date.now(),
-    queuedBy: from,
-    ...(fromUserId ? { queuedByUserId: fromUserId } : {}),
-    pipeline,
-    stage: 0,
-    ...(refs.length > 0 ? { attachments: refs } : {}),
-    ...(targets.length > 0 ? { targetFrameIds: targets } : {}),
-    ...(selector ? { targetSelector: selector } : {}),
-    ...(page ? { targetPageId: page } : {}),
-  }
-  list.unshift(card)
-  taskLog.set(canvasId, trimTaskLog(list))
-  persist.saveTask(canvasId, card)
-  broadcast(canvasId, { type: 'task', task: card })
-  /* a card that @mentions a connected agent is addressed to that agent: the
-     event wakes it specifically instead of every parked agent on the canvas.
-     Roles are left untargeted — the pipeline decides who picks the card up. */
-  const outside = mentionedRole(clean) ? undefined : mentionedAgent(clean, liveAgentNames(canvasId))
-  agentEvents.push(canvasId, {
-    kind: 'card',
-    ...(outside ? { targetAgent: outside } : {}),
-    data: { cardId: card.id, text: clean, pipeline },
-  })
-  logActivity(
-    canvasId,
-    resolveActor({ name: from, kind: 'user' }),
-    `queued a card for ${pipeline.map(roleName).join(' → ')}: “${clean}”`,
-  )
-  return card
-}
-
-const TASK_LOG_CAP = 100
-
-/** Keep the task log at its cap without losing open work: the oldest FINISHED
- *  tasks go first, so a bulk import can never push a queued, claimed or
- *  failed card off the board. Open cards past the cap are kept as well. */
-export function trimTaskLog(list: AgentTask[]): AgentTask[] {
-  if (list.length <= TASK_LOG_CAP) return list
-  const isOpen = (t: AgentTask) => !!t.queuedBy && !t.endedAt && !t.cancelledAt
-  let room = TASK_LOG_CAP - list.filter(isOpen).length
-  const kept: AgentTask[] = []
-  for (const t of list) {
-    if (isOpen(t)) kept.push(t)
-    else if (room > 0) {
-      kept.push(t)
-      room--
-    }
-  }
-  list.length = 0
-  list.push(...kept)
-  return list
-}
-
-/** One repo import as board cards: the design-system extraction first (it
- *  becomes the guide the sketches follow), then one sketch card per selected
- *  screen. Structured cards carry their own payload for the GitHub sketch
- *  runner (server/githubRecon.ts) rather than chat work.
- *  A screen already queued or in flight from the same connection is not
- *  queued twice. Returns the cards, oldest first. */
-export interface RepoImportInput {
-  connectionId: string
-  repo: string
-  screens: RepoScreenRef[]
-  designSystem: boolean
-}
-
-/** What an import would queue, after removing screens already waiting or in
- *  flight from the same connection. Pure — the route checks this before it
- *  queues anything, so a no-op re-import costs nothing. */
-export function planRepoCards(
-  canvasId: string,
-  input: RepoImportInput,
-): { kind: RepoCardKind; title: string; payload: RepoCardPayload }[] {
-  if (!store.getCanvas(canvasId)) return []
-  const list = taskLog.get(canvasId) ?? []
-  const open = list.filter((t) => t.queuedBy && !t.endedAt && t.payload?.connectionId === input.connectionId)
-  const importId = nanoid(8)
-  const base = { connectionId: input.connectionId, repo: input.repo, importId }
-  const wanted: { kind: RepoCardKind; title: string; payload: RepoCardPayload }[] = []
-  if (input.designSystem && !open.some((t) => t.kind === 'design-system'))
-    wanted.push({ kind: 'design-system', title: `Design system of ${input.repo}`, payload: base })
-  for (const screen of input.screens) {
-    const queued = open.some(
-      (t) =>
-        t.kind === 'sketch' &&
-        t.payload?.screen?.sourcePath === screen.sourcePath &&
-        t.payload.screen.kind === screen.kind,
-    )
-    if (!queued) wanted.push({ kind: 'sketch', title: screen.title, payload: { ...base, screen } })
-  }
-  return wanted
-}
-
-export function addRepoCards(canvasId: string, input: RepoImportInput, from: string, fromUserId: string): AgentTask[] {
-  const wanted = planRepoCards(canvasId, input)
-  if (!wanted.length) return []
-  const list = taskLog.get(canvasId) ?? []
-  const actor = resolveActor({ name: from, kind: 'user' })
-  const cards: AgentTask[] = []
-  /* startedAt orders the queue (oldest first); a shared timestamp would leave
-     the order to Map iteration, so each card sits one tick after the last */
-  const at = Date.now()
-  wanted.forEach((w, i) => {
-    const card: AgentTask = {
-      id: nanoid(8),
-      agentName: '',
-      color: colorFor(from),
-      status: w.title.slice(0, MAX_CARD_CHARS),
-      startedAt: at + i,
-      queuedBy: from,
-      queuedByUserId: fromUserId,
-      pipeline: [DEFAULT_ROLE_ID],
-      stage: 0,
-      kind: w.kind,
-      payload: w.payload,
-    }
-    list.unshift(card)
-    persist.saveTask(canvasId, card)
-    broadcast(canvasId, { type: 'task', task: card })
-    cards.push(card)
-  })
-  taskLog.set(canvasId, trimTaskLog(list))
-  if (cards.length) {
-    const sketches = cards.filter((c) => c.kind === 'sketch').length
-    const what = [
-      cards.some((c) => c.kind === 'design-system') ? 'the design system' : '',
-      sketches ? `${sketches} ${sketches === 1 ? 'screen' : 'screens'}` : '',
-    ]
-      .filter(Boolean)
-      .join(' and ')
-    logActivity(canvasId, actor, `queued ${what} from ${input.repo} for ${roleName(DEFAULT_ROLE_ID)}`)
-  }
-  return cards
-}
-
-/** Claim one open card by id for an outside agent (an MCP connection, which
- *  no pipeline stage names). The stage gate of the pipeline is invisible to an
- *  outside claim: taking queued work is a human-visible takeover — the board
- *  shows who holds the card, and Stop/Retry still work.
- *  Throws on the specific reason so the MCP layer can report it. */
-export function claimCard(canvasId: string, cardId: string, agentName: string): AgentTask {
-  const card = (taskLog.get(canvasId) ?? []).find((t) => t.id === cardId && t.queuedBy)
-  if (!card) throw new Error(`no card with id ${cardId} on this canvas`)
-  if (card.kind) throw new Error('this is a structured import card — it has no chat work to claim')
-  if (card.agentName) throw new Error(`card already claimed by ${card.agentName}`)
-  if (card.endedAt || card.cancelledAt) throw new Error('card is no longer open — it was completed or stopped')
-  if (card.failedAt) throw new Error('card failed and waits for a human retry')
-  card.agentName = agentName
-  card.color = colorFor(agentName)
-  card.claimedAt = Date.now()
-  persist.saveTask(canvasId, card)
-  broadcast(canvasId, { type: 'task', task: card })
-  return card
-}
-
-/** An agent finished its stage: hand the card to the next agent in the
- *  pipeline, or complete it if that was the last one. The finishing agent's
- *  final message rides along as the next stage's handoff note. */
-export function advanceCard(canvasId: string, cardId: string, by: Actor, stageSummary?: string): AgentTask | undefined {
-  const card = (taskLog.get(canvasId) ?? []).find((t) => t.id === cardId && t.queuedBy)
-  if (!card || card.endedAt || card.cancelledAt) return card
-  const pipeline = pipelineOf(card)
-  const next = (card.stage ?? 0) + 1
-  if (next >= pipeline.length) return completeCard(canvasId, cardId)
-
-  if (stageSummary?.trim()) card.stageSummary = stageSummary.trim().slice(0, 1000)
-  card.stage = next
-  card.agentName = ''
-  delete card.claimedAt
-  delete card.failedAt
-  delete card.failureReason
-  persist.saveTask(canvasId, card)
-  broadcast(canvasId, { type: 'task', task: card })
-  logActivity(canvasId, by, `handed “${card.status}” to ${roleName(pipeline[next])}`)
-  return card
-}
-
-export function completeCard(canvasId: string, cardId: string): AgentTask | undefined {
-  const card = (taskLog.get(canvasId) ?? []).find((t) => t.id === cardId && t.queuedBy)
-  if (!card || card.endedAt || card.cancelledAt) return card
-  card.endedAt = Date.now()
-  persist.saveTask(canvasId, card)
-  broadcast(canvasId, { type: 'task', task: card })
-  import('./notifications.ts')
-    .then((n) => n.notifyAgentEvent(canvasId, 'completed', `Card done: ${card.status}`))
-    .catch(() => {})
-  return card
-}
-
-/** An unsuccessful card stays failed until a human explicitly retries it. */
-export function failCard(canvasId: string, cardId: string, reason: string): AgentTask | undefined {
-  const card = (taskLog.get(canvasId) ?? []).find((t) => t.id === cardId && t.queuedBy)
-  if (!card || card.endedAt || card.cancelledAt) return card
-  card.failedAt = Date.now()
-  card.failureReason = reason
-  persist.saveTask(canvasId, card)
-  broadcast(canvasId, { type: 'task', task: card })
-  import('./notifications.ts')
-    .then((n) => n.notifyAgentEvent(canvasId, 'failed', `Card failed: ${card.status}`))
-    .catch(() => {})
-  return card
-}
-
-export function retryCard(canvasId: string, cardId: string, by: string): AgentTask | undefined {
-  const card = (taskLog.get(canvasId) ?? []).find((t) => t.id === cardId && t.queuedBy)
-  if (!card || card.endedAt) return card
-  if (!card.failedAt && !card.cancelledAt) return card
-  card.agentName = ''
-  delete card.claimedAt
-  delete card.failedAt
-  delete card.failureReason
-  /* a retry is the one thing that lifts a stop: the human has decided again */
-  delete card.cancelledAt
-  delete card.cancelledBy
-  persist.saveTask(canvasId, card)
-  broadcast(canvasId, { type: 'task', task: card })
-  logActivity(canvasId, resolveActor({ name: by, kind: 'user' }), `retried a card: “${card.status}”`)
-  return card
-}
-
 /* ------------------------------------------------------------------ */
 /* Live rendering of agent writes.                                     */
 /*                                                                     */
@@ -1559,8 +828,8 @@ interface StreamState {
   escaped: boolean
   lastActivity: number
   /** set when something other than the agent ended the stream, so the end can
-   *  say why (a human's edit, a takeover, a stop) */
-  endedBy?: 'idle' | 'taken over' | 'stopped' | 'replaced'
+   *  say why (a human's edit, a takeover) */
+  endedBy?: 'idle' | 'taken over' | 'replaced'
 }
 
 const streams = new Map<string, StreamState>() // frameId -> state
@@ -1734,7 +1003,6 @@ function finishReveal(frameId: string) {
   /* a reveal is a normal completion: saying nothing here would let the viewer
      read the end as an agent that went silent mid-stream */
   broadcast(frame.canvasId, { type: 'frame:streaming', frameId, active: false, actor: r.actor, reason: 'done' })
-  endAutoTask(frame.canvasId, r.actor)
 }
 
 function finishStream(frameId: string, logDone: boolean) {
@@ -1754,7 +1022,6 @@ function finishStream(frameId: string, logDone: boolean) {
     reason: logDone ? 'done' : (s.endedBy ?? 'idle'),
   })
   if (logDone) logActivity(frame.canvasId, s.actor, `finished designing “${frame.name}”`, frameId)
-  endAutoTask(frame.canvasId, s.actor)
 }
 
 setInterval(() => {
@@ -1827,7 +1094,6 @@ export function appendFrameHtml(
     streams.set(frameId, { actor, escaped, lastActivity: Date.now() })
     broadcast(frame.canvasId, { type: 'frame:streaming', frameId, active: true, actor })
     logActivity(frame.canvasId, actor, `is designing “${frame.name}” live…`, frameId)
-    autoTask(frame.canvasId, actor, `Designing “${frame.name}”`)
   }
   const s = streams.get(frameId)!
   s.lastActivity = Date.now()
@@ -1872,7 +1138,6 @@ export function createFrame(
     /* agent one-shot creation still plays back as a reveal */
     broadcast(canvasId, { type: 'frame:created', frame: { ...frame, html: '' }, actor })
     startReveal(frame, actor, 0)
-    autoTask(canvasId, actor, `Designing “${frame.name}”`)
   } else {
     broadcast(canvasId, { type: 'frame:created', frame, actor })
   }
@@ -1921,11 +1186,9 @@ export function updateFrame(
     } else if (smallTweak) {
       broadcast(frame.canvasId, { type: 'frame:updated', frame, actor })
       logActivity(frame.canvasId, actor, `tweaked the design of “${frame.name}”`, frame.id)
-      autoTask(frame.canvasId, actor, `Tweaking “${frame.name}”`)
     } else {
       startReveal(frame, actor, prefix)
       logActivity(frame.canvasId, actor, `updated the design of “${frame.name}”`, frame.id)
-      autoTask(frame.canvasId, actor, `Redesigning “${frame.name}”`)
     }
   } else {
     if (htmlChanged) {
@@ -1994,13 +1257,10 @@ export function deleteCanvas(canvasId: string): boolean {
   if (!c) return false
   for (const f of c.frames) thumbs.purge(f.id)
   broadcast(canvasId, { type: 'canvas:deleted' })
-  taskLog.delete(canvasId)
-  feedbackLog.delete(canvasId)
   commentLog.delete(canvasId)
   activityLog.delete(canvasId)
   decisionLog.delete(canvasId)
   proposalLog.delete(canvasId)
-  cancellations.delete(canvasId)
   for (const [frameId, record] of interruptedStreams) {
     if (record.canvasId === canvasId) interruptedStreams.delete(frameId)
   }
@@ -2143,88 +1403,6 @@ export function guidelineSummary(doc: GuidelineDoc): string {
   return ''
 }
 
-/* ---- agent plans ---- */
-
-const MAX_PLAN_STEPS = 20
-const MAX_STEP_TEXT = 200
-const MAX_STEP_NOTE = 500
-
-export interface PlanStepInput {
-  id: string
-  text: string
-}
-
-/** Publish (or replace) an agent's plan for a canvas. Throws on invalid input
- *  with a message meant for the caller's error channel. */
-export function setPlan(canvasId: string, agentName: string, steps: PlanStepInput[], actor: Actor): AgentPlan {
-  if (steps.length === 0) throw new Error('a plan needs at least one step')
-  if (steps.length > MAX_PLAN_STEPS) throw new Error(`${steps.length} steps — the limit is ${MAX_PLAN_STEPS}`)
-  const ids = new Set<string>()
-  const previous = planLog.get(canvasId)?.get(agentName)
-  const now = Date.now()
-  const clean = steps.map((step) => {
-    const id = step.id.trim()
-    if (!id) throw new Error('every step needs an id')
-    if (ids.has(id)) throw new Error(`duplicate step id “${id}”`)
-    ids.add(id)
-    const text = step.text.trim()
-    if (!text) throw new Error(`step “${id}” has no text`)
-    if (text.length > MAX_STEP_TEXT) throw new Error(`step “${id}” is longer than ${MAX_STEP_TEXT} characters`)
-    /* a re-published plan keeps each step's progress rather than resetting it */
-    const prior = previous?.steps.find((s) => s.id === id)
-    return prior && prior.text === text ? prior : { id, text, status: 'pending' as const, updatedAt: now }
-  })
-  const plan: AgentPlan = {
-    canvasId,
-    agentName,
-    ...(actor.owner ? { owner: actor.owner } : {}),
-    ...(actor.ownerId ? { ownerId: actor.ownerId } : {}),
-    steps: clean,
-    updatedAt: now,
-  }
-  const byAgent = planLog.get(canvasId) ?? new Map<string, AgentPlan>()
-  byAgent.set(agentName, plan)
-  planLog.set(canvasId, byAgent)
-  persist.savePlan(plan)
-  broadcast(canvasId, { type: 'plan', plan })
-  touch(canvasId, actor)
-  return plan
-}
-
-/** Move one step of a plan; the note is free text the agent leaves for itself. */
-export function updatePlanStep(
-  canvasId: string,
-  agentName: string,
-  stepId: string,
-  status: PlanStep['status'],
-  note: string | undefined,
-  actor: Actor,
-): AgentPlan | undefined {
-  const plan = planLog.get(canvasId)?.get(agentName)
-  if (!plan) return undefined
-  const step = plan.steps.find((s) => s.id === stepId)
-  if (!step) return undefined
-  if (note !== undefined && note.length > MAX_STEP_NOTE)
-    throw new Error(`note is longer than ${MAX_STEP_NOTE} characters`)
-  step.status = status
-  if (note !== undefined) step.note = note
-  step.updatedAt = Date.now()
-  plan.updatedAt = step.updatedAt
-  persist.savePlan(plan)
-  broadcast(canvasId, { type: 'plan', plan })
-  touch(canvasId, actor)
-  return plan
-}
-
-/** Every plan on the canvas, newest first. */
-export function getPlans(canvasId: string): AgentPlan[] {
-  return [...(planLog.get(canvasId)?.values() ?? [])].sort((a, b) => b.updatedAt - a.updatedAt)
-}
-
-export function getPlan(canvasId: string, agentName: string): AgentPlan | undefined {
-  return planLog.get(canvasId)?.get(agentName)
-}
-
 /** Replace the canvas's design tokens (or clear them with undefined).
  *  Validates first, so an invalid token never reaches the store. */
 export function setTokens(canvasId: string, tokens: DesignTokens | undefined, actor: Actor): Canvas | undefined {
@@ -2306,8 +1484,7 @@ export function patchGuideline(
 }
 
 /* Per-process memory of which agents have read a canvas's design docs —
-   worst case after a restart is one extra nudge, same trade-off as the
-   task log's announce tracking. */
+   worst case after a restart is one extra nudge. */
 const guidelinesSeen = new Set<string>()
 
 export function markGuidelinesSeen(canvasId: string, agentName: string) {
@@ -3037,74 +2214,6 @@ export async function resolveCanvasProposal(
     `${opts.accept ? 'accepted' : 'rejected'} ${proposal.proposedBy}’s ${CANVAS_PROPOSAL_WORD[proposal.kind]} proposal`,
   )
   return proposal
-}
-
-/* ------------------------------------------------------------------ */
-/* Queue ordering: higher priority first, then position, then arrival. */
-/* ------------------------------------------------------------------ */
-
-function queueOrder(a: AgentTask, b: AgentTask): number {
-  const pa = a.priority ?? 0
-  const pb = b.priority ?? 0
-  if (pa !== pb) return pb - pa
-  const sa = a.position ?? Number.MAX_SAFE_INTEGER
-  const sb = b.position ?? Number.MAX_SAFE_INTEGER
-  if (sa !== sb) return sa - sb
-  return a.startedAt - b.startedAt
-}
-
-/** Queued cards in the order work should be taken. */
-export function queuedCards(canvasId: string): AgentTask[] {
-  return (taskLog.get(canvasId) ?? [])
-    .filter((t) => t.queuedBy && !t.agentName && !t.failedAt && !t.endedAt && !t.cancelledAt)
-    .sort(queueOrder)
-}
-
-/** Rewrite the queue order: ids in array order get position 0..n. */
-export function reorderCards(canvasId: string, ids: string[]): boolean {
-  const list = taskLog.get(canvasId) ?? []
-  const byId = new Map(list.map((t) => [t.id, t]))
-  ids.forEach((id, index) => {
-    const card = byId.get(id)
-    if (!card) return
-    card.position = index
-    persist.saveTask(canvasId, card)
-    broadcast(canvasId, { type: 'task', task: card })
-  })
-  return true
-}
-
-export function setCardPriority(canvasId: string, cardId: string, priority: number): AgentTask | undefined {
-  const card = (taskLog.get(canvasId) ?? []).find((t) => t.id === cardId)
-  if (!card) return undefined
-  card.priority = Math.max(0, Math.min(9, Math.round(priority)))
-  persist.saveTask(canvasId, card)
-  broadcast(canvasId, { type: 'task', task: card })
-  return card
-}
-
-/** A specialist handed the card back to an earlier pipeline stage. */
-export function handBackCard(
-  canvasId: string,
-  cardId: string,
-  toAgent: string,
-  reason: string,
-  actor: Actor,
-): AgentTask | undefined {
-  const card = (taskLog.get(canvasId) ?? []).find((t) => t.id === cardId)
-  if (!card || !card.queuedBy) return card
-  const pipeline = pipelineOf(card)
-  const index = pipeline.findIndex((id) => roleName(id) === toAgent || id === toAgent)
-  if (index < 0) return card
-  card.stage = index
-  card.agentName = ''
-  card.handback = { fromAgent: actor.name, reason: reason.trim().slice(0, 500), at: Date.now() }
-  delete card.claimedAt
-  persist.saveTask(canvasId, card)
-  broadcast(canvasId, { type: 'task', task: card })
-  logActivity(canvasId, actor, `handed the card back to ${toAgent}: ${card.handback.reason}`)
-  agentEvents.push(canvasId, { kind: 'card', data: { cardId: card.id, handback: true, toAgent } })
-  return card
 }
 
 /** Restore a frame to a saved version. An ordinary edit: it versions, it

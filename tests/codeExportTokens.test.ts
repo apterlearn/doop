@@ -533,8 +533,6 @@ describe('agentsMd', () => {
       'append_frame_html',
       'edit_frame_html',
       'ready_for_review',
-      'complete_card',
-      'hand_back',
       'undo_last_change',
       'get_guide',
     ]) {

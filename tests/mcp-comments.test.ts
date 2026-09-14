@@ -266,14 +266,12 @@ describe('get_comments MCP tool', () => {
   it('does not claim or resolve anything while reading', async () => {
     const stored = [comment({ id: 'm1', forAgent: true, targetAgent: 'Doop', text: '@Doop bigger' })]
     vi.spyOn(actions, 'getComments').mockReturnValue(stored)
-    const takeFeedback = vi.spyOn(actions, 'takeFeedbackFor')
     const takeComments = vi.spyOn(actions, 'takeAgentCommentsFor')
     const resolve = vi.spyOn(actions, 'resolveComment')
     const before = JSON.parse(JSON.stringify(stored))
     const { client, close } = await connect()
     try {
       await callComments(client, { canvas_id: CANVAS.id, agent_name: 'Claude' })
-      expect(takeFeedback).not.toHaveBeenCalled()
       expect(takeComments).not.toHaveBeenCalled()
       expect(resolve).not.toHaveBeenCalled()
       expect(stored).toEqual(before)
@@ -284,25 +282,25 @@ describe('get_comments MCP tool', () => {
     }
   })
 
-  it('heartbeats for the resolved agent_name without delivering feedback', async () => {
+  it('heartbeats for the resolved agent_name without claiming a comment', async () => {
     vi.spyOn(actions, 'getComments').mockReturnValue([])
     const heartbeat = vi.spyOn(actions, 'heartbeatAgent').mockImplementation(() => {})
-    const takeFeedback = vi.spyOn(actions, 'takeFeedbackFor')
+    const takeComments = vi.spyOn(actions, 'takeAgentCommentsFor')
     const { client, close } = await connect()
     try {
       await callComments(client, { canvas_id: CANVAS.id, agent_name: 'Claude' })
       expect(heartbeat).toHaveBeenCalledTimes(1)
       expect(heartbeat.mock.calls[0]?.[0]).toBe(CANVAS.id)
-      expect(takeFeedback).not.toHaveBeenCalled()
+      expect(takeComments).not.toHaveBeenCalled()
 
       /* A call that omits the name still resolves one — the session remembers
          the agent this account works as — so presence still follows it. What
-         must never change is that reading claims no feedback. */
+         must never change is that reading claims no comment. */
       heartbeat.mockClear()
       await callComments(client, { canvas_id: CANVAS.id })
       expect(heartbeat).toHaveBeenCalledTimes(1)
       expect(heartbeat.mock.calls[0]?.[1]).toMatchObject({ name: 'Claude' })
-      expect(takeFeedback).not.toHaveBeenCalled()
+      expect(takeComments).not.toHaveBeenCalled()
     } finally {
       await close()
     }

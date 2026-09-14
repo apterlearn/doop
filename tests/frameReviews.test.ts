@@ -16,7 +16,8 @@ import type { Canvas, Frame } from '../shared/types.ts'
 /* Verification reports are persisted, so this file drives the real database:
    a PGlite cluster in a temp directory, migrated at boot exactly as the server
    does. What it proves is the part mocks cannot — that a report survives the
-   agent that made it, and that the delivery gate reads it back. */
+   agent that made it, and that a re-check after an edit records a new report
+   for the document it just ran on. */
 
 const dataRoot = mkdtempSync(path.join(tmpdir(), 'doop-frame-reviews-'))
 const OWNER_ID = 'reviews-owner'
@@ -97,13 +98,10 @@ beforeEach(async () => {
     () => {},
   )
   actions.hydrateLogs({
-    tasks: new Map(),
-    feedback: new Map(),
     comments: new Map(),
     activity: new Map(),
     decisions: new Map(),
     proposals: new Map(),
-    plans: new Map(),
   })
   const canvas: Canvas = {
     id: CANVAS_ID,
@@ -118,17 +116,8 @@ beforeEach(async () => {
   await persist.saveFrame(frame)
 })
 
-let cardSeq = 0
-function seedCard(agentName = 'Claude') {
-  cardSeq += 1
-  const card = actions.addQueuedCard(CANVAS_ID, `Card ${cardSeq}`, 'alice', undefined, undefined, 'alice')!
-  actions.claimCard(CANVAS_ID, card.id, agentName)
-  return card
-}
-
 describe.skipIf(!findBrowserPath())('stored verification reports', () => {
-  it('survives the agent that made it, and the gate reads it back', { timeout: 20_000 }, async () => {
-    const card = seedCard()
+  it('survives the agent that made it', { timeout: 20_000 }, async () => {
     const first = await connect()
     try {
       const review = await callTool(first.client, 'ready_for_review', {
@@ -146,19 +135,9 @@ describe.skipIf(!findBrowserPath())('stored verification reports', () => {
     } finally {
       await first.close()
     }
-
-    /* a different server instance, as a later session would be */
-    const second = await connect()
-    try {
-      const done = await callTool(second.client, 'complete_card', { card_id: card.id, agent_name: 'Claude' })
-      expect(done.isError).toBeFalsy()
-    } finally {
-      await second.close()
-    }
   })
 
-  it('marks the report stale once the frame changes, and clears it after a re-check', async () => {
-    const card = seedCard()
+  it('records a new report for the document a re-check ran on', async () => {
     const { client, close } = await connect()
     try {
       await callTool(client, 'ready_for_review', {
@@ -172,13 +151,8 @@ describe.skipIf(!findBrowserPath())('stored verification reports', () => {
         actions.resolveActor({ name: 'Claude', kind: 'agent', ownerId: OWNER_ID }),
       )
 
-      const blocked = await callTool(client, 'complete_card', { card_id: card.id, agent_name: 'Claude' })
-      expect(blocked.isError).toBe(true)
-      expect((blocked.parsed.error as unknown as { message: string }).message).toContain(
-        'changed after its last review',
-      )
-
-      /* the newest report is what the gate reads, so a fresh check unblocks it */
+      /* the frame moved on, so the earlier report no longer describes it: the
+         fresh check records the document it just ran on */
       const again = await callTool(client, 'ready_for_review', {
         canvas_id: CANVAS_ID,
         frame_id: frame.id,
@@ -189,37 +163,16 @@ describe.skipIf(!findBrowserPath())('stored verification reports', () => {
       expect(stored.length).toBeGreaterThanOrEqual(2)
       /* newest first: the current document is the one described */
       expect(stored[0]!.htmlSha).toBe(again.parsed.html_sha)
-
-      const done = await callTool(client, 'complete_card', { card_id: card.id, agent_name: 'Claude' })
-      expect(done.isError).toBeFalsy()
-    } finally {
-      await close()
-    }
-  })
-
-  it('does not carry one agent’s verification over to another’s frame', async () => {
-    const card = seedCard('Other')
-    const { client, close } = await connect()
-    try {
-      await callTool(client, 'ready_for_review', {
-        canvas_id: CANVAS_ID,
-        frame_id: frame.id,
-        agent_name: 'Claude',
-      })
-      /* the frame's last writer is Claude, so Other has nothing unverified and
-         nothing to answer for: the gate follows authorship, not the canvas */
-      const done = await callTool(client, 'complete_card', { card_id: card.id, agent_name: 'Other' })
-      expect(done.isError).toBeFalsy()
     } finally {
       await close()
     }
   })
 })
 
-/* The same gate, on a human's word. A reviewer reading the checks panel should
-   not have to wait for an agent to re-run the checks, and the report the button
-   produces has to be the same stored kind the panel and the delivery gate read
-   — not a second, parallel notion of "checked". */
+/* The same checks, on a human's word. A reviewer reading the checks panel
+   should not have to wait for an agent to re-run them, and the report the
+   button produces has to be the same stored kind the panel and the ship gate
+   read — not a second, parallel notion of "checked". */
 
 const REST_PORT = 4988
 

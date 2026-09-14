@@ -3,12 +3,11 @@ import * as ToggleGroupPrimitive from '@radix-ui/react-toggle-group'
 
 import { cn } from '@/lib/utils'
 
-/* One-of-N switches: the canvas's Canvas/Board views, the dashboard's
-   grid/list, the agent's model tier. Radix ToggleGroup makes the row a single
-   tab stop that the arrow keys move through — the hand-rolled buttons were
-   neither — and drives the selected look off data-state instead of a prop a
-   caller could forget to pass. Deselection is swallowed: these switches always
-   have exactly one answer. */
+/* One-of-N switches: the dashboard's grid/list and model-tier switches. Radix
+   ToggleGroup makes the row a single tab stop that the arrow keys move through
+   — the hand-rolled buttons were neither — and drives the selected look off
+   data-state instead of a prop a caller could forget to pass. Deselection is
+   swallowed: these switches always have exactly one answer. */
 function Segmented({
   className,
   value,
