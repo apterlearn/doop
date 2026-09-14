@@ -146,8 +146,9 @@ calls, in this order:
    @mentioned to that role and returns them (id, frame, selector, the human's text, who
    wrote it); the pin flips to "you are on it" so two connected agents do not both do the
    same note. Notes are addressed to ROLES, so pass the role you are working (doop, ux,
-   copy, brand, a11y, polish) — omit it only to match notes that @mentioned your agent_name
-   itself. It is idempotent per comment — calling it again returns nothing once a note is
+   copy, brand, a11y, polish) — omit it only when your agent_name already says which role
+   you work (connecting as "a11y" or "Accessibility" covers that role). It is idempotent
+   per comment — calling it again returns nothing once a note is
    yours — and an empty list means nothing is addressed to that role, not an error.
 3. **Do it, then answer.** Work the note like any design task (get_canvas for context,
    edit the frame, review with get_frame_screenshot), then reply_to_comment({ comment_id,
@@ -166,9 +167,10 @@ Waiting is the other half of the channel. wait_for_events parks until something 
 canvas needs you — a comment, an answer to your question, a proposal of yours being
 resolved, a human taking over a frame you were streaming into — and returns a cursor you
 pass back on the next call instead of polling. Pass the same role you claim with:
-wait_for_events({ canvas_id, cursor, role: "a11y" }). A human's note is addressed to a
-ROLE, so a wait that names only your agent_name sleeps through it — the one thing that
-could have woken you arrives while you are parked, and you time out for nothing.
+wait_for_events({ canvas_id, cursor, role: "a11y" }) — unless your agent_name already
+names the role you work. A human's note is addressed to a ROLE, so a wait that carries
+neither sleeps through it — the one thing that could have woken you arrives while you are
+parked, and you time out for nothing.
 ask_human is the blocking question: one ask to the humans on the canvas, answered inside
 the call or left open for get_answers. Neither is a loop — park, then work.
 

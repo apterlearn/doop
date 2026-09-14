@@ -651,7 +651,7 @@ describe('wait_for_events', () => {
     expect(blindParsed.timed_out, 'without a role the note is not addressed to this agent').toBe(true)
     expect(blindParsed.events).toEqual([])
     /* and the timeout says why, instead of letting the agent park forever */
-    expect(blindResult.allText).toContain('without a role')
+    expect(blindResult.allText).toContain('resolves to a role')
     expect(blindResult.allText).toContain('a11y')
     await close()
   })

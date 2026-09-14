@@ -2229,7 +2229,7 @@ export function buildMcpServer(
     {
       title: 'Claim the comments addressed to you',
       description:
-        'Take the element comments a human @mentioned your role in, so two connected agents do not both do the same note: each one is claimed under your agent_name and its pin flips to "you are on it" for the human watching. Humans address work by @mentioning a role, so pass role: "<id>" (doop, ux, copy, brand, a11y, polish) to take the notes for the role you are working — without it your agent_name is used, which only matches notes that @mentioned you by name. Returns the notes it claimed — id, frame, selector, the text the human wrote and who wrote it — and an empty list when nothing is addressed to that role (not an error). Idempotent per comment: claiming again returns nothing, because the note is already yours. Do the work, answer in the thread with reply_to_comment, and close the note with resolve_comment; call fail_comment instead when you cannot finish it.',
+        'Take the element comments a human @mentioned your role in, so two connected agents do not both do the same note: each one is claimed under your agent_name and its pin flips to "you are on it" for the human watching. Humans address work by @mentioning a role, so pass role: "<id>" (doop, ux, copy, brand, a11y, polish) to take the notes for the role you are working — without it your agent_name decides, which takes the notes addressed to you by name, or to the role your name itself names (an agent connected as "a11y" or "Accessibility" already covers that role). Returns the notes it claimed — id, frame, selector, the text the human wrote and who wrote it — and an empty list when nothing is addressed to that role (not an error). Idempotent per comment: claiming again returns nothing, because the note is already yours. Do the work, answer in the thread with reply_to_comment, and close the note with resolve_comment; call fail_comment instead when you cannot finish it.',
       annotations: { readOnlyHint: false, destructiveHint: false },
       inputSchema: {
         canvas_id: z.string(),
@@ -7805,7 +7805,7 @@ export function buildMcpServer(
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
       title: 'Wait for human events',
       description:
-        'Block until something on this canvas needs you: a comment (a human @mentioning a role, replying to you, or claiming your note), an answer to your question, a proposal of yours being resolved, or a human taking over a frame you were streaming into. Pass the cursor from your previous call to only see newer events; an empty cursor means everything pending. Between tasks, call this instead of ending your session — it also keeps your presence alive so the humans see you connected. Resolves on the first event or on timeout (whichever comes first); a timeout is normal, just call again. Pass `role` for the role you work: humans address work by @mentioning a role, and without it you will sleep through notes meant for you (notes that @mention your agent_name reach you either way).',
+        'Block until something on this canvas needs you: a comment (a human @mentioning a role, replying to you, or claiming your note), an answer to your question, a proposal of yours being resolved, or a human taking over a frame you were streaming into. Pass the cursor from your previous call to only see newer events; an empty cursor means everything pending. Between tasks, call this instead of ending your session — it also keeps your presence alive so the humans see you connected. Resolves on the first event or on timeout (whichever comes first); a timeout is normal, just call again. Pass `role` for the role you work: humans address work by @mentioning a role, so without it you are woken only by notes addressed to your own name, or to a role your name itself names (connecting as "a11y" covers that role).',
       inputSchema: {
         canvas_id: z.string(),
         cursor: z
@@ -7817,7 +7817,7 @@ export function buildMcpServer(
           .string()
           .optional()
           .describe(
-            'The role you are working, as an id or a name (e.g. "a11y" or "Accessibility"). Humans address work by @mentioning a role, so pass this or you will sleep through notes meant for you. Notes that @mention your agent_name by name reach you either way.',
+            'The role you are working, as an id or a name (e.g. "a11y" or "Accessibility"). Humans address work by @mentioning a role, so pass this unless your agent_name is already the role you work — a name that names a role covers it. Notes that @mention your agent_name reach you either way.',
           ),
         agent_name: agentName,
       },
@@ -7864,7 +7864,7 @@ export function buildMcpServer(
       if (summarized.length === 0 && !wanted && !roleFor(actor.name))
         return structuredWithNudge(
           { cursor: newCursor, timed_out: true, events: [] },
-          `Nothing arrived in ${Math.round(timeoutMs / 1000)}s — and you parked without a role, so notes @mentioning a role did not reach you. Humans address work to roles: pass role: "<id>" (one of ${AGENT_ROLES.map((r) => r.id).join(', ')}) to be woken for the role you work.`,
+          `Nothing arrived in ${Math.round(timeoutMs / 1000)}s, and nothing about your identity resolves to a role — so notes @mentioning one did not reach you. Humans address work to roles: pass role: "<id>" (one of ${AGENT_ROLES.map((r) => r.id).join(', ')}) to be woken for the role you work.`,
         )
       return structured({
         cursor: newCursor,
