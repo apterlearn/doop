@@ -10,24 +10,15 @@ import { ReviewPanel } from './ReviewPanel'
 import { TokensPanel } from './TokensPanel'
 import { ChecksPanel } from './ChecksPanel'
 import { ComponentsPanel } from './ComponentsPanel'
-import { RunPanel } from './RunPanel'
 import { Panel, PanelBody, PanelHeader, PanelTab, PanelTabPanel, PanelTabs, PanelTabsRoot } from './ui/panel'
 import { Button } from './ui/button'
 import { Tooltip } from './ui/tooltip'
 import { PanelCollapseRightIcon } from './ui/icons'
 import { Input } from './ui/input'
 import { Dot } from './ui/dot'
-import { isResidentLimit } from './TeamAllowance'
 import { ListMeta, ListSection } from './ui/list'
 
 const emptyNote = 'px-4 py-6 text-center text-[13px] text-ink-faint'
-
-/* feedback and retries are metered like any other resident task — a 403
-   here means the free tier ran out, so raise the connect wall */
-function reportLimit(err: unknown) {
-  if (isResidentLimit(err)) useStore.getState().setLimitWall(true)
-  else console.error(err)
-}
 
 function duration(t: AgentTask): string {
   const end = t.endedAt ?? Date.now()
@@ -87,9 +78,6 @@ export function ActivityPanel({
             <PanelTab value="checks" title="What the automated quality checks found on each frame">
               Checks
             </PanelTab>
-            <PanelTab value="run" title="What the agent did, tool call by tool call">
-              Run
-            </PanelTab>
             <PanelTab value="agents" title="MCP clients connected to your account — revoke one to cut it off">
               Clients
             </PanelTab>
@@ -124,9 +112,6 @@ export function ActivityPanel({
         <PanelTabPanel value="checks">
           <ChecksPanel />
         </PanelTabPanel>
-        <PanelTabPanel value="run">
-          <RunPanel />
-        </PanelTabPanel>
         <PanelTabPanel value="memory">
           <MemoryPanel />
         </PanelTabPanel>
@@ -142,19 +127,6 @@ export function ActivityPanel({
    pulses at the top of each group, finished ones are checked off below. */
 function TaskList() {
   const tasks = useStore((s) => s.tasks)
-  const canvasId = useStore((s) => s.canvas?.id)
-
-  /* Each finished run's journal is what says whether it can be undone and what
-     it changed — the row cannot offer the undo without it. A journal is
-     written as its run ends, so a terminal task is exactly when to re-read. */
-  const finished = useMemo(() => tasks.filter((t) => t.endedAt || t.failedAt || t.cancelledAt).length, [tasks])
-  useEffect(() => {
-    if (!canvasId) return
-    void api
-      .runJournals(canvasId)
-      .then((rows) => useStore.getState().setRunJournals(rows))
-      .catch(console.error)
-  }, [canvasId, finished])
 
   const groups = useMemo(() => {
     const byAgent = new Map<string, AgentTask[]>()
@@ -346,27 +318,8 @@ function TaskGroup({ list }: { list: AgentTask[] }) {
 function TaskRow({ task }: { task: AgentTask }) {
   const canvasId = useStore((s) => s.canvas?.id)
   const feedback = useStore((s) => s.feedback.filter((f) => f.taskId === task.id))
-  const journals = useStore((s) => s.runJournals)
   const [replying, setReplying] = useState(false)
   const [draft, setDraft] = useState('')
-  const [undoing, setUndoing] = useState(false)
-  const [undoNote, setUndoNote] = useState('')
-  const [undone, setUndone] = useState(false)
-
-  /* The run this task was: a journal names the card it ran for, so that link is
-     exact. A status task has no card, so it falls back to the agent's journal
-     written inside the window the task was live — the resident runs one run per
-     agent at a time, so at most one journal can be in that window. Undoing is
-     destructive, so the window is only ever closed (a finished task) and never
-     guessed from a name alone. */
-  const endedAt = task.cancelledAt ?? task.failedAt ?? task.endedAt
-  const journal =
-    undone || !endedAt
-      ? undefined
-      : (journals.find((j) => j.cardId === task.id) ??
-        journals.find((j) => j.agentName === task.agentName && j.at >= task.startedAt && j.at <= endedAt))
-  /* a run with no recorded frame changes has nothing to put back */
-  const undoable = !!canvasId && !!journal?.runId && (journal.frames?.length ?? 0) > 0
 
   async function submit() {
     const text = draft.trim()
@@ -376,28 +329,7 @@ function TaskRow({ task }: { task: AgentTask }) {
     try {
       await api.sendTaskFeedback(task.id, text)
     } catch (e) {
-      reportLimit(e)
-    }
-  }
-
-  async function undoRun() {
-    if (!canvasId || !journal?.runId || undoing) return
-    setUndoing(true)
-    setUndoNote('')
-    try {
-      const { reverted, skipped } = await api.revertRun(canvasId, journal.runId)
-      setUndone(true)
-      setUndoNote(
-        skipped.length
-          ? `Put ${reverted.length} frame${reverted.length === 1 ? '' : 's'} back · left ${skipped.length} alone: ${skipped
-              .map((s) => s.reason)
-              .join(' · ')}`
-          : `Put ${reverted.length} frame${reverted.length === 1 ? '' : 's'} back`,
-      )
-    } catch {
-      setUndoNote('Couldn’t undo that run — try again.')
-    } finally {
-      setUndoing(false)
+      console.error(e)
     }
   }
 
@@ -457,7 +389,7 @@ function TaskRow({ task }: { task: AgentTask }) {
           <Button
             variant="danger-solid"
             size="pill"
-            onClick={() => api.retryCard(canvasId, task.id).catch(reportLimit)}
+            onClick={() => api.retryCard(canvasId, task.id).catch(console.error)}
           >
             ↻ Retry
           </Button>
@@ -468,20 +400,9 @@ function TaskRow({ task }: { task: AgentTask }) {
             size="pill"
             className="flex-none"
             title="Stop this agent"
-            onClick={() => api.stopAgentWork(canvasId, task.agentName).catch(reportLimit)}
+            onClick={() => api.stopAgentWork(canvasId, task.agentName).catch(console.error)}
           >
             Stop
-          </Button>
-        ) : null}
-        {undoable && !undoing ? (
-          <Button
-            variant="ghost"
-            size="pill"
-            className="flex-none px-2.5 text-ink-soft hover:border-ink-soft hover:bg-transparent hover:text-ink"
-            title="Put every frame this run changed back to the version it started from"
-            onClick={() => void undoRun()}
-          >
-            ↶ Undo run
           </Button>
         ) : null}
         {!replying && (
@@ -496,7 +417,6 @@ function TaskRow({ task }: { task: AgentTask }) {
           </Button>
         )}
       </div>
-      {undoNote && <div className="mt-px mr-4 mb-1 ml-[34px] text-[11px] leading-[1.4] text-ink-faint">{undoNote}</div>}
       {feedback
         .slice()
         .reverse()
@@ -512,7 +432,7 @@ function TaskRow({ task }: { task: AgentTask }) {
                 <Button
                   variant="danger-solid"
                   size="pill"
-                  onClick={() => api.retryTaskFeedback(f.id).catch(reportLimit)}
+                  onClick={() => api.retryTaskFeedback(f.id).catch(console.error)}
                 >
                   ↻ Retry
                 </Button>
@@ -618,7 +538,6 @@ function ClientsList() {
   const [clients, setClients] = useState<ConnectedAgent[] | null>(null)
   const [failed, setFailed] = useState(false)
   const [note, setNote] = useState('')
-  const version = useStore((s) => s.allowanceVersion)
   useEffect(() => {
     let live = true
     api
@@ -636,7 +555,7 @@ function ClientsList() {
     return () => {
       live = false
     }
-  }, [version])
+  }, [])
 
   if (clients === null) {
     return (
@@ -681,7 +600,12 @@ function ClientsList() {
               setNote('')
               api
                 .revokeMcpAgent(c.clientId)
-                .then(() => useStore.getState().allowanceChanged())
+                .then(async () => {
+                  /* the revoked client must leave the list, or the row offers a
+                     revoke that can only fail */
+                  const list = await api.listMcpAgents().catch(() => null)
+                  if (list) setClients(list)
+                })
                 .catch(() => setNote(`Couldn't revoke ${c.name} — try again.`))
             }}
           >

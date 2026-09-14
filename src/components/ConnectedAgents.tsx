@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react'
 import { api, type ConnectedAgent } from '../lib/api'
-import { useStore } from '../lib/store'
 import { timeAgo } from '../lib/time'
 import { Button } from './ui/button'
 import { Note } from './ui/note'
@@ -16,9 +15,6 @@ export function ConnectedAgents() {
   const [clients, setClients] = useState<ConnectedAgent[] | null>(null)
   const [failed, setFailed] = useState(false)
   const [note, setNote] = useState('')
-  /* revoking bumps the shared counter, so this pane and the canvas's Clients
-     tab refresh together */
-  const version = useStore((s) => s.allowanceVersion)
 
   useEffect(() => {
     let live = true
@@ -37,14 +33,17 @@ export function ConnectedAgents() {
     return () => {
       live = false
     }
-  }, [version])
+  }, [])
 
   async function revoke(clientId: string) {
     try {
       await api.revokeMcpAgent(clientId)
-      useStore.getState().allowanceChanged()
       setNote('Revoked.')
       window.setTimeout(() => setNote(''), 4000)
+      /* the revoked client must leave the list, or the row offers a revoke
+         that can only fail */
+      const list = await api.listMcpAgents().catch(() => null)
+      if (list) setClients(list)
     } catch (err) {
       console.error(err)
       setNote('Couldn’t revoke that client — try again.')

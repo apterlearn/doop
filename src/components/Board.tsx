@@ -12,9 +12,8 @@ import {
   roleById,
   roleName,
 } from '../../shared/agents'
-import type { AgentTask, Frame, TaskUsage } from '../../shared/types'
+import type { AgentTask, Frame } from '../../shared/types'
 import { posthog } from '../lib/posthog'
-import { MeterLine, isResidentLimit, useAllowance } from './TeamAllowance'
 import { Button } from './ui/button'
 import { Textarea } from './ui/textarea'
 import { Card } from './ui/card'
@@ -57,19 +56,6 @@ const countCls = 'font-mono text-[11px] text-ink-faint'
 const cardBase = 'group relative px-4 py-3.5'
 /* mirrors MAX_CARD_CHARS in server/actions.ts */
 const MAX_CARD_CHARS = 4_000
-/** What a card's run spent, as the provider reported it. Shown on the running
- *  card so a human watching a long run can see the meter move. */
-function UsageLine({ usage }: { usage: TaskUsage }) {
-  const tokens = usage.input + usage.output + usage.cacheRead + usage.cacheWrite
-  if (tokens === 0) return null
-  return (
-    <div className="mt-1 text-[11px] tabular-nums text-ink-faint">
-      {tokens.toLocaleString()} tokens
-      {usage.cacheRead > 0 && <span> · {usage.cacheRead.toLocaleString()} cached</span>}
-      {usage.model && <span> · {usage.model}</span>}
-    </div>
-  )
-}
 
 const cardH3Cls =
   'line-clamp-8 break-words pr-4 font-display text-[14.5px] font-[650] leading-[1.35] tracking-[-0.01em]'
@@ -267,7 +253,6 @@ export function Board({ canvasId }: { canvasId: string }) {
   const activePageId = useStore((s) => s.activePageId)
   const [draft, setDraft] = useState<string | null>(null)
   const [agents, setAgents] = useState<string[]>([DEFAULT_ROLE_ID])
-  const { allowance, refresh } = useAllowance()
 
   /* a stopped card belongs with the failures: it needs a human decision, and
      its card body already reads "Attempt stopped" */
@@ -277,8 +262,6 @@ export function Board({ canvasId }: { canvasId: string }) {
       tasks.filter((t) => t.queuedBy && !t.agentName && !t.failedAt && !t.cancelledAt && !t.endedAt).sort(queueOrder),
     [tasks],
   )
-  /* paused cards stay claimed — an agent still owns them, the run is just
-     held — so they read in the in-progress column with a Resume control */
   const inProgress = tasks.filter((t) => t.agentName && !t.failedAt && !t.cancelledAt && !t.endedAt)
   const done = tasks.filter((t) => t.endedAt).slice(0, 14)
 
@@ -355,10 +338,8 @@ export function Board({ canvasId }: { canvasId: string }) {
       )
       posthog.capture('agent_task_queued', { pipeline_length: pipeline.length })
     } catch (err) {
-      if (isResidentLimit(err)) useStore.getState().setLimitWall(true)
-      else console.error(err)
+      console.error(err)
     }
-    refresh()
   }
 
   /* picking an agent from the roster opens a card already assigned to it */
@@ -419,12 +400,7 @@ export function Board({ canvasId }: { canvasId: string }) {
                   variant="danger-solid"
                   size="pill"
                   className="mt-2.5 px-[11px] py-[5px]"
-                  onClick={() =>
-                    api.retryCard(canvasId, t.id).catch((err) => {
-                      if (isResidentLimit(err)) useStore.getState().setLimitWall(true)
-                      else console.error(err)
-                    })
-                  }
+                  onClick={() => api.retryCard(canvasId, t.id).catch(console.error)}
                 >
                   ↻ Retry
                 </Button>
@@ -595,12 +571,11 @@ export function Board({ canvasId }: { canvasId: string }) {
                   >
                     Queue it
                   </Button>
-                  <MeterLine allowance={allowance} />
                   <span className={hintCls}>
                     {agents.length === 0
-                      ? 'Doop picks it up right away'
+                      ? 'Any agent connected over MCP can pick it up'
                       : agents.length === 1
-                        ? `${roleName(agents[0])} picks it up right away`
+                        ? `${roleName(agents[0])} takes it from here`
                         : `${roleName(agents[0])} starts, then ${agents.slice(1).map(roleName).join(' → ')}`}
                   </span>
                 </div>
@@ -632,7 +607,7 @@ export function Board({ canvasId }: { canvasId: string }) {
                 <div className={metaCls}>
                   <Dot
                     size="sm"
-                    className={cn(!t.pausedAt && 'animate-[stream-pulse_1.2s_ease-in-out_infinite]')}
+                    className="animate-[stream-pulse_1.2s_ease-in-out_infinite]"
                     style={{ background: t.color }}
                   />
                   <b className="inline-flex items-center gap-1">
@@ -644,43 +619,17 @@ export function Board({ canvasId }: { canvasId: string }) {
                   <span> · {timeAgo(t.claimedAt ?? t.startedAt)}</span>
                 </div>
                 <TargetChip task={t} frames={frames} />
-                {t.usage && <UsageLine usage={t.usage} />}
-                {t.pausedAt ? (
-                  <div className="mt-2.5 flex items-center gap-2.5">
-                    <Button
-                      size="pill"
-                      className="px-[11px] py-[5px]"
-                      title="Let the agent pick this card back up"
-                      onClick={() => api.resumeCard(canvasId, t.id).catch(console.error)}
-                    >
-                      ▶ Resume
-                    </Button>
-                    <span className="text-[11.5px] text-ink-faint">
-                      paused{t.pausedBy ? ` by ${t.pausedBy}` : ''} · {timeAgo(t.pausedAt)}
-                    </span>
-                  </div>
-                ) : (
-                  <div className="mt-2.5 flex items-center gap-2">
-                    <Button
-                      variant="ghost"
-                      size="pill"
-                      className="px-[11px] py-[5px]"
-                      title="Hold this run — the card stays claimed and can be resumed"
-                      onClick={() => api.pauseAgentWork(canvasId, t.agentName).catch(console.error)}
-                    >
-                      ⏸ Pause
-                    </Button>
-                    <Button
-                      variant="danger-solid"
-                      size="pill"
-                      className="px-[11px] py-[5px]"
-                      title="Stop this agent"
-                      onClick={() => api.stopAgentWork(canvasId, t.agentName).catch(console.error)}
-                    >
-                      Stop
-                    </Button>
-                  </div>
-                )}
+                <div className="mt-2.5 flex items-center gap-2">
+                  <Button
+                    variant="danger-solid"
+                    size="pill"
+                    className="px-[11px] py-[5px]"
+                    title="Stop this agent"
+                    onClick={() => api.stopAgentWork(canvasId, t.agentName).catch(console.error)}
+                  >
+                    Stop
+                  </Button>
+                </div>
               </Card>
             ))}
           </div>

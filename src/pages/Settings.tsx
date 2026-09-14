@@ -4,7 +4,6 @@ import { api } from '../lib/api'
 import { posthog } from '../lib/posthog'
 import { openCanvasTab } from '../lib/desktop'
 import { ModelAccountPanel } from '../components/ModelAccount'
-import { useAllowance } from '../components/TeamAllowance'
 import { AccountSettings } from '../components/AccountSettings'
 import { ConnectedAgents } from '../components/ConnectedAgents'
 import { AccountMenu, ConnectCard, IconBack, IconChevron, IconSpark, IconUser } from '../components/DashShell'
@@ -12,7 +11,6 @@ import { Tabs, TabsList, TabsTrigger } from '../components/ui/tabs'
 import { Button } from '../components/ui/button'
 import { Wordmark } from '../components/ui/wordmark'
 import { Card, CardDescription, CardHeader, CardTitle } from '../components/ui/card'
-import { Progress } from '../components/ui/progress'
 import {
   DashContent,
   DashHeader,
@@ -25,13 +23,13 @@ import {
   DashTitle,
 } from '../components/ui/dash'
 
-type Pane = 'agent' | 'account' | 'agents'
+type Pane = 'model' | 'account' | 'agents'
 
 /**
- * Account settings. Today it holds one thing — which model account the Doop
- * Agent runs on once the free tasks are spent — but it is the account-level
- * home for that kind of setting, so the canvas surfaces can link here instead
- * of carrying their own copy of it.
+ * Account settings: the model account agents can use for image generation and
+ * repo recon, who you are, and the MCP clients connected as you. It is the
+ * account-level home for all three, so the canvas surfaces can link here
+ * instead of carrying their own copy.
  *
  * It wears the same shell as the home dashboard: same rail, same top bar, same
  * account menu. Only the rail's middle changes, to a settings sub-nav.
@@ -39,11 +37,9 @@ type Pane = 'agent' | 'account' | 'agents'
 export function Settings() {
   /* the sub-nav switches panes rather than scrolling to an anchor — on a page
      this short an anchor jump looks like nothing happened */
-  const [pane, setPane] = useState<Pane>('agent')
-  const { allowance, refresh } = useAllowance()
-  const left = allowance ? Math.max(0, allowance.limit - allowance.used) : null
-  /* arriving from a canvas (the free-tier wall) should not cost you your
-     place — only same-origin canvas paths are honoured */
+  const [pane, setPane] = useState<Pane>('model')
+  /* arriving from a canvas should not cost you your place — only same-origin
+     canvas paths are honoured */
   const from = new URLSearchParams(location.search).get('from')
   const back = from && /^\/c\/[A-Za-z0-9_-]+$/.test(from) ? from : '/'
 
@@ -52,16 +48,6 @@ export function Settings() {
     posthog.capture('canvas_created')
     if (!openCanvasTab(canvas.id, canvas.name)) navigate(`/c/${canvas.id}`)
   }
-
-  const meter = allowance
-    ? allowance.byoModel
-      ? `Running on your ${allowance.byoKind === 'openai-key' ? 'OpenAI key' : 'ChatGPT subscription'}.`
-      : allowance.limit <= 0
-        ? 'No free tasks on this server — connect an account to use the Doop Agent.'
-        : left === 0
-          ? 'Your free tasks are used up.'
-          : `${left} of ${allowance.limit} free task${allowance.limit === 1 ? '' : 's'} left.`
-    : null
 
   return (
     <DashLayout>
@@ -78,8 +64,8 @@ export function Settings() {
 
         <DashSectionLabel>Settings</DashSectionLabel>
         <nav className="flex flex-col gap-0.5">
-          <DashNavItem icon={<IconSpark />} active={pane === 'agent'} onClick={() => setPane('agent')}>
-            Doop Agent
+          <DashNavItem icon={<IconSpark />} active={pane === 'model'} onClick={() => setPane('model')}>
+            Model account
           </DashNavItem>
           <DashNavItem icon={<IconUser />} active={pane === 'account'} onClick={() => setPane('account')}>
             Your account
@@ -119,11 +105,11 @@ export function Settings() {
           <div className="flex items-start gap-4 md:items-end">
             <div>
               <DashTitle>
-                {pane === 'agent' ? 'Doop Agent' : pane === 'account' ? 'Your account' : 'Connected agents'}
+                {pane === 'model' ? 'Model account' : pane === 'account' ? 'Your account' : 'Connected agents'}
               </DashTitle>
               <DashSubtitle>
-                {pane === 'agent'
-                  ? 'Which model account the agent runs on, for every canvas you work on.'
+                {pane === 'model'
+                  ? 'The model account your agents use for image generation and repo recon, on every canvas.'
                   : pane === 'account'
                     ? 'Who you are on every canvas — and how you get back into this one.'
                     : 'MCP clients acting as you — and how to cut one off.'}
@@ -133,8 +119,8 @@ export function Settings() {
 
           <Tabs value={pane} onValueChange={(next) => setPane(next as Pane)} className="mt-4 flex md:hidden">
             <TabsList className="h-10 w-full border border-line bg-surface p-1 shadow-card">
-              <TabsTrigger value="agent">
-                <IconSpark /> Doop Agent
+              <TabsTrigger value="model">
+                <IconSpark /> Model account
               </TabsTrigger>
               <TabsTrigger value="account">
                 <IconUser /> Your account
@@ -145,31 +131,16 @@ export function Settings() {
             </TabsList>
           </Tabs>
 
-          {pane === 'agent' ? (
+          {pane === 'model' ? (
             <Card className="mt-4 max-w-[1000px] overflow-hidden sm:mt-5">
               <CardHeader>
-                <CardTitle>Doop Agent</CardTitle>
+                <CardTitle>Model account</CardTitle>
                 <CardDescription>
-                  The Doop Agent designs on your canvases without a client to connect.{' '}
-                  {allowance && allowance.limit > 0
-                    ? 'Every account gets a few tasks on us. Connect an account of your own and it takes over from the next task — no limits, nothing metered.'
-                    : 'It runs on an account you connect — your ChatGPT subscription or an OpenAI key. No limits, nothing metered.'}
+                  Agents connected over MCP use this account for image generation, repo recon and design distillation.
+                  It runs on an account you connect — your ChatGPT subscription or an [OI] key.
                 </CardDescription>
-                {meter && (
-                  <div className="mt-[11px] flex flex-col items-start gap-[7px] text-[11.5px] text-ink-faint sm:flex-row sm:items-center sm:gap-2.5">
-                    {allowance && allowance.limit > 0 && !allowance.byoModel && (
-                      <Progress
-                        className="w-[min(100%,240px)] sm:w-[180px]"
-                        value={left ?? 0}
-                        max={allowance.limit}
-                        aria-label="Free Doop Agent tasks left"
-                      />
-                    )}
-                    <span>{meter}</span>
-                  </div>
-                )}
               </CardHeader>
-              <ModelAccountPanel onChange={refresh} />
+              <ModelAccountPanel />
             </Card>
           ) : pane === 'account' ? (
             <AccountSettings />

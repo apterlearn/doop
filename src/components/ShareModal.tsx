@@ -1,30 +1,54 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   COMMUNITY_CATEGORIES,
   COMMUNITY_CATEGORY_LABELS,
   type Canvas,
+  type CanvasRelease,
   type CommunityCategory,
 } from '../../shared/types'
 import { navigate } from '../App'
-import { api, ApiError, type CanvasMember } from '../lib/api'
+import { api, ApiError, type CanvasMember, type GithubConnectionInfo } from '../lib/api'
 import { authClient } from '../lib/auth'
 import { posthog } from '../lib/posthog'
+import { timeAgo } from '../lib/time'
+import { ConfirmDialog } from './ui/alert-dialog'
 import { Avatar } from './ui/avatar'
 import { Button } from './ui/button'
 import { Checkbox } from './ui/checkbox'
-import { XIcon } from './ui/icons'
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from './ui/collapsible'
+import { GithubIcon, XIcon } from './ui/icons'
 import { Input } from './ui/input'
 import { Modal, ModalTitle } from './ui/modal'
+import { Note } from './ui/note'
 import { Textarea } from './ui/textarea'
 import { ToggleChipGroup, ToggleChipItem } from './ui/toggle-chip'
 
 type ShareableCanvas = Pick<
   Canvas,
-  'id' | 'name' | 'ownerId' | 'linkAccess' | 'memberIds' | 'publishedAt' | 'description' | 'category'
+  | 'id'
+  | 'name'
+  | 'ownerId'
+  | 'linkAccess'
+  | 'memberIds'
+  | 'publishedAt'
+  | 'description'
+  | 'category'
+  | 'publishedReleaseId'
 >
 type SharePatch = Partial<
-  Pick<ShareableCanvas, 'linkAccess' | 'memberIds' | 'publishedAt' | 'description' | 'category'>
+  Pick<ShareableCanvas, 'linkAccess' | 'memberIds' | 'publishedAt' | 'description' | 'category' | 'publishedReleaseId'>
 >
+
+/* The gallery pin's "no release" choice. Release ids are nanoids, so this can
+   never collide with one. */
+const LIVE_PIN = 'live'
+
+/** One ship action at a time; the value is also the busy button's label key. */
+type ShipBusy = 'zip' | 'code' | 'pull' | 'update' | 'freeze' | null
+
+/** How many releases a collapsed list shows before the rest go behind a
+ *  disclosure — the modal is a fixed-height card, not a page. */
+const SHOWN_RELEASES = 3
 
 /* One sharing surface for the canvas and dashboard. The caller owns canvas
    state; this component reports optimistic access changes back to it. */
@@ -44,6 +68,9 @@ export function ShareModal({
   const isOwner = !!canvas.ownerId && canvas.ownerId === meId
   const linkEdits = canvas.linkAccess === 'edit'
   const [people, setPeople] = useState<CanvasMember[] | null>(null)
+  /* frozen snapshots, newest first — the ship section lists them and the
+     listing's pin picker chooses among them, so both read this one copy */
+  const [releases, setReleases] = useState<CanvasRelease[] | null>(null)
   const [email, setEmail] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -58,6 +85,18 @@ export function ShareModal({
       active = false
     }
   }, [canvas.id])
+
+  useEffect(() => {
+    if (!isOwner) return
+    let active = true
+    api
+      .listReleases(canvas.id)
+      .then((list) => active && setReleases(list))
+      .catch(() => active && setReleases([]))
+    return () => {
+      active = false
+    }
+  }, [canvas.id, isOwner])
 
   async function invite() {
     const clean = email.trim()
@@ -208,8 +247,16 @@ export function ShareModal({
           </Button>
         </div>
         {isOwner && (
-          <CommunityListing canvas={canvas} busy={busy} setBusy={setBusy} setError={setError} onChange={onChange} />
+          <CommunityListing
+            canvas={canvas}
+            releases={releases ?? []}
+            busy={busy}
+            setBusy={setBusy}
+            setError={setError}
+            onChange={onChange}
+          />
         )}
+        {isOwner && <ShipSection canvas={canvas} releases={releases} setReleases={setReleases} />}
       </>
     </Modal>
   )
@@ -220,21 +267,31 @@ export function ShareModal({
    with its own switch and its own blurb. */
 function CommunityListing({
   canvas,
+  releases,
   busy,
   setBusy,
   setError,
   onChange,
 }: {
   canvas: ShareableCanvas
+  releases: CanvasRelease[]
   busy: boolean
   setBusy: (busy: boolean) => void
   setError: (error: string | null) => void
   onChange: (patch: SharePatch) => void
 }) {
   const published = canvas.publishedAt !== undefined
+  const livePin = canvas.publishedReleaseId ?? null
   const [description, setDescription] = useState(canvas.description ?? '')
   const [category, setCategory] = useState<CommunityCategory>(canvas.category ?? 'website')
-  const dirty = published && (description.trim() !== (canvas.description ?? '') || category !== canvas.category)
+  /* the pin the human has chosen but not saved yet; `live` is the no-pin
+     choice, so a chosen release and "the live canvas" are one control */
+  const [pin, setPin] = useState(livePin ?? LIVE_PIN)
+  const dirty =
+    published &&
+    (description.trim() !== (canvas.description ?? '') ||
+      category !== canvas.category ||
+      (pin === LIVE_PIN ? null : pin) !== livePin)
 
   async function save(next: boolean) {
     if (busy) return
@@ -242,13 +299,23 @@ function CommunityListing({
     setError(null)
     try {
       if (next) {
-        const listing = await api.publishCanvas(canvas.id, { description: description.trim(), category })
+        /* a release with no frames is not a listing — the server refuses it,
+           and the picker never offers it */
+        const releaseId = pin === LIVE_PIN ? null : pin
+        const listing = await api.publishCanvas(canvas.id, { description: description.trim(), category }, releaseId)
         if (!published) posthog.capture('canvas_published')
-        onChange(listing)
+        /* what the listing carries is the pin we asked for: the server
+           validates it or refuses the publish, and null clears it */
+        onChange({ ...listing, publishedReleaseId: releaseId ?? undefined })
       } else {
         await api.unpublishCanvas(canvas.id)
         posthog.capture('canvas_unpublished')
-        onChange({ publishedAt: undefined, description: undefined, category: undefined })
+        onChange({
+          publishedAt: undefined,
+          description: undefined,
+          category: undefined,
+          publishedReleaseId: undefined,
+        })
       }
     } catch (caught) {
       setError(caught instanceof ApiError ? String(caught.body.error ?? 'publish failed') : 'publish failed')
@@ -256,6 +323,18 @@ function CommunityListing({
       setBusy(false)
     }
   }
+
+  const pinned = releases.find((release) => release.id === livePin)
+  /* a listing carries a release id, and the list the server hands back is
+     paged — so say the pin is outside this list rather than that it is gone */
+  const pinNote = !published
+    ? 'What a visitor sees once this canvas is listed.'
+    : !livePin
+      ? 'The listing shows the live canvas — every edit reaches the gallery.'
+      : pinned
+        ? `Pinned to “${pinned.name}” — visitors get that frozen snapshot, whatever the canvas does next.`
+        : 'Pinned to a release this list doesn’t carry.'
+  const pinnable = releases.filter((release) => release.frames.length > 0)
 
   return (
     <div className="mt-3.5 border-t border-line-soft pt-3.5">
@@ -269,6 +348,27 @@ function CommunityListing({
       <p className="mt-1 pl-[26px] text-[12px] leading-snug text-ink-faint">
         People can preview it and copy it into their own account. Your canvas stays private.
       </p>
+      {pinnable.length > 0 && (
+        <div className="mt-3 flex flex-col gap-1.5 pl-[26px]">
+          <span className="text-[12px] font-semibold text-ink-soft">Gallery shows</span>
+          {/* a canvas can carry a lot of releases: the cloud scrolls rather
+              than pushing the rest of the modal down, and every release stays
+              reachable */}
+          <div className="max-h-[104px] overflow-y-auto pr-1">
+            <ToggleChipGroup aria-label="Gallery preview source" className="gap-1.5" value={pin} onValueChange={setPin}>
+              <ToggleChipItem value={LIVE_PIN} className="px-2.5 py-1 text-[12px]" disabled={busy}>
+                The live canvas
+              </ToggleChipItem>
+              {pinnable.map((release) => (
+                <ToggleChipItem key={release.id} value={release.id} className="px-2.5 py-1 text-[12px]" disabled={busy}>
+                  {release.name}
+                </ToggleChipItem>
+              ))}
+            </ToggleChipGroup>
+          </div>
+          <Note>{pinNote}</Note>
+        </div>
+      )}
       {published && (
         <div className="mt-3 flex flex-col gap-2.5 pl-[26px]">
           <Textarea
@@ -299,6 +399,382 @@ function CommunityListing({
           )}
         </div>
       )}
+    </div>
+  )
+}
+
+/* Ship: the half of the loop that leaves doop — the canvas as a file, as a
+   pull request against a connected repo, and the frozen releases a handoff
+   link or a pinned listing points at. Owner-only, exactly like the listing
+   above: these spend the owner's repo credentials and rewrite their frames. */
+function ShipSection({
+  canvas,
+  releases,
+  setReleases,
+}: {
+  canvas: ShareableCanvas
+  releases: CanvasRelease[] | null
+  setReleases: (releases: CanvasRelease[]) => void
+}) {
+  const [busy, setBusy] = useState<ShipBusy>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
+  const [connections, setConnections] = useState<GithubConnectionInfo[] | null>(null)
+  const [repo, setRepo] = useState<string | null>(null)
+  const [prMessage, setPrMessage] = useState('')
+  /* the pull request this session opened: its number is what a later update
+     reports against, and its URL is what the human clicks through to */
+  const [pull, setPull] = useState<{ url: string; number: number } | null>(null)
+  const [releaseName, setReleaseName] = useState('')
+  /* the release whose Restore was clicked (awaiting confirmation), and the one
+     a restore is running for — the row being written over says so */
+  const [confirmRestore, setConfirmRestore] = useState<CanvasRelease | null>(null)
+  const [restoringId, setRestoringId] = useState<string | null>(null)
+  const [copied, setCopied] = useState<string | null>(null)
+  const [showAll, setShowAll] = useState(false)
+  const copyTimer = useRef<number | undefined>(undefined)
+
+  useEffect(() => () => window.clearTimeout(copyTimer.current), [])
+
+  /* The connection the pull request would spend. Same read the import surface
+     does; a canvas with no connection is the disabled state below, not an
+     error — nothing has failed yet. */
+  useEffect(() => {
+    let active = true
+    api
+      .listGithubConnections(canvas.id)
+      .then((list) => {
+        if (!active) return
+        setConnections(list)
+        setRepo((current) => current ?? list[0]?.repo ?? null)
+      })
+      .catch(() => active && setConnections([]))
+    return () => {
+      active = false
+    }
+  }, [canvas.id])
+
+  const connection = connections?.find((conn) => conn.repo === repo) ?? connections?.[0] ?? null
+
+  async function exportAs(format: 'zip' | 'code') {
+    if (busy) return
+    setBusy(format)
+    setError(null)
+    setNotice(null)
+    try {
+      const { url } = await api.exportCanvas(canvas.id, format)
+      /* the archive is a public asset URL, so the download is a link click —
+         nothing is fetched into memory to hand it back out */
+      const link = document.createElement('a')
+      link.href = url
+      link.download = format === 'zip' ? `${canvas.name}.zip` : `${canvas.name} (code).zip`
+      link.rel = 'noopener'
+      document.body.append(link)
+      link.click()
+      link.remove()
+    } catch (caught) {
+      setError(caught instanceof ApiError ? String(caught.body.error ?? 'the export failed') : 'the export failed')
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  async function openPull() {
+    if (busy || !connection) return
+    setBusy('pull')
+    setError(null)
+    setNotice(null)
+    try {
+      const opened = await api.openPullRequest(canvas.id, {
+        repo: connection.repo,
+        ...(prMessage.trim() ? { message: prMessage.trim() } : {}),
+      })
+      setPull(opened)
+      setPrMessage('')
+    } catch (caught) {
+      setError(
+        caught instanceof ApiError
+          ? String(caught.body.error ?? 'could not open the pull request')
+          : 'could not open the pull request',
+      )
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  async function updatePull() {
+    if (busy || !connection || !pull) return
+    setBusy('update')
+    setError(null)
+    setNotice(null)
+    try {
+      /* an empty message is the server's cue to describe the update itself */
+      const updated = await api.updatePullRequest(canvas.id, prMessage.trim(), connection.repo)
+      setPull({ url: updated.url, number: pull.number })
+      setPrMessage('')
+    } catch (caught) {
+      setError(
+        caught instanceof ApiError
+          ? String(caught.body.error ?? 'could not update the pull request')
+          : 'could not update the pull request',
+      )
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  async function freeze() {
+    if (busy || releases === null) return
+    setBusy('freeze')
+    setError(null)
+    setNotice(null)
+    try {
+      const release = await api.createRelease(canvas.id, releaseName.trim() || undefined)
+      setReleases([release, ...releases])
+      setReleaseName('')
+      setNotice(`Froze “${release.name}” — ${release.frames.length} frames.`)
+    } catch (caught) {
+      setError(
+        caught instanceof ApiError
+          ? String(caught.body.error ?? 'could not freeze a release')
+          : 'could not freeze a release',
+      )
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  async function restore(release: CanvasRelease) {
+    if (busy || restoringId) return
+    setRestoringId(release.id)
+    setError(null)
+    setNotice(null)
+    try {
+      await api.restoreRelease(canvas.id, release.id)
+      /* the frames land as ordinary edits, so the room — this canvas included
+         — is already being told what changed */
+      setNotice(`Restored “${release.name}” onto the canvas.`)
+    } catch (caught) {
+      setError(
+        caught instanceof ApiError ? String(caught.body.error ?? 'the restore was refused') : 'the restore was refused',
+      )
+    } finally {
+      setRestoringId(null)
+    }
+  }
+
+  async function copyRelease(release: CanvasRelease) {
+    setError(null)
+    try {
+      await navigator.clipboard.writeText(release.url)
+      setCopied(release.id)
+      window.clearTimeout(copyTimer.current)
+      copyTimer.current = window.setTimeout(
+        () => setCopied((current) => (current === release.id ? null : current)),
+        2000,
+      )
+    } catch {
+      setError('Couldn’t copy the link. Open the release and copy the URL from your browser instead.')
+    }
+  }
+
+  function releaseRow(release: CanvasRelease) {
+    const frames = release.frames.length
+    return (
+      <div key={release.id} className="flex items-center gap-2 px-[2px] py-1.5">
+        <span className="flex min-w-0 flex-1 flex-col leading-[1.3]">
+          <b className="overflow-hidden text-ellipsis whitespace-nowrap text-[13px] font-semibold">{release.name}</b>
+          <span className="overflow-hidden text-ellipsis whitespace-nowrap text-[12px] text-ink-faint">
+            {frames ? `${frames} frame${frames === 1 ? '' : 's'}` : 'no frames'} · {timeAgo(release.createdAt)} ·{' '}
+            {release.createdBy}
+          </span>
+        </span>
+        <Button
+          size="sm"
+          className="flex-none px-2.5 text-xs"
+          title={`Copy the public preview link (${release.url})`}
+          onClick={() => copyRelease(release)}
+        >
+          {copied === release.id ? 'Copied' : '⧉ Copy'}
+        </Button>
+        {/* an empty release has nothing to put back — restoring it can only
+            fail, so it offers no action rather than a dead one */}
+        {frames > 0 && (
+          <Button
+            size="sm"
+            variant="danger"
+            className="flex-none px-2.5 text-xs"
+            disabled={!!busy || restoringId !== null}
+            onClick={() => setConfirmRestore(release)}
+          >
+            {restoringId === release.id ? 'Restoring…' : 'Restore'}
+          </Button>
+        )}
+      </div>
+    )
+  }
+
+  return (
+    <div className="mt-3.5 flex flex-col gap-2.5 border-t border-line-soft pt-3.5">
+      <h3 className="text-[13px] font-semibold text-ink">Ship</h3>
+      <Note>
+        Hand the design to the people who build it: as a file, as a pull request on a connected repo, or as a frozen
+        version you can point at later.
+      </Note>
+
+      <div className="flex flex-col gap-1.5">
+        <b className="text-[12px] text-ink-soft">Export</b>
+        <div className="flex flex-wrap gap-2">
+          <Button size="sm" className="px-2.5 text-xs" disabled={!!busy} onClick={() => exportAs('zip')}>
+            {busy === 'zip' ? 'Zipping…' : 'Download ZIP'}
+          </Button>
+          <Button size="sm" className="px-2.5 text-xs" disabled={!!busy} onClick={() => exportAs('code')}>
+            {busy === 'code' ? 'Exporting…' : 'Export code'}
+          </Button>
+        </div>
+        <Note>
+          The ZIP is the canvas as one self-contained page; Export code is the repository file set a pull request
+          commits.
+        </Note>
+      </div>
+
+      <div className="flex flex-col gap-1.5 border-t border-line-soft pt-2.5">
+        <b className="text-[12px] text-ink-soft">Pull request</b>
+        {connection ? (
+          <>
+            <div className="flex items-center gap-2 text-[13px]">
+              <GithubIcon width={13} height={13} className="shrink-0 text-ink-faint" />
+              <b className="min-w-0 overflow-hidden text-ellipsis whitespace-nowrap font-semibold">
+                {connection.repo}
+                <span className="font-normal text-ink-faint">@{connection.branch}</span>
+              </b>
+              <Note className="mr-auto shrink-0">
+                {connection.frames
+                  ? `${connection.frames} screen${connection.frames === 1 ? '' : 's'}`
+                  : 'nothing imported yet'}
+              </Note>
+            </div>
+            {(connections?.length ?? 0) > 1 && (
+              <ToggleChipGroup
+                aria-label="Repository to ship to"
+                className="gap-1.5"
+                value={connection.repo}
+                onValueChange={setRepo}
+              >
+                {(connections ?? []).map((conn) => (
+                  <ToggleChipItem key={conn.id} value={conn.repo} className="px-2.5 py-1 text-[12px]" disabled={!!busy}>
+                    {conn.repo}
+                  </ToggleChipItem>
+                ))}
+              </ToggleChipGroup>
+            )}
+            <div className="flex flex-col items-stretch gap-2 sm:flex-row">
+              <Input
+                className="flex-1 rounded-[10px] bg-paper focus:ring-0"
+                maxLength={200}
+                placeholder="Pull request title (optional)"
+                value={prMessage}
+                disabled={!!busy}
+                onChange={(event) => setPrMessage(event.target.value)}
+              />
+              <Button variant="primary" className="justify-center" disabled={!!busy} onClick={openPull}>
+                {busy === 'pull' ? 'Opening…' : 'Open pull request'}
+              </Button>
+              {pull && (
+                <Button className="justify-center" disabled={!!busy} onClick={updatePull}>
+                  {busy === 'update' ? 'Updating…' : 'Update pull request'}
+                </Button>
+              )}
+            </div>
+            {pull && (
+              <Note className="break-all">
+                Pull request #{pull.number} —{' '}
+                <a
+                  className="font-semibold text-ink underline underline-offset-[3px]"
+                  href={pull.url}
+                  target="_blank"
+                  rel="noreferrer noopener"
+                >
+                  {pull.url}
+                </a>
+              </Note>
+            )}
+          </>
+        ) : (
+          <>
+            <div className="flex flex-wrap gap-2">
+              <Button size="sm" className="px-2.5 text-xs" disabled>
+                Open pull request
+              </Button>
+            </div>
+            <Note>
+              {connections === null
+                ? 'Checking whether a repo is connected…'
+                : 'No GitHub repo is connected to this canvas — connect one from Import to open a pull request.'}
+            </Note>
+          </>
+        )}
+      </div>
+
+      <div className="flex flex-col gap-1.5 border-t border-line-soft pt-2.5">
+        <b className="text-[12px] text-ink-soft">Releases</b>
+        <Note>
+          A release freezes every frame at its own public link — the version you send, pin the gallery to, or restore
+          onto the canvas.
+        </Note>
+        <div className="flex flex-col items-stretch gap-2 sm:flex-row">
+          <Input
+            className="flex-1 rounded-[10px] bg-paper focus:ring-0"
+            maxLength={120}
+            placeholder="Release name (optional)"
+            value={releaseName}
+            disabled={!!busy}
+            onChange={(event) => setReleaseName(event.target.value)}
+            onKeyDown={(event) => event.key === 'Enter' && freeze()}
+          />
+          <Button variant="primary" className="justify-center" disabled={!!busy || releases === null} onClick={freeze}>
+            {busy === 'freeze' ? 'Freezing…' : 'Freeze a release'}
+          </Button>
+        </div>
+        {releases === null ? (
+          <p className="text-[12px] text-ink-faint">Loading…</p>
+        ) : releases.length === 0 ? (
+          <Note>No releases yet — freeze one and it can be pinned in the gallery.</Note>
+        ) : (
+          <div className="flex flex-col gap-[2px]">
+            {releases.slice(0, SHOWN_RELEASES).map(releaseRow)}
+            {releases.length > SHOWN_RELEASES && (
+              <Collapsible open={showAll} onOpenChange={setShowAll}>
+                <CollapsibleTrigger className="self-start py-1 text-[12px] font-medium text-ink-soft hover:text-ink">
+                  {showAll ? 'Fewer releases' : `${releases.length - SHOWN_RELEASES} older releases`}
+                </CollapsibleTrigger>
+                <CollapsibleContent className="flex flex-col gap-[2px]">
+                  {releases.slice(SHOWN_RELEASES).map(releaseRow)}
+                </CollapsibleContent>
+              </Collapsible>
+            )}
+          </div>
+        )}
+      </div>
+
+      {error && <p className="mx-[2px] text-[12px] text-accent-ink">{error}</p>}
+      {notice && <Note tone="success">{notice}</Note>}
+
+      <ConfirmDialog
+        open={confirmRestore !== null}
+        onOpenChange={(open) => !open && setConfirmRestore(null)}
+        title={`Restore “${confirmRestore?.name ?? ''}”?`}
+        description={
+          <>
+            Restoring writes the {confirmRestore?.frames.length ?? 0} frozen frames back onto the canvas as ordinary
+            edits: frames you drew since are left alone, frames the canvas has lost come back, and every change can be
+            undone on its own.
+          </>
+        }
+        confirmLabel="Restore frames"
+        destructive
+        onConfirm={() => confirmRestore && restore(confirmRestore)}
+      />
     </div>
   )
 }

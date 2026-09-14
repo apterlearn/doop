@@ -1,11 +1,12 @@
 import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import type { AgentQuestion, ElementComment, Frame } from '../../shared/types'
 import { colorFor } from '../../shared/types'
-import { useStore, type StreamEndReason } from '../lib/store'
+import { checkVerdict, useStore, type StreamEndReason } from '../lib/store'
 import { registerFrameWindow, unregisterFrameWindow } from '../lib/frameBridge'
 import { api } from '../lib/api'
 import { sendWs } from '../lib/ws'
 import { throttle } from '../lib/throttle'
+import { timeAgo } from '../lib/time'
 import { getIdentity } from '../lib/identity'
 import { FRAME_BOOTSTRAP } from '../lib/frameRuntime'
 import { stripTokenStyle, withTokenStyle } from '../../shared/tokens'
@@ -24,7 +25,6 @@ import {
   roleName,
 } from '../../shared/agents'
 import { posthog } from '../lib/posthog'
-import { isResidentLimit } from './TeamAllowance'
 import { cn } from '@/lib/utils'
 import { Button } from './ui/button'
 import { Input } from './ui/input'
@@ -138,6 +138,27 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
   const flash = useStore((s) => s.flashes[frame.id])
   const stream = useStore((s) => s.streams[frame.id])
   const streamEnd = useStore((s) => s.streamEnds[frame.id])
+  /* The frame's last check, for the verdict dot in its label. The Checks tab
+     fills the same store entry, and a frame nobody opened that tab beside
+     still gets one: fetch once, and keep whatever we have if the fetch
+     fails — the panel's own load will try again. */
+  const review = useStore((s) => s.frameReviews[frame.id])
+  const setFrameReview = useStore((s) => s.setFrameReview)
+  const askedForReview = useRef(false)
+  useEffect(() => {
+    /* demo frames are product onboarding: nothing checks them, so asking
+       would be one request per onboarding frame for an answer that is always
+       the same */
+    if (frame.demo || review || askedForReview.current) return
+    askedForReview.current = true
+    api
+      .frameReviews(frame.id, 1)
+      .then(([latest]) => {
+        if (latest) setFrameReview(frame.id, latest)
+      })
+      .catch(console.error)
+  }, [frame.id, frame.demo, review, setFrameReview])
+  const check = review && { verdict: checkVerdict(review, frame), at: review.reviewedAt }
   /* the end notice is transient: "finished designing" is a confirmation, not
      a state, so it clears itself after a beat. The notice is derived from the
      store and only the dismissal is state — a full replace by the streaming
@@ -709,6 +730,32 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
               </Tooltip>
             )}
             <span className="overflow-hidden text-ellipsis">{frame.name}</span>
+            {/* the frame's own answer to "did this pass" — a dot, so the
+                verdict sits with the frame and not only in the Checks tab */}
+            {check && (
+              <Tooltip
+                label={
+                  check.verdict === 'pass'
+                    ? `Checks passed ${timeAgo(check.at)}`
+                    : check.verdict === 'fail'
+                      ? `Checks failed ${timeAgo(check.at)} — an agent cannot hand this frame back until it passes`
+                      : `Checked ${timeAgo(check.at)}, but the frame changed since — the report no longer describes it`
+                }
+                side="top"
+                align="start"
+              >
+                <span
+                  className={cn(
+                    'size-[7px] shrink-0 rounded-full',
+                    check.verdict === 'pass'
+                      ? 'bg-brand'
+                      : check.verdict === 'fail'
+                        ? 'bg-accent-ink'
+                        : 'border border-ink-faint',
+                  )}
+                />
+              </Tooltip>
+            )}
             <span className="flex gap-1">
               {stream && (
                 <span className={EDITOR_CHIP} style={{ background: stream.color }}>
@@ -870,15 +917,7 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
                   const replies = frameComments.filter((r) => r.parentId === c.id).reverse() // store is newest-first
                   const thread = [c, ...replies.sort((a, b) => a.at - b.at)]
                   const onReply = (text: string) =>
-                    api
-                      .replyComment(c.id, text)
-                      .then(() => posthog.capture('element_comment_replied'))
-                      .catch((err) => {
-                        /* the wall explains a hit limit; anything else
-                           surfaces in the thread so the draft survives */
-                        if (isResidentLimit(err)) useStore.getState().setLimitWall(true)
-                        throw err
-                      })
+                    api.replyComment(c.id, text).then(() => posthog.capture('element_comment_replied'))
                   const onResolve = () => {
                     api
                       .resolveComment(c.id)
@@ -886,11 +925,7 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
                       .catch(console.error)
                     setOpenThread(null)
                   }
-                  const onRetry = (id: string) =>
-                    api.retryComment(id).catch((err) => {
-                      if (isResidentLimit(err)) useStore.getState().setLimitWall(true)
-                      else console.error(err)
-                    })
+                  const onRetry = (id: string) => api.retryComment(id).catch(console.error)
                   /* An anchor that resolves to nothing has no position to draw
                      at. Rather than dropping the pin (and the conversation with
                      it), pin it to the frame's corner and say the element is
@@ -1114,11 +1149,7 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
                               ...(anchor.key ? { stableKey: anchor.key } : {}),
                             })
                             .then(() => posthog.capture('element_comment_created'))
-                            .catch((err) => {
-                              /* an @mention past the free tier raises the wall */
-                              if (isResidentLimit(err)) useStore.getState().setLimitWall(true)
-                              else console.error(err)
-                            })
+                            .catch(console.error)
                           if (editing) setComposing(false)
                           else closePopovers()
                         }}
@@ -1158,10 +1189,11 @@ function CommentComposer({
   const taRef = useRef<HTMLTextAreaElement>(null)
   useEffect(() => taRef.current?.focus(), [])
   const send = () => text.trim() && onSubmit(text)
-  /* @mention a resident agent to route the comment to it; without one the
-     comment is a note for the humans in the room. Outside agents connected
-     over MCP are addressable by name too, so the pills list them beside the
-     roles — derived from the stable presences map, as everywhere else here. */
+  /* @mention a role on the card, or a connected agent by name, to route the
+     comment to it; without one the comment is a note for the humans in the
+     room. Agents connected over MCP are addressable by name too, so the pills
+     list them beside the roles — derived from the stable presences map, as
+     everywhere else here. */
   const mentioned = mentionedRole(text)
   const presences = useStore((s) => s.presences)
   const outside = Object.values(presences)
@@ -1270,7 +1302,7 @@ function CommentThread({
       .catch(() => setFailed(true))
       .finally(() => setSending(false))
   }
-  /* the same resolution the server does on submit: a resident role, or a
+  /* the same resolution the server does on submit: a role on the card, or a
      connected agent's own name — a reply to either is a request to it */
   const mentioned = mentionedRole(reply)
   const presences = useStore((s) => s.presences)

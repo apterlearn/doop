@@ -13,16 +13,15 @@ const obCopy =
 
 /**
  * Getting-started checklist. No "next" buttons: each step checks itself off
- * from live canvas state (the demo agent's task ending, a real agent joining
- * presence, its first task appearing). Progress persists in localStorage so
- * completed steps stay checked across canvases and sessions.
+ * from live canvas state (an MCP agent joining presence, its first task
+ * appearing). Progress persists in localStorage so completed steps stay
+ * checked across canvases and sessions.
  */
 
 const LS_KEY = 'doop:onboarding'
 
 interface Progress {
   dismissed?: boolean
-  watched?: boolean
   connected?: boolean
   tasked?: boolean
 }
@@ -48,31 +47,29 @@ export function Onboarding() {
 
   /* live detection — flips only ever go false -> true */
   const live = useMemo(() => {
-    const demoDone = tasks.some((t) => t.agentName === 'Doop' && t.endedAt)
-    /* "connected" means an OUTSIDE agent over MCP — the resident team
-       (Doop and the specialists) doesn't count towards the setup steps */
+    /* "connected" means an agent over MCP, not the role names a card's
+       pipeline is assigned to */
     const realAgent = (t: { agentName: string }) => t.agentName !== '' && !roleByAgentName(t.agentName)
     const agentHere = Object.values(presences).some((p) => p.kind === 'agent' && !roleByAgentName(p.name))
     const agentWorked = tasks.some(realAgent)
-    return { watched: demoDone, connected: agentHere || agentWorked, tasked: agentWorked }
+    return { connected: agentHere || agentWorked, tasked: agentWorked }
   }, [tasks, presences])
 
   /* a step, once seen live, stays done: fold the live signals into the
      stored progress as they light up */
   const next: Progress = {
     ...progress,
-    watched: progress.watched || live.watched,
     connected: progress.connected || live.connected,
     tasked: progress.tasked || live.tasked,
   }
-  if (next.watched !== progress.watched || next.connected !== progress.connected || next.tasked !== progress.tasked) {
+  if (next.connected !== progress.connected || next.tasked !== progress.tasked) {
     setProgress(next)
   }
 
   useEffect(() => save(progress), [progress])
 
   if (progress.dismissed) return null
-  const allDone = progress.watched && progress.connected && progress.tasked
+  const allDone = progress.connected && progress.tasked
 
   function dismiss() {
     setProgress({ ...progress, dismissed: true })
@@ -90,12 +87,6 @@ export function Onboarding() {
 
   const checklist = (
     <>
-      <Step done={!!progress.watched} label="Watch an agent design">
-        {!progress.watched && (
-          <p className={obHint}>The Doop agent is drawing your welcome frame — watch the canvas.</p>
-        )}
-      </Step>
-
       <Step done={!!progress.connected} label="Connect your own agent">
         {!progress.connected && (
           <>
@@ -136,7 +127,7 @@ export function Onboarding() {
   )
 
   if (isMobile) {
-    const done = [progress.watched, progress.connected, progress.tasked].filter(Boolean).length
+    const done = [progress.connected, progress.tasked].filter(Boolean).length
     return (
       <Sheet>
         <SheetTrigger asChild>
@@ -145,7 +136,7 @@ export function Onboarding() {
             className="absolute left-3 top-3 z-30 h-10 gap-2 rounded-full bg-surface px-3 text-xs font-semibold shadow-card"
           >
             <span className="text-brand">✦</span> Getting started
-            <span className="font-mono text-[10px] text-ink-faint">{done}/3</span>
+            <span className="font-mono text-[10px] text-ink-faint">{done}/2</span>
           </Button>
         </SheetTrigger>
         <SheetContent
@@ -155,7 +146,7 @@ export function Onboarding() {
           <div className="border-b border-line-soft px-5 py-4 pr-14">
             <SheetTitle className="font-display text-lg font-extrabold">Getting started</SheetTitle>
             <SheetDescription className="mt-1 text-xs text-ink-soft">
-              Three live steps to learn the human-and-agent workflow.
+              Two live steps to learn the human-and-agent workflow.
             </SheetDescription>
           </div>
           <div className="flex flex-col gap-4 px-5 py-5">{checklist}</div>

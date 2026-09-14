@@ -4,6 +4,9 @@ import type {
   AgentQuestion,
   Canvas,
   CanvasMeta,
+  CanvasProposal,
+  CanvasRelease,
+  CanvasReviewSummary,
   CommunityCategory,
   CommunityItem,
   DesignTokens,
@@ -12,8 +15,7 @@ import type {
   FrameReview,
   FrameVersion,
   Page,
-  RunEvent,
-  RunJournal,
+  ReviewPolicy,
 } from '../../shared/types'
 
 export type HomeActivity = ActivityItem & { canvasId: string; canvasName: string }
@@ -109,20 +111,6 @@ export interface DiscoveredSite {
   truncated: boolean
 }
 
-/** The Doop Agent's free-task meter for the signed-in user. */
-export interface Allowance {
-  used: number
-  limit: number
-  /** connected an agent of their own over MCP — unmetered */
-  connected: boolean
-  /** connected a model account the Doop Agent itself can run on */
-  byoModel: boolean
-  byoKind?: ModelAccountKind
-  byoEmail?: string
-  /** free tasks are spent and their own account is carrying the agent */
-  onOwnAccount: boolean
-}
-
 export type ModelAccountKind = 'chatgpt' | 'openai-key'
 
 /** An in-flight device sign-in: the user types `userCode` at `verificationUrl`
@@ -215,11 +203,17 @@ export const api = {
   /* owner-only: what the share link grants people who aren't invited */
   setLinkAccess: (id: string, linkAccess: 'edit' | 'none') =>
     req('/api/canvases/' + id, { method: 'PATCH', body: JSON.stringify({ linkAccess }) }),
-  /* community gallery: owner-only listing, open browsing and copying */
-  publishCanvas: (id: string, listing: { description: string; category: CommunityCategory }) =>
+  /* community gallery: owner-only listing, open browsing and copying. A
+     listing may pin a release, so the gallery shows and hands out that frozen
+     snapshot instead of whatever the canvas says today */
+  publishCanvas: (
+    id: string,
+    listing: { description: string; category: CommunityCategory },
+    releaseId?: string | null,
+  ) =>
     req<Pick<Canvas, 'publishedAt' | 'description' | 'category'>>(`/api/canvases/${id}/publish`, {
       method: 'PUT',
-      body: JSON.stringify(listing),
+      body: JSON.stringify({ ...listing, ...(releaseId !== undefined ? { releaseId } : {}) }),
     }),
   unpublishCanvas: (id: string) => req(`/api/canvases/${id}/publish`, { method: 'DELETE' }),
   listCommunity: () => req<CommunityItem[]>('/api/community'),
@@ -278,6 +272,13 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ on }),
     }),
+  /* owner-only: which agent writes must clear approval, and the extra tool
+     names gated under the `destructive` policy */
+  setReviewPolicy: (canvasId: string, policy: ReviewPolicy, approvalTools: string[]) =>
+    req<{ reviewPolicy: ReviewPolicy; approvalTools: string[] }>(`/api/canvases/${canvasId}/review-policy`, {
+      method: 'POST',
+      body: JSON.stringify({ policy, approval_tools: approvalTools }),
+    }),
   /** the frame's stored verification reports, newest first */
   frameReviews: (frameId: string, limit = 5) =>
     req<(FrameReview & { current: boolean })[]>(`/api/frames/${frameId}/reviews?limit=${limit}`),
@@ -285,8 +286,25 @@ export const api = {
    *  ready_for_review, for when a reviewer does not want to wait for an agent */
   runFrameReviews: (frameId: string) =>
     req<FrameReview & { current: boolean }>(`/api/frames/${frameId}/reviews`, { method: 'POST' }),
+  /** the canvas-wide sweep: the per-frame gate aggregated into one verdict
+   *  for the whole design, run now rather than per frame */
+  runCanvasReviews: (canvasId: string) =>
+    req<CanvasReviewSummary>(`/api/canvases/${canvasId}/reviews`, { method: 'POST' }),
   frameProposals: (canvasId: string, status?: FrameProposal['status']) =>
     req<FrameProposal[]>(`/api/canvases/${canvasId}/frame-proposals${status ? `?status=${status}` : ''}`),
+  canvasProposals: async (canvasId: string, status?: CanvasProposal['status']) => {
+    const { proposals } = await req<{ proposals: CanvasProposal[] }>(
+      `/api/canvases/${canvasId}/canvas-proposals${status ? `?status=${status}` : ''}`,
+    )
+    return proposals
+  },
+  /* accept applies the proposal through the ordinary setters; a reject may
+     carry a note the agent reads back */
+  resolveCanvasProposal: (canvasId: string, proposalId: string, accept: boolean, note?: string) =>
+    req<CanvasProposal>(`/api/canvases/${canvasId}/canvas-proposals/${proposalId}`, {
+      method: 'POST',
+      body: JSON.stringify({ accept, ...(note ? { note } : {}) }),
+    }),
   /* the canvas design tokens, as the Tokens panel edits them */
   setTokens: (canvasId: string, tokens: DesignTokens | null) =>
     req<{ tokens: DesignTokens | null }>(`/api/canvases/${canvasId}/tokens`, {
@@ -412,7 +430,6 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ urls }),
     }),
-  agentAllowance: () => req<Allowance>('/api/agent-allowance'),
   modelAccount: () => req<ModelAccountStatus>('/api/model-account'),
   chatgptAuthorize: () =>
     req<{ url: string; state: string; catching: boolean }>('/api/model-account/chatgpt/authorize', { method: 'POST' }),
@@ -462,36 +479,45 @@ export const api = {
     req(`/api/canvases/${canvasId}/agents/stop`, { method: 'POST', body: JSON.stringify({ agentName }) }),
   deleteCard: (canvasId: string, cardId: string) =>
     req(`/api/canvases/${canvasId}/cards/${cardId}`, { method: 'DELETE' }),
-  pauseAgentWork: (canvasId: string, agentName: string) =>
-    req(`/api/canvases/${canvasId}/agents/pause`, { method: 'POST', body: JSON.stringify({ agent_name: agentName }) }),
-  resumeCard: (canvasId: string, cardId: string) =>
-    req(`/api/canvases/${canvasId}/cards/${cardId}/resume`, { method: 'POST' }),
   /* the queue's running order: ids in the order the cards should run */
   reorderCards: (canvasId: string, ids: string[]) =>
     req(`/api/canvases/${canvasId}/cards/reorder`, { method: 'POST', body: JSON.stringify({ ids }) }),
   setCardPriority: (canvasId: string, cardId: string, priority: number) =>
     req(`/api/canvases/${canvasId}/cards/${cardId}`, { method: 'PATCH', body: JSON.stringify({ priority }) }),
+  /* ship: a downloadable archive (or the bare source), and the same design
+     opened as a pull request against a connected repo */
+  exportCanvas: (canvasId: string, format: 'zip' | 'code') =>
+    req<{ url: string }>(`/api/canvases/${canvasId}/export`, { method: 'POST', body: JSON.stringify({ format }) }),
+  /* `repo` names the connection to spend: the route requires it, and a canvas
+     may have more than one connected repository */
+  openPullRequest: (canvasId: string, opts?: { repo?: string; message?: string; base?: string }) =>
+    req<{ url: string; number: number }>(`/api/canvases/${canvasId}/pull-request`, {
+      method: 'POST',
+      body: JSON.stringify({
+        ...(opts?.repo ? { repo: opts.repo } : {}),
+        ...(opts?.message ? { message: opts.message } : {}),
+        ...(opts?.base ? { base: opts.base } : {}),
+      }),
+    }),
+  /* push the canvas's later changes onto the pull request already open */
+  updatePullRequest: (canvasId: string, message: string, repo?: string) =>
+    req<{ url: string }>(`/api/canvases/${canvasId}/pull-request/update`, {
+      method: 'POST',
+      body: JSON.stringify({ ...(repo ? { repo } : {}), message }),
+    }),
+  /* releases: frozen snapshots of the canvas, newest first */
+  listReleases: async (canvasId: string) => {
+    const { releases } = await req<{ releases: CanvasRelease[] }>(`/api/canvases/${canvasId}/releases`)
+    return releases
+  },
+  createRelease: (canvasId: string, name?: string) =>
+    req<CanvasRelease>(`/api/canvases/${canvasId}/releases`, {
+      method: 'POST',
+      body: JSON.stringify({ ...(name ? { name } : {}) }),
+    }),
+  restoreRelease: (canvasId: string, releaseId: string) =>
+    req<{ ok: true }>(`/api/canvases/${canvasId}/releases/${releaseId}/restore`, { method: 'POST' }),
   plans: (canvasId: string) => req<AgentPlan[]>(`/api/canvases/${canvasId}/plans`),
-  runEvents: (canvasId: string, runId?: string, limit = 200) => {
-    const q = new URLSearchParams({ limit: String(limit) })
-    if (runId) q.set('run_id', runId)
-    return req<RunEvent[]>(`/api/canvases/${canvasId}/run-events?${q}`)
-  },
-  /** what each run did — duration, turns, tool calls, tokens and cost — newest
-   *  first; optionally one agent's. The same records a run is reverted from. */
-  runJournals: (canvasId: string, agentName?: string, limit = 20) => {
-    const q = new URLSearchParams({ limit: String(limit) })
-    if (agentName) q.set('agent', agentName)
-    return req<RunJournal[]>(`/api/canvases/${canvasId}/run-journals?${q}`)
-  },
-  /** Undo everything one run changed: every frame it touched goes back to the
-   *  version the run started from. A frame someone edited since, or deleted,
-   *  comes back under `skipped` instead of being clobbered. */
-  revertRun: (canvasId: string, runId: string) =>
-    req<{ reverted: string[]; skipped: { frame_id: string; reason: string }[] }>(
-      `/api/canvases/${canvasId}/runs/${runId}/revert`,
-      { method: 'POST' },
-    ),
   listMcpAgents: () => req<ConnectedAgent[]>('/api/mcp-agents'),
   revokeMcpAgent: (clientId: string) => req(`/api/mcp-agents/${encodeURIComponent(clientId)}`, { method: 'DELETE' }),
 }

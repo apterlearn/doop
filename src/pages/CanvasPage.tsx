@@ -22,9 +22,7 @@ import { Inspector } from '../components/Inspector'
 import { ElementPanel } from '../components/ElementPanel'
 import { ActivityPanel } from '../components/ActivityPanel'
 import { ConnectModal } from '../components/ConnectModal'
-import { LimitWall, isResidentLimit } from '../components/TeamAllowance'
 import { PromptBar } from '../components/PromptBar'
-import { WorkingNow } from '../components/WorkingNow'
 import { SideRail } from '../components/SideRail'
 import { LayersPanel, LayersRailToggle } from '../components/LayersPanel'
 import { Onboarding } from '../components/Onboarding'
@@ -128,7 +126,6 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
   const [renaming, setRenaming] = useState(false)
   const [toast, setToast] = useState<string | null>(null)
   const updateReady = useStore((s) => s.updateReady)
-  const limitWall = useStore((s) => s.limitWall)
 
   /* keep the desktop shell's tab label in step with the live canvas name.
      The store's canvas briefly lags a navigation (the previous page's data
@@ -717,7 +714,6 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
                 </Button>
               )}
             </div>
-            <WorkingNow />
             <PromptBar canvasId={canvasId} />
             <Onboarding />
             {!isMobile && (layersOpen ? <LayersPanel onAddFrame={addFrame} /> : <LayersRailToggle />)}
@@ -838,17 +834,6 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
           }}
         />
       )}
-      {limitWall && (
-        <LimitWall
-          canvasId={canvasId}
-          onClose={() => useStore.getState().setLimitWall(false)}
-          onOpenConnect={() => {
-            useStore.getState().setLimitWall(false)
-            posthog.capture('agent_connection_opened')
-            setShowConnect(true)
-          }}
-        />
-      )}
       {showImport && (
         <ImportModal
           canvasId={canvasId}
@@ -869,7 +854,7 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
             setShowImport(false)
             setGhInstallPass(null)
             setView('board')
-            showToast(`${cardCount} ${cardCount === 1 ? 'card' : 'cards'} queued — Doop is on it`)
+            showToast(`${cardCount} ${cardCount === 1 ? 'card' : 'cards'} queued — a connected agent can claim them`)
           }}
         />
       )}
@@ -1042,11 +1027,6 @@ function ImportModal({
       })
       onQueued(result.cards.length)
     } catch (e) {
-      if (isResidentLimit(e)) {
-        useStore.getState().setLimitWall(true)
-        onClose()
-        return
-      }
       setError(errorMessage(e, 'repository import failed'))
       setBusy(null)
     }

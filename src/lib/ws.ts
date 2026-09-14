@@ -121,11 +121,11 @@ function handle(msg: ServerMessage) {
       s.setProposals(msg.proposals)
       s.setPlans(msg.plans)
       s.setFrameProposals(msg.frameProposals)
+      s.setCanvasProposals(msg.canvasProposals ?? [])
       s.setQuestions(msg.questions)
       s.setReviewModeLocal(msg.reviewMode)
       s.setReviewPolicyLocal(msg.reviewPolicy ?? (msg.reviewMode ? 'all_writes' : 'off'), msg.approvalTools ?? [])
       s.setComponents(msg.components ?? [])
-      s.setRunEvents(msg.runEvents)
       s.setFrameLocks(msg.frameLocks ?? {})
       break
     case 'presence:join':
@@ -207,11 +207,11 @@ function handle(msg: ServerMessage) {
     case 'frameProposal:deleted':
       s.removeFrameProposal(msg.proposalId)
       break
+    case 'canvasProposal':
+      s.upsertCanvasProposal(msg.proposal)
+      break
     case 'question':
       s.upsertQuestion(msg.question)
-      break
-    case 'run:event':
-      s.pushRunEvent(msg.event)
       break
     case 'canvas:reviewMode':
       s.setReviewModeLocal(msg.reviewMode)

@@ -1,21 +1,28 @@
 import { useEffect, useRef, useState } from 'react'
 import { useStore } from '../lib/store'
 import { api } from '../lib/api'
+import { cn } from '../lib/utils'
 import { posthog } from '../lib/posthog'
 import { uploadImageFrames } from '../lib/frameClipboard'
-import { MeterLine, isResidentLimit, useAllowance } from './TeamAllowance'
+import { AGENT_ROLES, DEFAULT_ROLE_ID, PIPELINE_PRESETS, roleById, roleName } from '../../shared/agents'
 import { Button } from './ui/button'
 import { Input } from './ui/input'
 import { Note } from './ui/note'
 import { DoopMark } from './Logo'
+import { RoleMark } from './RoleMark'
 
 /**
- * The canvas's front door to the resident team: a prompt bar that queues a
- * board card without anyone having to discover the board first.
+ * The canvas's front door to the board: a prompt bar that queues a card
+ * without anyone having to discover the board first. A connected MCP agent
+ * claims the card from there.
  *
  * Screenshots and images attach via the paperclip (or a paste into the
  * input); on send they land on the canvas as reference frames and the card
  * carries their ids so the agent looks at them before designing.
+ *
+ * The bar also names the card's pipeline — who works on it and in what order
+ * — so a prompt can be addressed to the Copywriter or the Accessibility pass
+ * without a detour through the board.
  */
 
 const MAX_ATTACHMENTS = 4
@@ -39,7 +46,6 @@ interface Attachment {
 
 export function PromptBar({ canvasId }: { canvasId: string }) {
   const frames = useStore((s) => s.canvas?.frames)
-  const { allowance, refresh } = useAllowance()
   const [text, setText] = useState('')
   const [attachments, setAttachments] = useState<Attachment[]>([])
   const [busy, setBusy] = useState(false)
@@ -48,6 +54,11 @@ export function PromptBar({ canvasId }: { canvasId: string }) {
      the target chip afterwards does not rewrite what was just confirmed */
   const [sentTarget, setSentTarget] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  /* the card's pipeline: who works on it, in click order. Never empty — a
+     card always names someone, so the default comes back when the last role
+     is dropped. */
+  const [agents, setAgents] = useState<string[]>([DEFAULT_ROLE_ID])
+  const [pickerOpen, setPickerOpen] = useState(false)
   /* what the card is about: the frame (and element) selected on the canvas.
      Dismissible per selection, so "design something new" stays one ✕ away. */
   const selectedId = useStore((s) => s.selectedId)
@@ -63,6 +74,7 @@ export function PromptBar({ canvasId }: { canvasId: string }) {
   const target = targetDismissed ? undefined : targetFrame
   const inputRef = useRef<HTMLInputElement>(null)
   const fileRef = useRef<HTMLInputElement>(null)
+  const barRef = useRef<HTMLFormElement>(null)
 
   /* after a submit, the first frame that wasn't on the canvas before gets a
      camera flight — the deliverable must stream in on-screen, never somewhere
@@ -90,6 +102,24 @@ export function PromptBar({ canvasId }: { canvasId: string }) {
   }, [attachments])
   useEffect(() => () => attachmentsRef.current.forEach((a) => URL.revokeObjectURL(a.preview)), [])
 
+  /* the picker opens upward over the canvas, so a click anywhere else — or
+     Escape — has to put it away again */
+  useEffect(() => {
+    if (!pickerOpen) return
+    const away = (e: PointerEvent) => {
+      if (!barRef.current?.contains(e.target as Node)) setPickerOpen(false)
+    }
+    const escape = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setPickerOpen(false)
+    }
+    document.addEventListener('pointerdown', away)
+    document.addEventListener('keydown', escape)
+    return () => {
+      document.removeEventListener('pointerdown', away)
+      document.removeEventListener('keydown', escape)
+    }
+  }, [pickerOpen])
+
   function showError(msg: string) {
     setError(msg)
     window.setTimeout(() => setError(null), 5000)
@@ -113,24 +143,19 @@ export function PromptBar({ canvasId }: { canvasId: string }) {
     setAttachments((cur) => cur.filter((a) => a.preview !== preview))
   }
 
+  /* clicking a chip appends it to the pipeline, so click order = run order —
+     the board's compose-box rule, with the last role staying put */
+  function toggleAgent(id: string) {
+    setAgents((prev) => {
+      if (!prev.includes(id)) return [...prev, id]
+      const rest = prev.filter((x) => x !== id)
+      return rest.length > 0 ? rest : [DEFAULT_ROLE_ID]
+    })
+  }
+
   async function submit(prompt: string) {
     const clean = prompt.trim()
     if (!clean || busy) return
-    /* known-doomed send: no free tasks and no model account. Open the wall
-       up front instead of uploading attachments only to 403 — but confirm
-       against the server first, since the cached allowance can be stale
-       (an account connected in another tab). The server enforces either
-       way, so an unreachable check just falls through. Text stays in place. */
-    if (allowance && !allowance.byoModel && allowance.used >= allowance.limit) {
-      setBusy(true)
-      const fresh = await api.agentAllowance().catch(() => null)
-      setBusy(false)
-      if (fresh && !fresh.byoModel && fresh.used >= fresh.limit) {
-        useStore.getState().setLimitWall(true)
-        return
-      }
-      refresh()
-    }
     setBusy(true)
     try {
       /* attachments first: each becomes a reference frame on the canvas, and
@@ -149,7 +174,7 @@ export function PromptBar({ canvasId }: { canvasId: string }) {
       await api.addCard(
         canvasId,
         clean,
-        ['doop'],
+        agents,
         refFrames.map((f) => f.id),
         target ? [target.id] : undefined,
         target
@@ -164,18 +189,17 @@ export function PromptBar({ canvasId }: { canvasId: string }) {
       attachments.forEach((a) => URL.revokeObjectURL(a.preview))
       setAttachments([])
       setText('')
+      /* the picker returns to the default with the input */
+      setAgents([DEFAULT_ROLE_ID])
+      setPickerOpen(false)
       setSentTarget(target?.name ?? null)
       setSent(true)
       window.setTimeout(() => setSent(false), 5000)
     } catch (err) {
-      if (isResidentLimit(err)) useStore.getState().setLimitWall(true)
-      else {
-        console.error(err)
-        showError(err instanceof Error ? err.message : 'Something went wrong — try again')
-      }
+      console.error(err)
+      showError(err instanceof Error ? err.message : 'Something went wrong — try again')
     } finally {
       setBusy(false)
-      refresh()
     }
   }
 
@@ -221,7 +245,8 @@ export function PromptBar({ canvasId }: { canvasId: string }) {
         </div>
       )}
       <form
-        className="flex items-center gap-2 rounded-[12px] border border-line bg-surface p-1.5 shadow-pop max-md:gap-[3px] max-md:p-[5px]"
+        ref={barRef}
+        className="relative flex items-center gap-2 rounded-[12px] border border-line bg-surface p-1.5 shadow-pop max-md:gap-[3px] max-md:p-[5px]"
         onSubmit={(e) => {
           e.preventDefault()
           void submit(text)
@@ -260,6 +285,33 @@ export function PromptBar({ canvasId }: { canvasId: string }) {
             <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
           </svg>
         </Button>
+        {/* who the card is addressed to: the pipeline as its role marks, one
+            click away from every preset and every role */}
+        <Button
+          variant="bare"
+          className="flex flex-none items-center gap-[3px] rounded-full px-1.5 py-1.5 text-ink-faint hover:bg-paper hover:text-ink-soft"
+          aria-label={`Pipeline: ${agents.map(roleName).join(' → ')}`}
+          aria-expanded={pickerOpen}
+          title={`Pipeline: ${agents.map(roleName).join(' → ')}`}
+          disabled={busy}
+          onClick={() => setPickerOpen((open) => !open)}
+        >
+          {agents.map((id) => (
+            <RoleMark key={id} role={roleById(id)} size={15} />
+          ))}
+          <svg
+            className={cn('size-[10px] transition-transform duration-[120ms]', pickerOpen && 'rotate-180')}
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2.5"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M6 15l6-6 6 6" />
+          </svg>
+        </Button>
         <Input
           ref={inputRef}
           variant="bare"
@@ -267,7 +319,7 @@ export function PromptBar({ canvasId }: { canvasId: string }) {
           className="flex-1 px-1 py-1.5 md:px-2 md:text-sm"
           value={text}
           disabled={busy}
-          placeholder="Ask the Doop Agent to design something…"
+          placeholder="Describe what an agent should design…"
           onChange={(e) => setText(e.target.value)}
           onPaste={(e) => {
             const images = [...(e.clipboardData?.files ?? [])].filter((f) => f.type.startsWith('image/'))
@@ -285,6 +337,55 @@ export function PromptBar({ canvasId }: { canvasId: string }) {
         >
           {busy ? '…' : 'Design it'}
         </Button>
+        {pickerOpen && (
+          <div
+            role="group"
+            aria-label="Assign to"
+            className="absolute bottom-[calc(100%+10px)] left-0 right-0 z-40 flex flex-col gap-2 rounded-[12px] border border-line bg-surface p-2.5 shadow-pop"
+          >
+            <div className="flex flex-wrap gap-[3px]">
+              {PIPELINE_PRESETS.map((p) => (
+                <Button
+                  key={p.id}
+                  variant="bare"
+                  className={cn(
+                    'rounded-full px-1.5 py-0.5 text-[10.5px] font-[650]',
+                    agents.join(',') === p.roles.join(',') && 'bg-paper-deep text-accent-ink',
+                  )}
+                  onClick={() => setAgents(p.roles)}
+                >
+                  {p.label}
+                </Button>
+              ))}
+            </div>
+            <div className="flex flex-wrap gap-1">
+              {AGENT_ROLES.map((role) => {
+                const at = agents.indexOf(role.id)
+                return (
+                  <Button
+                    key={role.id}
+                    variant="ghost"
+                    size="sm"
+                    className={cn(
+                      'gap-1 rounded-full px-2 py-1 text-[11.5px] text-ink-soft hover:border-ink-soft hover:bg-transparent',
+                      at >= 0 && 'border-ink bg-ink text-white hover:border-ink hover:bg-ink hover:text-white',
+                    )}
+                    title={role.blurb}
+                    onClick={() => toggleAgent(role.id)}
+                  >
+                    <RoleMark role={role} size={13} />
+                    {role.name}
+                    {at >= 0 && agents.length > 1 && (
+                      <span className="grid h-[13px] min-w-[13px] place-items-center rounded-full bg-white/25 font-mono text-[9.5px]">
+                        {at + 1}
+                      </span>
+                    )}
+                  </Button>
+                )
+              })}
+            </div>
+          </div>
+        )}
       </form>
       <div className="flex min-h-4 justify-center">
         {error ? (
@@ -295,12 +396,10 @@ export function PromptBar({ canvasId }: { canvasId: string }) {
           <Note size="sm" className="text-xs text-ink-soft">
             <DoopMark size={11} />{' '}
             {sentTarget
-              ? `The Doop Agent is on it — watch “${sentTarget}”`
-              : 'The Doop Agent is on it — watch the canvas'}
+              ? `Queued — a connected agent can claim “${sentTarget}”`
+              : 'Queued — a connected agent can claim it from the board'}
           </Note>
-        ) : (
-          <MeterLine allowance={allowance} />
-        )}
+        ) : null}
       </div>
     </div>
   )

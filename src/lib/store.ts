@@ -6,6 +6,7 @@ import type {
   AgentTask,
   Canvas,
   CanvasFocus,
+  CanvasProposal,
   ComponentSummary,
   DesignDecision,
   DesignTokens,
@@ -13,6 +14,7 @@ import type {
   Frame,
   FrameLockHolder,
   FrameProposal,
+  FrameReview,
   FrameVersion,
   GuidelineDoc,
   MemoryProposal,
@@ -20,8 +22,6 @@ import type {
   Page,
   Presence,
   ReviewPolicy,
-  RunEvent,
-  RunJournal,
   TaskFeedback,
 } from '../../shared/types'
 import type { SnapGuide } from './snap'
@@ -30,8 +30,7 @@ import type { SnapGuide } from './snap'
 export type StreamEndReason = 'done' | 'idle' | 'taken over' | 'stopped' | 'replaced'
 
 /** Which tab the side panel shows. */
-export type PanelTab =
-  'tasks' | 'activity' | 'memory' | 'tokens' | 'agents' | 'review' | 'checks' | 'run' | 'components'
+export type PanelTab = 'tasks' | 'activity' | 'memory' | 'tokens' | 'agents' | 'review' | 'checks' | 'components'
 
 export interface Viewport {
   x: number
@@ -62,15 +61,17 @@ interface State {
   plans: AgentPlan[]
   /** agent frame changes waiting for approval while review mode is on */
   frameProposals: FrameProposal[]
+  /** agent canvas-level changes (tokens, a guideline doc, the breakpoints, the
+   *  page set) waiting for approval while review mode is on */
+  canvasProposals: CanvasProposal[]
   /** questions agents asked; open ones surface on their frame and in Review */
   questions: AgentQuestion[]
-  /** the resident agents' tool-call timeline, newest first */
-  runEvents: RunEvent[]
-  /** what each run did — duration, turns, tool calls, tokens and cost — as
-   *  the Run tab and the Agents tab's undo read them, newest first */
-  runJournals: RunJournal[]
   /** frameId -> saved versions, loaded on demand by the Inspector's History */
   frameVersions: Record<string, FrameVersion[]>
+  /** frameId -> the newest stored check for that frame, as the Checks tab and
+   *  the frame's own label read it. One copy, so a verdict can never differ
+   *  between the two surfaces. */
+  frameReviews: Record<string, FrameReview & { current: boolean }>
   /** frameId -> the actor editing it right now; agents hold these, humans
    *  never do, and a human sees the chip so they know why a frame is busy */
   frameLocks: Record<string, FrameLockHolder>
@@ -126,12 +127,6 @@ interface State {
   /** frameId -> how the last stream into it ended, so the frame can say so
    *  instead of dropping its border unexplained */
   streamEnds: Record<string, { name: string; color: string; isAgent: boolean; reason: StreamEndReason; at: number }>
-  /** the free-tier wall is showing — in the store so any surface that hits
-   *  the resident-task limit (board, prompt bar, element comment) can raise it */
-  limitWall: boolean
-  /** bumped whenever the allowance could have changed (a model account was
-   *  connected or dropped) so every meter on screen re-reads it */
-  allowanceVersion: number
   /** a request for the Stage to glide the camera to a frame — the prompt bar
    *  raises it so a first deliverable streams in on-screen, never off-canvas */
   flyTo: { frameId: string; at: number } | null
@@ -181,14 +176,16 @@ interface State {
   setFrameProposals(proposals: FrameProposal[]): void
   upsertFrameProposal(proposal: FrameProposal): void
   removeFrameProposal(proposalId: string): void
+  setCanvasProposals(proposals: CanvasProposal[]): void
+  upsertCanvasProposal(proposal: CanvasProposal): void
   setQuestions(questions: AgentQuestion[]): void
   upsertQuestion(question: AgentQuestion): void
-  setRunEvents(events: RunEvent[]): void
-  pushRunEvent(event: RunEvent): void
-  /** the canvas's run journals, newest first — the Run tab's totals and the
-   *  undo action's change set come from here, not from the event stream */
-  setRunJournals(journals: RunJournal[]): void
   setFrameVersions(frameId: string, versions: FrameVersion[]): void
+  /** record the newest check for a frame (a run, or a load) */
+  setFrameReview(frameId: string, review: FrameReview & { current: boolean }): void
+  /** merge checks by frame, newest report per frame — a bulk load, or the
+   *  per-frame refresh a canvas sweep comes back with */
+  setFrameReviews(reviews: (FrameReview & { current: boolean })[]): void
   setStream(
     frameId: string,
     actor: { name: string; color: string; isAgent: boolean } | null,
@@ -206,8 +203,6 @@ interface State {
   /** open the side panel on a tab from anywhere (a question pin, a toast) */
   requestPanel(tab: PanelTab): void
   clearPanelRequest(): void
-  setLimitWall(v: boolean): void
-  allowanceChanged(): void
   requestFlyTo(frameId: string): void
   setActivePage(id?: string): void
   /** replace canvas.pages wholesale (a ws 'pages' broadcast); repairs the
@@ -239,6 +234,16 @@ export function visibleFrames(s: { canvas: Canvas | null; activePageId?: string 
   return c.frames.filter((f) => f.pageId === s.activePageId)
 }
 
+/** What a stored check says right now: its verdict, or `stale` when the frame
+ *  has been edited since it was run. The server's `current` flag is the
+ *  authority as of the fetch; a frame changed after that is stale by
+ *  definition. Both the Checks tab and a frame's own label read this, so a
+ *  verdict cannot differ between the two surfaces. */
+export function checkVerdict(review: FrameReview & { current: boolean }, frame: Frame): 'pass' | 'fail' | 'stale' {
+  if (!review.current || review.frameUpdatedAt !== frame.updatedAt) return 'stale'
+  return review.verdict
+}
+
 const LAYERS_OPEN_KEY = 'doop:layers-open'
 
 function readLayersOpen(): boolean {
@@ -262,14 +267,12 @@ export const useStore = create<State>((set, get) => ({
   proposals: [],
   plans: [],
   panelTab: 'tasks',
-  limitWall: false,
-  allowanceVersion: 0,
   flyTo: null,
   frameProposals: [],
+  canvasProposals: [],
   questions: [],
-  runEvents: [],
-  runJournals: [],
   frameVersions: {},
+  frameReviews: {},
   frameLocks: {},
   reviewMode: false,
   reviewPolicy: 'off',
@@ -295,10 +298,18 @@ export const useStore = create<State>((set, get) => ({
   /* leaving a canvas drops its per-frame state: locks and loaded version
      lists belong to frames that no longer exist on screen */
   setCanvas: (canvas) =>
-    set(
+    set((s) =>
       canvas
-        ? { canvas, streams: {}, streamEnds: {} }
-        : { canvas: null, streams: {}, frameLocks: {}, frameVersions: {}, streamEnds: {} },
+        ? {
+            canvas,
+            streams: {},
+            streamEnds: {},
+            /* a verdict belongs to the frames it was run on, so opening a
+               different canvas starts clean rather than showing another
+               canvas's checks beside its frames */
+            ...(s.canvas && s.canvas.id !== canvas.id ? { frameReviews: {} } : {}),
+          }
+        : { canvas: null, streams: {}, frameLocks: {}, frameVersions: {}, frameReviews: {}, streamEnds: {} },
     ),
   setFrameLocks: (frameLocks) => set({ frameLocks }),
   setActivePage: (activePageId) => set({ activePageId }),
@@ -436,6 +447,14 @@ export const useStore = create<State>((set, get) => ({
     }),
   removeFrameProposal: (proposalId) =>
     set((s) => ({ frameProposals: s.frameProposals.filter((p) => p.id !== proposalId) })),
+  setCanvasProposals: (canvasProposals) => set({ canvasProposals: (canvasProposals ?? []).slice(0, 100) }),
+  upsertCanvasProposal: (proposal) =>
+    set((s) => {
+      const canvasProposals = s.canvasProposals.some((p) => p.id === proposal.id)
+        ? s.canvasProposals.map((p) => (p.id === proposal.id ? proposal : p))
+        : [proposal, ...s.canvasProposals].slice(0, 100)
+      return { canvasProposals }
+    }),
   setQuestions: (questions) => set({ questions: (questions ?? []).slice(0, 100) }),
   upsertQuestion: (question) =>
     set((s) => {
@@ -444,13 +463,19 @@ export const useStore = create<State>((set, get) => ({
         : [question, ...s.questions].slice(0, 100)
       return { questions }
     }),
-  setRunEvents: (runEvents) => set({ runEvents: (runEvents ?? []).slice(0, 500) }),
-  pushRunEvent: (event) =>
-    set((s) =>
-      s.runEvents.some((e) => e.id === event.id) ? {} : { runEvents: [event, ...s.runEvents].slice(0, 500) },
-    ),
-  setRunJournals: (journals) => set({ runJournals: (journals ?? []).slice(0, 100) }),
   setFrameVersions: (frameId, versions) => set((s) => ({ frameVersions: { ...s.frameVersions, [frameId]: versions } })),
+  setFrameReview: (frameId, review) => set((s) => ({ frameReviews: { ...s.frameReviews, [frameId]: review } })),
+  /* A sweep and a manual run can land in either order, so the newer report
+     wins rather than the one that arrived last. */
+  setFrameReviews: (reviews) =>
+    set((s) => {
+      const frameReviews = { ...s.frameReviews }
+      for (const review of reviews) {
+        const held = frameReviews[review.frameId]
+        if (!held || review.reviewedAt >= held.reviewedAt) frameReviews[review.frameId] = review
+      }
+      return { frameReviews }
+    }),
   setFrameLock: (frameId, holder) =>
     set((s) => {
       const frameLocks = { ...s.frameLocks }
@@ -517,8 +542,6 @@ export const useStore = create<State>((set, get) => ({
       return { proposals }
     }),
   setPanelTab: (panelTab) => set({ panelTab }),
-  setLimitWall: (limitWall) => set({ limitWall }),
-  allowanceChanged: () => set((s) => ({ allowanceVersion: s.allowanceVersion + 1 })),
   requestFlyTo: (frameId) => set({ flyTo: { frameId, at: Date.now() } }),
   /* selecting a different frame (or deselecting) closes the Inspector — the
      panel must not follow surface clicks, paste, or undo onto another frame.

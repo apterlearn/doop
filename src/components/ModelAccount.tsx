@@ -2,7 +2,6 @@ import { useCallback, useEffect, useState } from 'react'
 import { api } from '../lib/api'
 import type { DeviceFlow, ModelAccountStatus } from '../lib/api'
 import { posthog } from '../lib/posthog'
-import { useStore } from '../lib/store'
 import { CodeBlock } from './ui/code-block'
 import { Button } from './ui/button'
 import { Input } from './ui/input'
@@ -11,7 +10,7 @@ import { ToggleChip, ToggleChipGroup, ToggleChipItem } from './ui/toggle-chip'
 import { cn } from '@/lib/utils'
 
 /**
- * "Keep the Doop Agent running on my own subscription."
+ * "Run image generation, repo recon and distillation on my own subscription."
  *
  * OpenAI issues no redirect URI for a hosted app, so connecting ChatGPT takes
  * one of three shapes, cheapest first:
@@ -105,7 +104,7 @@ const maInput = 'rounded-[10px] border-ink px-3 py-[10px] font-mono focus:ring-0
 /* buttons in the responsive action rows centre their label once stacked */
 const rowBtn = 'max-md:justify-center'
 
-export function ModelAccountPanel({ onChange }: { onChange?: () => void }) {
+export function ModelAccountPanel() {
   const { account, refresh, set } = useModelAccount()
   const [authUrl, setAuthUrl] = useState('')
   /* true while the server is listening on the loopback callback port for us —
@@ -127,11 +126,8 @@ export function ModelAccountPanel({ onChange }: { onChange?: () => void }) {
       setRedirect('')
       setApiKey('')
       setError('')
-      onChange?.()
-      /* every allowance meter and wall on screen re-reads, not just this pane */
-      useStore.getState().allowanceChanged()
     },
-    [set, onChange],
+    [set],
   )
 
   /* poll only while a sign-in is actually in flight */
@@ -239,7 +235,7 @@ export function ModelAccountPanel({ onChange }: { onChange?: () => void }) {
     }
   }
 
-  const pickModel = async (model: string) => {
+  const chooseModel = async (model: string) => {
     setBusy(true)
     setError('')
     try {
@@ -279,7 +275,7 @@ export function ModelAccountPanel({ onChange }: { onChange?: () => void }) {
      only advertise what that plan can run, so they stay inert. */
   const modelChips = (live: boolean) =>
     live ? (
-      <ToggleChipGroup aria-label="Model" value={account.model ?? ''} onValueChange={pickModel} disabled={busy}>
+      <ToggleChipGroup aria-label="Model" value={account.model ?? ''} onValueChange={chooseModel} disabled={busy}>
         {options.map((m) => (
           <ToggleChipItem key={m.id} value={m.id} title={m.blurb}>
             {m.id === account.model && <Tick />}

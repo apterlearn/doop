@@ -4,7 +4,6 @@ import { sendFocus, sendWs } from '../lib/ws'
 import { throttle } from '../lib/throttle'
 import { FrameView } from './FrameView'
 import { FlowOverlay } from './FlowOverlay'
-import { GhostFrames } from './GhostFrames'
 import { Cursors } from './Cursors'
 import { SnapGuides } from './SnapGuides'
 import { MOD_KEY } from '../lib/keys'
@@ -558,9 +557,6 @@ export function Stage({ onAddFrame }: { onAddFrame: (preset?: FramePreset) => vo
               {frames.map((f) => (
                 <FrameView key={f.id} frame={f} raster={raster} />
               ))}
-              {/* ghost placement mirrors the server's auto-place, which lands
-                 on the first page — only show it while viewing that page */}
-              {(!canvas?.pages?.length || activePageId === canvas.pages?.[0]?.id) && <GhostFrames />}
               <FlowOverlay />
               <SnapGuides />
               <Cursors />
