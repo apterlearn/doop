@@ -31,6 +31,9 @@ import { diffFrames } from './visualDiff.ts'
 import { cssForTokens, stripTokenStyle } from '../shared/tokens.ts'
 import { lintFrame, lintProbe, planTokenFixes, type LintRule } from './designLint.ts'
 import { deriveDesignSystem, designSystemMarkdown } from './designSystem.ts'
+import { designLlmConfigured } from './designLlm.ts'
+import { FRAME_HEIGHT, FRAME_WIDTH, runDesignWorkflow } from './designWorkflow.ts'
+import { getDesignWorkflowPrefs } from './designWorkflowSettings.ts'
 import { probeFrame, type Probe } from './domProbe.ts'
 import {
   deleteElement,
@@ -636,6 +639,7 @@ export const MUTATING_TOOLS: Record<string, true> = {
   revert_frame: true,
   review_canvas: true,
   review_frame: true,
+  run_design_workflow: true,
   run_frame_script: true,
   save_decision: true,
   set_breakpoints: true,
@@ -768,6 +772,7 @@ export const TOOL_DOMAINS: Record<string, string> = {
   revert_frame: 'frame',
   review_canvas: 'verify',
   review_frame: 'verify',
+  run_design_workflow: 'frame',
   run_frame_script: 'frame',
   save_decision: 'canvas',
   search_components: 'canvas',
@@ -7529,7 +7534,7 @@ export function buildMcpServer(
       annotations: { readOnlyHint: true, destructiveHint: false },
       title: 'Get server capabilities',
       description:
-        'Which optional integrations are actually configured on this server (screenshot renderer, image/icon/logo search, website capture, model accounts, GitHub), plus the current size and rate limits. It also catalogues the surface itself: every registered tool with its domain and its read-only/destructive/idempotent flags, and the resources and prompts this server exposes. Call it ONCE before planning asset-heavy, import-heavy or export-heavy work: it is how you know a feature is available instead of discovering a failure mid-task.',
+        'Which optional integrations are actually configured on this server (screenshot renderer, image/icon/logo search, website capture, model accounts, the design workflow’s implementer and judge models, GitHub), plus the current size and rate limits. It also catalogues the surface itself: every registered tool with its domain and its read-only/destructive/idempotent flags, and the resources and prompts this server exposes. Call it ONCE before planning asset-heavy, import-heavy or export-heavy work: it is how you know a feature is available instead of discovering a failure mid-task.',
       inputSchema: {},
       outputSchema: { capabilities: z.record(z.unknown()) },
     },
@@ -9892,6 +9897,107 @@ export function buildMcpServer(
         has_more: next < all.length,
         ...(next < all.length ? { next_offset: next } : {}),
       })
+    },
+  )
+
+  /* ---- design workflow: the implementer + judge pipeline ---- */
+
+  /* The loop runs here, server-side, on the operator's one provider. Every
+     attempt lands through actions.ts, so a human in the room watches the
+     design build and rebuild itself while this call is still open; nothing
+     streams back to the caller until the judge passes or the budget is spent.
+     The verdict is pinned to the frame by the engine, and the run's one
+     timeline entry is the wrapper's own record of this call — which is why
+     this handler adds neither. */
+  tool(
+    'run_design_workflow',
+    {
+      annotations: { readOnlyHint: false, destructiveHint: false },
+      title: 'Design a frame with implementer + judge models',
+      description:
+        "Design a frame from a brief with a server-side implementer + judge pipeline: an implementer model writes the frame HTML and streams it live onto the canvas, a deterministic review plus a judge model critique it, and the implementer iterates on the judge's issues until the judge passes or the attempts run out. Needs DESIGN_LLM_BASE_URL on the server and a model pair picked in Settings. Long-running — the call blocks until the workflow finishes (up to ~30 min), and each attempt replaces the frame HTML.",
+      inputSchema: {
+        canvas_id: z.string(),
+        brief: z
+          .string()
+          .min(1)
+          .max(4000)
+          .describe('The design brief: what the implementer writes from and the judge measures against'),
+        frame_name: z
+          .string()
+          .max(200)
+          .optional()
+          .describe(
+            `Title for the new frame, which is created at ${FRAME_WIDTH} × ${FRAME_HEIGHT}. Defaults to "Design workflow"`,
+          ),
+        frame_id: z
+          .string()
+          .optional()
+          .describe(
+            'Redesign this existing frame instead of creating one — it must be on canvas_id, and its own size is the artboard the design is written and reviewed against',
+          ),
+        max_attempts: z
+          .number()
+          .int()
+          .min(1)
+          .max(5)
+          .optional()
+          .describe('Implementer/judge rounds before giving up (1–5, default 3)'),
+        agent_name: agentName,
+      },
+    },
+    async ({ canvas_id, brief, frame_name, frame_id, max_attempts, agent_name }) => {
+      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      const gated = reviewGate(canvas_id)
+      if (gated) return gated
+      /* The engine writes every attempt through actions.ts, so a canvas whose
+         policy would turn those writes into proposals would spend two model
+         calls per attempt on nothing. This is the broader gate than review
+         mode: reviewPolicy 'destructive' with any of these tools listed in
+         approvalTools refuses them too. */
+      if (actions.agentWritesGated(canvas_id, ['create_frame', 'update_frame', 'append_frame_html']))
+        return err(
+          'unsupported',
+          'this canvas gates agent writes — turn review mode off (or clear the approval list) before running the design workflow, or the implementer’s writes would land as proposals',
+        )
+      if (!designLlmConfigured())
+        return err(
+          'unsupported',
+          'the design workflow is not configured on this server — set DESIGN_LLM_BASE_URL and pick models in Settings',
+        )
+      /* the model pair is per user, so there is no anonymous answer to "which
+         models": the run would have to guess whose Settings to read */
+      if (!ownerId)
+        return err('forbidden', 'the design workflow needs a signed-in account — connect MCP with your doop login')
+      const prefs = await getDesignWorkflowPrefs(ownerId)
+      if (!prefs.implementerModel || !prefs.judgeModel)
+        return err(
+          'unsupported',
+          'no design workflow models are picked — choose an implementer and a judge in Settings',
+        )
+      /* A redesign target is only meaningful on the canvas the caller named:
+         the engine drives actions.ts with THAT canvas's tokens and broadcasts
+         to its viewers, so a frame from another canvas would be judged against
+         the wrong design system. */
+      if (frame_id && frameFor(frame_id)?.canvasId !== canvas_id)
+        return err('invalid_input', `frame ${frame_id} is not on canvas ${canvas_id}`)
+      const actor = actorFrom(agent_name)
+      try {
+        const result = await runDesignWorkflow({
+          canvasId: canvas_id,
+          brief,
+          frameName: (frame_name ?? '').trim() || 'Design workflow',
+          implementerModel: prefs.implementerModel,
+          judgeModel: prefs.judgeModel,
+          actor,
+          ...(max_attempts ? { maxAttempts: max_attempts } : {}),
+          ...(frame_id ? { frameId: frame_id } : {}),
+        })
+        return structured(result)
+      } catch (e) {
+        /* the provider's own words are the actionable part of a failed run */
+        return err('upstream_failed', e instanceof Error ? e.message : 'the design workflow failed')
+      }
     },
   )
 

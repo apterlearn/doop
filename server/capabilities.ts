@@ -1,5 +1,6 @@
 import { findBrowserPath } from './screenshot.ts'
 import { contextDevConfigured } from './contextDev.ts'
+import { designLlmConfigured } from './designLlm.ts'
 import { IMPORTS_PER_MIN, MAX_FRAME_HTML_BYTES, RENDERS_PER_MIN, SEARCHES_PER_MIN, UPLOADS_PER_MIN } from './limits.ts'
 import { MAX_ASSET_BYTES } from './assets.ts'
 import { listAllConnections, type GithubConnection } from './github.ts'
@@ -16,6 +17,10 @@ export interface ServerCapabilities {
   image_search: 'pexels' | 'none'
   website_import: 'context_dev' | 'chromium' | 'none'
   github: 'app' | 'pat' | 'none'
+  /** The server-side implementer + judge design pipeline (run_design_workflow):
+   *  the endpoint is the operator's env, which model plays which part is per
+   *  user, so this only says the workflow can run here at all. */
+  design_workflow: boolean
   limits: {
     frame_html_bytes: number
     asset_bytes: number
@@ -39,6 +44,7 @@ export async function capabilities(): Promise<ServerCapabilities> {
     image_search: process.env.PEXELS_API_KEY ? 'pexels' : 'none',
     website_import: contextDevConfigured() ? 'context_dev' : 'chromium',
     github: await githubMode(),
+    design_workflow: designLlmConfigured(),
     limits: {
       frame_html_bytes: MAX_FRAME_HTML_BYTES,
       asset_bytes: MAX_ASSET_BYTES,

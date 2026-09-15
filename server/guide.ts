@@ -245,6 +245,16 @@ whole canvas against a frozen release, per frame, as a pixel ratio when both ver
 render at one size and a line diff when they do not, plus what was added or removed
 since. Reach for them instead of re-reading a whole design to spot a change.
 
+The server can also run the whole loop for you: **run_design_workflow** puts an implementer
+model and a judge model on one frame — the implementer writes from your brief, the judge
+critiques the HTML plus the deterministic review findings, and the implementer iterates
+until the judge passes or the attempts run out. It is optional: it needs the server's
+design-LLM endpoint (DESIGN_LLM_BASE_URL) and a model pair picked in Settings, and it writes
+the frame through the ordinary frame write, so the run streams to the room like any other
+design. Reach for it when a human wants a design produced and critiqued without a connected
+agent driving every step — otherwise you are the implementer, and this is the loop you
+already run.
+
 ## Design brief — before your first frame
 
 ${DESIGN_BRIEF}

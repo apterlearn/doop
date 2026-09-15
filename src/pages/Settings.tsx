@@ -4,6 +4,7 @@ import { api } from '../lib/api'
 import { posthog } from '../lib/posthog'
 import { openCanvasTab } from '../lib/desktop'
 import { ModelAccountPanel } from '../components/ModelAccount'
+import { DesignWorkflowPanel } from '../components/DesignWorkflow'
 import { AccountSettings } from '../components/AccountSettings'
 import { ConnectedAgents } from '../components/ConnectedAgents'
 import { AccountMenu, ConnectCard, IconBack, IconChevron, IconSpark, IconUser } from '../components/DashShell'
@@ -132,16 +133,29 @@ export function Settings() {
           </Tabs>
 
           {pane === 'model' ? (
-            <Card className="mt-4 max-w-[1000px] overflow-hidden sm:mt-5">
-              <CardHeader>
-                <CardTitle>Model account</CardTitle>
-                <CardDescription>
-                  Agents connected over MCP use this account for image generation, repo recon and design distillation.
-                  It runs on an account you connect — your ChatGPT subscription or an [OI] key.
-                </CardDescription>
-              </CardHeader>
-              <ModelAccountPanel />
-            </Card>
+            <>
+              <Card className="mt-4 max-w-[1000px] overflow-hidden sm:mt-5">
+                <CardHeader>
+                  <CardTitle>Model account</CardTitle>
+                  <CardDescription>
+                    Agents connected over MCP use this account for image generation, repo recon and design distillation.
+                    It runs on an account you connect — your ChatGPT subscription or an [OI] key.
+                  </CardDescription>
+                </CardHeader>
+                <ModelAccountPanel />
+              </Card>
+              <Card className="mt-4 max-w-[1000px] overflow-hidden sm:mt-5">
+                <CardHeader>
+                  <CardTitle>Design workflow</CardTitle>
+                  <CardDescription>
+                    Runs a design brief through two models: the implementer writes the frame, the judge critiques it,
+                    and the implementer iterates until it passes. The run_design_workflow tool runs the pair picked
+                    here, taken from the provider's live model list.
+                  </CardDescription>
+                </CardHeader>
+                <DesignWorkflowPanel />
+              </Card>
+            </>
           ) : pane === 'account' ? (
             <AccountSettings />
           ) : (

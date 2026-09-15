@@ -54,7 +54,9 @@ Everything works with no configuration: data persists to an embedded Postgres (P
 and every optional integration (SMTP, stock photos, object storage, analytics) degrades gracefully
 until its variable in [.env.example](.env.example) is set. No key is needed to design — the agents you
 connect over MCP bring their own model; `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` only turn on the two
-server-side model calls ([image generation and the distiller](#models-doop-runs-no-agent-of-its-own)).
+server-side model calls ([image generation and the distiller](#models-doop-runs-no-agent-of-its-own)),
+and the optional design workflow runs its own implementer and judge models on `DESIGN_LLM_BASE_URL` +
+`DESIGN_LLM_API_KEY`.
 
 Or self-host the production build with Docker:
 
@@ -103,21 +105,28 @@ agent you connect.
 
 Agents bring their own model. You connect an MCP client — [CC], Codex, or anything else that speaks
 MCP — and it works the element comments you @mention a role in, designing on your
-subscription. There is no server-side agent, no per-task meter and no server key to fund: a comment
-waits for whichever agent works the role it @mentioned, and the roles are defined in
-[`shared/agents.ts`](shared/agents.ts).
+subscription. No server-side agent drives your comments, no per-task meter, and no server key is needed
+to design: a comment waits for whichever agent works the role it @mentioned, and the roles are defined
+in [`shared/agents.ts`](shared/agents.ts).
 
-Two server-side features do call a provider, each only when its key is set:
+Three server-side features do call a provider, each only when its key is set:
 
 - **Image generation** (`generate_image`) uses `OPENAI_API_KEY`, or the [OI] API key a caller
   connected in Settings — a connected account wins over the server's.
 - **The guideline distiller** ([`server/distill.ts`](server/distill.ts)) proposes durable style rules
   from your canvas on `ANTHROPIC_API_KEY` — or, with no server key, on the model of the connected MCP
   client, borrowed through MCP sampling. The same key gates background auto-tagging.
+- **The design workflow** (`run_design_workflow`) runs an implementer model and a judge model on one
+  [OI]-compatible endpoint (`DESIGN_LLM_BASE_URL` + `DESIGN_LLM_API_KEY`): the implementer writes a
+  frame from a brief, the judge critiques the HTML plus the deterministic review findings, and the
+  implementer iterates until it passes. Each user picks their own pair of models in Settings, from the
+  endpoint's own `/v1/models` list.
 
 ```bash
 ANTHROPIC_API_KEY=sk-ant-...   # the distiller + background auto-tagging
 OPENAI_API_KEY=sk-...          # image generation
+DESIGN_LLM_BASE_URL=https://your-provider/v1   # the design workflow's implementer + judge
+DESIGN_LLM_API_KEY=sk-...
 ```
 
 Everything else works with no configuration at all.
@@ -432,6 +441,7 @@ Steering happens at three layers (the same architecture paper.design uses, plus 
 | `list_frames`             | Page through a canvas's frames without pulling their HTML: id, name, page, position, size, who last touched each one and when, plus a public image_url.                                                                                                                                                                                                                  |
 | `move_frame`              | Move a frame to another page of its canvas (page by id or exact name — get_canvas lists both), optionally repositioning it with x/y in the same call.                                                                                                                                                                                                                    |
 | `revert_frame`            | Restore a frame to a version from get_frame_history.                                                                                                                                                                                                                                                                                                                     |
+| `run_design_workflow`     | Design a frame from a brief with a server-side implementer + judge pipeline: an implementer model writes the frame HTML and streams it onto the canvas, a judge model critiques the HTML plus the deterministic review findings, and the implementer iterates until the judge passes or attempts run out. Needs DESIGN_LLM_BASE_URL and a model pair picked in Settings. |
 | `run_frame_script`        | Run a short script inside a rendered frame to make the one structural change the element tools cannot express — a bulk renumber, every repeated card rewritten.                                                                                                                                                                                                          |
 | `search_frames`           | Find which frames on a canvas mention something: a literal, case-insensitive substring matched against every frame name and its HTML, newest-updated first, with a few short snippets around each hit.                                                                                                                                                                   |
 | `set_frame_css`           | Write the frame's own stylesheet (a <style data-doop-css> block in its head): the only place responsive rules (@media), interaction states (:hover/:focus/:active) and motion (transition/@keyframes) can live.                                                                                                                                                          |
@@ -507,7 +517,7 @@ Steering happens at three layers (the same architecture paper.design uses, plus 
 | `update_pull_request`     | Re-commit the canvas onto the branch a previous handoff opened and comment the summary on its pull request — the "send the client an update" path. Refuses with `not_found` when no pull request is open for that branch pair.                                                                                                                                           |
 | `comment_pull_request`    | Say something on a pull request this canvas opened: a conversation comment, or — with `in_reply_to` — an answer on one of the inline review comments, so the reply stays attached to the file and line it is about.                                                                                                                                                      |
 | `get_agents`              | The design roles this canvas organises work by, and who is live on it right now: each role with what it is for, and every MCP agent currently present on the canvas. Roles are the vocabulary a human @mentions in a comment; no agent is attached to one.                                                                                                               |
-| `get_capabilities`        | Which optional integrations are actually configured on this server (screenshot renderer, image/icon/logo search, website capture, GitHub), plus the current size and rate limits.                                                                                                                                                                                        |
+| `get_capabilities`        | Which optional integrations are actually configured on this server (screenshot renderer, image/icon/logo search, website capture, model accounts, the design workflow's implementer and judge models, GitHub), plus the current size and rate limits.                                                                                                                    |
 | `get_guide`               | Read the Doop agent guide: mandatory review checkpoints, the streaming workflow, frame sizing, design-quality doctrine, and multiplayer etiquette.                                                                                                                                                                                                                       |
 | `get_memory`              | What the connected account has taught Doop about its taste, kept across canvases: preferences, brand rules and working workflows.                                                                                                                                                                                                                                        |
 | `remember`                | Teach Doop something durable about this account that outlives the canvas: a styling preference ("likes generous whitespace"), a brand rule ("never use pure black"), a workflow ("wants mobile-first drafts first").                                                                                                                                                     |

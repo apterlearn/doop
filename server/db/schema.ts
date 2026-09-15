@@ -632,3 +632,16 @@ export const userMemory = pgTable(
   },
   (t) => [index('user_memory_user_idx').on(t.userId)],
 )
+
+/** The two models the design workflow runs on: an implementer that writes a
+ *  frame from a brief, and a judge that critiques it until it passes. Per
+ *  user, because the ids are picked from the operator's own provider; both
+ *  columns are null until someone picks, falling back to the env defaults.
+ *  The provider itself is env-only (DESIGN_LLM_BASE_URL / DESIGN_LLM_API_KEY)
+ *  and is never stored here. */
+export const designWorkflowSettings = pgTable('design_workflow_settings', {
+  userId: text('user_id').primaryKey(),
+  implementerModel: text('implementer_model'),
+  judgeModel: text('judge_model'),
+  updatedAt: bigint('updated_at', { mode: 'number' }).notNull(),
+})

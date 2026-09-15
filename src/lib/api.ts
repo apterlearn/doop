@@ -143,6 +143,18 @@ export interface ModelAccountStatus {
   models?: AgentModelOption[]
 }
 
+/** The implementer/judge model pair the design workflow runs on. Both come
+ *  from the server's one [OI]-compatible endpoint, so `models` is whatever the
+ *  provider lists right now — and `modelsError` is set when it cannot be
+ *  reached, which does not stop a saved pair from being edited by hand. */
+export interface DesignWorkflowStatus {
+  configured: boolean
+  implementerModel: string
+  judgeModel: string
+  models: { id: string }[]
+  modelsError?: string
+}
+
 export interface WebsiteImportResult {
   frames: Frame[]
   failures: { url: string; error: string }[]
@@ -442,6 +454,12 @@ export const api = {
   disconnectModelAccount: () => req<ModelAccountStatus>('/api/model-account', { method: 'DELETE' }),
   setAgentModel: (model: string) =>
     req<ModelAccountStatus>('/api/model-account', { method: 'PATCH', body: JSON.stringify({ model }) }),
+  designWorkflow: () => req<DesignWorkflowStatus>('/api/design-workflow'),
+  setDesignWorkflow: (implementerModel: string, judgeModel: string) =>
+    req<DesignWorkflowStatus>('/api/design-workflow', {
+      method: 'PATCH',
+      body: JSON.stringify({ implementerModel, judgeModel }),
+    }),
   addComment: (frameId: string, input: { selector: string; snippet: string; text: string; stableKey?: string }) =>
     req(`/api/frames/${frameId}/comments`, { method: 'POST', body: JSON.stringify(input) }),
   replyComment: (commentId: string, text: string) =>

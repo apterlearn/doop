@@ -340,6 +340,14 @@ function assertAgentWriteAllowed(
   throw new ReviewModeError(canvasId, toolName, canvas!.reviewMode ? 'all_writes' : (canvas!.reviewPolicy ?? 'off'))
 }
 
+/** Whether the canvas's policy would refuse an agent write through any of
+ *  `toolNames`. A multi-step tool checks this once, before it spends a model
+ *  call on work the gate would throw away. */
+export function agentWritesGated(canvasId: string, toolNames: string[]): boolean {
+  const canvas = store.getCanvas(canvasId)
+  return toolNames.some((name) => policyRequiresApproval(canvas, name, false))
+}
+
 function touch(canvasId: string, actor: Actor, frameId?: string | null) {
   if (actor.kind === 'agent') agentTouch(canvasId, actor.name, frameId, actor.owner, actor.ownerId)
 }

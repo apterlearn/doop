@@ -71,6 +71,8 @@ import * as githubApp from './githubApp.ts'
 import { importRepoScreen } from './githubRecon.ts'
 import { seed } from './seed.ts'
 import * as modelAccounts from './modelAccounts.ts'
+import * as designWorkflowSettings from './designWorkflowSettings.ts'
+import { designModelsStatus } from './designLlm.ts'
 import { AGENT_MODELS } from './openaiAgent.ts'
 import { colorFor } from '../shared/types.ts'
 import type { FrameLockHolder } from '../shared/types.ts'
@@ -805,6 +807,38 @@ app.post('/api/model-account/openai-key', async (req, res) => {
 app.delete('/api/model-account', async (req, res) => {
   await modelAccounts.disconnect(req.user!.id)
   res.json(accountView({ connected: false }))
+})
+
+/* ---- the design workflow's model pair: an implementer and a judge, both on
+   the operator's single [OI]-compatible endpoint. The credential is server
+   env; a user only picks which of its models plays each part. */
+
+/* The status and the model list travel together, like accountView: the client
+   re-renders straight from the response. An unreachable provider is a 200
+   with `modelsError` — the saved pair still has to render. */
+async function designWorkflowView(userId: string) {
+  const prefs = await designWorkflowSettings.getDesignWorkflowPrefs(userId)
+  if (!prefs.configured) return { ...prefs, models: [] }
+  const { models, error } = await designModelsStatus()
+  return { ...prefs, models, ...(error ? { modelsError: error } : {}) }
+}
+
+app.get('/api/design-workflow', (req, res) => {
+  designWorkflowView(req.user!.id)
+    .then((view) => res.json(view))
+    .catch(() => res.status(500).json({ error: 'design workflow settings unavailable' }))
+})
+
+app.patch('/api/design-workflow', async (req, res) => {
+  try {
+    await designWorkflowSettings.setDesignWorkflowPrefs(req.user!.id, {
+      implementerModel: String(req.body?.implementerModel ?? ''),
+      judgeModel: String(req.body?.judgeModel ?? ''),
+    })
+    res.json(await designWorkflowView(req.user!.id))
+  } catch (e) {
+    res.status(400).json({ error: e instanceof Error ? e.message : 'could not save the design workflow models' })
+  }
 })
 
 app.get('/api/canvases', (req, res) =>

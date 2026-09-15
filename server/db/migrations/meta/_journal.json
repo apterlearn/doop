@@ -232,6 +232,13 @@
       "when": 1789357554017,
       "tag": "0032_plain_rick_jones",
       "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "7",
+      "when": 1789385686392,
+      "tag": "0033_wise_the_fallen",
+      "breakpoints": true
     }
   ]
 }
