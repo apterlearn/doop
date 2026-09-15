@@ -9,6 +9,7 @@ import type {
   CommunityCategory,
   CommunityItem,
   Component,
+  ComponentSummary,
   DesignTokens,
   Frame,
   FrameProposal,
@@ -418,6 +419,11 @@ export const api = {
   /* one component's full record: the markup the library list leaves out, so a
      row can be instanced onto the canvas as a frame */
   getComponent: (id: string) => req<Component>(`/api/components/${id}`),
+  /* the library as the panel lists it — metadata and instance counts, no
+     markup. Only the server counts instances (it walks the canvas's frames),
+     and a new frame broadcasts no components update, so a row refetches this
+     to bring its own count up to date. */
+  listComponents: (canvasId: string) => req<ComponentSummary[]>(`/api/canvases/${canvasId}/components`),
   /* pages: ordered sub-canvases grouping the canvas's frames */
   createPage: (canvasId: string, name: string) =>
     req<Page>(`/api/canvases/${canvasId}/pages`, {

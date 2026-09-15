@@ -123,12 +123,17 @@ const activityRow = 'flex animate-[chip-in_0.25s_ease] gap-2.5 px-4 py-[9px] tex
 function ActivityList() {
   const activity = useStore((s) => s.activity)
   const frames = useStore((s) => s.canvas?.frames)
+  const activePageId = useStore((s) => s.activePageId)
   return (
     <PanelBody className="py-2">
       {activity.length === 0 && <div className={emptyNote}>No activity yet. Add a frame, or connect an agent.</div>}
       {activity.map((a) => {
         const frameId = a.frameId
-        const jumpable = !!frameId && !!frames?.some((f) => f.id === frameId)
+        const frame = frames?.find((f) => f.id === frameId)
+        /* the stage draws only the active page, so a frame on another page is
+           not on screen: the jump moves the tab first, or the camera would
+           glide to coordinates nothing is drawn at */
+        const jumpPage = frame && activePageId && frame.pageId !== activePageId ? frame.pageId : undefined
         const body = (
           <>
             <Dot className="mt-[5px]" style={{ background: a.actorColor }} />
@@ -146,7 +151,7 @@ function ActivityList() {
             </div>
           </>
         )
-        if (!jumpable) {
+        if (!frame) {
           return (
             <div key={a.id} className={activityRow}>
               {body}
@@ -160,8 +165,14 @@ function ActivityList() {
             title="Go to this frame"
             className={cn(activityRow, 'w-full text-left hover:bg-paper-deep')}
             onClick={() => {
-              useStore.getState().select(frameId)
-              useStore.getState().requestFlyTo(frameId)
+              const s = useStore.getState()
+              /* the tab first: the fly reads its frame from the whole canvas,
+                 so switching pages cannot lose the target */
+              if (jumpPage) s.setActivePage(jumpPage)
+              /* the guard above narrowed `frame`, not `frameId`, so read the
+                 id off the frame we know exists */
+              s.select(frame.id)
+              s.requestFlyTo(frame.id)
             }}
           >
             {body}
@@ -178,6 +189,7 @@ function ActivityList() {
 function RunList() {
   const runEvents = useStore((s) => s.runEvents)
   const frames = useStore((s) => s.canvas?.frames)
+  const activePageId = useStore((s) => s.activePageId)
   return (
     <PanelBody className="py-2">
       {runEvents.length === 0 && (
@@ -185,7 +197,11 @@ function RunList() {
       )}
       {runEvents.map((e) => {
         const frameId = e.frameId
-        const jumpable = !!frameId && !!frames?.some((f) => f.id === frameId)
+        const frame = frames?.find((f) => f.id === frameId)
+        /* the stage draws only the active page, so a frame on another page is
+           not on screen: the jump moves the tab first, or the camera would
+           glide to coordinates nothing is drawn at */
+        const jumpPage = frame && activePageId && frame.pageId !== activePageId ? frame.pageId : undefined
         const body = (
           <div>
             <div>
@@ -207,7 +223,7 @@ function RunList() {
             </div>
           </div>
         )
-        if (!jumpable) {
+        if (!frame) {
           return (
             <div key={e.id} className={activityRow}>
               {body}
@@ -221,8 +237,14 @@ function RunList() {
             title="Go to this frame"
             className={cn(activityRow, 'w-full text-left hover:bg-paper-deep')}
             onClick={() => {
-              useStore.getState().select(frameId)
-              useStore.getState().requestFlyTo(frameId)
+              const s = useStore.getState()
+              /* the tab first: the fly reads its frame from the whole canvas,
+                 so switching pages cannot lose the target */
+              if (jumpPage) s.setActivePage(jumpPage)
+              /* the guard above narrowed `frame`, not `frameId`, so read the
+                 id off the frame we know exists */
+              s.select(frame.id)
+              s.requestFlyTo(frame.id)
             }}
           >
             {body}

@@ -120,6 +120,7 @@ actions.hydrateLogs({
   decisions: data.decisions,
   proposals: data.proposals,
 })
+runLog.hydrate(data.runEvents)
 actions.hydrateUserMemory([...(data.userMemory?.values() ?? [])].flat())
 store.initComponents([...(data.components?.values() ?? [])].flat())
 seed()

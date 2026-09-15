@@ -323,13 +323,18 @@ function resultSummary(result: CallToolResult | undefined): string {
 }
 
 /** The frame a step wrote, for the Run timeline's jump-to-frame: the frame the
- *  call returned, or the one a writing call named. A read that merely names a
- *  frame is not "the frame this step wrote", so it carries no id. */
+ *  call returned, or the one a writing call named. Only a call that landed
+ *  wrote anything — a step that was refused or failed named a frame it never
+ *  touched, and the Run tab would offer a jump from a row it renders as failed
+ *  — so a failed step carries no id. Nor does a read that merely names a frame:
+ *  that is not "the frame this step wrote" either. */
 function runEventFrameId(
   args: Record<string, unknown>,
   result: CallToolResult | undefined,
+  ok: boolean,
   isWrite: boolean,
 ): string | undefined {
+  if (!ok) return undefined
   const text = result?.content?.find((block) => block.type === 'text')?.text
   if (text) {
     try {
@@ -1511,7 +1516,7 @@ export function buildMcpServer(
       ok,
       ms,
       summary: summary.slice(0, 200),
-      frameId: runEventFrameId(record, result, WRITE_OPS.has(name)),
+      frameId: runEventFrameId(record, result, ok, WRITE_OPS.has(name)),
     })
   }
 

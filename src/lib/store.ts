@@ -290,11 +290,13 @@ export const useStore = create<State>((set, get) => ({
             canvas,
             streams: {},
             streamEnds: {},
-            runEvents: [],
-            /* a verdict belongs to the frames it was run on, so opening a
-               different canvas starts clean rather than showing another
-               canvas's checks beside its frames */
-            ...(s.canvas && s.canvas.id !== canvas.id ? { frameReviews: {} } : {}),
+            /* a verdict and a timeline belong to the canvas they were read on,
+               so opening a different canvas starts clean rather than showing
+               another canvas's checks and tool calls beside its frames. Both
+               are guarded on the id: setCanvas also carries an in-place patch
+               of the canvas being viewed (a share toggle, a rename), and that
+               must not wipe what the panel is showing. */
+            ...(s.canvas && s.canvas.id !== canvas.id ? { runEvents: [], frameReviews: {} } : {}),
           }
         : {
             canvas: null,

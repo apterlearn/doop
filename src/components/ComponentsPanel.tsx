@@ -48,15 +48,17 @@ export function ComponentsPanel() {
 }
 
 /** One component: its thumbnail, its name and size, and how many frames hold
- *  an instance. A row has two actions: insert the component's markup into the
- *  canvas as a new frame — centered in the view, on the page being watched —
- *  or copy its name for an agent to reference. */
+ *  an instance. A row has two actions: insert an instance of the component as
+ *  a new frame — centered in the view, on the page being watched, and tracking
+ *  the library entry from then on — or copy its name for an agent to
+ *  reference. */
 function ComponentRow({ component: c }: { component: ComponentSummary }) {
   /* the variant's parent, when it is still in the library */
   const parentName = useStore((s) => s.components.find((x) => x.id === c.variantOf)?.name)
   const [failed, setFailed] = useState(false)
   const [copied, setCopied] = useState(false)
   const [inserting, setInserting] = useState(false)
+  const [insertFailed, setInsertFailed] = useState(false)
 
   const copyName = () => {
     navigator.clipboard.writeText(c.name).then(() => {
@@ -71,6 +73,7 @@ function ComponentRow({ component: c }: { component: ComponentSummary }) {
      the first one. */
   const insert = async () => {
     setInserting(true)
+    setInsertFailed(false)
     try {
       const component = await api.getComponent(c.id)
       const s = useStore.getState()
@@ -79,18 +82,37 @@ function ComponentRow({ component: c }: { component: ComponentSummary }) {
       const center = stageCenterWorld()
       const frame = await api.createFrame(component.canvasId, {
         name: component.name,
-        html: component.html,
+        /* the markup goes in inside the same wrapper the server's
+           insert_component builds. That wrapper is the whole of what makes the
+           new frame an instance: update_component propagation, the
+           delete_component guard and this row's own instance count all find an
+           instance by its data-doop-component attribute. A fresh instance
+           carries no overrides. */
+        html: `<div data-doop-component="${component.id}">${component.html}</div>`,
         width: component.width,
         height: component.height,
         x: Math.round(center.x - component.width / 2),
         y: Math.round(center.y - component.height / 2),
         ...(pageId ? { pageId } : {}),
       })
-      posthog.capture('frame_created')
+      posthog.capture('frame_created', { via: 'component' })
       recordCreate(frame)
       useStore.getState().select(frame.id)
+      /* last, and on its own: the frame is created and the canvas already
+         shows it, so this only catches up the row's own count — the library
+         list is the server's count of frames holding an instance, and a frame
+         creation does not broadcast a components update. Deliberately not
+         awaited and its failure only logged: the insert has succeeded by now,
+         and a count that lands a beat late beats a row claiming it failed. */
+      void api
+        .listComponents(component.canvasId)
+        .then((list) => useStore.getState().setComponents(list))
+        .catch(console.error)
     } catch (err) {
       console.error(err)
+      /* the row says so: a silent failure reads as a button that does nothing
+         — most often the component was deleted while the row was on screen */
+      setInsertFailed(true)
     } finally {
       /* either way the row stays usable: a stuck "Inserting…" would read as a
          button that does nothing */
@@ -136,6 +158,7 @@ function ComponentRow({ component: c }: { component: ComponentSummary }) {
               </Button>
             </div>
           </div>
+          {insertFailed && <ListMeta className="text-accent-ink">Couldn&rsquo;t insert — try again.</ListMeta>}
         </div>
       </div>
     </ListItem>

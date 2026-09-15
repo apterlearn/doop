@@ -550,9 +550,9 @@ design canvas: humans edit it in a browser while agents edit the same frames ove
 - \`ready_for_review\` runs the quality gate — token conformance, accessibility, layout
   and content checks at three widths — and records the result against the exact
   document it checked. Any later edit invalidates it.
-- The ship paths (\`create_release\`, \`publish_canvas\`, \`open_pull_request\`) refuse a canvas
-  whose frames you changed and did not verify. Fix what the report names, then call
-  \`ready_for_review\` again.
+- The ship paths (\`create_release\`, \`publish_canvas\`, \`open_pull_request\`, \`restore_release\`)
+  refuse a canvas whose frames you changed and did not verify. Fix what the report names, then
+  call \`ready_for_review\` again.
 - \`undo_last_change\` puts a frame back the way it was before your last write; it
   refuses when someone else has changed the frame since, because their work is not
   yours to discard.

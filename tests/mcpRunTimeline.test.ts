@@ -197,4 +197,87 @@ describe('the run timeline for a connected agent', () => {
       await close()
     }
   })
+
+  it('records the frame a write landed on, so the Run tab can jump to it', async () => {
+    const { client, close } = await connect()
+    try {
+      await callTool(client, 'create_frame', {
+        canvas_id: CANVAS_ID,
+        name: 'Hero',
+        width: 1200,
+        height: 900,
+        html: '<h1>hi</h1>',
+        agent_name: 'Claude',
+      })
+      const frameId = store.getCanvas(CANVAS_ID)!.frames[0]!.id
+      await callTool(client, 'append_frame_html', {
+        frame_id: frameId,
+        html_chunk: '<section>more</section>',
+        start: true,
+        agent_name: 'Claude',
+      })
+
+      const events = runLog.getRunEvents(CANVAS_ID, { limit: 50 })
+      const write = events.find((event) => event.name === 'append_frame_html')
+      expect(write?.ok).toBe(true)
+      expect(write?.frameId).toBe(frameId)
+    } finally {
+      await close()
+    }
+  })
+
+  it('records no frame for a write that was refused, though it named a real one', async () => {
+    const { client, close } = await connect()
+    try {
+      await callTool(client, 'create_frame', {
+        canvas_id: CANVAS_ID,
+        name: 'Hero',
+        width: 1200,
+        height: 900,
+        html: '<h1>hi</h1>',
+        agent_name: 'Claude',
+      })
+      const frameId = store.getCanvas(CANVAS_ID)!.frames[0]!.id
+      /* the frame moved on under the agent: the write is refused, and the row
+         must not offer a jump to a frame it never touched */
+      const { isError } = await callTool(client, 'set_frame_html', {
+        frame_id: frameId,
+        html: '<h1>rewritten</h1>',
+        expected_updated_at: new Date(0).toISOString(),
+        agent_name: 'Claude',
+      })
+      expect(isError).toBe(true)
+
+      const events = runLog.getRunEvents(CANVAS_ID, { limit: 50 })
+      const refused = events.find((event) => event.name === 'set_frame_html')
+      expect(refused?.ok).toBe(false)
+      expect(refused?.frameId).toBeUndefined()
+    } finally {
+      await close()
+    }
+  })
+
+  it('records no frame for a read that merely names one', async () => {
+    const { client, close } = await connect()
+    try {
+      await callTool(client, 'create_frame', {
+        canvas_id: CANVAS_ID,
+        name: 'Hero',
+        width: 1200,
+        height: 900,
+        html: '<h1>hi</h1>',
+        agent_name: 'Claude',
+      })
+      const frameId = store.getCanvas(CANVAS_ID)!.frames[0]!.id
+      await callTool(client, 'get_frame', { frame_id: frameId, agent_name: 'Claude' })
+
+      const events = runLog.getRunEvents(CANVAS_ID, { limit: 50 })
+      const read = events.find((event) => event.name === 'get_frame')
+      /* the read landed, it just did not write anything to jump to */
+      expect(read?.ok).toBe(true)
+      expect(read?.frameId).toBeUndefined()
+    } finally {
+      await close()
+    }
+  })
 })

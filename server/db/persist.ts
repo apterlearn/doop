@@ -270,8 +270,8 @@ export async function getFrameVersion(versionId: string): Promise<FrameVersion |
 
 /* Verification reports: append-only, capped per frame. Written from the
    review_frame and review_canvas tools, read by the checks panel and by the
-   ship gates (create_release, publish_canvas, open_pull_request) when they
-   decide whether a delivery may ship. */
+   ship gates (create_release, publish_canvas, open_pull_request, restore_release)
+   when they decide whether a delivery may ship. */
 const MAX_FRAME_REVIEWS = 20
 
 export async function saveFrameReview(review: FrameReview): Promise<void> {

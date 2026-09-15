@@ -92,6 +92,18 @@ export function forgetCanvas(canvasId: string): void {
   writeBehind(() => db.delete(runEvents).where(eq(runEvents.canvasId, canvasId)))
 }
 
+/** Seed the ring from the database at boot — a restart must not erase the
+ *  recent timeline a human was watching. Each list arrives newest first, the
+ *  order `record` and the reads assume, and is copied so the ring never
+ *  aliases the hydrated map; a canvas with no events is left out entirely
+ *  rather than given an empty list to carry. */
+export function hydrate(events: Map<string, RunEvent[]>): void {
+  for (const [canvasId, list] of events) {
+    if (list.length === 0) continue
+    runLog.set(canvasId, list.slice(0, CAP))
+  }
+}
+
 /** Retention pass: forget everything at least `ms` old — what the boot path
  *  calls to keep seven days of history. An event exactly on the cutoff counts
  *  as pruned, so `pruneOlderThan(0)` empties the log. */

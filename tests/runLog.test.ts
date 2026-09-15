@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest'
-import { forgetCanvas, getRunEvents, pruneOlderThan, record } from '../server/runLog.ts'
+import { forgetCanvas, getRunEvents, hydrate, pruneOlderThan, record } from '../server/runLog.ts'
 import type { RunEvent } from '../shared/types.ts'
 
 /**
@@ -27,6 +27,26 @@ function recordTool(i: number, runId = 'run-1'): RunEvent {
     ms: i,
     summary: `call ${i}`,
   })
+}
+
+/**
+ * One row as the boot path hands it to the ring: the id and timestamp are the
+ * database's, and each canvas's list arrives newest first — the order
+ * `record` writes and the reads assume.
+ */
+function persistedTool(i: number, at: number): RunEvent {
+  return {
+    id: `persisted-${i}`,
+    canvasId,
+    runId: 'run-1',
+    agentName: 'Doop Agent',
+    kind: 'tool',
+    name: 'create_frame',
+    ok: true,
+    ms: i,
+    summary: `call ${i}`,
+    at,
+  }
 }
 
 describe('record / getRunEvents', () => {
@@ -86,6 +106,51 @@ describe('record / getRunEvents', () => {
 
   it('reports an unknown canvas as empty', () => {
     expect(getRunEvents('c-never-used')).toEqual([])
+  })
+})
+
+describe('hydrate', () => {
+  it('seeds a canvas with the persisted events in the newest-first order they arrived in', () => {
+    const base = Date.now()
+    const persisted = [persistedTool(3, base), persistedTool(2, base - 1_000), persistedTool(1, base - 2_000)]
+    hydrate(new Map([[canvasId, persisted]]))
+
+    const events = getRunEvents(canvasId)
+    expect(events.map((e) => e.summary)).toEqual(['call 3', 'call 2', 'call 1'])
+    expect(events[0]).toMatchObject({ id: 'persisted-3', canvasId, runId: 'run-1', at: base })
+  })
+
+  it('leaves a canvas with no persisted events reading as empty', () => {
+    const empty: RunEvent[] = []
+    hydrate(new Map([[canvasId, empty]]))
+
+    expect(getRunEvents(canvasId)).toEqual([])
+    recordTool(1)
+    expect(empty).toHaveLength(0)
+  })
+
+  it('keeps only the newest 500 of a longer persisted list, leaving the list itself whole', () => {
+    const base = Date.now()
+    const persisted: RunEvent[] = []
+    for (let i = 599; i >= 0; i--) persisted.push(persistedTool(i, base - (599 - i)))
+    hydrate(new Map([[canvasId, persisted]]))
+
+    const events = getRunEvents(canvasId, { limit: 500 })
+    expect(events).toHaveLength(500)
+    expect(events[0]?.summary).toBe('call 599')
+    expect(events.at(-1)?.summary).toBe('call 100')
+    expect(persisted).toHaveLength(600)
+  })
+
+  it('does not alias the persisted list when the canvas is recorded to again', () => {
+    const base = Date.now()
+    const persisted = [persistedTool(2, base), persistedTool(1, base - 1_000)]
+    hydrate(new Map([[canvasId, persisted]]))
+
+    recordTool(3)
+
+    expect(getRunEvents(canvasId).map((e) => e.summary)).toEqual(['call 3', 'call 2', 'call 1'])
+    expect(persisted.map((e) => e.summary)).toEqual(['call 2', 'call 1'])
   })
 })
 

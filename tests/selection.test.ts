@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { Canvas, Frame } from '../shared/types'
+import type { Canvas, Frame, FrameReview, RunEvent } from '../shared/types'
 
 /* the history module talks to the server and analytics — stub both so the
    undo stack can be exercised as pure bookkeeping */
@@ -25,6 +25,26 @@ function frame(id: string, x = 0, y = 0): Frame {
     width: 100,
     height: 100,
   } as Frame
+}
+
+function runEvent(id: string): RunEvent {
+  return { id, canvasId: 'c1', runId: 'r1', agentName: 'agent', at: 1, kind: 'tool', name: 'write_frame' }
+}
+
+function review(frameId: string): FrameReview & { current: boolean } {
+  return {
+    id: `r-${frameId}`,
+    frameId,
+    canvasId: 'c1',
+    htmlSha: 'sha',
+    frameUpdatedAt: 0,
+    verdict: 'pass',
+    summary: {},
+    report: null,
+    reviewedAt: 1,
+    reviewedBy: 'human',
+    current: true,
+  }
 }
 
 function seed(...frames: Frame[]) {
@@ -162,5 +182,34 @@ describe('review follow-ups', () => {
     /* and that redo is itself undoable */
     await history.undo()
     expect(api.updateFrame).toHaveBeenLastCalledWith('b', { x: 0 })
+  })
+})
+
+/* setCanvas also carries an in-place patch of the canvas already on screen (a
+   share toggle, a description edit), so the per-canvas state it drops must be
+   dropped only when the canvas actually changed */
+describe('per-canvas state when the canvas is set', () => {
+  it('a same-canvas patch keeps the run timeline', () => {
+    useStore.getState().pushRunEvent(runEvent('e1'))
+    useStore.getState().pushRunEvent(runEvent('e2'))
+    const canvas = useStore.getState().canvas!
+    /* the shape ShareModal hands over for a link-access toggle */
+    useStore.getState().setCanvas({ ...canvas, linkAccess: 'edit' })
+    expect(useStore.getState().canvas!.linkAccess).toBe('edit')
+    expect(useStore.getState().runEvents.map((e) => e.id)).toEqual(['e2', 'e1'])
+  })
+
+  it('opening a different canvas clears the run timeline', () => {
+    useStore.getState().pushRunEvent(runEvent('e1'))
+    useStore.getState().setCanvas({ id: 'c2', name: 'other', frames: [] } as unknown as Canvas)
+    expect(useStore.getState().canvas!.id).toBe('c2')
+    expect(useStore.getState().runEvents).toEqual([])
+  })
+
+  it('a same-canvas patch keeps the stored frame reviews', () => {
+    useStore.getState().setFrameReview('a', review('a'))
+    const canvas = useStore.getState().canvas!
+    useStore.getState().setCanvas({ ...canvas, description: 'gallery blurb' })
+    expect(useStore.getState().frameReviews['a']).toMatchObject({ frameId: 'a', verdict: 'pass' })
   })
 })

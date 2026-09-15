@@ -66,8 +66,22 @@ function PanelTabsRoot({ className, ...props }: React.ComponentProps<typeof Tabs
 
 function PanelTabs({ className, ...props }: React.ComponentProps<typeof TabsPrimitive.List>) {
   /* min-w-0 so a long tab strip shrinks instead of shoving the close button
-     out through the panel's padding */
-  return <TabsPrimitive.List data-slot="panel-tabs" className={cn('flex min-w-0 gap-0.5', className)} {...props} />
+     out through the panel's padding, and it scrolls once the tabs outgrow the
+     panel rather than painting past its edge, where a clipped tab cannot be
+     clicked at all. The bar is hidden — a 26px strip has no room for one, and
+     the half-visible tab is what says there is more — and the vertical padding
+     is real, then cancelled, so a focused tab's outline has room to draw
+     inside the scroll box instead of being cut off by it. */
+  return (
+    <TabsPrimitive.List
+      data-slot="panel-tabs"
+      className={cn(
+        'flex min-w-0 gap-0.5 -my-1 overflow-x-auto overflow-y-hidden py-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden',
+        className,
+      )}
+      {...props}
+    />
+  )
 }
 
 function PanelTab({ className, ...props }: React.ComponentProps<typeof TabsPrimitive.Trigger>) {
@@ -75,7 +89,9 @@ function PanelTab({ className, ...props }: React.ComponentProps<typeof TabsPrimi
     <TabsPrimitive.Trigger
       data-slot="panel-tab"
       className={cn(
-        'rounded-sm px-2 py-[3px] font-mono text-[11px] font-medium uppercase tracking-[0.09em] text-ink-faint transition-colors hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ink data-[state=active]:bg-paper-deep data-[state=active]:text-ink',
+        /* shrink-0: a tab is as wide as its label, so the strip overflows and
+           scrolls rather than squeezing a word out of shape */
+        'shrink-0 rounded-sm px-2 py-[3px] font-mono text-[11px] font-medium whitespace-nowrap uppercase tracking-[0.09em] text-ink-faint transition-colors hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ink data-[state=active]:bg-paper-deep data-[state=active]:text-ink',
         className,
       )}
       {...props}
