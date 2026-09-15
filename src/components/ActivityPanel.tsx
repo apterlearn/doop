@@ -41,6 +41,12 @@ export function ActivityPanel({
           <PanelTabs>
             <PanelTab value="activity">Activity</PanelTab>
             <PanelTab
+              value="run"
+              title="What the connected agents actually did — every MCP tool call on this canvas, newest first"
+            >
+              Run
+            </PanelTab>
+            <PanelTab
               value="memory"
               title="Design memory — references, rules and decisions every agent on this canvas designs with"
             >
@@ -82,6 +88,9 @@ export function ActivityPanel({
         </PanelHeader>
         <PanelTabPanel value="activity">
           <ActivityList />
+        </PanelTabPanel>
+        <PanelTabPanel value="run">
+          <RunList />
         </PanelTabPanel>
         <PanelTabPanel value="tokens">
           <TokensPanel />
@@ -147,6 +156,67 @@ function ActivityList() {
         return (
           <button
             key={a.id}
+            type="button"
+            title="Go to this frame"
+            className={cn(activityRow, 'w-full text-left hover:bg-paper-deep')}
+            onClick={() => {
+              useStore.getState().select(frameId)
+              useStore.getState().requestFlyTo(frameId)
+            }}
+          >
+            {body}
+          </button>
+        )
+      })}
+    </PanelBody>
+  )
+}
+
+/* What the connected agents actually did, newest first: one row per MCP tool
+   call. Same rule as the feed above — when the step's frame still exists the
+   row is a button that flies the canvas to it. */
+function RunList() {
+  const runEvents = useStore((s) => s.runEvents)
+  const frames = useStore((s) => s.canvas?.frames)
+  return (
+    <PanelBody className="py-2">
+      {runEvents.length === 0 && (
+        <div className={emptyNote}>No agent activity yet — connect an MCP client and it will show up here.</div>
+      )}
+      {runEvents.map((e) => {
+        const frameId = e.frameId
+        const jumpable = !!frameId && !!frames?.some((f) => f.id === frameId)
+        const body = (
+          <div>
+            <div>
+              <span className="font-bold">
+                {e.agentName}
+                <span className="ml-[5px] font-mono text-[9.5px] font-medium uppercase tracking-[0.08em] text-ink-faint">
+                  {e.name ?? e.kind}
+                </span>
+              </span>{' '}
+              {(e.summary || e.ok === false) && (
+                <span className="text-ink-soft">
+                  {e.ok === false ? (e.summary ? `failed — ${e.summary}` : 'failed') : e.summary}
+                </span>
+              )}
+            </div>
+            <div className="mt-0.5 text-[11px] text-ink-faint">
+              {timeAgo(e.at)}
+              {e.ms !== undefined && ` · ${e.ms}ms`}
+            </div>
+          </div>
+        )
+        if (!jumpable) {
+          return (
+            <div key={e.id} className={activityRow}>
+              {body}
+            </div>
+          )
+        }
+        return (
+          <button
+            key={e.id}
             type="button"
             title="Go to this frame"
             className={cn(activityRow, 'w-full text-left hover:bg-paper-deep')}

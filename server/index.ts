@@ -1830,6 +1830,14 @@ app.delete('/api/components/:id', (req, res) => {
   res.json({ ok: true })
 })
 
+/** A component's full record — the markup an insert needs, which the summary list omits. */
+app.get('/api/components/:id', (req, res) => {
+  const component = store.getComponent(req.params.id)
+  if (!component) return res.status(404).json({ error: 'component not found' })
+  if (!requireCanvas(req, res, component.canvasId)) return
+  res.json(component)
+})
+
 /** A run's tool-call timeline, newest first. */
 app.get('/api/canvases/:id/run-events', (req, res) => {
   if (!requireCanvas(req, res, req.params.id)) return

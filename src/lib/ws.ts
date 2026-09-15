@@ -123,6 +123,7 @@ function handle(msg: ServerMessage) {
       s.setReviewModeLocal(msg.reviewMode)
       s.setReviewPolicyLocal(msg.reviewPolicy ?? (msg.reviewMode ? 'all_writes' : 'off'), msg.approvalTools ?? [])
       s.setComponents(msg.components ?? [])
+      s.setRunEvents(msg.runEvents ?? [])
       s.setFrameLocks(msg.frameLocks ?? {})
       break
     case 'presence:join':
@@ -206,6 +207,9 @@ function handle(msg: ServerMessage) {
          summaries, so the row is built here; the id is on the message either
          way, which is how a deletion names the row it removes */
       s.upsertComponent(msg.component ? summarizeComponent(msg.component, s.components) : null, msg.componentId)
+      break
+    case 'run:event':
+      s.pushRunEvent(msg.event)
       break
     case 'frame:lock':
       s.setFrameLock(msg.frameId, msg.holder)

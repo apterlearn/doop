@@ -322,6 +322,37 @@ function resultSummary(result: CallToolResult | undefined): string {
     .slice(0, 200)
 }
 
+/** The frame a step wrote, for the Run timeline's jump-to-frame: the frame the
+ *  call returned, or the one a writing call named. A read that merely names a
+ *  frame is not "the frame this step wrote", so it carries no id. */
+function runEventFrameId(
+  args: Record<string, unknown>,
+  result: CallToolResult | undefined,
+  isWrite: boolean,
+): string | undefined {
+  const text = result?.content?.find((block) => block.type === 'text')?.text
+  if (text) {
+    try {
+      const parsed: unknown = JSON.parse(text)
+      if (parsed && typeof parsed === 'object') {
+        if ('frame' in parsed && parsed.frame && typeof parsed.frame === 'object' && 'id' in parsed.frame) {
+          const id = parsed.frame.id
+          if (typeof id === 'string' && id) return id
+        }
+        if ('frame_id' in parsed) {
+          const id = parsed.frame_id
+          if (typeof id === 'string' && id) return id
+        }
+      }
+    } catch {
+      /* not our payload — no frame to point at */
+    }
+  }
+  if (!isWrite) return undefined
+  const named = args.frame_id
+  return typeof named === 'string' && named ? named : undefined
+}
+
 /** A failed tool's text block, as a structured error. Falls back to `internal`
  *  for anything that is not our own JSON payload (a transport-level failure). */
 function parseToolError(text: string | undefined): McpErrorPayload {
@@ -1453,7 +1484,14 @@ export function buildMcpServer(
    *  human watches what an agent did, and a connected MCP agent's work is
    *  exactly that. One event per canvas-scoped call, named by the agent that
    *  made it — a separate runId per agent session, so the panel can group them. */
-  const recordRunEvent = (name: string, args: unknown, ok: boolean, ms: number, summary: string) => {
+  const recordRunEvent = (
+    name: string,
+    args: unknown,
+    ok: boolean,
+    ms: number,
+    summary: string,
+    result?: CallToolResult,
+  ) => {
     if (!args || typeof args !== 'object') return
     const record = args as Record<string, unknown>
     if (typeof record.agent_name !== 'string') return
@@ -1473,6 +1511,7 @@ export function buildMcpServer(
       ok,
       ms,
       summary: summary.slice(0, 200),
+      frameId: runEventFrameId(record, result, WRITE_OPS.has(name)),
     })
   }
 
@@ -1556,14 +1595,14 @@ export function buildMcpServer(
           if (replayed) {
             replayed.content.push({ type: 'text' as const, text: JSON.stringify({ idempotent_replay: true }) })
             recordToolCall(name, true, Date.now() - started)
-            recordRunEvent(name, args, true, Date.now() - started, 'idempotent replay')
+            recordRunEvent(name, args, true, Date.now() - started, 'idempotent replay', replayed)
             return contextNotices(args, interruptedResult(args, replayed), used, declared)
           }
         }
         try {
           const result = await (cb as unknown as ToolHandler)(args, extra)
           recordToolCall(name, !result?.isError, Date.now() - started)
-          recordRunEvent(name, args, !result?.isError, Date.now() - started, resultSummary(result))
+          recordRunEvent(name, args, !result?.isError, Date.now() - started, resultSummary(result), result)
           /* only a result that landed is remembered: a refused write's key
              stays free, so the retry of a failure still runs */
           if (opKey && result && !result.isError) remember(opIdOwner(name), opKey, result)

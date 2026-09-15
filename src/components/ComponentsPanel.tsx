@@ -1,6 +1,10 @@
 import { useState } from 'react'
 import type { ComponentSummary } from '../../shared/types'
 import { useStore } from '../lib/store'
+import { api } from '../lib/api'
+import { stageCenterWorld } from '../lib/frameClipboard'
+import { recordCreate } from '../lib/history'
+import { posthog } from '../lib/posthog'
 import { PanelBody } from './ui/panel'
 import { Button } from './ui/button'
 import { ListHint, ListItem, ListMeta, ListSection, ListTitle } from './ui/list'
@@ -44,19 +48,54 @@ export function ComponentsPanel() {
 }
 
 /** One component: its thumbnail, its name and size, and how many frames hold
- *  an instance. Rows are informational — there is no per-component selection
- *  in the app yet — so the only action is copying the name an agent asks for. */
+ *  an instance. A row has two actions: insert the component's markup into the
+ *  canvas as a new frame — centered in the view, on the page being watched —
+ *  or copy its name for an agent to reference. */
 function ComponentRow({ component: c }: { component: ComponentSummary }) {
   /* the variant's parent, when it is still in the library */
   const parentName = useStore((s) => s.components.find((x) => x.id === c.variantOf)?.name)
   const [failed, setFailed] = useState(false)
   const [copied, setCopied] = useState(false)
+  const [inserting, setInserting] = useState(false)
 
   const copyName = () => {
     navigator.clipboard.writeText(c.name).then(() => {
       setCopied(true)
       window.setTimeout(() => setCopied(false), 1500)
     }, console.error)
+  }
+
+  /* the summary row carries no markup, so the full component is fetched first.
+     Insertion follows the same rules as a frame preset: it lands centered in
+     the view, and only a later page needs saying — the server auto-places on
+     the first one. */
+  const insert = async () => {
+    setInserting(true)
+    try {
+      const component = await api.getComponent(c.id)
+      const s = useStore.getState()
+      const onFirstPage = !s.activePageId || s.canvas?.pages?.[0]?.id === s.activePageId
+      const pageId = onFirstPage ? undefined : s.activePageId
+      const center = stageCenterWorld()
+      const frame = await api.createFrame(component.canvasId, {
+        name: component.name,
+        html: component.html,
+        width: component.width,
+        height: component.height,
+        x: Math.round(center.x - component.width / 2),
+        y: Math.round(center.y - component.height / 2),
+        ...(pageId ? { pageId } : {}),
+      })
+      posthog.capture('frame_created')
+      recordCreate(frame)
+      useStore.getState().select(frame.id)
+    } catch (err) {
+      console.error(err)
+    } finally {
+      /* either way the row stays usable: a stuck "Inserting…" would read as a
+         button that does nothing */
+      setInserting(false)
+    }
   }
 
   return (
@@ -88,9 +127,14 @@ function ComponentRow({ component: c }: { component: ComponentSummary }) {
           </ListMeta>
           <div className="flex items-center justify-between gap-2">
             <ListMeta>{bytes(c.htmlBytes)}</ListMeta>
-            <Button variant="bare" size="pill" onClick={copyName}>
-              {copied ? 'Copied' : 'Copy name'}
-            </Button>
+            <div className="flex items-center gap-1">
+              <Button variant="bare" size="pill" onClick={insert} disabled={inserting}>
+                {inserting ? 'Inserting…' : 'Insert'}
+              </Button>
+              <Button variant="bare" size="pill" onClick={copyName}>
+                {copied ? 'Copied' : 'Copy name'}
+              </Button>
+            </div>
           </div>
         </div>
       </div>

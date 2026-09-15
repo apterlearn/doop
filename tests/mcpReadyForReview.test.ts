@@ -138,7 +138,6 @@ beforeEach(() => {
     () => {},
     () => {},
     () => {},
-    () => {},
   )
   actions.hydrateLogs({
     comments: new Map(),

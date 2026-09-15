@@ -20,6 +20,7 @@ import type {
   Page,
   Presence,
   ReviewPolicy,
+  RunEvent,
 } from '../../shared/types'
 import type { SnapGuide } from './snap'
 
@@ -27,7 +28,7 @@ import type { SnapGuide } from './snap'
 export type StreamEndReason = 'done' | 'idle' | 'taken over' | 'replaced'
 
 /** Which tab the side panel shows. */
-export type PanelTab = 'activity' | 'memory' | 'tokens' | 'agents' | 'review' | 'checks' | 'components'
+export type PanelTab = 'activity' | 'memory' | 'tokens' | 'agents' | 'review' | 'checks' | 'components' | 'run'
 
 export interface Viewport {
   x: number
@@ -74,6 +75,8 @@ interface State {
   /** the canvas component library — reusable pieces agents can instance into
    *  frames, listed by the Components tab */
   components: ComponentSummary[]
+  /** the agent run timeline: one entry per MCP tool call, newest first */
+  runEvents: RunEvent[]
   /** which tab the side panel shows — in the store so a Memory-suggestion
    *  toast anywhere in the app can jump straight to the Memory tab */
   panelTab: PanelTab
@@ -182,6 +185,9 @@ interface State {
   /** upsert a component by id (summary set), or drop it when it was deleted
    *  (summary null) — newest-updated first either way */
   upsertComponent(summary: ComponentSummary | null, id: string): void
+  setRunEvents(events: RunEvent[]): void
+  /** prepend one timeline entry, keeping the list bounded like the server's ring */
+  pushRunEvent(event: RunEvent): void
   /** open the side panel on a tab from anywhere (a question pin, a toast) */
   requestPanel(tab: PanelTab): void
   clearPanelRequest(): void
@@ -257,6 +263,7 @@ export const useStore = create<State>((set, get) => ({
   reviewPolicy: 'off',
   approvalTools: [],
   components: [],
+  runEvents: [],
   panelRequest: null,
   selectedIds: [],
   selectedId: null,
@@ -283,12 +290,21 @@ export const useStore = create<State>((set, get) => ({
             canvas,
             streams: {},
             streamEnds: {},
+            runEvents: [],
             /* a verdict belongs to the frames it was run on, so opening a
                different canvas starts clean rather than showing another
                canvas's checks beside its frames */
             ...(s.canvas && s.canvas.id !== canvas.id ? { frameReviews: {} } : {}),
           }
-        : { canvas: null, streams: {}, frameLocks: {}, frameVersions: {}, frameReviews: {}, streamEnds: {} },
+        : {
+            canvas: null,
+            streams: {},
+            frameLocks: {},
+            frameVersions: {},
+            frameReviews: {},
+            streamEnds: {},
+            runEvents: [],
+          },
     ),
   setFrameLocks: (frameLocks) => set({ frameLocks }),
   setActivePage: (activePageId) => set({ activePageId }),
@@ -450,6 +466,10 @@ export const useStore = create<State>((set, get) => ({
       components.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))
       return { components }
     }),
+  setRunEvents: (runEvents) => set({ runEvents: (runEvents ?? []).slice(0, 200) }),
+  /* the server sends the timeline newest-first, so a live entry goes on the
+     front and the oldest falls off the end of the same bounded window */
+  pushRunEvent: (event) => set((s) => ({ runEvents: [event, ...s.runEvents].slice(0, 200) })),
   requestPanel: (tab) => set({ panelRequest: { tab, at: Date.now() } }),
   clearPanelRequest: () => set({ panelRequest: null }),
   renameCanvasLocal: (name) => set((s) => (s.canvas ? { canvas: { ...s.canvas, name } } : {})),

@@ -16,8 +16,8 @@
 - Zustand 4.5.4 - client-side state management.
 - Radix UI primitives (`@radix-ui/react-*`, ^1.x-2.x) + shadcn 4.19.0 - accessible UI primitives
   generated into `src/components/ui`.
-- `@anthropic-ai/sdk` 0.115.0 and `@modelcontextprotocol/sdk` 1.12.0 - power the built-in Doop
-  Agent and the MCP server that lets external agents (e.g. Claude Code) design on a canvas.
+- `@anthropic-ai/sdk` 0.115.0 - powers the guideline distiller and background auto-tagging.
+- `@modelcontextprotocol/sdk` 1.12.0 - powers the MCP server that lets external agents (e.g. [CC]) design on a canvas.
 - `ws` 8.18.0 - WebSocket server for realtime multiplayer (cursors, presence, frame edits,
   activity feed) over one room per canvas.
 

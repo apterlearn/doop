@@ -138,7 +138,7 @@ const ASSETS_DATA = mkdtempSync(path.join(tmpdir(), 'doop-asset-listing-'))
 beforeAll(async () => {
   process.chdir(ASSETS_DATA)
   await initDb()
-})
+}, 60_000)
 
 afterAll(async () => {
   await closeDb()

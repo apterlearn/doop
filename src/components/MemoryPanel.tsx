@@ -70,8 +70,8 @@ export function MemoryPanel() {
           </p>
           <ul className="mt-2.5 flex flex-col gap-2 pl-4">
             <li className="text-[12px] leading-[1.5] text-ink-soft">
-              <b>References</b> — pin a frame you love (the 🧠 on its corner). Agents copy its colors, type and layout
-              when they design something new.
+              <b>References</b> — pin a frame you love (right-click it → “Add to design memory”, or ☆ Pin in the
+              Inspector). Agents copy its colors, type and layout when they design something new.
             </li>
             <li className="text-[12px] leading-[1.5] text-ink-soft">
               <b>Rules</b> — style guides agents read before designing. Write them, or let them grow.
@@ -120,8 +120,8 @@ export function MemoryPanel() {
       </ListSection>
       {references.length === 0 ? (
         <ListHint>
-          No references yet. Pin a frame you like (the 🧠 on its corner) and agents will copy its colors, type and
-          layout in new designs.
+          No references yet. Pin a frame you like (right-click it → “Add to design memory”, or ☆ Pin in the Inspector)
+          and agents will copy its colors, type and layout in new designs.
         </ListHint>
       ) : (
         references.map((r) => (

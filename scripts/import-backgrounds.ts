@@ -1,6 +1,6 @@
 /**
  * Background library importer — bulk-loads a folder of images into the
- * backgrounds table (the search_backgrounds catalog) and object storage.
+ * backgrounds table (the list_backgrounds catalog) and object storage.
  *
  * Runs against the database this process is configured for: DATABASE_URL,
  * or the local PGlite under ./data when unset. Per image it does what an

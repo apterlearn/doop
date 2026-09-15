@@ -95,7 +95,6 @@ beforeEach(async () => {
     () => {},
     () => {},
     () => {},
-    () => {},
   )
   actions.hydrateLogs({
     comments: new Map(),

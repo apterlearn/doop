@@ -8,6 +8,7 @@ import type {
   CanvasReviewSummary,
   CommunityCategory,
   CommunityItem,
+  Component,
   DesignTokens,
   Frame,
   FrameProposal,
@@ -414,6 +415,9 @@ export const api = {
     req<Frame>('/api/frames/' + frameId, { method: 'PATCH', body: JSON.stringify({ ...patch, actor: actor() }) }),
   deleteFrame: (frameId: string) =>
     req('/api/frames/' + frameId, { method: 'DELETE', body: JSON.stringify({ actor: actor() }) }),
+  /* one component's full record: the markup the library list leaves out, so a
+     row can be instanced onto the canvas as a frame */
+  getComponent: (id: string) => req<Component>(`/api/components/${id}`),
   /* pages: ordered sub-canvases grouping the canvas's frames */
   createPage: (canvasId: string, name: string) =>
     req<Page>(`/api/canvases/${canvasId}/pages`, {

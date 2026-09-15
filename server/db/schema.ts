@@ -443,7 +443,7 @@ export const modelAccounts = pgTable('model_accounts', {
   updatedAt: bigint('updated_at', { mode: 'number' }).notNull(),
 })
 
-/* The curated background library behind search_backgrounds
+/* The curated background library behind list_backgrounds
    (server/backgrounds.ts). Bytes live in object storage under bg/<id>.webp
    and bg/<id>-t.webp; this row is everything the search ranks on. */
 export const backgrounds = pgTable('backgrounds', {

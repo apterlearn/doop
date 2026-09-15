@@ -95,9 +95,9 @@ export function App() {
       </>
     )
   /* signed out: every path lands on the sign-in form. The marketing site is
-     a separate service (see server/marketing.ts) that owns `/` for
-     visitors; share links (/c/…) and interrupted MCP OAuth redirects keep
-     their URL so the deep link / resume logic survives the sign-in. */
+     a separate service that owns `/` for visitors; share links (/c/…) and
+     interrupted MCP OAuth redirects keep their URL so the deep link / resume
+     logic survives the sign-in. */
   if (!session)
     return (
       <>

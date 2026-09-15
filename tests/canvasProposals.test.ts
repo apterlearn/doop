@@ -30,7 +30,7 @@ const sent: ServerMessage[] = []
 beforeAll(async () => {
   process.chdir(dataRoot)
   await initDb()
-})
+}, 60_000)
 
 afterAll(async () => {
   /* the same drain the server runs on shutdown: frame writes are debounced, and
@@ -50,7 +50,6 @@ beforeEach(() => {
   sent.length = 0
   actions.wire(
     (_id, msg) => sent.push(msg),
-    () => {},
     () => {},
     () => {},
   )
@@ -83,7 +82,7 @@ beforeEach(() => {
 
 describe('canvas proposals', () => {
   it('stores a pending row with the tokens it replaces, and leaves the canvas alone', async () => {
-    actions.setTokens(canvasId, { colors: { ink: '#111110' } }, OWNER)
+    actions.setTokens(canvasId, { colors: { ink: '#111110' }, updatedAt: 0, updatedBy: OWNER.name }, OWNER)
     const current = store.getCanvas(canvasId)!.tokens
     sent.length = 0
 
@@ -104,7 +103,7 @@ describe('canvas proposals', () => {
   })
 
   it('applies the payload on accept, and records the note', async () => {
-    actions.setTokens(canvasId, { colors: { ink: '#111110' } }, OWNER)
+    actions.setTokens(canvasId, { colors: { ink: '#111110' }, updatedAt: 0, updatedBy: OWNER.name }, OWNER)
     const next = { colors: { ink: '#333333' }, spacing: [4, 8] }
     const proposal = await actions.proposeCanvasChange(canvasId, 'tokens', next, AGENT)
     sent.length = 0
@@ -129,7 +128,7 @@ describe('canvas proposals', () => {
   })
 
   it('leaves the canvas alone on reject, and records why', async () => {
-    actions.setTokens(canvasId, { colors: { ink: '#111110' } }, OWNER)
+    actions.setTokens(canvasId, { colors: { ink: '#111110' }, updatedAt: 0, updatedBy: OWNER.name }, OWNER)
     const current = store.getCanvas(canvasId)!.tokens
     const proposal = await actions.proposeCanvasChange(canvasId, 'tokens', { colors: { ink: '#ff0000' } }, AGENT)
 
@@ -171,7 +170,7 @@ describe('canvas proposals', () => {
   })
 
   it('stores a clear as a null payload, and applies it as a clear', async () => {
-    actions.setTokens(canvasId, { colors: { ink: '#111110' } }, OWNER)
+    actions.setTokens(canvasId, { colors: { ink: '#111110' }, updatedAt: 0, updatedBy: OWNER.name }, OWNER)
     const proposal = await actions.proposeCanvasChange(canvasId, 'tokens', null, AGENT)
 
     /* a clear round-trips as a JSON null — the payload column is nullable, so

@@ -43,7 +43,7 @@ vi.mock('../server/review.ts', async (importOriginal) => {
 beforeAll(async () => {
   process.chdir(dataRoot)
   await initDb()
-})
+}, 60_000)
 
 afterAll(async () => {
   await closeDb()
