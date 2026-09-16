@@ -70,6 +70,17 @@ async function waitForVersions(frameId: string, count: number) {
   }
 }
 
+/** The other direction: the purge's delete is fire-and-forget too, so poll for
+ *  the rows to leave rather than guessing how long the write takes. */
+async function waitForNoVersions(frameId: string) {
+  const deadline = Date.now() + 5000
+  for (;;) {
+    if ((await persist.listFrameVersions(frameId, 100)).length === 0) return
+    if (Date.now() > deadline) throw new Error(`frame versions survived the purge of ${frameId}`)
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+}
+
 let counter = 0
 let canvas: Canvas
 let frame: Frame
@@ -225,15 +236,19 @@ describe('frame version history', () => {
     }
   })
 
-  it('drops a frame’s history with the frame', async () => {
+  it('keeps a trashed frame’s history, and drops it when the frame is purged', async () => {
+    const actor = actions.resolveActor({ name: 'alice', kind: 'user' })
     await persist.saveFrame(frame, true)
     await waitForVersions(frame.id, 1)
-    persist.deleteFrame(frame.id)
-    const deadline = Date.now() + 5000
-    for (;;) {
-      if ((await persist.listFrameVersions(frame.id, 100)).length === 0) break
-      if (Date.now() > deadline) throw new Error('frame versions survived the frame')
-      await new Promise((resolve) => setTimeout(resolve, 25))
-    }
+
+    /* the trash keeps the frame's identity, so a restore brings back the frame
+       itself — which is only true if the history came through with it */
+    expect(actions.deleteFrame(frame.id, actor)).toBeTruthy()
+    expect(await persist.listFrameVersions(frame.id, 100)).toHaveLength(1)
+
+    /* emptying the trash is the irreversible half: the row and its history go
+       together, or a recreated id would inherit the old frame's versions */
+    expect(actions.purgeFrame(frame.id, actor)).toBe(true)
+    await waitForNoVersions(frame.id)
   })
 })
