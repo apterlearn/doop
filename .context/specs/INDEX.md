@@ -6,4 +6,6 @@ lists every file in this folder.
 
 ## Active
 
-(none yet)
+- [agent-process-features.md](agent-process-features.md) - Must-have features for the agentic design
+  process — intent enforcement, agent identity/permissions, human-triggered workflow,
+  trash/canvas-version tools, durable signals, timeline detail.
