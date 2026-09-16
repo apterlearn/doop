@@ -5,29 +5,48 @@ import { afterAll, beforeAll, expect, it } from 'vitest'
 import { Client, startServer, type Server } from './harness.ts'
 
 /**
- * The design-workflow settings routes against the REAL server (see
- * ./harness.ts). The Settings card reads its whole state out of these two
- * routes, so what matters here is the shape it renders from: the pair the user
- * picked, the model list pulled live from the operator's provider, and the
- * fact that an unreachable provider still renders the saved pair instead of
- * blanking the card.
+ * The design-workflow routes against the REAL server (see ./harness.ts): the
+ * two the Settings card reads its whole state out of, and the brief route the
+ * composer starts a run through. What matters here is what each surface
+ * renders from — the pair the user picked, the model list pulled live from the
+ * operator's provider, an unreachable provider still rendering the saved pair
+ * instead of blanking the card, and a brief answered with the run its canvas
+ * and the Run tab now hold.
  *
- * The only fake is the provider itself — a two-line HTTP stub, because the
- * alternative is a real third-party endpoint. Everything else (session gate,
- * PGlite row, model fetch) is the deployed code path.
+ * The only fake is the provider itself — an HTTP stub serving the model list
+ * and the two completions a run makes, because the alternative is a real
+ * third-party endpoint. Everything else (session gate, PGlite rows, the
+ * engine, the action layer) is the deployed code path.
  *
- * 4989/4990 are clear of every other test file's ports; the stub provider and
+ * 4989-4992 are clear of every other test file's ports; the stub provider and
  * the dead port bind OS-assigned ports, so they can never collide.
  */
 
 const PORT = 4989
 const PORT_OFFLINE = 4990
+/** the same server with no endpoint at all: the operator who never set one,
+ *  whose brief route has to refuse in the words the card renders */
+const PORT_UNCONFIGURED = 4992
 
 const IMPLEMENTER = 'deepseek-v4.1-flash'
 const JUDGE = 'kimi-k3'
 
 /** The provider's list, in the order it sends them. */
 const MODELS = [{ id: JUDGE }, { id: IMPLEMENTER }]
+
+/** The second account: invited to a canvas as a viewer, so a brief has to be
+ *  refused it. */
+const VIEWER_EMAIL = 'viewer@test.dev'
+
+/** What the implementer answers a run with: the document the brief route has
+ *  to leave on the canvas. */
+const DESIGNED_HTML =
+  '<!doctype html><html><body><h1>Pricing</h1><p>Three tiers, one clear call to action</p></body></html>'
+
+/** What the judge answers: the one object the engine parses out of the reply. */
+function judgeReply(verdict: 'pass' | 'fail', summary: string, issues: string[] = []): string {
+  return JSON.stringify({ verdict, summary, issues })
+}
 
 /** What the client renders from: prefs first, provider list alongside. */
 interface WorkflowView {
@@ -38,12 +57,32 @@ interface WorkflowView {
   modelsError?: string
 }
 
+/** What a brief run answers with: the run id the caller was told to watch, and
+ *  the engine's own report on how it went. */
+interface BriefRun {
+  runId: string
+  ok: boolean
+  attempts: number
+  frameId: string
+  judgeVerdict: 'pass' | 'fail'
+  judgeSummary: string
+}
+
 let provider: HttpServer
 let providerAuth: string | undefined
+/** What the provider answers each model with, keyed by the model the request
+ *  names — the whole reason one stub can play both parts of a run. */
+const replies: Record<string, string> = {}
+/** Every completion asked for, in order: what tells a brief refused at the door
+ *  from one that spent two model calls getting there. */
+const completionCalls: string[] = []
 let server: Server
 let offline: Server
+let unconfigured: Server
 let user: Client
 let offlineUser: Client
+let unconfiguredUser: Client
+let viewer: Client
 
 /** A port nothing is listening on: bind one, read it, give it back. */
 async function freePort(): Promise<number> {
@@ -64,6 +103,28 @@ beforeAll(async () => {
       res.end(JSON.stringify({ data: MODELS }))
       return
     }
+    /* the engine's two calls: the implementer writes the document the brief
+       route was asked for, the judge answers the verdict that ends the run.
+       Both are scripted by the test, because a real model is exactly what this
+       stub stands in for — and a model with nothing scripted answers 500, so a
+       run that reaches one it should not have has failed loudly. */
+    if (req.method === 'POST' && req.url === '/v1/chat/completions') {
+      const chunks: Buffer[] = []
+      req.on('data', (chunk: Buffer) => chunks.push(chunk))
+      req.on('end', () => {
+        const { model } = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { model?: string }
+        const content = model === undefined ? undefined : replies[model]
+        if (model !== undefined) completionCalls.push(model)
+        if (content === undefined) {
+          res.writeHead(500, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: { message: `no scripted reply for ${model ?? 'an unnamed model'}` } }))
+          return
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ choices: [{ message: { content }, finish_reason: 'stop' }] }))
+      })
+      return
+    }
     res.writeHead(404, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify({ error: { message: 'no such route' } }))
   })
@@ -81,6 +142,7 @@ beforeAll(async () => {
     DOOP_JUDGE_MODEL: JUDGE,
   })
   user = await new Client(server).signUp('workflow@test.dev', 'Wanda Workflow')
+  viewer = await new Client(server).signUp(VIEWER_EMAIL, 'Vic Viewer')
 
   /* the same server pointed at nothing: an operator whose provider is down */
   const deadPort = await freePort()
@@ -93,11 +155,24 @@ beforeAll(async () => {
     DOOP_JUDGE_MODEL: JUDGE,
   })
   offlineUser = await new Client(offline).signUp('offline@test.dev', 'Ollie Offline')
+
+  /* and the server that was never pointed anywhere. The endpoint is set to the
+     empty string rather than left out: startServer inherits this process's
+     environment, and a machine that has one of its own must not quietly
+     configure the instance that is supposed to have none. */
+  unconfigured = await startServer(PORT_UNCONFIGURED, {
+    ...auth,
+    BETTER_AUTH_URL: `http://localhost:${PORT_UNCONFIGURED}`,
+    DESIGN_LLM_BASE_URL: '',
+    DESIGN_LLM_API_KEY: '',
+  })
+  unconfiguredUser = await new Client(unconfigured).signUp('unconfigured@test.dev', 'Una Unconfigured')
 }, 120_000)
 
 afterAll(() => {
   server?.stop()
   offline?.stop()
+  unconfigured?.stop()
   provider?.close()
 })
 
@@ -164,4 +239,97 @@ it('requires a session', async () => {
   const res = await fetch(`${server.base}/api/design-workflow`)
   expect(res.status).toBe(401)
   expect((await res.json()) as { error: string }).toMatchObject({ error: 'unauthorized' })
+}, 30_000)
+
+/* ------------------------------------------------------------------ */
+/* The brief route: the composer's door onto the engine.               */
+/* ------------------------------------------------------------------ */
+
+it('runs the brief the owner wrote and answers with the run the canvas now holds', async () => {
+  /* the route runs the pair this account picked in Settings, so it is picked
+     here first — the run below is the MCP tool's own loop, on the same pair */
+  const saved = await user.patch('/api/design-workflow', { implementerModel: IMPLEMENTER, judgeModel: JUDGE })
+  expect(saved.status).toBe(200)
+
+  const canvas = (await (await user.post('/api/canvases', { name: 'Brief' })).json()) as { id: string }
+  replies[IMPLEMENTER] = DESIGNED_HTML
+  replies[JUDGE] = judgeReply('pass', 'three tiers, one clear call to action')
+  completionCalls.length = 0
+
+  const res = await user.post(`/api/canvases/${canvas.id}/brief`, { brief: 'a pricing card with three tiers' })
+  expect(res.status).toBe(200)
+  const run = (await res.json()) as BriefRun
+
+  expect(run.ok).toBe(true)
+  expect(run.attempts).toBe(1)
+  expect(run.judgeVerdict).toBe('pass')
+  expect(run.judgeSummary).toBe('three tiers, one clear call to action')
+  expect(run.runId).toEqual(expect.any(String))
+  /* both models, in the order the loop runs them: this route is a door onto
+     the engine, not a second runtime that answers on its own */
+  expect(completionCalls).toEqual([IMPLEMENTER, JUDGE])
+
+  /* the design landed as a frame the canvas really holds, under the engine's
+     own name for it */
+  const view = (await (await user.get(`/api/canvases/${canvas.id}`)).json()) as {
+    frames: { id: string; name: string; html: string }[]
+  }
+  expect(view.frames.map((frame) => frame.id)).toEqual([run.frameId])
+  expect(view.frames[0]?.name).toBe('Design workflow')
+  expect(view.frames[0]?.html).toContain('Three tiers, one clear call to action')
+
+  /* and the runId in the answer is the id the engine's lines carry, so the
+     caller can watch the run it was just told had finished */
+  const events = (await (await user.get(`/api/canvases/${canvas.id}/run-events?run_id=${run.runId}`)).json()) as {
+    kind: string
+    summary: string
+  }[]
+  expect(events.map((event) => `${event.kind}: ${event.summary}`)).toEqual([
+    'status: three tiers, one clear call to action',
+    'status: judge reviewing attempt 1',
+    'status: implementing attempt 1/3',
+  ])
+}, 60_000)
+
+it('refuses a brief from a viewer member, before any model is asked', async () => {
+  const canvas = (await (await user.post('/api/canvases', { name: 'Read only' })).json()) as { id: string }
+  const added = await user.post(`/api/canvases/${canvas.id}/members`, { email: VIEWER_EMAIL, role: 'viewer' })
+  expect(added.status, await added.text()).toBe(200)
+  replies[IMPLEMENTER] = DESIGNED_HTML
+  completionCalls.length = 0
+
+  const res = await viewer.post(`/api/canvases/${canvas.id}/brief`, { brief: 'a pricing card with three tiers' })
+  expect(res.status).toBe(403)
+  expect((await res.json()) as { error: string }).toMatchObject({
+    error: 'this canvas is read-only — ask the owner for edit access',
+  })
+  /* the refusal is a door, not a bad run: no model was asked and the canvas is
+     exactly as the viewer found it */
+  expect(completionCalls).toEqual([])
+  const view = (await (await user.get(`/api/canvases/${canvas.id}`)).json()) as { frames: unknown[] }
+  expect(view.frames).toEqual([])
+}, 30_000)
+
+it('refuses a brief on a server with no endpoint, in the off state the card renders', async () => {
+  /* the Settings card and the brief box both read this: with no endpoint on
+     the server there is nothing to run and nothing to pick */
+  const card = (await (await unconfiguredUser.get('/api/design-workflow')).json()) as WorkflowView
+  expect(card).toMatchObject({ configured: false, models: [] })
+
+  const canvas = (await (await unconfiguredUser.post('/api/canvases', { name: 'No endpoint' })).json()) as {
+    id: string
+  }
+  const res = await unconfiguredUser.post(`/api/canvases/${canvas.id}/brief`, { brief: 'a pricing card' })
+  expect(res.status).toBe(400)
+  const refusal = (await res.json()) as { error: string }
+  /* the operator's own fix is the actionable part, so the sentence names the
+     env var — the same one the card's "Design workflow off" note names */
+  expect(refusal.error).toContain('DESIGN_LLM_BASE_URL')
+  expect(refusal.error).toContain('not configured')
+
+  /* the refusal is the whole answer: no frame, no run on the timeline */
+  const view = (await (await unconfiguredUser.get(`/api/canvases/${canvas.id}`)).json()) as { frames: unknown[] }
+  expect(view.frames).toEqual([])
+  const events = (await (await unconfiguredUser.get(`/api/canvases/${canvas.id}/run-events`)).json()) as unknown[]
+  expect(events).toEqual([])
 }, 30_000)

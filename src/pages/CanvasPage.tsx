@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import type { Presence } from '../../shared/types'
 import { isReadOnly, useStore, visibleFrames } from '../lib/store'
 import { connect, disconnect, sendWs } from '../lib/ws'
 import {
   api,
   ApiError,
+  type BriefRun,
   type DiscoveredSite,
   type GithubConnectionInfo,
   type GithubImportResult,
@@ -22,6 +24,7 @@ import { Inspector } from '../components/Inspector'
 import { ElementPanel } from '../components/ElementPanel'
 import { ActivityPanel } from '../components/ActivityPanel'
 import { ConnectModal } from '../components/ConnectModal'
+import { useDesignWorkflow } from '../components/DesignWorkflow'
 import { SideRail } from '../components/SideRail'
 import { LayersPanel, LayersRailToggle } from '../components/LayersPanel'
 import { Onboarding } from '../components/Onboarding'
@@ -55,6 +58,7 @@ import {
 import { moveFrameInStack, type ZDir } from '../lib/frameOrder'
 import { authClient } from '../lib/auth'
 import { posthog } from '../lib/posthog'
+import { timeAgo } from '../lib/time'
 import { useIsMobile } from '../hooks/use-mobile'
 import { cn } from '@/lib/utils'
 import { Button } from '../components/ui/button'
@@ -142,6 +146,22 @@ const Z_STEP: Record<string, [ZDir, ZDir]> = {
   '{': ['backward', 'back'],
 }
 
+/* The presence stack has no room for a second line, so an agent's freshness
+   rides the tile's hover text: `lastSeen` is the last thing the room heard
+   from it, and silence is the one signal a human has for telling an agent
+   that is thinking from one that is stuck. Past a minute the tile fades —
+   a connection that quiet is the stalled case, not a busy one. */
+const AGENT_QUIET_MS = 60_000
+
+function agentTileProps(p: Presence) {
+  /* people are always here by definition — only agents go quiet */
+  if (p.kind !== 'agent' || p.lastSeen === undefined) return {}
+  return {
+    title: `${p.name}${p.owner ? ` (${p.owner}'s agent)` : ' (agent)'} · active ${timeAgo(p.lastSeen)}`,
+    className: Date.now() - p.lastSeen > AGENT_QUIET_MS ? 'opacity-45' : undefined,
+  }
+}
+
 /** `onSignIn` is set only on the share-link path: it is how a read-only
  *  visitor swaps the canvas for the sign-in form without losing the URL, so
  *  the same canvas is there (editable, this time) once they have an account. */
@@ -167,6 +187,7 @@ export function CanvasPage({ canvasId, onSignIn }: { canvasId: string; onSignIn?
   const [presenting, setPresenting] = useState(false)
   const [showFindReplace, setShowFindReplace] = useState(false)
   const [showShortcuts, setShowShortcuts] = useState(false)
+  const [showBrief, setShowBrief] = useState(false)
   /* the page the find-and-replace sweep is scoped to, and its name for the
      modal's scope line; unset on a canvas that has no pages yet */
   const activePageId = useStore((s) => s.activePageId)
@@ -553,6 +574,18 @@ export function CanvasPage({ canvasId, onSignIn }: { canvasId: string; onSignIn?
     [presences, me.clientId],
   )
 
+  /* Those ages have to move on their own: a presence re-renders only when the
+     room hears from it, and going quiet is exactly what a stalled agent does
+     — without a clock its tile would sit on "just now" until the sweep
+     dropped it. Only runs while an agent is on the canvas. */
+  const [, ageTick] = useState(0)
+  const agentsHere = others.some((p) => p.kind === 'agent')
+  useEffect(() => {
+    if (!agentsHere) return
+    const t = window.setInterval(() => ageTick((n) => n + 1), 15_000)
+    return () => window.clearInterval(t)
+  }, [agentsHere])
+
   const selectedFrame = canvas?.frames.find((f) => f.id === selectedId) ?? null
   /* the panel only shows when a frame-name click (or deep link) opened it —
      selecting a frame by clicking its surface must not slide it in */
@@ -609,6 +642,15 @@ export function CanvasPage({ canvasId, onSignIn }: { canvasId: string; onSignIn?
               <Button
                 variant="bare"
                 className="h-8 px-2.5 text-[12.5px] font-medium"
+                onClick={() => setShowBrief(true)}
+                title="Describe a frame and the implementer + judge models design it"
+              >
+                <SparkIcon className="size-[13px]" />
+                Brief
+              </Button>
+              <Button
+                variant="bare"
+                className="h-8 px-2.5 text-[12.5px] font-medium"
                 onClick={() => setShowImport(true)}
                 title="Import a live web page as a frame"
               >
@@ -629,7 +671,15 @@ export function CanvasPage({ canvasId, onSignIn }: { canvasId: string; onSignIn?
               <Avatar name={me.name} kind="user" stacked />
             </Button>
             {others.map((p) => (
-              <Avatar key={p.clientId} name={p.name} color={p.color} kind={p.kind} owner={p.owner} stacked />
+              <Avatar
+                key={p.clientId}
+                name={p.name}
+                color={p.color}
+                kind={p.kind}
+                owner={p.owner}
+                stacked
+                {...agentTileProps(p)}
+              />
             ))}
           </div>
           <BarDivider />
@@ -727,7 +777,15 @@ export function CanvasPage({ canvasId, onSignIn }: { canvasId: string; onSignIn?
           >
             <Avatar name={me.name} kind="user" stacked />
             {others.map((p) => (
-              <Avatar key={p.clientId} name={p.name} color={p.color} kind={p.kind} owner={p.owner} stacked />
+              <Avatar
+                key={p.clientId}
+                name={p.name}
+                color={p.color}
+                kind={p.kind}
+                owner={p.owner}
+                stacked
+                {...agentTileProps(p)}
+              />
             ))}
           </div>
           {!readOnly && (
@@ -903,6 +961,16 @@ export function CanvasPage({ canvasId, onSignIn }: { canvasId: string; onSignIn?
                       className="h-11 justify-start border-line bg-surface px-4"
                       onClick={() => {
                         setShowMobileActions(false)
+                        setShowBrief(true)
+                      }}
+                    >
+                      <SparkIcon className="size-4" /> Design from a brief
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      className="h-11 justify-start border-line bg-surface px-4"
+                      onClick={() => {
+                        setShowMobileActions(false)
                         void addTextFrame()
                       }}
                     >
@@ -984,6 +1052,29 @@ export function CanvasPage({ canvasId, onSignIn }: { canvasId: string; onSignIn?
           onClose={() => setShowFindReplace(false)}
         />
       )}
+      {!readOnly && showBrief && (
+        <BriefModal
+          canvasId={canvasId}
+          /* a frame picked on the canvas is the redesign target; with none
+             picked the brief opens a new frame on the page in view */
+          frame={selectedFrame}
+          pageId={activePageId}
+          onClose={() => setShowBrief(false)}
+          onDone={(run) => {
+            setShowBrief(false)
+            if (run.frameId) select(run.frameId)
+            /* the run is on the Run tab — its lines stream there while the
+               engine works, so this says only how it ended */
+            useStore.getState().setPanelTab('run')
+            setShowActivity(true)
+            showToast(
+              run.ok
+                ? `Design passed the judge after ${run.attempts} attempt${run.attempts === 1 ? '' : 's'}`
+                : 'Design run ended without a pass — the reason is on the Run tab',
+            )
+          }}
+        />
+      )}
       {showShortcuts && <ShortcutSheet onClose={() => setShowShortcuts(false)} />}
       {presenting && selectedId && <PresentMode frameId={selectedId} onClose={() => setPresenting(false)} />}
       {!readOnly && showShare && canvas && (
@@ -1048,6 +1139,111 @@ export function CanvasPage({ canvasId, onSignIn }: { canvasId: string; onSignIn?
 /* hairline between the top bar's clusters: actions | presence | sharing */
 function BarDivider() {
   return <span aria-hidden className="mx-1 h-[22px] w-px bg-line-soft" />
+}
+
+/* The brief box: describe the frame you want and the server's implementer +
+   judge models design it. The run is the one the MCP tool starts — the frame
+   streams onto the canvas from behind this modal and the Run tab carries the
+   timeline — so this component is only the door: a brief, its target, and the
+   refusals the server answers with. */
+function BriefModal({
+  canvasId,
+  frame,
+  pageId,
+  onClose,
+  onDone,
+}: {
+  canvasId: string
+  /** the frame the brief redesigns; unset makes a new one, on this page */
+  frame: { id: string; name: string } | null
+  pageId?: string
+  onClose: () => void
+  onDone: (run: BriefRun) => void
+}) {
+  /* the same status the Settings card reads, from the same route: `configured`
+     is the server having an endpoint at all */
+  const { status } = useDesignWorkflow()
+  const [brief, setBrief] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  /* the two reasons the run refuses before spending a model call: no endpoint
+     on the server, no model pair picked for this account. The words are the
+     refusals' own, so the box explains itself before the answer does. */
+  const off = !!status && !status.configured
+  const noModels = !!status?.configured && (!status.implementerModel || !status.judgeModel)
+  const ready = !!status && status.configured && !noModels
+  const note = off
+    ? 'Design workflow off — set DESIGN_LLM_BASE_URL on the server.'
+    : noModels
+      ? 'no design workflow models are picked — choose an implementer and a judge in Settings'
+      : ''
+
+  async function start() {
+    if (busy || !ready || !brief.trim()) return
+    setBusy(true)
+    setError(null)
+    try {
+      onDone(await api.runBrief(canvasId, brief.trim(), frame ? { frameId: frame.id } : pageId ? { pageId } : {}))
+    } catch (caught) {
+      /* the refusal is the server's own sentence — the same one an agent
+         reading the tool's answer gets. The modal stays open on it; a run that
+         did start ends only once, and that is what onDone is for. */
+      setError(
+        caught instanceof ApiError
+          ? String(caught.body.error ?? 'the run could not start')
+          : caught instanceof Error
+            ? caught.message.replace(/^\d+\s*/, '')
+            : 'the run could not start',
+      )
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Modal size="md" onClose={() => !busy && onClose()}>
+      <>
+        <div className="flex flex-col gap-[5px]">
+          <ModalEyebrow>Design workflow</ModalEyebrow>
+          <ModalTitle>{frame ? 'Redesign this frame' : 'Design from a brief'}</ModalTitle>
+        </div>
+        <ModalLede>
+          {frame
+            ? `An implementer model rewrites “${frame.name}” from your brief, a review and a judge critique it, and it iterates until the judge passes.`
+            : 'An implementer model writes a new frame from your brief, a review and a judge critique it, and it iterates until the judge passes.'}
+        </ModalLede>
+        <Field className="mt-[22px]" label="Brief" labelVariant="form" htmlFor="brief-text">
+          <Textarea
+            id="brief-text"
+            autoFocus
+            rows={6}
+            spellCheck={false}
+            className="text-[13px] focus:ring-0"
+            placeholder="A pricing page for a two-tier SaaS — calm, editorial, one clear call to action…"
+            value={brief}
+            disabled={busy || !ready}
+            onChange={(e) => {
+              setBrief(e.target.value)
+              setError(null)
+            }}
+          />
+        </Field>
+        <Note className="mt-[10px] block">
+          Each attempt replaces the frame as it lands, so the design streams in behind this box. The run is on the Run
+          tab.
+        </Note>
+        {note && <Note className="mt-[10px] block">{note}</Note>}
+        {error && <p className={errorNoteCls}>{error}</p>}
+        <ModalActions>
+          <Button variant="ghost" disabled={busy} onClick={onClose}>
+            Cancel
+          </Button>
+          <Button variant="primary" disabled={busy || !ready || !brief.trim()} onClick={() => void start()}>
+            {busy ? 'Designing…' : 'Design it →'}
+          </Button>
+        </ModalActions>
+      </>
+    </Modal>
+  )
 }
 
 function ImportModal({

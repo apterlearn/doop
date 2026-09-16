@@ -1,5 +1,5 @@
 import http from 'node:http'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import express from 'express'
@@ -77,6 +77,7 @@ import {
 import { buildZip } from './zip.ts'
 import type { ZipEntry } from './zip.ts'
 import { reviewCanvas } from './canvasReview.ts'
+import { FRAME_HEIGHT, FRAME_WIDTH, runDesignWorkflow } from './designWorkflow.ts'
 import { commentPullRequest, commitToBranch, ensurePullRequest } from './githubWrite.ts'
 import { nanoid } from 'nanoid'
 import { cssForTokens } from '../shared/tokens.ts'
@@ -115,7 +116,7 @@ import { importRepoScreen } from './githubRecon.ts'
 import { seed } from './seed.ts'
 import * as modelAccounts from './modelAccounts.ts'
 import * as designWorkflowSettings from './designWorkflowSettings.ts'
-import { designModelsStatus } from './designLlm.ts'
+import { designLlmConfigured, designModelsStatus } from './designLlm.ts'
 import { AGENT_MODELS } from './openaiAgent.ts'
 import { colorFor } from '../shared/types.ts'
 import type { FrameLockHolder } from '../shared/types.ts'
@@ -1403,6 +1404,91 @@ app.patch('/api/design-workflow', async (req, res) => {
     res.json(await designWorkflowView(req.user!.id))
   } catch (e) {
     res.status(400).json({ error: e instanceof Error ? e.message : 'could not save the design workflow models' })
+  }
+})
+
+/* The brief ceiling and the frame a brief creates when the caller named no
+   page for it: both are the MCP tool's own values, restated so the two doors
+   onto the engine take the same briefs and create the same frame. */
+const BRIEF_MAX_CHARS = 4000
+const BRIEF_FRAME_NAME = 'Design workflow'
+
+/* The same loop as `run_design_workflow`, started by the person in front of
+   the canvas rather than by a connected agent: this route is a door onto the
+   engine, not a second runtime. The brief goes straight into runDesignWorkflow,
+   the frame it writes streams onto the canvas from there, and the engine's
+   lines land in the Run tab as a run. The actor is the human who asked, so
+   presence and attribution read as a human-initiated run; the refusals below
+   repeat the MCP tool's words, because both doors stand between a paid model
+   call and work the canvas would never take. */
+app.post('/api/canvases/:id/brief', async (req, res) => {
+  const c = requireCanvasIntent(req, res, req.params.id, 'edit')
+  if (!c) return
+  const brief = String(req.body?.brief ?? '').trim()
+  if (!brief) return res.status(400).json({ error: 'a brief is required' })
+  if (brief.length > BRIEF_MAX_CHARS)
+    return res.status(400).json({ error: `the brief is too long — keep it under ${BRIEF_MAX_CHARS} characters` })
+  /* The engine writes every attempt through actions.ts with this request's
+     actor — a human, whom the approval gate never stops — so review mode would
+     promise the humans in the room an approval the run cannot honour. The
+     canvas is asked the same question the tool asks, and answers in the same
+     words. */
+  if (actions.agentWritesGated(c.id, ['create_frame', 'update_frame', 'append_frame_html']))
+    return res.status(409).json({
+      error:
+        'this canvas gates agent writes — turn review mode off (or clear the approval list) before running the design workflow, or the implementer’s writes would land as proposals',
+    })
+  if (!designLlmConfigured())
+    return res.status(400).json({
+      error:
+        'the design workflow is not configured on this server — set DESIGN_LLM_BASE_URL and pick models in Settings',
+    })
+  /* the model pair is per user, so there is no anonymous answer to "which
+     models": the engine has to know whose Settings to read */
+  const prefs = await designWorkflowSettings.getDesignWorkflowPrefs(req.user!.id)
+  if (!prefs.implementerModel || !prefs.judgeModel)
+    return res.status(409).json({
+      error: 'no design workflow models are picked — choose an implementer and a judge in Settings',
+    })
+  const frameId = typeof req.body?.frameId === 'string' ? req.body.frameId : ''
+  const pageId = typeof req.body?.pageId === 'string' ? req.body.pageId : ''
+  /* a redesign target is only meaningful on the canvas the caller named: the
+     engine drives THAT canvas's tokens and broadcasts to its viewers, so a
+     frame from another canvas would be judged against the wrong design system */
+  if (frameId && store.getFrame(frameId)?.canvasId !== c.id) return res.status(404).json({ error: 'frame not found' })
+  if (pageId && !c.pages?.some((page) => page.id === pageId)) return res.status(404).json({ error: 'page not found' })
+  /* The engine opens its frame on the canvas's first page. A human composing
+     while looking at another page means that page, so the frame is created
+     here — the same one the engine would have made, at the engine's own size
+     and name — and handed over as the frame to write into. */
+  const target =
+    frameId ||
+    (pageId
+      ? (actions.createFrame(
+          c.id,
+          { name: BRIEF_FRAME_NAME, html: '', width: FRAME_WIDTH, height: FRAME_HEIGHT, pageId },
+          resolveActorFromReq(req),
+        )?.id ?? '')
+      : '')
+  /* the run id is minted here rather than inside the engine, so the answer can
+     name the run whose lines the caller is about to watch */
+  const runId = randomUUID()
+  try {
+    const result = await runDesignWorkflow({
+      canvasId: c.id,
+      brief,
+      frameName: BRIEF_FRAME_NAME,
+      implementerModel: prefs.implementerModel,
+      judgeModel: prefs.judgeModel,
+      actor: resolveActorFromReq(req),
+      ...(target ? { frameId: target } : {}),
+      runId,
+    })
+    res.json({ runId, ...result })
+  } catch (error) {
+    /* the provider's own words are the actionable part of a failed run */
+    console.error('[design-workflow] brief run failed', error)
+    res.status(502).json({ error: error instanceof Error ? error.message : 'the design workflow failed' })
   }
 })
 

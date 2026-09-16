@@ -214,6 +214,18 @@ export interface DesignWorkflowStatus {
   modelsError?: string
 }
 
+/** What a brief run ended with. The server answers with the engine's whole
+ *  report, and the composer reads the outcome out of it: `runId` is the run
+ *  whose lines the Run tab grouped while it worked, `attempts` how many the
+ *  judge spent, `ok` whether it ever passed, and `frameId` the frame the design
+ *  landed in — '' when no attempt produced one. */
+export interface BriefRun {
+  runId: string
+  ok: boolean
+  attempts: number
+  frameId: string
+}
+
 export interface WebsiteImportResult {
   frames: Frame[]
   failures: { url: string; error: string }[]
@@ -897,6 +909,16 @@ export const api = {
     req<DesignWorkflowStatus>('/api/design-workflow', {
       method: 'PATCH',
       body: JSON.stringify({ implementerModel, judgeModel }),
+    }),
+  /** Start the design workflow from a written brief — the same server-side run
+   *  the MCP tool starts, started by the person in front of the canvas. The
+   *  frame streams in behind this promise, so it resolves when the run is over,
+   *  not when it starts. `frameId` redesigns that frame; `pageId` is the page a
+   *  new frame lands on. */
+  runBrief: (canvasId: string, brief: string, target: { frameId?: string; pageId?: string } = {}) =>
+    req<BriefRun>(`/api/canvases/${canvasId}/brief`, {
+      method: 'POST',
+      body: JSON.stringify({ brief, ...target }),
     }),
   addComment: (frameId: string, input: { selector: string; snippet: string; text: string; stableKey?: string }) =>
     req(`/api/frames/${frameId}/comments`, { method: 'POST', body: JSON.stringify(input) }),
