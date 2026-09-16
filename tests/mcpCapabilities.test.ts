@@ -11,6 +11,7 @@ import { PUBLIC_ORIGIN } from '../server/auth.ts'
 import { closeDb, initDb } from '../server/db/index.ts'
 import * as persist from '../server/db/persist.ts'
 import { buildMcpServer, MUTATING_TOOLS, TOOL_DOMAINS } from '../server/mcp.ts'
+import { DESTRUCTIVE_TOOLS } from '../server/mcpPolicy.ts'
 import { findBrowserPath } from '../server/screenshot.ts'
 import { store } from '../server/store.ts'
 import type { Canvas } from '../shared/types.ts'
@@ -216,6 +217,12 @@ describe('get_capabilities catalogues the registered surface', () => {
       ]) {
         expect(destructive, `${name} must be marked destructive`).toContain(name)
       }
+      /* The review panel offers DESTRUCTIVE_TOOLS as the suggestions for its
+         gate list, and that list is a plain constant the REST route serves
+         without a server in hand — so this is where it is held to the live
+         registrations: a tool that starts (or stops) declaring itself
+         destructive fails here until the constant follows. */
+      expect([...destructive].sort()).toEqual([...DESTRUCTIVE_TOOLS].sort())
       /* and nothing that only reads is claimed to destroy */
       const canvasRead = caps.tools.find((t) => t.name === 'get_canvas')!
       expect(canvasRead.destructive).toBe(false)

@@ -292,8 +292,13 @@ Any container host works; Railway/Fly are the least friction:
    persistent volume mounted at `/app/data`.
 3. Set `BETTER_AUTH_SECRET` (long random string) and `BETTER_AUTH_URL` (the public origin,
    e.g. `https://doop.example.com`). Extra allowed origins: `TRUSTED_ORIGINS` (comma-separated).
-4. Health check: `GET /healthz`. The server trusts one proxy hop (`trust proxy`), so
-   TLS termination at the platform edge works out of the box.
+4. Health check: `GET /healthz` (liveness — the process is answering) and `GET /readyz`
+   (readiness — the database answers and the store has been hydrated from it; this is the one a
+   load balancer should point at, so a wedged database takes the instance out of rotation instead
+   of restarting it). The server trusts one proxy hop (`trust proxy`), so TLS termination at the
+   platform edge works out of the box. Every tunable that needs no code change — the port, the
+   rate limits, trash retention, the asset sweep — is listed with its default in
+   [.env.example](.env.example).
 
 Local sanity check of the exact production image:
 

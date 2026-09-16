@@ -1,18 +1,32 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import type * as apiModule from '../src/lib/api'
 import type { Canvas, Frame, FrameReview, RunEvent } from '../shared/types'
 
 /* the history module talks to the server and analytics — stub both so the
-   undo stack can be exercised as pure bookkeeping */
+   undo stack can be exercised as pure bookkeeping. The history module also
+   imports the stale-write predicate it classifies a failed replay with, so the
+   mock keeps the real one: a partial mock rather than a bare `{ api }`, which
+   left that named export undefined and turned every exercised failure path
+   into a mock error. */
 const api = {
   updateFrame: vi.fn(async (_id: string, _patch: object) => ({})),
   deleteFrame: vi.fn(async () => ({})),
   createFrame: vi.fn(async (_canvasId: string, rest: Partial<Frame>) => ({ ...frame('new'), ...rest, id: 'new' })),
 }
-vi.mock('../src/lib/api', () => ({ api }))
+vi.mock('../src/lib/api', async (importOriginal) => ({
+  ...(await importOriginal<typeof apiModule>()),
+  api,
+}))
 vi.mock('../src/lib/posthog', () => ({ posthog: { capture: vi.fn() } }))
 
 const { useStore } = await import('../src/lib/store')
 const history = await import('../src/lib/history')
+
+/* The (frame, patch) pairs a replay sent, in order. A replay also hands the
+   write its precondition — the freshness of the copy it replayed from — and
+   that value is whatever this store holds, not what these cases are about, so
+   it stays out of the assertion rather than pinning the call's arity. */
+const writes = () => api.updateFrame.mock.calls.map(([id, patch]) => [id, patch])
 
 function frame(id: string, x = 0, y = 0): Frame {
   return {
@@ -110,19 +124,20 @@ describe('grouped history', () => {
       { frameId: 'b', before: { x: 0, y: 0 }, after: { x: 10, y: 10 } },
     ])
     await history.undo()
-    expect(api.updateFrame).toHaveBeenCalledTimes(2)
-    expect(api.updateFrame).toHaveBeenCalledWith('a', { x: 0, y: 0 })
-    expect(api.updateFrame).toHaveBeenCalledWith('b', { x: 0, y: 0 })
+    expect(writes()).toEqual([
+      ['a', { x: 0, y: 0 }],
+      ['b', { x: 0, y: 0 }],
+    ])
     await history.undo()
-    expect(api.updateFrame).toHaveBeenCalledTimes(2)
+    expect(writes()).toHaveLength(2)
     await history.redo()
-    expect(api.updateFrame).toHaveBeenCalledTimes(4)
-    expect(api.updateFrame).toHaveBeenLastCalledWith('b', { x: 10, y: 10 })
+    expect(writes()).toHaveLength(4)
+    expect(writes().at(-1)).toEqual(['b', { x: 10, y: 10 }])
   })
 
   it('a group delete removes every frame and one undo brings them all back', async () => {
     const frames = useStore.getState().canvas!.frames
-    history.deleteFramesTracked(frames.slice(0, 2))
+    await history.deleteFramesTracked(frames.slice(0, 2))
     expect(api.deleteFrame).toHaveBeenCalledTimes(2)
     await history.undo()
     expect(api.createFrame).toHaveBeenCalledTimes(2)
@@ -182,11 +197,11 @@ describe('review follow-ups', () => {
     expect(frames.find((f) => f.id === 'b')!.x).toBe(0)
     /* only b was undone, so only b comes back on redo */
     await history.redo()
-    expect(api.updateFrame).toHaveBeenCalledTimes(3)
-    expect(api.updateFrame).toHaveBeenLastCalledWith('b', { x: 1 })
+    expect(writes()).toHaveLength(3)
+    expect(writes().at(-1)).toEqual(['b', { x: 1 }])
     /* and that redo is itself undoable */
     await history.undo()
-    expect(api.updateFrame).toHaveBeenLastCalledWith('b', { x: 0 })
+    expect(writes().at(-1)).toEqual(['b', { x: 0 }])
   })
 })
 

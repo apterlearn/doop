@@ -437,6 +437,86 @@ for (const dir of CHILD_INDEX_DIRS) {
   }
 }
 
+// ---------------- Rule 13: README tool table <-> server/mcp.ts ----------------
+// The README carries a hand-written row for every tool server/mcp.ts registers
+// (a table over a hundred rows long), and nothing else in CI reads that table.
+// A tool added without a row -- or a row left behind by a rename -- therefore
+// rots silently, and the first person to notice is a user asking for a tool
+// that is not there. Unlike the .context/ indexes above there is no "aged out"
+// reading here: the table is the inventory of what the server serves, so a name
+// in one place and not the other is a defect in either direction.
+
+const MCP_SOURCE_PATH = join(ROOT, 'server', 'mcp.ts')
+const TOOL_TABLE_HEADING_RE = /^#{2,3}\s+MCP tools\s*$/
+
+// A registration is a call to the file's local `tool(...)` wrapper, whose first
+// argument is the name as a string literal (the wrapper forwards it to
+// server.registerTool, which takes the variable -- so that call is not what
+// this reads). Nothing else in the file passes a literal name to `tool(`.
+const MCP_TOOL_REG_RE = /\btool\(\s*'([a-z0-9_]+)'/g
+
+// One row per tool: the first cell is the name in backticks. The slice below
+// stops at the next heading, so a table elsewhere in the README cannot leak in.
+const README_TOOL_ROW_RE = /^\|\s*`([a-z0-9_]+)`\s*\|/
+
+// The lines under a heading, running to the next heading of the same or a
+// higher level, or to EOF -- the slice Markdown itself gives that section.
+function sectionLines(src, headingRe) {
+  const lines = src.split('\n')
+  const start = lines.findIndex((line) => headingRe.test(line))
+  if (start === -1) return null
+
+  const level = HEADING_RE.exec(lines[start])[1].length
+  const body = []
+  for (const line of lines.slice(start + 1)) {
+    const nextHeading = HEADING_RE.exec(line)
+    if (nextHeading && nextHeading[1].length <= level) break
+    body.push(line)
+  }
+  return body
+}
+
+const readmeSrc = readIfExists(join(ROOT, 'README.md'))
+const mcpSrc = readIfExists(MCP_SOURCE_PATH)
+
+if (readmeSrc === null) {
+  err('README.md is missing, so its MCP tool table cannot be checked')
+} else if (mcpSrc === null) {
+  err('server/mcp.ts is missing, so its MCP tool table cannot be checked')
+} else {
+  const section = sectionLines(readmeSrc, TOOL_TABLE_HEADING_RE)
+  if (section === null) {
+    err('README.md has no "MCP tools" section, so the tool table cannot be checked')
+  } else {
+    const registered = new Set([...mcpSrc.matchAll(MCP_TOOL_REG_RE)].map((m) => m[1]))
+    const documented = new Set(
+      section.map((line) => README_TOOL_ROW_RE.exec(line)?.[1]).filter((name) => name !== undefined),
+    )
+
+    // A pattern that matches nothing would make the comparison below vacuous
+    // and report the whole table as stale, so say what actually happened.
+    if (registered.size === 0) {
+      err(
+        'no tool registrations found in server/mcp.ts -- the pattern in this rule no longer matches how tools are registered, so the README table went unchecked',
+      )
+    }
+
+    const missingFromReadme = [...registered].filter((name) => !documented.has(name)).sort()
+    const extraInReadme = [...documented].filter((name) => !registered.has(name)).sort()
+
+    if (missingFromReadme.length > 0) {
+      err(
+        `README.md's MCP tool table is missing ${missingFromReadme.length} tool(s) that server/mcp.ts registers: ${missingFromReadme.join(', ')}`,
+      )
+    }
+    if (extraInReadme.length > 0) {
+      err(
+        `README.md's MCP tool table names ${extraInReadme.length} tool(s) that server/mcp.ts does not register: ${extraInReadme.join(', ')}`,
+      )
+    }
+  }
+}
+
 // ---------------- Report ----------------
 
 if (warnings.length > 0) {
