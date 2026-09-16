@@ -54,7 +54,11 @@ export async function startServer(port: number, env: Record<string, string> = {}
     stopped,
     stop({ keepData }: { keepData?: boolean } = {}) {
       proc.kill()
-      if (!keepData) rmSync(dataDir, { recursive: true, force: true })
+      /* the server syncs its PGlite cluster on the way out (flush, then close),
+         so the directory can only be removed once the child is really gone:
+         deleting it underneath a live postgres is how rmSync fails with
+         ENOTEMPTY mid-walk, on the directory postgres just recreated. */
+      if (!keepData) void stopped.then(() => rmSync(dataDir, { recursive: true, force: true }))
     },
   }
 }
