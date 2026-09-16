@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { Frame, RunEvent } from '../../shared/types'
 import { isReadOnly, useStore } from '../lib/store'
-import { ApiError, api, type ConnectedAgent } from '../lib/api'
+import { ApiError, api, type AgentSignal, type ConnectedAgent } from '../lib/api'
 import { timeAgo } from '../lib/time'
 import { cn } from '@/lib/utils'
 import { MemoryPanel } from './MemoryPanel'
@@ -303,6 +303,45 @@ function RunGroup({
      readable forever, but only a live connection has a next tool call to refuse
      or a next call to read a steer on */
   const canControl = !readOnly && Object.values(presences).some((p) => p.kind === 'agent' && p.name === run.agentName)
+  /* what the canvas is still holding for this agent: a stop that has not
+     reached a tool call yet, and steers nobody has read. The agent name is
+     kept with the list so the answer is only ever read against the group that
+     asked for it — an agent with no live connection has no next call for
+     either to land on, and a list fetched for another run must not appear
+     here — which is what keeps this off the effect's cleanup path */
+  const [polled, setPolled] = useState<{ agent: string; list: AgentSignal[] } | null>(null)
+
+  useEffect(() => {
+    if (!canControl || !canvasId) return
+    const id = canvasId
+    const agent = run.agentName
+    /* polled rather than pushed: the indicator only has to be roughly current,
+       and the toast on the press already acknowledged the action. A failed poll
+       is not worth a toast — it would repeat every 5s for as long as the
+       network stayed down */
+    let live = true
+    async function poll() {
+      try {
+        const { signals: pending } = await api.agentSignals(id)
+        /* a reply already in flight when the group's agent changed, or when the
+           group unmounted, must not write over the newer state */
+        if (!live) return
+        setPolled({ agent, list: pending.filter((s) => s.agentName === agent) })
+      } catch (err) {
+        console.error('agent signals poll failed', err)
+      }
+    }
+    void poll()
+    const timer = window.setInterval(() => void poll(), 5000)
+    return () => {
+      live = false
+      window.clearInterval(timer)
+    }
+  }, [canControl, canvasId, run.agentName])
+
+  const signals = canControl && polled?.agent === run.agentName ? polled.list : []
+  const stopPending = signals.some((s) => s.kind === 'stop')
+  const queuedSteers = signals.filter((s) => s.kind === 'steer').length
 
   function showToast(message: string) {
     setToast(message)
@@ -361,8 +400,27 @@ function RunGroup({
     <>
       <ListSection className="pb-1">
         <span className="min-w-0 truncate">{run.agentName}</span>
-        <span className="flex-none normal-case">
-          {run.steps.length} step{run.steps.length === 1 ? '' : 's'} · {timeAgo(newest.at)}
+        <span className="flex min-w-0 flex-wrap items-center justify-end gap-x-1.5 gap-y-1 normal-case">
+          <span className="whitespace-nowrap">
+            {run.steps.length} step{run.steps.length === 1 ? '' : 's'} · {timeAgo(newest.at)}
+          </span>
+          {/* a stop that has not landed yet: the agent only finds out at its
+              next tool call, so without this the press looks like nothing */}
+          {stopPending && (
+            <Badge tone="outline" title={`Stop queued — ${run.agentName}'s next tool call is refused`}>
+              Stop pending
+            </Badge>
+          )}
+          {queuedSteers > 0 && (
+            <Badge
+              tone="outline"
+              title={`${queuedSteers} unread — ${run.agentName} reads ${
+                queuedSteers === 1 ? 'it' : 'them'
+              } on its next call`}
+            >
+              {queuedSteers} steer{queuedSteers === 1 ? '' : 's'} queued
+            </Badge>
+          )}
         </span>
       </ListSection>
       {(canControl || canRevert) && (

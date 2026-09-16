@@ -70,6 +70,38 @@ const policyChipTitle: Record<ReviewPolicy, string> = {
 }
 const OWNER_ONLY = 'Only the canvas owner can change the review policy'
 
+/* The tools whose own MCP annotation calls them destructive — what the editor
+   offers as suggestions beside the free-text input. One list for the whole
+   page load: the registry does not change while a tab is open, so opening the
+   panel again must not re-ask. A failure is not cached, so the next open gets
+   another try. */
+let destructiveTools: string[] | null = null
+let destructiveToolsInFlight: Promise<string[]> | null = null
+
+function loadDestructiveTools(): Promise<string[]> {
+  if (destructiveTools) return Promise.resolve(destructiveTools)
+  if (destructiveToolsInFlight) return destructiveToolsInFlight
+  const request = api
+    .destructiveTools()
+    .then(({ tools }) => {
+      destructiveTools = tools
+      return tools
+    })
+    .catch((err) => {
+      /* suggestions are a convenience: a dead route leaves the input as the
+         only way to name a tool, not a broken editor */
+      console.error('destructive tools fetch failed', err)
+      return []
+    })
+    .finally(() => {
+      /* the cache check above is what answers the next caller: the settled
+         request is done being interesting either way */
+      destructiveToolsInFlight = null
+    })
+  destructiveToolsInFlight = request
+  return request
+}
+
 /** The chip group hands back a plain string; the three settings are the only
  *  values it can carry, and the guard keeps that fact in the type. */
 function isReviewPolicy(value: string): value is ReviewPolicy {
@@ -158,6 +190,10 @@ export function ReviewPanel() {
   const [savingPolicy, setSavingPolicy] = useState(false)
   const [policyError, setPolicyError] = useState('')
   const [toolDraft, setToolDraft] = useState('')
+  /* the destructive-declaring tool names, offered under the input so an owner
+     does not have to recall them. Seeded from the shared cache, so reopening
+     the panel shows the suggestions without a re-request */
+  const [suggestedTools, setSuggestedTools] = useState<string[]>(destructiveTools ?? [])
   const [expiredOpen, setExpiredOpen] = useState(false)
   const [historyOpen, setHistoryOpen] = useState(false)
   /* Hunks the server refused when a patch was accepted — its old_str no longer
@@ -179,6 +215,20 @@ export function ReviewPanel() {
       })
       .catch(console.error)
   }, [canvasId])
+
+  /* the suggestions live beside the tool list, so nothing is asked for while
+     the policy is off or a viewer is reading — the same branch that renders
+     the input is the one that wants them */
+  useEffect(() => {
+    if (readOnly || reviewPolicy === 'off') return
+    let live = true
+    void loadDestructiveTools().then((tools) => {
+      if (live) setSuggestedTools(tools)
+    })
+    return () => {
+      live = false
+    }
+  }, [readOnly, reviewPolicy])
 
   const awaiting = useMemo(() => proposals.filter((p) => p.status === 'pending' || p.status === 'stale'), [proposals])
   const pendingCanvas = useMemo(() => canvasProposals.filter((p) => p.status === 'pending'), [canvasProposals])
@@ -238,15 +288,25 @@ export function ReviewPanel() {
       .finally(() => setSavingPolicy(false))
   }
 
+  /* One more name in the gated list — the end both ways in reach: the draft
+     the input commits, and a suggestion chip's own name. */
+  function addGatedTool(name: string) {
+    if (!name || !isOwner || savingPolicy || approvalTools.includes(name)) return
+    savePolicy(reviewPolicy, [...approvalTools, name])
+  }
+
   /* A tool name typed into the chip input: committed on Enter, comma or blur,
      and dropped when it is already gated — the same name twice is one gate.
      The policy itself is untouched: this only edits the list it gates by. */
   function addApprovalTool() {
     const name = toolDraft.trim().replace(/,+$/, '')
     setToolDraft('')
-    if (!name || !isOwner || savingPolicy || approvalTools.includes(name)) return
-    savePolicy(reviewPolicy, [...approvalTools, name])
+    addGatedTool(name)
   }
+
+  /* the declarations the list does not gate yet — a suggestion for a name
+     already gated would be a button that can only do nothing */
+  const suggestions = suggestedTools.filter((tool) => !approvalTools.includes(tool))
 
   return (
     <PanelBody className="flex flex-col pb-3">
@@ -291,56 +351,80 @@ export function ReviewPanel() {
               ))}
             </ToggleChipGroup>
             {reviewPolicy !== 'off' && (
-              <Field
-                label={reviewPolicy === 'destructive' ? 'Also gate these tools' : 'Extra gated tools'}
-                htmlFor="review-approval-tools"
-                hint={
-                  reviewPolicy === 'destructive'
-                    ? 'Tool names gated on top of the ones that declare themselves destructive. Enter adds one; ✕ removes it.'
-                    : 'Every write is gated already — these names stay gated if you narrow the policy to destructive. Enter adds one; ✕ removes it.'
-                }
-                className="mt-3"
-              >
-                <div className="flex flex-wrap items-center gap-1.5 rounded-md border border-line bg-surface px-2 py-1.5 focus-within:border-ink">
-                  {approvalTools.map((tool) => (
-                    <Badge key={tool} className="gap-1 pr-1">
-                      {tool}
-                      <button
-                        type="button"
-                        className="text-ink-faint hover:text-accent-ink"
-                        aria-label={`Stop gating ${tool}`}
-                        disabled={!isOwner || savingPolicy}
-                        onClick={() =>
-                          savePolicy(
-                            reviewPolicy,
-                            approvalTools.filter((t) => t !== tool),
-                          )
+              <>
+                <Field
+                  label={reviewPolicy === 'destructive' ? 'Also gate these tools' : 'Extra gated tools'}
+                  htmlFor="review-approval-tools"
+                  hint={
+                    (reviewPolicy === 'destructive'
+                      ? 'Tool names gated on top of the ones that declare themselves destructive. Enter adds one; ✕ removes it.'
+                      : 'Every write is gated already — these names stay gated if you narrow the policy to destructive. Enter adds one; ✕ removes it.') +
+                    (suggestions.length > 0
+                      ? ' The suggestions below are the tools that declare themselves destructive.'
+                      : '')
+                  }
+                  className="mt-3"
+                >
+                  <div className="flex flex-wrap items-center gap-1.5 rounded-md border border-line bg-surface px-2 py-1.5 focus-within:border-ink">
+                    {approvalTools.map((tool) => (
+                      <Badge key={tool} className="gap-1 pr-1">
+                        {tool}
+                        <button
+                          type="button"
+                          className="text-ink-faint hover:text-accent-ink"
+                          aria-label={`Stop gating ${tool}`}
+                          disabled={!isOwner || savingPolicy}
+                          onClick={() =>
+                            savePolicy(
+                              reviewPolicy,
+                              approvalTools.filter((t) => t !== tool),
+                            )
+                          }
+                        >
+                          ✕
+                        </button>
+                      </Badge>
+                    ))}
+                    <Input
+                      id="review-approval-tools"
+                      variant="bare"
+                      inputSize="sm"
+                      className="min-w-[104px] flex-1 font-mono md:text-[12px]"
+                      value={toolDraft}
+                      placeholder="tool_name"
+                      spellCheck={false}
+                      disabled={!isOwner || savingPolicy}
+                      onBlur={addApprovalTool}
+                      onChange={(e) => setToolDraft(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' || e.key === ',') {
+                          e.preventDefault()
+                          addApprovalTool()
                         }
+                      }}
+                    />
+                  </div>
+                </Field>
+                {/* the names an owner would otherwise have to recall, one tap
+                    each, saved through the path the input commits with */}
+                {suggestions.length > 0 && (
+                  <div className="mt-2 flex flex-wrap gap-1.5">
+                    {suggestions.map((tool) => (
+                      <Button
+                        key={tool}
+                        variant="ghost"
+                        size="pill"
+                        className="font-mono font-normal"
+                        disabled={!isOwner || savingPolicy}
+                        title={`${tool} declares itself destructive`}
+                        onClick={() => addGatedTool(tool)}
                       >
-                        ✕
-                      </button>
-                    </Badge>
-                  ))}
-                  <Input
-                    id="review-approval-tools"
-                    variant="bare"
-                    inputSize="sm"
-                    className="min-w-[104px] flex-1 font-mono md:text-[12px]"
-                    value={toolDraft}
-                    placeholder="tool_name"
-                    spellCheck={false}
-                    disabled={!isOwner || savingPolicy}
-                    onBlur={addApprovalTool}
-                    onChange={(e) => setToolDraft(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' || e.key === ',') {
-                        e.preventDefault()
-                        addApprovalTool()
-                      }
-                    }}
-                  />
-                </div>
-              </Field>
+                        {tool}
+                      </Button>
+                    ))}
+                  </div>
+                )}
+              </>
             )}
           </>
         )}
