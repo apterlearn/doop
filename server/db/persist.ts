@@ -35,8 +35,19 @@ import type {
  * Nothing on the live path (presence, cursors, reveal ticks) awaits the DB.
  */
 
-function swallow(p: Promise<unknown>) {
-  p.catch((err) => console.error('[db] write failed', err))
+/** Every write nobody awaits, so flush() can wait for them before the database
+ *  is closed. Closing over a write still in flight is not merely a lost row:
+ *  PGlite's close spins forever in its WASM exit path when it lands mid-query,
+ *  so the shutdown's own timeout is the only thing that ends the process, with
+ *  ./data/pg left unsynced. */
+const inFlightWrites = new Set<Promise<unknown>>()
+
+function swallow(p: Promise<unknown>): void {
+  /* the tracked copy cannot reject — a failed write is logged, not thrown at a
+     caller that has nowhere to put it, and a rejection here would be unhandled */
+  const tracked = p.catch((err) => console.error('[db] write failed', err))
+  inFlightWrites.add(tracked)
+  void tracked.then(() => inFlightWrites.delete(tracked))
 }
 
 /** every mutable canvas column, so insert and upsert can't drift apart */
@@ -1676,17 +1687,18 @@ export function hydrateAgentMessages(messages: Map<string, AgentMessage[]>): voi
   }
 }
 
-/** Flush pending debounced frame writes (called on shutdown). */
+/** Flush pending debounced frame writes, then wait for every write still in
+ *  flight (called on shutdown, and by tests before they close the database).
+ *  writeFrame itself is only reachable through swallow, so routing the
+ *  debounced ones through it too keeps one definition of "in flight". */
 export async function flush(getFrame: (id: string) => Frame | undefined): Promise<void> {
   const pending = [...frameTimers.values()]
   for (const [, { timer }] of frameTimers) clearTimeout(timer)
   frameTimers.clear()
-  await Promise.allSettled(
-    pending.map(({ frame }) => {
-      const f = getFrame(frame.id) ?? frame
-      return writeFrame(f)
-    }),
-  )
+  for (const { frame } of pending) swallow(writeFrame(getFrame(frame.id) ?? frame))
+  /* one pass is not enough: awaiting can start more work as it settles, and the
+     point is to hand the caller a database with nothing outstanding */
+  while (inFlightWrites.size) await Promise.allSettled([...inFlightWrites])
 }
 
 /* ------------------------------------------------------------------ */
