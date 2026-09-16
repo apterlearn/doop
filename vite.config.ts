@@ -18,6 +18,16 @@ export default defineConfig({
       '@': fileURLToPath(new URL('./src', import.meta.url)),
     },
   },
+  /* Vitest reads this file too. The suite drives a real Chromium wherever the
+     platform has one (the element, stylesheet, a11y and review tests all render
+     a real page), and the first launch in a worker is a cold one: on a loaded
+     CI runner that launch runs past the 5s default, and the test killed
+     mid-launch takes the next one down with it. Tests that are slow for another
+     reason already carry their own budget (70_000 for the restart suites), so
+     this only lifts the floor for the ones relying on the default. */
+  test: {
+    testTimeout: 30_000,
+  },
   server: {
     port: webPort,
     /* cargo's build output is huge and, on Windows, its binaries stay locked
