@@ -10,6 +10,8 @@ import * as authSchema from './db/auth-schema.ts'
 import { store } from './store.ts'
 import * as demo from './demo.ts'
 import { mailerConfigured, sendMail } from './mailer.ts'
+import { intentAtLeast, linkIntent } from './access.ts'
+import type { Canvas } from '../shared/types.ts'
 
 /**
  * better-auth on our own database: email/password + cookie sessions now;
@@ -548,4 +550,42 @@ export function readGuestTicket(ticket: unknown, now = Date.now()): GuestTicket 
   const expiresAt = Number(rawExpiresAt)
   if (!Number.isFinite(expiresAt) || expiresAt <= now) return null
   return { canvasId, mode, expiresAt }
+}
+
+/** Verify a ticket's signature and answer what it names, WITHOUT the expiry
+ *  check: a refresh is a caller renewing a credential that just lapsed, so the
+ *  expiry is the one field it must not refuse on. The live gate stays the
+ *  link — the route re-checks linkIntent — and the signature is what makes the
+ *  canvas id and mode unforgeable. */
+export function readGuestTicketIgnoringExpiry(ticket: unknown): Omit<GuestTicket, 'expiresAt'> | null {
+  const parts = String(ticket ?? '').split('.')
+  if (parts.length !== 5) return null
+  const [version, canvasId, mode, , signature] = parts
+  if (version !== 'g1') return null
+  if (!canvasId || (mode !== 'view' && mode !== 'comment' && mode !== 'edit')) return null
+  const expected = signTicketPayload(parts.slice(0, 4).join('.'))
+  const a = Buffer.from(signature!)
+  const b = Buffer.from(expected)
+  if (a.length !== b.length || !timingSafeEqual(a, b)) return null
+  return { canvasId, mode }
+}
+
+/** A fresh ticket for the same canvas and mode, from a ticket whose signature
+ *  is still good — the lapsed one is exactly what a refresh renews, which is
+ *  why the read above skips the expiry. Everything else comes from the live
+ *  canvas: the link must still point at this ticket's canvas, must still be
+ *  on, and must not have been narrowed below the ticket's mode, or an old
+ *  `edit` ticket would launder itself back into an `edit` link the owner has
+ *  since turned down. The caller has already proven the link's password (or
+ *  the link has none), so a refresh never has to ask again — see the route. */
+export function refreshGuestTicket(
+  ticket: unknown,
+  canvas: Canvas,
+  now = Date.now(),
+): { ticket: string; expiresAt: number } | null {
+  const read = readGuestTicketIgnoringExpiry(ticket)
+  if (!read || read.canvasId !== canvas.id) return null
+  const intent = linkIntent(canvas, { now })
+  if (!intent || !intentAtLeast(intent, read.mode)) return null
+  return mintGuestTicket(read.canvasId, read.mode, now)
 }

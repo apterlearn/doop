@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
+import type { Dirent } from 'node:fs'
 import type { S3Client } from '@aws-sdk/client-s3'
 
 /**
@@ -82,4 +83,64 @@ export async function getObject(key: string): Promise<Buffer | null> {
     if ((e as NodeJS.ErrnoException).code === 'ENOENT') return null
     throw e
   }
+}
+
+/** Every key in the store, with its last-modified time. Keys are the same
+ *  shape putObject takes — `thumb/` and `bg/` prefixed ones included — because
+ *  the caller is what decides which of them it may touch. */
+export async function listObjects(): Promise<{ key: string; lastModified: number }[]> {
+  const objects: { key: string; lastModified: number }[] = []
+  if (BUCKET) {
+    const { ListObjectsV2Command } = await import('@aws-sdk/client-s3')
+    /* a bucket can hold millions of keys, so the walk is a page loop: the page
+       is spent and dropped before the next is fetched, and only the mapping
+       survives. `IsTruncated` with no token is the last page S3 will answer
+       (an empty NextContinuationToken means the same), so the loop ends there
+       rather than asking a question with no answer. */
+    let token: string | undefined
+    do {
+      const page = await (await client()).send(new ListObjectsV2Command({ Bucket: BUCKET, ContinuationToken: token }))
+      for (const object of page.Contents ?? []) {
+        /* a versioned bucket's delete markers arrive without a Key; skipping
+           one is right, there is no object behind it. LastModified is absent
+           on nothing else a list returns, and 0 reads as "older than any
+           cutoff" downstream, which is the safe direction for a GC. */
+        if (object.Key) objects.push({ key: object.Key, lastModified: object.LastModified?.getTime() ?? 0 })
+      }
+      token = page.IsTruncated ? page.NextContinuationToken : undefined
+    } while (token)
+    return objects
+  }
+  /* putObject creates the directory, so a fresh install has none and there is
+     nothing to walk: absent is an empty store, not a failure. Any other error
+     is thrown — the same rule getObject follows, where a read that fails is
+     not a read that found nothing. */
+  const top = await fs.readdir(DISK_DIR, { withFileTypes: true }).catch((e: NodeJS.ErrnoException) => {
+    if (e.code === 'ENOENT') return undefined
+    throw e
+  })
+  if (!top) return []
+  /* A plain recursion rather than readdir's own `recursive`, for two reasons:
+     the key has to come back POSIX-joined (`thumb/<id>.png`, the shape
+     putObject and getObject are handed) however the platform spells its
+     separator, and the filter is assertKey — the module's one statement of
+     what a key may be — so nothing here restates the pattern. */
+  const walk = async (dir: string, prefix: string, entries: Dirent[]): Promise<void> => {
+    for (const entry of entries) {
+      const key = prefix ? `${prefix}/${entry.name}` : entry.name
+      if (entry.isDirectory()) {
+        const at = path.join(dir, entry.name)
+        await walk(at, key, await fs.readdir(at, { withFileTypes: true }))
+        continue
+      }
+      try {
+        assertKey(key)
+      } catch {
+        continue /* not a key putObject could have written */
+      }
+      objects.push({ key, lastModified: (await fs.stat(path.join(dir, entry.name))).mtimeMs })
+    }
+  }
+  await walk(DISK_DIR, '', top)
+  return objects
 }

@@ -1277,6 +1277,16 @@ export function restoreFrameRow(frameId: string) {
   swallow(db.update(t.frames).set({ deletedAt: null }).where(eq(t.frames.id, frameId)))
 }
 
+/** Undo a page's trash flag — the page row a page delete kept. */
+export function restorePageRow(pageId: string) {
+  swallow(db.update(t.pages).set({ deletedAt: null }).where(eq(t.pages.id, pageId)))
+}
+
+/** Undo a component's trash flag — the library row a component delete kept. */
+export function restoreComponentRow(id: string) {
+  swallow(db.update(t.components).set({ deletedAt: null }).where(eq(t.components.id, id)))
+}
+
 /** Remove a canvas row and every dependent row it owns. Only the purge job
  *  calls this — every ordinary delete goes through deleteCanvas, which only
  *  sets the flag. */
@@ -1307,6 +1317,35 @@ export function hardDeleteCanvas(canvasId: string) {
   swallow(db.delete(t.pages).where(eq(t.pages.canvasId, canvasId)))
   swallow(db.delete(t.canvasMembers).where(eq(t.canvasMembers.canvasId, canvasId)))
   swallow(db.delete(t.canvasInvites).where(eq(t.canvasInvites.canvasId, canvasId)))
+  /* Credentials follow the canvas they grant access to: a design-sync key is a
+     write-only capability for THIS canvas and a GitHub connection is a repo
+     import source for it, so a purged canvas must not strand either. The key's
+     links and edges are keyed by key id, not canvas id, so they are deleted by
+     subquery reading sync_keys — chained, not merely listed first, because the
+     subquery is evaluated when each delete runs and the key row has to still be
+     there for it to find them. */
+  swallow(
+    db
+      .delete(t.syncLinks)
+      .where(
+        inArray(
+          t.syncLinks.keyId,
+          db.select({ id: t.syncKeys.id }).from(t.syncKeys).where(eq(t.syncKeys.canvasId, canvasId)),
+        ),
+      )
+      .then(() =>
+        db
+          .delete(t.syncEdges)
+          .where(
+            inArray(
+              t.syncEdges.keyId,
+              db.select({ id: t.syncKeys.id }).from(t.syncKeys).where(eq(t.syncKeys.canvasId, canvasId)),
+            ),
+          ),
+      )
+      .then(() => db.delete(t.syncKeys).where(eq(t.syncKeys.canvasId, canvasId))),
+  )
+  swallow(db.delete(t.githubConnections).where(eq(t.githubConnections.canvasId, canvasId)))
   forgetAgentMessages(canvasId)
   swallow(db.delete(t.canvases).where(eq(t.canvases.id, canvasId)))
 }
@@ -1664,6 +1703,11 @@ export interface Hydrated {
   /** Trashed frames of live canvases (a frame of a trashed canvas rides with
    *  its canvas above instead). */
   trashedFrames: { frame: Frame; deletedAt: number }[]
+  /** Trashed pages of live canvases, same rule as trashedFrames: a restore
+   *  puts the page (and so its frames' home) back. */
+  trashedPages?: { page: Page; deletedAt: number }[]
+  /** Trashed library components of live canvases, same rule again. */
+  trashedComponents?: { component: Component; deletedAt: number }[]
   /** canvasId -> version summaries, newest first — the History tab's timeline,
    *  ready to serve without a DB round trip. */
   canvasVersions: Map<string, CanvasVersionSummary[]>
@@ -1761,6 +1805,40 @@ function toFrame(row: typeof t.frames.$inferSelect): Frame {
   }
 }
 
+/** A stored page row as the in-memory shape. Shared by the live and trashed
+ *  partitions of a hydrate, so a page restored from the trash is assembled
+ *  exactly like one that never left. */
+function toPage(row: typeof t.pages.$inferSelect): Page {
+  return {
+    id: row.id,
+    canvasId: row.canvasId,
+    name: row.name,
+    position: row.position,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  }
+}
+
+/** A stored component row as the in-memory shape. Shared by the live and
+ *  trashed partitions of a hydrate, the same way toPage is. */
+function toComponent(row: typeof t.components.$inferSelect): Component {
+  return {
+    id: row.id,
+    canvasId: row.canvasId,
+    name: row.name,
+    ...(row.description ? { description: row.description } : {}),
+    html: row.html,
+    width: row.width,
+    height: row.height,
+    ...(row.props != null ? { props: row.props } : {}),
+    ...(row.variantOf ? { variantOf: row.variantOf } : {}),
+    createdBy: row.createdBy,
+    updatedBy: row.updatedBy,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  }
+}
+
 export async function hydrate(): Promise<Hydrated> {
   const [
     canvasRows,
@@ -1817,7 +1895,10 @@ export async function hydrate(): Promise<Hydrated> {
   /* Trash is a partition, not a filter: deleted rows must not come back live,
      but they must come back *listable* — a trashed canvas keeps its frames
      inside it (they are hidden by their canvas, not deleted one by one) and a
-     trashed frame of a live canvas lands in the trash map ready to restore. */
+     trashed frame of a live canvas lands in the trash map ready to restore.
+     Pages and components are partitioned the same way as frames, just below:
+     a deleted row of a LIVE canvas is the user's to list and restore, while a
+     deleted row of a trashed canvas stays out (it comes back with the canvas). */
   const canvases: Canvas[] = []
   const trashedCanvases: { canvas: Canvas; deletedAt: number }[] = []
   const byId = new Map<string, Canvas>()
@@ -1844,6 +1925,16 @@ export async function hydrate(): Promise<Hydrated> {
       continue
     }
     byId.get(row.canvasId)?.frames.push(toFrame(row))
+  }
+  const trashedPages: { page: Page; deletedAt: number }[] = []
+  for (const row of pageRows) {
+    if (row.deletedAt == null || !byId.has(row.canvasId)) continue
+    trashedPages.push({ page: toPage(row), deletedAt: row.deletedAt })
+  }
+  const trashedComponents: { component: Component; deletedAt: number }[] = []
+  for (const row of componentRows) {
+    if (row.deletedAt == null || !byId.has(row.canvasId)) continue
+    trashedComponents.push({ component: toComponent(row), deletedAt: row.deletedAt })
   }
   for (const m of memberRows) {
     const c = byId.get(m.canvasId)
@@ -1910,14 +2001,7 @@ export async function hydrate(): Promise<Hydrated> {
     const now = Date.now()
     for (const c of canvases) {
       const rows = livePageRows.filter((p) => p.canvasId === c.id)
-      c.pages = rows.map((p) => ({
-        id: p.id,
-        canvasId: p.canvasId,
-        name: p.name,
-        position: p.position,
-        createdAt: p.createdAt,
-        updatedAt: p.updatedAt,
-      }))
+      c.pages = rows.map(toPage)
       if (!c.pages.length) {
         const page: Page = {
           id: nanoid(10),
@@ -1945,16 +2029,7 @@ export async function hydrate(): Promise<Hydrated> {
      not written to, and a frame whose page was itself deleted is re-homed when
      the canvas is restored. */
   for (const entry of trashedCanvases) {
-    entry.canvas.pages = livePageRows
-      .filter((p) => p.canvasId === entry.canvas.id)
-      .map((p) => ({
-        id: p.id,
-        canvasId: p.canvasId,
-        name: p.name,
-        position: p.position,
-        createdAt: p.createdAt,
-        updatedAt: p.updatedAt,
-      }))
+    entry.canvas.pages = livePageRows.filter((p) => p.canvasId === entry.canvas.id).map(toPage)
   }
   const now = Date.now()
   const interruptedReason = 'The agent stopped before finishing. Retry when you are ready.'
@@ -2161,21 +2236,7 @@ export async function hydrate(): Promise<Hydrated> {
   for (const row of componentRows) {
     if (row.deletedAt != null) continue
     const list = components.get(row.canvasId) ?? []
-    list.push({
-      id: row.id,
-      canvasId: row.canvasId,
-      name: row.name,
-      ...(row.description ? { description: row.description } : {}),
-      html: row.html,
-      width: row.width,
-      height: row.height,
-      ...(row.props != null ? { props: row.props } : {}),
-      ...(row.variantOf ? { variantOf: row.variantOf } : {}),
-      createdBy: row.createdBy,
-      updatedBy: row.updatedBy,
-      createdAt: row.createdAt,
-      updatedAt: row.updatedAt,
-    })
+    list.push(toComponent(row))
     components.set(row.canvasId, list)
   }
 
@@ -2197,6 +2258,8 @@ export async function hydrate(): Promise<Hydrated> {
     canvases,
     trashedCanvases,
     trashedFrames,
+    trashedPages,
+    trashedComponents,
     canvasVersions,
     comments,
     activity,

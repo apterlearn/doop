@@ -10,10 +10,13 @@ import { nanoid } from 'nanoid'
  *   app.use(requestId())     // first: right after `const app = express()`
  *   app.use(errorHandler())  // last: after every route and the static/SPA handler
  *
- * requestId() has to be first so /relay, /i/, /a/, /u/ and the ws upgrade all
- * carry an id, and errorHandler() has to be last so it is the handler Express
- * reaches when a route throws or calls next(err). Nothing else changes: a
- * route that answers 500 itself keeps its own body.
+ * requestId() has to be first so that every HTTP request carries an id — the
+ * API routes and /relay, /i/, /a/ and /u/ alike — and errorHandler() has to be
+ * last so it is the handler Express reaches when a route throws or calls
+ * next(err). Neither reaches the websocket upgrade: Express middleware never
+ * runs for one, so the handshake carries no id, and there is none to correlate
+ * it with. Nothing else changes: a route that answers 500 itself keeps its own
+ * body.
  */
 
 /** The response header the id travels in, in both directions: a proxy that

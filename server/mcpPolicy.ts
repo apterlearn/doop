@@ -59,3 +59,41 @@ export function toolEnabled(
   if (!opts.readonly) return true
   return opts.readOnlyHint === true || policy.allow.has(name)
 }
+
+/**
+ * The tools whose registrations declare `destructiveHint: true`, sorted.
+ *
+ * The review panel offers these as the suggestions for its gate list — a tool
+ * that tells clients it destroys something is exactly the tool an owner means
+ * to gate — and they live here as a plain list because an annotation is only
+ * reachable inside a *built* MCP server, while the REST route that serves the
+ * suggestions answers for every session. tests/mcpCapabilities.test.ts pins
+ * this list to the live registrations, so a tool that starts declaring itself
+ * destructive (or stops) fails the suite until the list follows.
+ */
+export const DESTRUCTIVE_TOOLS: readonly string[] = [
+  'cancel_job',
+  'comment_pull_request',
+  'delete_asset',
+  'delete_canvas',
+  'delete_component',
+  'delete_element',
+  'delete_frame',
+  'delete_page',
+  'delete_release',
+  'fail_comment',
+  'generate_image',
+  'open_pull_request',
+  'resolve_canvas_proposal',
+  'resolve_comment',
+  'resolve_frame_proposal',
+  'resolve_frame_proposals',
+  'restore_release',
+  'revert_frame',
+  'revert_run',
+  'search_images',
+  'unpublish_canvas',
+  'update_pull_request',
+  'upload_font',
+  'withdraw_proposal',
+]

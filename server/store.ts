@@ -51,13 +51,15 @@ class Store {
   canvases = new Map<string, Canvas>()
   private frameIndex = new Map<string, string>() // frameId -> canvasId
 
-  /** The trash: canvases and frames that were deleted but are still
-   *  recoverable. They are out of every live structure above, which is what
-   *  "deleted" means to a reader — requireCanvas, listCanvases, the gallery
-   *  and the ws join all read the map the canvas left. Loaded at boot, so the
-   *  trash survives a restart and the purge job has a clock to read. */
+  /** The trash: canvases, frames, pages and components that were deleted but
+   *  are still recoverable. They are out of every live structure above, which
+   *  is what "deleted" means to a reader — requireCanvas, listCanvases, the
+   *  gallery and the ws join all read the map the canvas left. Loaded at boot,
+   *  so the trash survives a restart and the purge job has a clock to read. */
   private trashedCanvases = new Map<string, { canvas: Canvas; deletedAt: number }>()
   private trashedFrames = new Map<string, { frame: Frame; deletedAt: number }>()
+  private trashedPages = new Map<string, { page: Page; deletedAt: number }>()
+  private trashedComponents = new Map<string, { component: Component; deletedAt: number }>()
 
   /** canvasId -> version summaries, newest first. A ring, capped like the
    *  canvas_versions table it mirrors, so the History tab never waits on the
@@ -76,9 +78,16 @@ class Store {
   }
 
   /** Load the trash at boot. */
-  initTrash(canvases: { canvas: Canvas; deletedAt: number }[], frames: { frame: Frame; deletedAt: number }[]) {
+  initTrash(
+    canvases: { canvas: Canvas; deletedAt: number }[],
+    frames: { frame: Frame; deletedAt: number }[],
+    pages: { page: Page; deletedAt: number }[] = [],
+    components: { component: Component; deletedAt: number }[] = [],
+  ) {
     for (const entry of canvases) this.trashedCanvases.set(entry.canvas.id, entry)
     for (const entry of frames) this.trashedFrames.set(entry.frame.id, entry)
+    for (const entry of pages) this.trashedPages.set(entry.page.id, entry)
+    for (const entry of components) this.trashedComponents.set(entry.component.id, entry)
   }
 
   /** Load the version rings at boot (newest first, already capped). */
@@ -123,9 +132,24 @@ class Store {
     return this.trashedFrames.get(id)
   }
 
-  /** The user's trash: the canvases they own and the frames sitting on those
-   *  canvases, newest deletion first. A frame trashed on someone else's canvas
-   *  is not theirs to see or restore. */
+  getTrashedPage(id: string) {
+    return this.trashedPages.get(id)
+  }
+
+  /** The frames a page delete took down with it: they live in `trashedFrames`
+   *  like any other trashed frame and still carry the page they came from, so
+   *  this is how a page restore finds the ones to bring back with it. */
+  listTrashedFramesOnPage(pageId: string): Frame[] {
+    return [...this.trashedFrames.values()].filter((entry) => entry.frame.pageId === pageId).map((entry) => entry.frame)
+  }
+
+  getTrashedComponent(id: string) {
+    return this.trashedComponents.get(id)
+  }
+
+  /** The user's trash: the canvases they own and the frames, pages and
+   *  components sitting on those canvases, newest deletion first. Something
+   *  trashed on someone else's canvas is not theirs to see or restore. */
   listTrash(userId: string) {
     const canvases = [...this.trashedCanvases.values()]
       .filter((entry) => entry.canvas.ownerId === userId)
@@ -150,7 +174,35 @@ class Store {
         name: entry.frame.name,
         deletedAt: entry.deletedAt,
       }))
-    return { canvases, frames }
+    const pages = [...this.trashedPages.values()]
+      .flatMap((entry) => {
+        const canvas = this.canvases.get(entry.page.canvasId)
+        if (!canvas || canvas.ownerId !== userId) return []
+        return [{ entry, canvas }]
+      })
+      .sort((a, b) => b.entry.deletedAt - a.entry.deletedAt)
+      .map(({ entry, canvas }) => ({
+        id: entry.page.id,
+        canvasId: canvas.id,
+        canvasName: canvas.name,
+        name: entry.page.name,
+        deletedAt: entry.deletedAt,
+      }))
+    const components = [...this.trashedComponents.values()]
+      .flatMap((entry) => {
+        const canvas = this.canvases.get(entry.component.canvasId)
+        if (!canvas || canvas.ownerId !== userId) return []
+        return [{ entry, canvas }]
+      })
+      .sort((a, b) => b.entry.deletedAt - a.entry.deletedAt)
+      .map(({ entry, canvas }) => ({
+        id: entry.component.id,
+        canvasId: canvas.id,
+        canvasName: canvas.name,
+        name: entry.component.name,
+        deletedAt: entry.deletedAt,
+      }))
+    return { canvases, frames, pages, components }
   }
 
   /** Put a trashed canvas back where it was: the same object, its frames
@@ -197,13 +249,59 @@ class Store {
     return frame
   }
 
+  /** Put a trashed page back on its canvas, in the slot it held: `position`
+   *  was its index when it went, and a page delete renumbers the survivors
+   *  densely, so splicing at that index is the delete's exact inverse — then
+   *  the run is renumbered again, because the restore is an insertion like any
+   *  other. The page's frames are trashed as frames, so this puts back the page
+   *  alone: `listTrashedFramesOnPage` names them and `actions.restorePage`
+   *  restores them through `restoreFrame`, one action for the user either way. */
+  restorePage(id: string): Page | undefined {
+    const entry = this.trashedPages.get(id)
+    if (!entry) return undefined
+    const c = this.canvases.get(entry.page.canvasId)
+    if (!c) return undefined
+    this.trashedPages.delete(id)
+    const page = entry.page
+    const pages = c.pages ?? (c.pages = [])
+    pages.splice(Math.min(Math.max(page.position, 0), pages.length), 0, page)
+    this.renumber(pages)
+    c.updatedAt = Date.now()
+    persist.restorePageRow(id)
+    for (const p of pages) persist.savePage(c.id, p)
+    persist.saveCanvas(c)
+    return page
+  }
+
+  /** Put a trashed component back in its canvas's library, with the id it
+   *  always had — instances already stamped into frames point at that id. */
+  restoreComponent(id: string): Component | undefined {
+    const entry = this.trashedComponents.get(id)
+    if (!entry) return undefined
+    const canvasId = entry.component.canvasId
+    if (!this.canvases.has(canvasId)) return undefined
+    this.trashedComponents.delete(id)
+    const list = this.components.get(canvasId) ?? []
+    list.push(entry.component)
+    this.components.set(canvasId, list)
+    persist.restoreComponentRow(id)
+    return entry.component
+  }
+
   /** Drop every in-memory trace of a canvas: the maps keyed by canvas id, the
-   *  frame index, its trashed frames, and its access state. Shared by the two
-   *  hard deletes below, which differ only in where the canvas came from. */
+   *  frame index, its trashed frames/pages/components, and its access state.
+   *  Shared by the two hard deletes below, which differ only in where the
+   *  canvas came from. */
   private forget(c: Canvas): void {
     for (const f of c.frames) this.frameIndex.delete(f.id)
     for (const [frameId, entry] of this.trashedFrames) {
       if (entry.frame.canvasId === c.id) this.trashedFrames.delete(frameId)
+    }
+    for (const [pageId, entry] of this.trashedPages) {
+      if (entry.page.canvasId === c.id) this.trashedPages.delete(pageId)
+    }
+    for (const [componentId, entry] of this.trashedComponents) {
+      if (entry.component.canvasId === c.id) this.trashedComponents.delete(componentId)
     }
     this.canvases.delete(c.id)
     this.canvasVersions.delete(c.id)
@@ -330,6 +428,10 @@ class Store {
       const idx = list.findIndex((c) => c.id === componentId)
       if (idx === -1) continue
       const [component] = list.splice(idx, 1)
+      /* the index came from findIndex on this very list, so this is only the
+         noUncheckedIndexedAccess guard */
+      if (!component) continue
+      this.trashedComponents.set(componentId, { component, deletedAt: Date.now() })
       if (list.length === 0) this.components.delete(canvasId)
       persist.deleteComponentRow(componentId)
       return component
@@ -896,9 +998,10 @@ class Store {
   }
 
   /** Remove a page and every frame on it. Refuses the canvas's only page —
-   *  callers surface that as a 409. The frames are trashed rather than
-   *  destroyed: deleting a page is one action to take back, so each frame on
-   *  it stays restorable on its own from /api/trash. */
+   *  callers surface that as a 409. Neither the page nor the frames are
+   *  destroyed: deleting a page is one action to take back, so the page and
+   *  each frame on it stay restorable from /api/trash while the retention
+   *  window runs. */
   deletePage(pageId: string): { canvas: Canvas; page: Page; frames: Frame[] } | undefined {
     const found = this.getPage(pageId)
     if (!found) return undefined
@@ -910,6 +1013,7 @@ class Store {
     const frames = c.frames.filter((f) => f.pageId === pageId)
     c.frames = c.frames.filter((f) => f.pageId !== pageId)
     const deletedAt = Date.now()
+    this.trashedPages.set(pageId, { page: found.page, deletedAt })
     for (const f of frames) {
       this.frameIndex.delete(f.id)
       this.trashedFrames.set(f.id, { frame: f, deletedAt })

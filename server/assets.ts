@@ -451,7 +451,9 @@ export const ORPHAN_GRACE_MS = 24 * 60 * 60 * 1000
 /** An uploaded asset's key: `<id>.<ext>`, with no prefix. Only keys of this
  *  shape can belong to an assets row, and checking it is what keeps a derived
  *  thumbnail (`thumb/`) or a curated background (`bg/`) out of reach of a
- *  sweep: both live in the same store, neither is ever named by this table. */
+ *  sweep: both live in the same store, neither is ever named by this table.
+ *  Both passes of the sweep lean on it for exactly that — the row pass on the
+ *  key a row would wear, the object pass on every key the store lists. */
 const ASSET_KEY_RE = /^[A-Za-z0-9_-]+\.[a-z0-9]+$/
 
 export interface OrphanSweepResult {
@@ -465,24 +467,20 @@ export interface OrphanSweepResult {
    *  grace window, whose object could not be checked, or whose stored key is
    *  not a plain asset key */
   skipped: number
+  /** objects in the store under a plain asset key */
+  objects: number
+  /** keys whose object has no assets row and is past the grace window */
+  strayObjects: string[]
+  /** how many stray objects were actually removed; always 0 in a dry run */
+  deletedObjects: number
 }
 
 /**
- * Reap asset rows nothing can serve and nothing references.
+ * Reap what nothing can serve and nothing references, from both sides of the
+ * ledger.
  *
- * Why this reads the assets table and not object storage: server/storage.ts
- * has no list operation — it can put, get and delete a key it is handed, and
- * nothing more — so nothing here can enumerate what is actually in the bucket.
- * The sweep the plan's ledger was built for (an object whose asset id has no
- * row) is therefore out of reach, and that limitation is real:
- *  - on disk (`./data/assets`, dev) the sweep never opens the directory, so an
- *    object left by a failed upload is invisible to it;
- *  - on S3 the same holds, and there is no way around it without a
- *    ListObjectsV2 page walk added to storage.ts. Objects stranded by a
- *    bucket-side delete, an interrupted PUT, or a database restored from an
- *    older backup stay stranded until such an operation exists.
- *
- * What it does find, from the rows:
+ * Rows the sweep can no longer serve — the assets table names them, no frame
+ * points at them:
  *  1. An unreferenced row whose object is gone — `getObject` returns null, so
  *     getAsset() returns null, /a/<id> 404s, and the row is dead weight the
  *     listing keeps reporting.
@@ -490,21 +488,40 @@ export interface OrphanSweepResult {
  *     ORPHAN_GRACE_MS — a genuine leak (an upload never placed, a diff image,
  *     an export zip).
  *
+ * Objects no assets row names — the half a table read can never see, because
+ * an id with no row leaves nothing to look up. These are what a stranded PUT
+ * (bytes written, row never made), a bucket-side delete's counterpart, or a
+ * database restored from an older backup leave behind, and they stay invisible
+ * for good without a listing. So the pass calls storage.listObjects() and takes
+ * every key shaped like an asset key — ASSET_KEY_RE, which a derived `thumb/`
+ * or a curated `bg/` can never match — that is past the grace window and whose
+ * id has no row, deleting the object itself: a stray has no row, so there is
+ * nothing to route through deleteAsset and no row for this pass to own.
+ *
  * A row that asset_refs still points at is never deleted, whatever its age or
  * whether its bytes are readable: frame HTML still names that URL, and dropping
  * the row would turn a recoverable state (a bucket that comes back, a re-upload
  * under the same id) into a permanently nameless one. `asset_refs` is left
  * alone even for the rows this does delete — it mirrors frame HTML, exactly as
- * deleteAsset documents.
+ * deleteAsset documents. A `thumb/` or `bg/` object is never touched by either
+ * pass, and neither is anything inside the grace window: a key younger than a
+ * day belongs to an upload whose frame is still being written.
  *
- * `dryRun` defaults to true: it logs the ids it would remove and deletes
- * nothing. Deleting goes through `deleteAsset`, so an orphan loses its row
+ * No failed read is evidence of absence, on either side: an object whose bytes
+ * cannot be fetched leaves its row alone (`getObject` returning undefined is a
+ * read that failed, not an object that is gone), and a listing that throws is
+ * logged and the sweep carries on with what the rows said. This is a GC — it
+ * must never take the process down.
+ *
+ * `dryRun` defaults to true: it logs the ids and keys it would remove and
+ * deletes nothing. A row goes through `deleteAsset`, so an orphan loses its row
  * first and its object second like every other removal, and an object that is
- * already gone is a tolerated no-op there.
+ * already gone is a tolerated no-op there; a stray object is removed from the
+ * store directly, having no row to lose first.
  *
  * Cost: every assets row and every asset_refs row, plus one object read per
- * unreferenced row (existence is checked by fetching the bytes — storage has
- * no HEAD). Referenced rows cost nothing beyond the two table reads.
+ * unreferenced row (existence is checked by fetching the bytes — storage has no
+ * HEAD) and one full listing of the store.
  *
  * Not wired to boot: the caller is the ASSET_GC path in server/index.ts.
  */
@@ -542,13 +559,54 @@ export async function sweepOrphanAssets(opts: { dryRun?: boolean } = {}): Promis
       console.error(`[assets] orphan sweep could not delete ${id}`, e)
     }
   }
-  const listed =
-    orphans.length > 25 ? `${orphans.slice(0, 25).join(', ')}, … +${orphans.length - 25} more` : orphans.join(', ')
+  /* Second pass: the store side. The rows above are the only thing that can
+     say which keys are named, so the id set is built from them rather than
+     re-read; everything else comes from the listing. */
+  let objects = 0
+  const strayObjects: string[] = []
+  let deletedObjects = 0
+  try {
+    const rowIds = new Set(rows.map((row) => row.id))
+    /* ASSET_KEY_RE is the entire guard on this side: it admits only
+       `<id>.<ext>`, so a derived thumbnail and a curated background — same
+       store, other owners, never named by this table — are not candidates,
+       exactly as the row pass relies on it. */
+    const keys = (await storage.listObjects()).filter((object) => ASSET_KEY_RE.test(object.key))
+    objects = keys.length
+    for (const object of keys) {
+      if (object.lastModified > cutoff) continue /* the upload's frame may still be on its way */
+      const id = object.key.slice(0, object.key.lastIndexOf('.'))
+      if (rowIds.has(id)) continue
+      strayObjects.push(object.key)
+      if (dryRun) continue
+      try {
+        await storage.deleteObject(object.key)
+        deletedObjects += 1
+      } catch (e) {
+        /* one unreachable object must not abort the sweep */
+        console.error(`[assets] orphan sweep could not delete ${object.key}`, e)
+      }
+    }
+  } catch (e) {
+    /* A listing is a read, and a read that fails is not an empty store: the
+       row pass's findings are still real, so they are reported and the miss is
+       logged. Nothing is inferred from a store we could not see. */
+    console.error('[assets] orphan sweep could not list the store', e)
+  }
+  /* one truncation rule for both sides: a sweep that found more than a screen
+     of names is still one log line */
+  const listed = (keys: string[]) =>
+    keys.length > 25 ? `${keys.slice(0, 25).join(', ')}, … +${keys.length - 25} more` : keys.join(', ')
+  const head = `[assets] orphan sweep${dryRun ? ' (dry run)' : ''}: scanned ${rows.length} row(s), ${objects} object(s)`
+  const counts =
+    `${dryRun ? 'would delete' : 'deleted'} ${dryRun ? orphans.length : deleted} row(s) and ` +
+    `${dryRun ? strayObjects.length : deletedObjects} object(s)`
+  /* ids and keys are listed apart — a row id is something to grep the table
+     for, a key is bytes that are already gone — and an empty side contributes
+     nothing rather than a dangling separator */
+  const named = [listed(orphans), listed(strayObjects)].filter((part) => part !== '').join(' | ')
   console.log(
-    orphans.length === 0
-      ? `[assets] orphan sweep${dryRun ? ' (dry run)' : ''}: scanned ${rows.length} row(s), no orphans`
-      : `[assets] orphan sweep${dryRun ? ' (dry run)' : ''}: scanned ${rows.length} row(s), ` +
-          `${dryRun ? 'would delete' : 'deleted'} ${dryRun ? orphans.length : deleted}: ${listed}`,
+    orphans.length === 0 && strayObjects.length === 0 ? `${head}, no orphans` : `${head}, ${counts}: ${named}`,
   )
-  return { scanned: rows.length, orphans, deleted, skipped }
+  return { scanned: rows.length, orphans, deleted, skipped, objects, strayObjects, deletedObjects }
 }

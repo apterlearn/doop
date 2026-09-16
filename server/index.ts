@@ -7,13 +7,14 @@ import { eq, inArray, and, ne, isNotNull } from 'drizzle-orm'
 import { toNodeHandler, fromNodeHeaders } from 'better-auth/node'
 import { oAuthDiscoveryMetadata } from 'better-auth/plugins'
 import { WebSocketServer, WebSocket } from 'ws'
+import sharp from 'sharp'
 import { store } from './store.ts'
 import * as runLog from './runLog.ts'
 import * as agentEvents from './agentEvents.ts'
 import * as actions from './actions.ts'
 import * as frameLocks from './frameLocks.ts'
 import { getImage, renderHtmlPreview } from './previews.ts'
-import { diffFrames } from './visualDiff.ts'
+import { compareRgba, diffFrames } from './visualDiff.ts'
 import type {
   AgentQuestion,
   Canvas,
@@ -36,6 +37,7 @@ import {
   isAdmin,
   isCanvasRole,
   linkIntent,
+  memberRole,
 } from './access.ts'
 import type { CanvasIntent, CanvasRole } from './access.ts'
 import {
@@ -49,6 +51,8 @@ import {
   PUBLIC_ORIGIN,
   loginProvidersConfig,
   readGuestTicket,
+  readGuestTicketIgnoringExpiry,
+  refreshGuestTicket,
   verifyLinkPassword,
 } from './auth.ts'
 import { sendMail } from './mailer.ts'
@@ -81,6 +85,7 @@ import { frameSha, reviewFrame, reviewToRecord } from './review.ts'
 import { handleMcpRequest, wireBroadcast as wireMcpBroadcast } from './mcp.ts'
 import { replaceInFrames } from './findReplace.ts'
 import { groupClients } from './mcpClients.ts'
+import { DESTRUCTIVE_TOOLS } from './mcpPolicy.ts'
 import {
   getAsset,
   getCanvasAsset,
@@ -97,7 +102,7 @@ import {
 } from './assets.ts'
 import type { AssetMeta, AssetWithBytes } from './assets.ts'
 import { assets as assetsTable } from './db/schema.ts'
-import { renderCanvasImage, CANVAS_IMAGE_PADDING } from './canvasImage.ts'
+import { renderCanvasImage, CANVAS_IMAGE_PADDING, isRenderableForCanvas } from './canvasImage.ts'
 import { errorHandler, requestId } from './httpErrors.ts'
 import { healthReport, livenessReport, markStoreHydrated } from './health.ts'
 import { GLOBAL_RATE_WINDOW_MS, globalLimitKey, sweepGlobalLimits, takeGlobalSlot } from './rateLimit.ts'
@@ -157,7 +162,7 @@ store.init(data.canvases)
    says "the read that fills the store has run", not "there was something in
    it". */
 markStoreHydrated()
-store.initTrash(data.trashedCanvases, data.trashedFrames)
+store.initTrash(data.trashedCanvases, data.trashedFrames, data.trashedPages ?? [], data.trashedComponents ?? [])
 store.initCanvasVersions(data.canvasVersions)
 store.initLinkHashes(data.linkHashes ?? new Map())
 initMemberRoles(data.memberRoles ?? [])
@@ -775,6 +780,39 @@ app.post('/api/public/canvases/:id', async (req, res) => {
   res.json({ canvas: publicCanvas(c), access: intent, ticket, expiresAt })
 })
 
+/** A visitor's ticket has run its half-hour and the room closed the socket on
+ *  it (4401). Without this the client reloads and re-opens the link — which on
+ *  a password-protected one means asking for the password again, for a visitor
+ *  who never lost their claim to it. Holding the ticket IS the proof: it was
+ *  minted here, for this canvas, after the password was satisfied, and its
+ *  signature is what the caller cannot forge. The EXPIRY is the one thing this
+ *  must not refuse on — it is precisely what the caller is renewing — so the
+ *  ticket is read without it and the live link is what still has to hold. */
+app.post('/api/public/canvases/:id/guest-ticket/refresh', (req, res) => {
+  /* the same IP brake as the open route, first: this signs a ticket, and a
+     caller looping it burns the CPU for nothing either way */
+  if (!takeLinkAttempt(req.ip ?? req.socket.remoteAddress ?? ''))
+    return res.status(429).json({ error: 'too many attempts — wait a minute' })
+  const c = store.getCanvas(req.params.id)
+  const ticket = readGuestTicketIgnoringExpiry(req.body?.ticket)
+  /* link and ticket must BOTH still hold, and be about the same canvas: the
+     owner turning the link off closes this door without waiting for anything,
+     and a ticket for another canvas is not a credential for this one */
+  const intent = c ? linkIntent(c) : null
+  if (!c || !intent || !ticket || ticket.canvasId !== c.id)
+    return res.status(401).json({ error: 'this link is not open', code: 'link_off' })
+  /* narrowing an edit link to view takes the edit ticket with it: the visitor's
+     older, broader ticket must not be laundered into a fresh one */
+  if (!intentAtLeast(intent, ticket.mode)) return res.status(403).json({ error: 'this link is read-only' })
+  /* the mint re-runs every check above against the same canvas, so no caller
+     can ever mint from a lapsed link; the status split stays here, because
+     mapping a refusal onto 401 vs 403 is the HTTP layer's job */
+  const fresh = refreshGuestTicket(req.body?.ticket, c)
+  if (!fresh) return res.status(401).json({ error: 'this link is not open', code: 'link_off' })
+  /* the mode is the caller's own, re-minted: a refresh never widens it */
+  res.json({ ...fresh, access: ticket.mode })
+})
+
 /** Comment on a frame through a comment-or-edit link. The ticket names the
  *  canvas and the mode it was minted for; the link is re-checked here so
  *  turning it off closes the door the ticket was for, without waiting for the
@@ -891,8 +929,8 @@ function canvasAddressedBy(req: express.Request): Canvas | undefined {
  *  about this canvas. A viewer — a viewer-role member, or a view-mode link
  *  visitor — must be able to take the design away with them, so these sit below
  *  the edit bar. Each is gated elsewhere regardless: duplicate needs durable
- *  access, export and the image export need the canvas gate. */
-const READS_THAT_STORE = /^\/canvases\/[^/]+\/(export(-image)?|duplicate)$/
+ *  access, export, the image export and the version diff need the canvas gate. */
+const READS_THAT_STORE = /^\/canvases\/[^/]+\/(export(-image)?|duplicate|versions\/[^/]+\/diff)$/
 
 /** How far a state-changing /api call must reach on the canvas it addresses.
  *  `null` = the route does not write canvas content. Commenting is the one
@@ -1054,6 +1092,16 @@ app.post('/api/account/sessions/revoke-others', async (req, res) => {
     .where(and(eq(authSchema.session.userId, req.user!.id), ne(authSchema.session.id, req.sessionId ?? '')))
     .returning({ id: authSchema.session.id })
   res.json({ ok: true, revoked: rows.length })
+})
+
+/* The review panel suggests which tools an owner means to put behind
+   approval. Recalling exact tool names is the part people get wrong — one
+   typo and the destructive call sails through as an unlisted tool — so the
+   names come from the tools themselves: the registrations that declare
+   `destructiveHint`. A logged-in account is the whole bar: it is a list of
+   tool names, not a credential or anyone's data. */
+app.get('/api/destructive-tools', (_req, res) => {
+  res.json({ tools: [...DESTRUCTIVE_TOOLS] })
 })
 
 /** A canvas name as a filename inside an export zip: safe on every
@@ -1588,6 +1636,68 @@ app.post('/api/canvases/:id/versions/:versionId/restore', async (req, res) => {
   res.json({ ok: true, restored: result.restored, created: result.created })
 })
 
+/** What restoring a version would change, as two renders of one page: the
+ *  canvas as it stands now, and the version's frozen frames. A read like the
+ *  image export below — it draws what is already there and stores the bytes for
+ *  the caller, changes no design data and takes no version — so a read-only
+ *  visitor may look (see READS_THAT_STORE above).
+ *
+ *  The page is resolved the way the export route resolves it: the one the
+ *  caller asked for, else the canvas's first. Both sides are handed to the
+ *  compositor in the stage's paint order, `z` with array order as the tiebreak. */
+app.post('/api/canvases/:id/versions/:versionId/diff', async (req, res) => {
+  const c = requireCanvas(req, res, req.params.id)
+  if (!c) return
+  const version = await persist.getCanvasVersion(req.params.versionId)
+  /* a version belongs to exactly one canvas: asking for another canvas's
+     snapshot with this canvas in the path is a 404, not a cross-canvas read */
+  if (!version || version.canvasId !== c.id) return res.status(404).json({ error: 'version not found' })
+  const requested = typeof req.body?.pageId === 'string' ? req.body.pageId : undefined
+  if (requested !== undefined && !c.pages?.some((page) => page.id === requested))
+    return res.status(404).json({ error: 'page not found' })
+  const pageId = requested ?? c.pages?.[0]?.id
+  const onPage = (frames: Frame[]) =>
+    frames
+      .filter((frame) => frame.pageId === pageId)
+      .slice()
+      .sort((a, b) => a.z - b.z)
+  const current = onPage(c.frames)
+  const frozen = onPage(persist.releaseFrames(version))
+  /* nothing to draw on either side: there is no picture to compare, and saying
+     so is the answer rather than two blank PNGs */
+  if (!current.some(isRenderableForCanvas) || !frozen.some(isRenderableForCanvas)) return res.json({ empty: true })
+  try {
+    /* sequentially, never in parallel: the compositor documents one Chromium
+       page per frame and a peak-memory bound, and two concurrent canvas renders
+       would double it */
+    const live = await renderCanvasImage(current, c.tokens, { scale: 0.5 })
+    const past = await renderCanvasImage(frozen, version.tokens ?? c.tokens, { scale: 0.5 })
+    const liveAsset = await createAsset(live.png, { canvasId: c.id, ownerId: req.user!.id, uploadedBy: req.user!.name })
+    const pastAsset = await createAsset(past.png, { canvasId: c.id, ownerId: req.user!.id, uploadedBy: req.user!.name })
+    /* The ratio only means something between images of the same size: a page
+       that grew or shrank is answered by the two pictures themselves, so the
+       field is left off rather than computed against a padded box. */
+    const liveRaw = await sharp(live.png).ensureAlpha().raw().toBuffer({ resolveWithObject: true })
+    const pastRaw = await sharp(past.png).ensureAlpha().raw().toBuffer({ resolveWithObject: true })
+    const sameSize = liveRaw.info.width === pastRaw.info.width && liveRaw.info.height === pastRaw.info.height
+    const comparison = sameSize
+      ? await compareRgba(
+          { data: liveRaw.data, width: liveRaw.info.width, height: liveRaw.info.height },
+          { data: pastRaw.data, width: pastRaw.info.width, height: pastRaw.info.height },
+        )
+      : undefined
+    res.json({
+      current: `${PUBLIC_ORIGIN}/a/${liveAsset.id}.${liveAsset.ext}`,
+      version: `${PUBLIC_ORIGIN}/a/${pastAsset.id}.${pastAsset.ext}`,
+      ...(comparison ? { changedRatio: Number(comparison.changed_ratio.toFixed(4)) } : {}),
+    })
+  } catch (e) {
+    /* a page past the pixel guard, or a frame the renderer could not load:
+       the message names the reason rather than an opaque failure */
+    res.status(400).json({ error: e instanceof Error ? e.message : 'the diff failed' })
+  }
+})
+
 /* ---- ship: the download the Export button hands a human, and the design
    opened as a pull request against a connected repo ---- */
 
@@ -1680,7 +1790,12 @@ app.post('/api/canvases/:id/export-image', async (req, res) => {
   if (requested !== undefined && !c.pages?.some((page) => page.id === requested))
     return res.status(404).json({ error: 'page not found' })
   const pageId = requested ?? c.pages?.[0]?.id
-  const frames = pageId ? c.frames.filter((frame) => frame.pageId === pageId) : c.frames
+  /* stacking order is `z` (ties by array order), exactly as the stage paints
+     it: the compositor draws in the order it is handed, so an unsorted page
+     would put a restacked frame behind the one it now covers */
+  const frames = (pageId ? c.frames.filter((frame) => frame.pageId === pageId) : c.frames)
+    .slice()
+    .sort((a, b) => a.z - b.z)
   /* a colour by name, hex or function — sharp parses it and refuses what it
      does not understand, so the field only needs a length bound */
   const background = typeof req.body?.background === 'string' ? req.body.background.trim().slice(0, 64) : ''
@@ -1837,14 +1952,16 @@ app.delete('/api/canvases/:id', (req, res) => {
   res.json({ ok: true })
 })
 
-/* ---- trash: deleted canvases and frames, still recoverable ----
+/* ---- trash: deleted canvases, frames, pages and components, still
+   recoverable ----
    A trashed canvas is out of the store's live map (so it is out of every read
    path at once — requireCanvas, the dashboard, the gallery, the ws join) and a
-   trashed frame is out of its canvas and the frame index. Both are listed here
-   and put back here, until the retention window passes and the purge job
-   removes the rows for good. Every route is owner-scoped: a canvas by its
-   owner, a frame by the owner of the canvas it sits on. Anything else is a
-   404 — the trash is not a way to discover someone else's deleted work. */
+   trashed frame, page or component is out of its canvas and the frame index.
+   All of them are listed here and put back here, until the retention window
+   passes and the purge job removes the rows for good. Every route is
+   owner-scoped: a canvas by its owner, a frame/page/component by the owner of
+   the canvas it sits on. Anything else is a 404 — the trash is not a way to
+   discover someone else's deleted work. */
 
 app.get('/api/trash', (req, res) => {
   res.json(store.listTrash(req.user!.id))
@@ -1879,6 +1996,25 @@ app.delete('/api/trash/frames/:id', (req, res) => {
   const canvas = entry ? store.getCanvas(entry.frame.canvasId) : undefined
   if (!entry || canvas?.ownerId !== req.user!.id) return res.status(404).json({ error: 'not found' })
   actions.purgeFrame(entry.frame.id, resolveActorFromReq(req))
+  res.json({ ok: true })
+})
+
+/** A page or a component still sits on a LIVE canvas — that is why it was
+ *  trashed on its own rather than with a canvas — so a restore puts it back
+ *  and tells the room, exactly as the frame restore does. */
+app.post('/api/trash/pages/:id/restore', (req, res) => {
+  const entry = store.getTrashedPage(req.params.id)
+  const canvas = entry ? store.getCanvas(entry.page.canvasId) : undefined
+  if (!entry || canvas?.ownerId !== req.user!.id) return res.status(404).json({ error: 'not found' })
+  actions.restorePage(entry.page.id, resolveActorFromReq(req))
+  res.json({ ok: true })
+})
+
+app.post('/api/trash/components/:id/restore', (req, res) => {
+  const entry = store.getTrashedComponent(req.params.id)
+  const canvas = entry ? store.getCanvas(entry.component.canvasId) : undefined
+  if (!entry || canvas?.ownerId !== req.user!.id) return res.status(404).json({ error: 'not found' })
+  actions.restoreComponent(entry.component.id, resolveActorFromReq(req))
   res.json({ ok: true })
 })
 
@@ -1919,9 +2055,11 @@ app.patch('/api/canvases/:id', async (req, res) => {
 /* ------------------------------------------------------------------ */
 /* Collaborators: Figma-style invites. The owner invites existing doop */
 /* accounts by email; each member carries the role the owner gave     */
-/* them, which is what the gate reads. Management is owner-only       */
-/* (members may remove themselves); the people list is visible to     */
-/* anyone with access.                                                 */
+/* them, which is what the gate reads. Roles and invitations are the  */
+/* owner's and their admins' to hand out — an admin may manage        */
+/* collaborators, while the canvas-level decisions that go with       */
+/* ownership (the share link's policy, deleting the canvas) stay the  */
+/* owner's alone. The people list is visible to anyone with access.   */
 /* ------------------------------------------------------------------ */
 
 /** A member row as the client's CanvasMember: the account, whether it is the
@@ -1935,6 +2073,13 @@ function memberView(c: Canvas, id: string, account: { name: string; email: strin
     owner: id === c.ownerId,
     role: id === c.ownerId ? ('admin' as const) : store.roleOf(c.id, id),
   }
+}
+
+/** The owner, or a member the owner made an admin: who may hand out roles and
+ *  invitations. Anything above that (deleting the canvas, the share link's
+ *  policy) stays the owner's alone. */
+function canManageMembers(c: Canvas, userId: string): boolean {
+  return c.ownerId === userId || (c.memberIds?.includes(userId) === true && memberRole(c.id, userId) === 'admin')
 }
 
 app.get('/api/canvases/:id/members', async (req, res) => {
@@ -1951,12 +2096,14 @@ app.get('/api/canvases/:id/members', async (req, res) => {
   res.json(ids.map((id) => memberView(c, id, byId.get(id))))
 })
 
-/** Change a member's role. Owner-only: a member who could re-role themselves
- *  holds no role at all, and one who could re-role others holds every role. */
+/** Change a member's role. Owner or admin: a member who could re-role
+ *  themselves holds no role at all, and one who could re-role others holds
+ *  every role — which is exactly what handing the job to an admin means. */
 app.patch('/api/canvases/:id/members/:userId', async (req, res) => {
   const c = requireCanvas(req, res, req.params.id)
   if (!c) return
-  if (c.ownerId !== req.user!.id) return res.status(403).json({ error: 'only the owner can change roles' })
+  if (!canManageMembers(c, req.user!.id))
+    return res.status(403).json({ error: 'only the owner or an admin can change roles' })
   const role = req.body?.role
   if (!isCanvasRole(role)) return res.status(400).json({ error: 'role must be viewer, commenter, editor or admin' })
   if (req.params.userId === c.ownerId)
@@ -1973,7 +2120,8 @@ app.patch('/api/canvases/:id/members/:userId', async (req, res) => {
 app.post('/api/canvases/:id/members', async (req, res) => {
   const c = requireCanvas(req, res, req.params.id)
   if (!c) return
-  if (c.ownerId !== req.user!.id) return res.status(403).json({ error: 'only the owner can invite people' })
+  if (!canManageMembers(c, req.user!.id))
+    return res.status(403).json({ error: 'only the owner or an admin can invite people' })
   const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : ''
   if (!email) return res.status(400).json({ error: 'email required' })
   const role: CanvasRole = isCanvasRole(req.body?.role) ? req.body.role : 'editor'
@@ -1990,8 +2138,9 @@ app.post('/api/canvases/:id/members', async (req, res) => {
 app.delete('/api/canvases/:id/members/:userId', (req, res) => {
   const c = requireCanvas(req, res, req.params.id)
   if (!c) return
-  if (c.ownerId !== req.user!.id && req.params.userId !== req.user!.id)
-    return res.status(403).json({ error: 'only the owner can remove collaborators' })
+  /* anyone may remove THEMSELVES — leaving a canvas is not a permission */
+  if (!canManageMembers(c, req.user!.id) && req.params.userId !== req.user!.id)
+    return res.status(403).json({ error: 'only the owner or an admin can remove collaborators' })
   if (!store.removeMember(c.id, req.params.userId)) return res.status(404).json({ error: 'not a collaborator' })
   res.json({ ok: true })
 })
@@ -2023,14 +2172,16 @@ function inviteView(invite: persist.CanvasInviteRow) {
 app.get('/api/canvases/:id/invites', async (req, res) => {
   const c = requireCanvas(req, res, req.params.id)
   if (!c) return
-  if (c.ownerId !== req.user!.id) return res.status(403).json({ error: 'only the owner can see invitations' })
+  if (!canManageMembers(c, req.user!.id))
+    return res.status(403).json({ error: 'only the owner or an admin can see invitations' })
   res.json((await persist.listInvites(c.id)).map(inviteView))
 })
 
 app.post('/api/canvases/:id/invites', async (req, res) => {
   const c = requireCanvas(req, res, req.params.id)
   if (!c) return
-  if (c.ownerId !== req.user!.id) return res.status(403).json({ error: 'only the owner can invite people' })
+  if (!canManageMembers(c, req.user!.id))
+    return res.status(403).json({ error: 'only the owner or an admin can invite people' })
   const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : ''
   if (!email || !email.includes('@')) return res.status(400).json({ error: 'a valid email is required' })
   const role = req.body?.role
@@ -2065,7 +2216,8 @@ app.post('/api/canvases/:id/invites', async (req, res) => {
 app.delete('/api/canvases/:id/invites/:inviteId', async (req, res) => {
   const c = requireCanvas(req, res, req.params.id)
   if (!c) return
-  if (c.ownerId !== req.user!.id) return res.status(403).json({ error: 'only the owner can revoke invitations' })
+  if (!canManageMembers(c, req.user!.id))
+    return res.status(403).json({ error: 'only the owner or an admin can revoke invitations' })
   if (!(await persist.deleteInvite(c.id, req.params.inviteId)))
     return res.status(404).json({ error: 'no such invitation' })
   res.json({ ok: true })
@@ -2996,7 +3148,19 @@ app.delete('/api/canvases/:id/agent-messages/:messageId', (req, res) => {
 /* Stop or redirect a connected agent: the stop lands on its next tool call,
    the steer is read there. Same write bar as every other canvas edit — a
    viewer cannot end someone's run — and both are recorded on the run timeline
-   so the humans see the intervention, not just the silence that follows. */
+   so the humans see the intervention, not just the silence that follows.
+   The same block also lists what is still queued: a stop waiting for the
+   agent's next call, and steers it has not read yet. */
+
+/** What the canvas is holding for its agents right now — an `AgentSignal[]`,
+ *  oldest first, in the shape the requests above filed: a pending stop, and
+ *  every steer not yet drained. Reads only: what is queued is the humans'
+ *  business, including a viewer's. */
+app.get('/api/canvases/:id/agent-signals', (req, res) => {
+  const c = requireCanvasIntent(req, res, req.params.id, 'view')
+  if (!c) return
+  res.json({ signals: agentEvents.listSignals(c.id) })
+})
 
 app.post('/api/canvases/:id/agents/:agentName/stop', (req, res) => {
   const c = requireCanvasIntent(req, res, req.params.id, 'edit')
@@ -3005,6 +3169,12 @@ app.post('/api/canvases/:id/agents/:agentName/stop', (req, res) => {
   agentEvents.requestStop(c.id, agentName, req.user!.name)
   const runId = currentRunId(c.id, agentName)
   if (runId) runLog.recordStatus(c.id, runId, agentName, 'stop', `${req.user!.name} stopped the run`)
+  /* A human pressed stop, so the people opted into "a run failed or was
+     stopped" hear about it here — fire-and-forget, exactly as the question
+     path does: mail must never hold up the stop it reports. */
+  import('./notifications.ts')
+    .then((n) => n.notifyAgentEvent(c.id, 'stop', `${req.user!.name} stopped ${agentName}`))
+    .catch(() => {})
   res.json({ ok: true })
 })
 
@@ -3791,10 +3961,28 @@ app.use(errorHandler())
    parsed). */
 const MAX_WS_PAYLOAD = 1024 * 1024
 
+/* Two tiers on purpose. The transport refuses an absurd frame before the
+   library buffers it (the ws default is 100 MiB, which is not a ceiling); the
+   check in the handler answers the messages that are merely oversized with
+   4409, the code this server documents and src/lib/ws.ts shows the client. A
+   frame between the two is read and refused; one past the transport cap never
+   reaches us, and the library's 1009 is the honest answer for a client that
+   sent it. */
+const MAX_WS_FRAME = 4 * MAX_WS_PAYLOAD
+
 const server = http.createServer(app)
-const wss = new WebSocketServer({ server, path: '/ws' })
+const wss = new WebSocketServer({ server, path: '/ws', maxPayload: MAX_WS_FRAME })
 
 wss.on('connection', (ws, upgradeReq) => {
+  /* The library enforces maxPayload itself — a frame past the transport cap is
+     refused at its length header, the socket is closed with 1009, and the
+     failure surfaces here as an 'error' event. An EventEmitter with no 'error'
+     listener throws, and this is a server: one absurd frame must not become an
+     outage. Logged, and nothing else — the socket is already gone, so the close
+     handler below runs and drops the connection from the room. Every other
+     thing ws reports about this socket lands here too, for the same reason. */
+  ws.on('error', (e) => console.error(`[ws] socket error: ${e.message}`))
+
   /* the session cookie rides the upgrade request; resolve it once */
   const sessionPromise = auth.api.getSession({ headers: fromNodeHeaders(upgradeReq.headers) }).catch(() => null)
 

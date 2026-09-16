@@ -1492,6 +1492,44 @@ export function purgeFrame(frameId: string, actor: Actor): boolean {
   return true
 }
 
+/** Undo a page delete: the page comes back where it was, so the room is told
+ *  about the page list the way it hears about any page mutation — and the
+ *  frames that went down with the page come back too. A page delete is one
+ *  action ("remove the page and every frame on it"), so its inverse has to be
+ *  one action as well: restoring the page alone would leave the user staring
+ *  at an empty page with its frames waiting in the trash one by one. */
+export function restorePage(pageId: string, actor: Actor): Page | undefined {
+  const page = store.restorePage(pageId)
+  if (!page) return undefined
+  const canvas = store.getCanvas(page.canvasId)!
+  /* listed before the restores, because each restore takes its entry out of
+     the trash; restoreFrame also keeps each frame's own pageId, which the page
+     restore has just made valid again by putting the page back */
+  const frames = store
+    .listTrashedFramesOnPage(page.id)
+    .flatMap((frame) => (store.restoreFrame(frame.id) ? [frame] : []))
+  broadcast(page.canvasId, { type: 'pages', pages: canvas.pages ?? [], actor })
+  for (const frame of frames) broadcast(page.canvasId, { type: 'frame:created', frame, actor })
+  logActivity(
+    page.canvasId,
+    actor,
+    frames.length === 0
+      ? `restored page “${page.name}” from the trash`
+      : `restored page “${page.name}” and its ${frames.length} frame${frames.length === 1 ? '' : 's'} from the trash`,
+  )
+  return page
+}
+
+/** Undo a component delete: back in the canvas's library under its old id, so
+ *  the frames carrying instances of it resolve again. */
+export function restoreComponent(componentId: string, actor: Actor): Component | undefined {
+  const component = store.restoreComponent(componentId)
+  if (!component) return undefined
+  broadcast(component.canvasId, { type: 'component', componentId, component, actor })
+  logActivity(component.canvasId, actor, `restored component “${component.name}” from the trash`)
+  return component
+}
+
 /** Everything a canvas keeps outside the store: the thumbnail cache and the
  *  in-memory logs keyed by canvas id. Shared by the trash purge and the
  *  account wipe — both end with a canvas that no longer exists, and a log left
@@ -1636,6 +1674,10 @@ export function deletePage(pageId: string, actor: Actor): DeletedPage | undefine
        apply, one level up */
     const locked = found.canvas.frames.find((f) => f.pageId === pageId && f.locked)
     if (locked) throw new FrameLockedByUserError(locked.id, locked.name)
+    /* the snapshot is taken while the page and its frames are still there:
+       "restore the canvas as it was before I deleted this page" is the thing a
+       delete needs history for */
+    snapshotCanvas(found.canvas.id, 'delete', actor.name)
   }
   const result = store.deletePage(pageId)
   if (!result) return undefined

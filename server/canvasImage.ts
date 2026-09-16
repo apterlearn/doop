@@ -20,8 +20,10 @@ import { renderFrame } from './screenshot.ts'
  *    rotated frame's layout box is still its unrotated one and compositing it
  *    unrotated is where the box actually is.
  *  - `opacity` is ignored: the frame is drawn as the browser rasterizes it.
- *  - `z` is ignored. Frames are opaque rectangles at distinct positions on a
- *    page; if two overlap, the later one in `frames` wins.
+ *  - `z` is the caller's to order: the compositor draws in the order it is
+ *    handed, so a caller passes the page's frames sorted by `z` (what the
+ *    stage does) and two overlapping frames land in the same paint order
+ *    here as on screen.
  *
  * Cost: one isolated Chromium page per renderable frame, sequentially — a
  * page of ten frames is ten page loads and ten PNG encodes. Callers are

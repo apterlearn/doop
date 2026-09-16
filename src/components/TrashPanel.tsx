@@ -1,31 +1,51 @@
 import * as React from 'react'
 import { useCallback, useEffect, useState } from 'react'
-import type { TrashContents, TrashedCanvas, TrashedFrame } from '../lib/api'
+import type { TrashContents, TrashedCanvas, TrashedEntry } from '../lib/api'
 import { api } from '../lib/api'
 import { timeAgo } from '../lib/time'
 import { Button } from './ui/button'
 import { ConfirmDialog } from './ui/alert-dialog'
 import { Toast } from './ui/toast'
 
-/* The Trash view: what deleting a canvas or a frame actually does now.
+/* The Trash view: what deleting a canvas, a frame, a page or a component
+ *  actually does now.
  *
- *  Neither is destroyed when it is deleted — the row is marked deleted, the
- *  frame stops rendering and the canvas leaves the dashboard, and both wait
- *  here to be put back. The only ways out of the trash are a restore and the
- *  purge that clears anything left for thirty days. That ordering is the
- *  point: "delete" is a decision a person can take back, and this is where
- *  they take it back. */
+ *  None of them is destroyed when it is deleted — the row is marked deleted,
+ *  the frames and pages stop rendering, the component leaves the library and
+ *  the canvas leaves the dashboard, and all of them wait here to be put back.
+ *  The ways out of the trash are a restore and the purge that clears anything
+ *  left for thirty days; a page or a component takes the restore and the
+ *  purge, and has no permanent-delete button of its own, because on its own it
+ *  is nothing to destroy. That ordering is the point: "delete" is a decision a
+ *  person can take back, and this is where they take it back. */
 
-/** What a row, the confirm dialog and the request callbacks all address. */
-type Target = { kind: 'canvas' | 'frame'; id: string; label: string }
+/** What a row, the confirm dialog and the request callbacks all address. The
+ *  four kinds share the row; only their restore request differs. */
+type Target = { kind: 'canvas' | 'frame' | 'page' | 'component'; id: string; label: string }
 
 /** one trash row: the list-view shell Home's canvas list uses */
 const rowCls =
   'flex flex-wrap items-center gap-x-3 gap-y-1.5 border-b border-line-soft px-3 py-2.5 last:border-b-0 md:px-3.5 md:py-[11px]'
 
 const canvasTarget = (canvas: TrashedCanvas): Target => ({ kind: 'canvas', id: canvas.id, label: canvas.name })
-const frameTarget = (frame: TrashedFrame): Target => ({ kind: 'frame', id: frame.id, label: frame.name })
+const frameTarget = (frame: TrashedEntry): Target => ({ kind: 'frame', id: frame.id, label: frame.name })
+const pageTarget = (page: TrashedEntry): Target => ({ kind: 'page', id: page.id, label: page.name })
+const componentTarget = (component: TrashedEntry): Target => ({
+  kind: 'component',
+  id: component.id,
+  label: component.name,
+})
 const keyOf = (t: Target) => `${t.kind}:${t.id}`
+
+/** The request that puts each kind of trashed thing back: a trashed frame, page
+ *  and component read as the same row, so the row's target kind is the whole
+ *  choice. */
+const RESTORE: Record<Target['kind'], (id: string) => Promise<{ ok: true }>> = {
+  canvas: api.restoreTrashedCanvas,
+  frame: api.restoreTrashedFrame,
+  page: api.restoreTrashedPage,
+  component: api.restoreTrashedComponent,
+}
 
 export function TrashPanel({ onRestored }: { onRestored: () => void }) {
   const [contents, setContents] = useState<TrashContents | null>(null)
@@ -54,8 +74,7 @@ export function TrashPanel({ onRestored }: { onRestored: () => void }) {
     if (busy) return
     setBusy(keyOf(target))
     setError(null)
-    const call = target.kind === 'canvas' ? api.restoreTrashedCanvas(target.id) : api.restoreTrashedFrame(target.id)
-    call
+    RESTORE[target.kind](target.id)
       .then(() => {
         showToast(`Restored “${target.label}”`)
         load()
@@ -69,8 +88,11 @@ export function TrashPanel({ onRestored }: { onRestored: () => void }) {
   }
 
   /* Permanent: the row goes, and nothing brings it back. The dialog says so
-     before this runs. */
+     before this runs. Pages and components have no button that reaches this:
+     the retention purge is what ends them, so a target of either kind here is
+     a mistake rather than a request. */
   function purge(target: Target) {
+    if (target.kind !== 'canvas' && target.kind !== 'frame') return
     setPurging(null)
     setBusy(keyOf(target))
     setError(null)
@@ -89,20 +111,22 @@ export function TrashPanel({ onRestored }: { onRestored: () => void }) {
 
   const canvases = contents?.canvases ?? []
   const frames = contents?.frames ?? []
-  const empty = canvases.length === 0 && frames.length === 0
+  const pages = contents?.pages ?? []
+  const components = contents?.components ?? []
+  const empty = canvases.length === 0 && frames.length === 0 && pages.length === 0 && components.length === 0
 
   return (
     <div className="mt-[18px]">
       <p className="max-w-[560px] text-[13px] leading-[1.55] text-ink-soft">
-        Deleting a canvas or a frame moves it here — nothing is destroyed. Restore it and it comes back exactly as it
-        was; anything left here is cleared out automatically after 30 days.
+        Deleting a canvas, a frame, a page or a component moves it here — nothing is destroyed. Restore it and it comes
+        back exactly as it was; anything left here is cleared out automatically after 30 days.
       </p>
       {error && <p className="mt-2 text-[12.5px] text-accent-ink">{error}</p>}
       {contents === null ? (
         <p className="mt-4 text-[13.5px] text-ink-soft">Loading the trash…</p>
       ) : empty ? (
         <p className="mt-4 text-[13.5px] text-ink-soft">
-          The trash is empty. Delete a canvas or a frame and it waits here instead of disappearing.
+          The trash is empty. Delete a canvas, a frame, a page or a component and it waits here instead of disappearing.
         </p>
       ) : (
         <>
@@ -144,6 +168,40 @@ export function TrashPanel({ onRestored }: { onRestored: () => void }) {
               })}
             </Section>
           )}
+          {pages.length > 0 && (
+            <Section label="Pages" count={pages.length}>
+              {pages.map((page) => {
+                const t = pageTarget(page)
+                return (
+                  <Row
+                    key={t.id}
+                    name={page.name}
+                    meta={`in ${page.canvasName} · deleted ${timeAgo(page.deletedAt)}`}
+                    target={t}
+                    busy={busy === keyOf(t)}
+                    onRestore={restore}
+                  />
+                )
+              })}
+            </Section>
+          )}
+          {components.length > 0 && (
+            <Section label="Components" count={components.length}>
+              {components.map((component) => {
+                const t = componentTarget(component)
+                return (
+                  <Row
+                    key={t.id}
+                    name={component.name}
+                    meta={`in ${component.canvasName} · deleted ${timeAgo(component.deletedAt)}`}
+                    target={t}
+                    busy={busy === keyOf(t)}
+                    onRestore={restore}
+                  />
+                )
+              })}
+            </Section>
+          )}
         </>
       )}
       <ConfirmDialog
@@ -175,8 +233,10 @@ function Section({ label, count, children }: { label: string; count: number; chi
   )
 }
 
-/** One trashed thing: what it is, where it came from, and the two decisions
- *  left — put it back, or end it. */
+/** One trashed thing: what it is, where it came from, and the decisions left —
+ *  put it back, and end it for good where there is such a thing as ending it.
+ *  A page and a component have no `onPurge`: nothing here destroys one, and no
+ *  button is offered for what does not exist. */
 function Row({
   name,
   meta,
@@ -190,7 +250,7 @@ function Row({
   target: Target
   busy: boolean
   onRestore: (target: Target) => void
-  onPurge: (target: Target) => void
+  onPurge?: (target: Target) => void
 }) {
   return (
     <div className={rowCls}>
@@ -200,9 +260,11 @@ function Row({
         <Button variant="ghost" size="sm" disabled={busy} onClick={() => onRestore(target)}>
           Restore
         </Button>
-        <Button variant="bare-danger" size="sm" disabled={busy} onClick={() => onPurge(target)}>
-          Delete forever
-        </Button>
+        {onPurge && (
+          <Button variant="bare-danger" size="sm" disabled={busy} onClick={() => onPurge(target)}>
+            Delete forever
+          </Button>
+        )}
       </span>
     </div>
   )
