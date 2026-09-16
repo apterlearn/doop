@@ -9,12 +9,14 @@ import { ToolbarButton, ToolbarDivider } from './ui/toolbar'
    canvas stays uncluttered.
 
    The geometry is deliberately local and boring: align uses the selection's
-   bounding box, distribute keeps the first and last of the stack order in
-   place and spreads the frames between them to even gaps. Locked frames take
-   part in the box the rest align to — a locked frame is the natural reference
-   — but never move themselves, mirroring the rule the server enforces on
-   their content. Hidden frames are off the stage and so out of the maths
-   entirely. */
+   bounding box, distribute keeps the frame at each end of its axis in place
+   and spreads the ones between them to even gaps — the ends being the
+   leftmost and rightmost (or topmost and bottommost) of the selection, since
+   a spread is a statement about where the frames are, not about the order
+   they happen to stack in. Locked frames take part in the box the rest align
+   to — a locked frame is the natural reference — but never move themselves,
+   mirroring the rule the server enforces on their content. Hidden frames are
+   off the stage and so out of the maths entirely. */
 
 type AlignMode = 'left' | 'hcenter' | 'right' | 'top' | 'vmiddle' | 'bottom' | 'distribute-h' | 'distribute-v'
 
@@ -93,12 +95,15 @@ function plan(mode: AlignMode, selected: Frame[], all: Frame[]): Move[] {
     if (movable.length < 3) return moves
     const pos = mode === 'distribute-h' ? 'x' : 'y'
     const size = mode === 'distribute-h' ? 'width' : 'height'
-    /* the stack order is the sort position (z ascending, ties by array order,
-       exactly what the Stage paints): the first frame keeps its leading edge
-       and the last keeps its trailing one, and the frames between them are
-       spread to one even gap each */
+    /* the sort position is the axis the mode works on, not the stack order:
+       the leftmost (or topmost) frame keeps its leading edge and the
+       rightmost (or bottommost) keeps its trailing one, so the pins are the
+       two extremes of the spread itself and no frame can be moved past
+       another. Array order breaks a tie, keeping the line stable. */
     const arrayOrder = new Map(all.map((f, i) => [f.id, i]))
-    const line = [...movable].sort((a, b) => a.z - b.z || (arrayOrder.get(a.id) ?? 0) - (arrayOrder.get(b.id) ?? 0))
+    const line = [...movable].sort(
+      (a, b) => a[pos] - b[pos] || (arrayOrder.get(a.id) ?? 0) - (arrayOrder.get(b.id) ?? 0),
+    )
     const first = line[0]!
     const last = line[line.length - 1]!
     const span = last[pos] + last[size] - first[pos]

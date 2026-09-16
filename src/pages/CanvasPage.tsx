@@ -240,7 +240,14 @@ export function CanvasPage({ canvasId, onSignIn }: { canvasId: string; onSignIn?
       if ((e.key === 'Delete' || e.key === 'Backspace') && selectedIds.length) {
         e.preventDefault()
         const frames = useStore.getState().canvas?.frames.filter((f) => selectedIds.includes(f.id)) ?? []
+        /* ⌫ asks for what the menu's Move to trash asks for, so it answers the
+           same way: the frames left the canvas, and the server's count of how
+           many says so */
         deleteFramesTracked(frames)
+          .then((n) => {
+            if (n > 0) showToast(`${n} frame${n === 1 ? '' : 's'} moved to trash — undo with ⌘Z`)
+          })
+          .catch(console.error)
       }
       /* arrows nudge the selection (⇧ moves a grid step). A locked frame never
          moves; a selection that is entirely locked falls through untouched. */
@@ -313,10 +320,14 @@ export function CanvasPage({ canvasId, onSignIn }: { canvasId: string; onSignIn?
         return
       }
       /* ⌘A: everything on the page being viewed, not the frames parked on
-         other pages of the same canvas */
+         other pages of the same canvas — and never a hidden frame, which is
+         off the stage entirely: the marquee skips one, and a select-all that
+         pulled it in would move or delete a frame the user cannot see */
       if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'a') {
         e.preventDefault()
-        const ids = visibleFrames(useStore.getState()).map((f) => f.id)
+        const ids = visibleFrames(useStore.getState())
+          .filter((f) => !f.hidden)
+          .map((f) => f.id)
         if (ids.length) useStore.getState().selectMany(ids)
         return
       }

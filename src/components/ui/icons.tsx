@@ -102,6 +102,17 @@ export function SyncIcon(props: SVGProps<SVGSVGElement>) {
   )
 }
 
+/* a circular arrow whose head sits in the gap it leaves — the rotate handle
+   above a selected frame */
+export function RotateIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg {...iconProps} {...props}>
+      <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+      <path d="M18.36 1.64v4h-4" />
+    </svg>
+  )
+}
+
 /* arrow into a tray — the top bar's Import */
 export function ImportIcon(props: SVGProps<SVGSVGElement>) {
   return (

@@ -273,12 +273,14 @@ export function Inspector({
               </Button>
             </div>
           </Field>
-          <Field label="Rotation">
+          <Field label="Rotation" hint="↑↓ 1° — ⇧↑↓ 15°">
             <NumInput
               value={frame.rotation}
               min={-360}
               max={360}
               disabled={contentLocked}
+              step={1}
+              bigStep={15}
               onCommit={(v) => commitMeta({ rotation: v })}
             />
           </Field>
@@ -411,8 +413,21 @@ export function Inspector({
                   : `last edit by ${frame.updatedBy}`}
           </span>
           {!readOnly && (
-            <Button variant="bare-danger" size="sm" onClick={() => deleteFrameTracked(frame)}>
-              Delete frame
+            <Button
+              variant="bare-danger"
+              size="sm"
+              onClick={() => {
+                /* the frames left the canvas and the server's count of how
+                   many says so — a delete somebody else got to first is not
+                   reported as one of ours */
+                deleteFrameTracked(frame)
+                  .then((n) => {
+                    if (n > 0) showToast(`${n} frame${n === 1 ? '' : 's'} moved to trash — undo with ⌘Z`)
+                  })
+                  .catch(console.error)
+              }}
+            >
+              Move to trash
             </Button>
           )}
         </footer>
@@ -459,6 +474,8 @@ function NumInput({
   min,
   max,
   disabled,
+  step = 1,
+  bigStep = 10,
   onCommit,
 }: {
   value: number
@@ -466,6 +483,9 @@ function NumInput({
   min?: number
   max?: number
   disabled?: boolean
+  /* what ↑/↓ move by, and what they move by while ⇧ is held */
+  step?: number
+  bigStep?: number
   onCommit: (v: number) => void
 }) {
   const [draft, setDraft] = useState(String(value))
@@ -496,7 +516,26 @@ function NumInput({
         if (n !== value) onCommit(n)
         else setDraft(String(value))
       }}
-      onKeyDown={(e) => e.key === 'Enter' && (e.target as HTMLInputElement).blur()}
+      onKeyDown={(e) => {
+        const el = e.target as HTMLInputElement
+        if (e.key === 'Enter') {
+          el.blur()
+          return
+        }
+        /* ↑/↓ step the field itself. A held arrow repeats, so each press
+           commits on its own — the same one-save-per-value rhythm the field
+           has when it commits on blur. The draft is written too, so the
+           number under the caret is the one being saved. */
+        if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return
+        e.preventDefault()
+        const by = (e.shiftKey ? bigStep : step) * (e.key === 'ArrowUp' ? 1 : -1)
+        let n = Math.round(value) + by
+        if (min !== undefined) n = Math.max(min, n)
+        if (max !== undefined) n = Math.min(max, n)
+        if (n === value) return
+        setDraft(String(n))
+        onCommit(n)
+      }}
     />
   )
 }

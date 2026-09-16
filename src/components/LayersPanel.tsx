@@ -15,6 +15,7 @@ import { Panel, PanelBody, PanelHeader } from './ui/panel'
 import { Button } from './ui/button'
 import { Input } from './ui/input'
 import { Tooltip } from './ui/tooltip'
+import { Toast } from './ui/toast'
 import {
   ContextMenu,
   ContextMenuContent,
@@ -116,6 +117,22 @@ export function LayersPanel({ onAddFrame }: { onAddFrame: () => void }) {
   const readOnly = useStore(isReadOnly)
   const [query, setQuery] = useState('')
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set())
+  /* the rail's own status line: a deleted frame leaves the tree with nothing
+     else to say it happened, and the panel has no other toast to ride on */
+  const [toast, setToast] = useState<string | null>(null)
+  function showToast(message: string) {
+    setToast(message)
+    window.setTimeout(() => setToast(null), 2400)
+  }
+  function deleteFrameRow(frame: Frame) {
+    /* the count is the server's answer, not the size of the request: a frame
+       somebody else already removed is not one more the user just trashed */
+    deleteFramesTracked([frame])
+      .then((n) => {
+        if (n > 0) showToast(`${n} frame${n === 1 ? '' : 's'} moved to trash — undo with ⌘Z`)
+      })
+      .catch(console.error)
+  }
   /* a frame drag in flight: which row is moving, and which edge of which row
      the pointer is over. The refs carry the same facts for the handlers —
      dragstart, dragover and drop can land in one task, before React has
@@ -233,7 +250,7 @@ export function LayersPanel({ onAddFrame }: { onAddFrame: () => void }) {
         /* no row is deleted for a viewer: the key falls through unhandled
            rather than deleting something the server would refuse anyway */
         if (readOnly) return
-        if (row?.kind === 'frame') deleteFramesTracked([row.frame])
+        if (row?.kind === 'frame') deleteFrameRow(row.frame)
         else if (row) deleteLayer(row.frame, row.node.selector)
         break
       default:
@@ -246,121 +263,132 @@ export function LayersPanel({ onAddFrame }: { onAddFrame: () => void }) {
   }
 
   return (
-    <Panel className="left-3 inset-y-3 w-[300px]">
-      <PanelHeader>
-        <span className="rounded-sm bg-paper-deep px-2 py-[3px] font-mono text-[11px] font-medium uppercase tracking-[0.09em] text-ink">
-          Layers
-        </span>
-        <Tooltip label="Collapse panel" side="bottom" align="end">
-          <Button
-            variant="bare"
-            size="icon-sm"
-            className={railBtn}
-            aria-label="Collapse panel"
-            onClick={() => setLayersOpen(false)}
-          >
-            <PanelCollapseIcon width={13} height={13} />
-          </Button>
-        </Tooltip>
-      </PanelHeader>
-      <label className="mx-3 mt-2.5 mb-1 flex h-8 items-center gap-2 rounded-lg border border-line bg-paper px-2.5 text-ink-faint focus-within:border-ink">
-        <SearchIcon width={13} height={13} className="flex-none" />
-        <Input
-          variant="bare"
-          inputSize="auto"
-          className="h-full text-[12.5px] md:text-[12.5px]"
-          placeholder="Search layers"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-        />
-      </label>
-      <div className="flex items-center justify-between py-1 pr-2 pl-3.5 font-mono text-[10px] font-medium uppercase tracking-[0.12em] text-ink-faint">
-        <span>Frames · {frames.length}</span>
-        <span className="flex gap-0.5">
-          <Tooltip label="Collapse all" side="bottom">
+    <>
+      <Panel className="left-3 inset-y-3 w-[300px]">
+        <PanelHeader>
+          <span className="rounded-sm bg-paper-deep px-2 py-[3px] font-mono text-[11px] font-medium uppercase tracking-[0.09em] text-ink">
+            Layers
+          </span>
+          <Tooltip label="Collapse panel" side="bottom" align="end">
             <Button
               variant="bare"
               size="icon-sm"
-              className={sectionBtn}
-              aria-label="Collapse all"
-              onClick={() => setExpanded(new Set())}
+              className={railBtn}
+              aria-label="Collapse panel"
+              onClick={() => setLayersOpen(false)}
             >
-              <CollapseAllIcon width={12} height={12} />
+              <PanelCollapseIcon width={13} height={13} />
             </Button>
           </Tooltip>
-          {readOnly ? (
-            <span className="self-center pr-1 text-ink-faint" title="Read only — sign in to edit this canvas">
-              Read only
-            </span>
-          ) : (
-            <Tooltip label="New frame" side="bottom" align="end">
-              <Button variant="bare" size="icon-sm" className={sectionBtn} aria-label="New frame" onClick={onAddFrame}>
-                <PlusIcon width={12} height={12} />
+        </PanelHeader>
+        <label className="mx-3 mt-2.5 mb-1 flex h-8 items-center gap-2 rounded-lg border border-line bg-paper px-2.5 text-ink-faint focus-within:border-ink">
+          <SearchIcon width={13} height={13} className="flex-none" />
+          <Input
+            variant="bare"
+            inputSize="auto"
+            className="h-full text-[12.5px] md:text-[12.5px]"
+            placeholder="Search layers"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+          />
+        </label>
+        <div className="flex items-center justify-between py-1 pr-2 pl-3.5 font-mono text-[10px] font-medium uppercase tracking-[0.12em] text-ink-faint">
+          <span>Frames · {frames.length}</span>
+          <span className="flex gap-0.5">
+            <Tooltip label="Collapse all" side="bottom">
+              <Button
+                variant="bare"
+                size="icon-sm"
+                className={sectionBtn}
+                aria-label="Collapse all"
+                onClick={() => setExpanded(new Set())}
+              >
+                <CollapseAllIcon width={12} height={12} />
               </Button>
             </Tooltip>
+            {readOnly ? (
+              <span className="self-center pr-1 text-ink-faint" title="Read only — sign in to edit this canvas">
+                Read only
+              </span>
+            ) : (
+              <Tooltip label="New frame" side="bottom" align="end">
+                <Button
+                  variant="bare"
+                  size="icon-sm"
+                  className={sectionBtn}
+                  aria-label="New frame"
+                  onClick={onAddFrame}
+                >
+                  <PlusIcon width={12} height={12} />
+                </Button>
+              </Tooltip>
+            )}
+          </span>
+        </div>
+        <PanelBody className="px-2 pb-2 outline-none" role="tree" tabIndex={0} onKeyDown={onKeyDown}>
+          {frames.length === 0 && (
+            <div className="px-3 py-6 text-center text-[12.5px] text-ink-faint">
+              {readOnly
+                ? 'No frames on this page.'
+                : 'No frames yet. Press + to add one, or ask the agent for a design.'}
+            </div>
           )}
-        </span>
-      </div>
-      <PanelBody className="px-2 pb-2 outline-none" role="tree" tabIndex={0} onKeyDown={onKeyDown}>
-        {frames.length === 0 && (
-          <div className="px-3 py-6 text-center text-[12.5px] text-ink-faint">
-            {readOnly ? 'No frames on this page.' : 'No frames yet. Press + to add one, or ask the agent for a design.'}
-          </div>
-        )}
-        {frames.length > 0 && rows.length === 0 && (
-          <div className="px-3 py-6 text-center text-[12.5px] text-ink-faint">Nothing matches “{query.trim()}”.</div>
-        )}
-        {rows.map((row) =>
-          row.kind === 'frame' ? (
-            <FrameRow
-              key={row.key}
-              row={row}
-              selected={row.frame.id === selectedId && !selectedElement}
-              current={row.frame.id === selectedId}
-              dragging={row.frame.id === dragId}
-              dropEdge={dropAt?.id === row.frame.id ? dropAt.edge : null}
-              onDragStart={() => {
-                dragFrom.current = row.frame.id
-                setDragId(row.frame.id)
-              }}
-              onDragOverRow={(edge) => {
-                dragEdge.current = { id: row.frame.id, edge }
-                setDropAt((prev) =>
-                  prev?.id === row.frame.id && prev.edge === edge ? prev : { id: row.frame.id, edge },
-                )
-              }}
-              onDropRow={() => {
-                const from = dragFrom.current
-                const at = dragEdge.current
-                if (from) dropFrame(from, row.frame.id, at?.id === row.frame.id ? at.edge : 'before')
-                endDrag()
-              }}
-              onDragEnd={endDrag}
-              onToggle={() => setOpen(row.key, !row.open)}
-              onActivate={() => activate(row)}
-            />
-          ) : (
-            <NodeRow
-              key={row.key}
-              row={row}
-              selected={row.key === currentKey}
-              onToggle={() => setOpen(row.key, !row.open)}
-              onActivate={() => activate(row)}
-            />
-          ),
-        )}
-      </PanelBody>
-      <footer className="flex flex-none items-center justify-between gap-2 whitespace-nowrap border-t border-line-soft px-3 py-[9px] font-mono text-[10px] tracking-[0.04em] text-ink-faint">
-        <span>
-          <Kbd>↑</Kbd>
-          <Kbd>↓</Kbd> move · <Kbd>←</Kbd>
-          <Kbd>→</Kbd> fold
-        </span>
-        <span>
-          <Kbd>↵</Kbd> fly to frame
-        </span>
-      </footer>
-    </Panel>
+          {frames.length > 0 && rows.length === 0 && (
+            <div className="px-3 py-6 text-center text-[12.5px] text-ink-faint">Nothing matches “{query.trim()}”.</div>
+          )}
+          {rows.map((row) =>
+            row.kind === 'frame' ? (
+              <FrameRow
+                key={row.key}
+                row={row}
+                selected={row.frame.id === selectedId && !selectedElement}
+                current={row.frame.id === selectedId}
+                dragging={row.frame.id === dragId}
+                dropEdge={dropAt?.id === row.frame.id ? dropAt.edge : null}
+                onDragStart={() => {
+                  dragFrom.current = row.frame.id
+                  setDragId(row.frame.id)
+                }}
+                onDragOverRow={(edge) => {
+                  dragEdge.current = { id: row.frame.id, edge }
+                  setDropAt((prev) =>
+                    prev?.id === row.frame.id && prev.edge === edge ? prev : { id: row.frame.id, edge },
+                  )
+                }}
+                onDropRow={() => {
+                  const from = dragFrom.current
+                  const at = dragEdge.current
+                  if (from) dropFrame(from, row.frame.id, at?.id === row.frame.id ? at.edge : 'before')
+                  endDrag()
+                }}
+                onDragEnd={endDrag}
+                onToggle={() => setOpen(row.key, !row.open)}
+                onActivate={() => activate(row)}
+              />
+            ) : (
+              <NodeRow
+                key={row.key}
+                row={row}
+                selected={row.key === currentKey}
+                onToggle={() => setOpen(row.key, !row.open)}
+                onActivate={() => activate(row)}
+              />
+            ),
+          )}
+        </PanelBody>
+        <footer className="flex flex-none items-center justify-between gap-2 whitespace-nowrap border-t border-line-soft px-3 py-[9px] font-mono text-[10px] tracking-[0.04em] text-ink-faint">
+          <span>
+            <Kbd>↑</Kbd>
+            <Kbd>↓</Kbd> move · <Kbd>←</Kbd>
+            <Kbd>→</Kbd> fold
+          </span>
+          <span>
+            <Kbd>↵</Kbd> fly to frame
+          </span>
+        </footer>
+      </Panel>
+      {toast && <Toast>{toast}</Toast>}
+    </>
   )
 }
 

@@ -233,12 +233,28 @@ export interface ConnectedAgent {
   lastUsedAt: number
 }
 
-/** One frame as a canvas snapshot froze it: the fields a preview reads. A
- *  checkpoint also freezes stacking, lock, visibility, rotation and opacity —
- *  neither a thumbnail nor a restore decision here needs them. Mirrors
- *  `ReleaseFrame` in server/db/persist.ts (the client cannot import from
- *  server/), and neither a checkpoint's frame nor a release's is a live frame:
- *  the frame a snapshot names may have been deleted since. */
+/** A stop or a steer a human aimed at a connected agent, pending until the
+ *  agent's next tool call reads it. Mirrors `AgentSignal` in
+ *  server/agentEvents.ts (the client cannot import from server/): the run
+ *  timeline lists these so a press that has not landed is visible. */
+export interface AgentSignal {
+  canvasId: string
+  /** the name the signal was addressed by — what the run timeline groups runs
+   *  under, and what the agent calls tools with */
+  agentName: string
+  kind: 'stop' | 'steer'
+  /** what was asked for — a stop has nothing to say beyond itself */
+  message?: string
+  at: number
+  /** who asked: the human's display name, as the timeline shows it */
+  by: string
+}
+
+/** One frame as a canvas snapshot froze it: the fields a preview reads, plus
+ *  the ones a restore writes back. Mirrors `ReleaseFrame` in
+ *  server/db/persist.ts (the client cannot import from server/), and neither a
+ *  checkpoint's frame nor a release's is a live frame: the frame a snapshot
+ *  names may have been deleted since. */
 export interface CanvasVersionFrame {
   id: string
   name: string
@@ -247,6 +263,14 @@ export interface CanvasVersionFrame {
   x: number
   y: number
   html: string
+  /** stacking, lock, visibility, rotation and opacity travel with the frozen
+   *  frame: a restore puts them back, so an undo of that restore has to know
+   *  them */
+  z: number
+  locked: boolean
+  hidden: boolean
+  rotation: number
+  opacity: number
   pageId?: string
 }
 
@@ -269,6 +293,20 @@ export interface CanvasVersion extends Omit<CanvasVersionSummary, 'frameCount'> 
   tokens?: DesignTokens
 }
 
+/** What a checkpoint would change, rendered rather than listed: the page as it
+ *  stands now and as the checkpoint held it, each one a public image URL, so a
+ *  restore can be looked at before it is taken. `changedRatio` is omitted when
+ *  the two renders do not share a size — there is no share of pixels to speak
+ *  of then — and `empty` marks a comparison with nothing on one side. */
+export interface CanvasVersionDiff {
+  current: string | null
+  version: string | null
+  /** changed share of pixels — omitted when the two renders have different sizes */
+  changedRatio?: number
+  /** one side had no renderable frames */
+  empty?: boolean
+}
+
 /** A deleted canvas waiting in the trash: restorable, or purgeable for good. */
 export interface TrashedCanvas {
   id: string
@@ -277,9 +315,11 @@ export interface TrashedCanvas {
   frameCount: number
 }
 
-/** A deleted frame waiting in the trash, with the canvas it came from so a
- *  row can say where restoring it would put it back. */
-export interface TrashedFrame {
+/** A deleted frame, page or component waiting in the trash, with the canvas it
+ *  came from so a row can say where restoring it would put it back. The three
+ *  read the same because the trash row is the same row: only the route that
+ *  restores it differs. */
+export interface TrashedEntry {
   id: string
   canvasId: string
   canvasName: string
@@ -287,10 +327,14 @@ export interface TrashedFrame {
   deletedAt: number
 }
 
-/** Everything the trash holds, as the dashboard lists it. */
+/** Everything the trash holds, as the dashboard lists it. Canvases are their
+ *  own shape (they are what the rest of the trash hangs off); the frames,
+ *  pages and components of a canvas all list as entries. */
 export interface TrashContents {
   canvases: TrashedCanvas[]
-  frames: TrashedFrame[]
+  frames: TrashedEntry[]
+  pages: TrashedEntry[]
+  components: TrashedEntry[]
 }
 import { getIdentity } from './identity'
 
@@ -520,8 +564,14 @@ export const api = {
   copyCommunityCanvas: (id: string) => req<Canvas>(`/api/community/${id}/copy`, { method: 'POST' }),
   /* collaborators: the owner plus invited members */
   listMembers: (canvasId: string) => req<CanvasMember[]>(`/api/canvases/${canvasId}/members`),
-  inviteMember: (canvasId: string, email: string) =>
-    req<CanvasMember>(`/api/canvases/${canvasId}/members`, { method: 'POST', body: JSON.stringify({ email }) }),
+  /* the role is part of the invite, not a second call: the route takes it and
+     falls back to editor when it is left out, so an existing caller that only
+     names an email still gets the behaviour it asked for */
+  inviteMember: (canvasId: string, email: string, role?: CanvasRole) =>
+    req<CanvasMember>(`/api/canvases/${canvasId}/members`, {
+      method: 'POST',
+      body: JSON.stringify(role ? { email, role } : { email }),
+    }),
   removeMember: (canvasId: string, userId: string) =>
     req(`/api/canvases/${canvasId}/members/${userId}`, { method: 'DELETE' }),
   /* design-sync keys for the embeddable snippet */
@@ -663,6 +713,10 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ message }),
     }),
+  /* what this canvas is still holding for its agents: a stop that has not
+     reached a tool call yet, and steers nobody has read. The run timeline
+     polls it, because a press that only toasts is invisible until it lands */
+  agentSignals: (canvasId: string) => req<{ signals: AgentSignal[] }>(`/api/canvases/${canvasId}/agent-signals`),
   /* take back everything one run did: the frames it touched return to the
      version each was at before the run started. Frames changed by anyone else
      since are refused rather than clobbered, so the response reports both. */
@@ -784,6 +838,11 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify({ ...patch, actor: actor() }),
     }),
+  /* remove a library entry. Refused with 409 while frames still hold an
+     instance of it, unless `force` — the frames keep their markup either way,
+     they simply stop being bound to a library entry. */
+  deleteComponent: (componentId: string, opts: { force?: boolean } = {}) =>
+    req<{ ok: true }>(`/api/components/${componentId}${opts.force ? '?force=true' : ''}`, { method: 'DELETE' }),
   /* pages: ordered sub-canvases grouping the canvas's frames */
   createPage: (canvasId: string, name: string) =>
     req<Page>(`/api/canvases/${canvasId}/pages`, {
@@ -887,8 +946,9 @@ export const api = {
   restoreRelease: (canvasId: string, releaseId: string) =>
     req<{ ok: true }>(`/api/canvases/${canvasId}/releases/${releaseId}/restore`, { method: 'POST' }),
   /* canvas history: checkpoints the server takes on its own — as the canvas is
-     edited and before every delete — that the History tab lists, previews and
-     restores. A restore is itself checkpointed, so it stays undoable here. */
+     edited and before every delete — that the History tab lists, previews,
+     compares and restores. A restore is itself checkpointed, so it stays
+     undoable here. */
   listCanvasVersions: async (canvasId: string) => {
     const { versions } = await req<{ versions: CanvasVersionSummary[] }>(`/api/canvases/${canvasId}/versions`)
     return versions
@@ -903,15 +963,35 @@ export const api = {
     req<{ ok: true; restored: number; created: number }>(`/api/canvases/${canvasId}/versions/${versionId}/restore`, {
       method: 'POST',
     }),
-  /* trash: deleting a canvas or a frame moves it here rather than destroying
-     it, so every delete is recoverable until it is purged on purpose */
+  /* what restoring this checkpoint would change, as two renders of one page:
+     the diff writes no frame, so it is a POST for the body it takes, not for
+     what it does. `pageId` picks the page to render; without it the canvas's
+     own active page is used. */
+  canvasVersionDiff: (canvasId: string, versionId: string, pageId?: string) =>
+    req<CanvasVersionDiff>(`/api/canvases/${canvasId}/versions/${versionId}/diff`, {
+      method: 'POST',
+      body: JSON.stringify(pageId ? { pageId } : {}),
+    }),
+  /* trash: deleting a canvas, a frame, a page or a component moves it here
+     rather than destroying it, so every delete is recoverable until it is
+     purged on purpose */
   listTrash: () => req<TrashContents>('/api/trash'),
   restoreTrashedCanvas: (id: string) => req<{ ok: true }>(`/api/trash/canvases/${id}/restore`, { method: 'POST' }),
   purgeTrashedCanvas: (id: string) => req<{ ok: true }>(`/api/trash/canvases/${id}`, { method: 'DELETE' }),
   restoreTrashedFrame: (id: string) => req<{ ok: true }>(`/api/trash/frames/${id}/restore`, { method: 'POST' }),
   purgeTrashedFrame: (id: string) => req<{ ok: true }>(`/api/trash/frames/${id}`, { method: 'DELETE' }),
+  /* pages and components are restorable but not purgeable by hand: the rows
+     they hold are reachable again through their canvas, so the retention purge
+     is the only thing that ends them */
+  restoreTrashedPage: (id: string) => req<{ ok: true }>(`/api/trash/pages/${id}/restore`, { method: 'POST' }),
+  restoreTrashedComponent: (id: string) => req<{ ok: true }>(`/api/trash/components/${id}/restore`, { method: 'POST' }),
   listMcpAgents: () => req<ConnectedAgent[]>('/api/mcp-agents'),
   revokeMcpAgent: (clientId: string) => req(`/api/mcp-agents/${encodeURIComponent(clientId)}`, { method: 'DELETE' }),
+  /* the tools whose own MCP annotation says they destroy something: what a
+     `destructive` review policy gates without being told, and what the policy
+     editor offers as suggestions. Account-level, not per canvas — there is one
+     tool registry, so its declarations read the same everywhere */
+  destructiveTools: () => req<{ tools: string[] }>('/api/destructive-tools'),
 }
 
 export interface AdminCanvas extends CanvasMeta {

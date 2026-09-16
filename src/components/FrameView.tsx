@@ -31,7 +31,7 @@ import { Button } from './ui/button'
 import { Input } from './ui/input'
 import { Textarea } from './ui/textarea'
 import { Tooltip } from './ui/tooltip'
-import { EyeOffIcon, GithubIcon, LockIcon, SyncIcon } from './ui/icons'
+import { EyeOffIcon, GithubIcon, LockIcon, RotateIcon, SyncIcon } from './ui/icons'
 import { isSyncedFrame } from '../lib/sync'
 import { isGithubFrame, isGithubPlaceholder } from '../lib/github'
 import { AgentIcon } from './AgentIcon'
@@ -289,10 +289,18 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
       const zoom = useStore.getState().viewport.zoom
       const dx = (ev.clientX - base.x) / zoom
       const dy = (ev.clientY - base.y) / zoom
+      /* ⇧ moves along one axis only: whichever delta is larger owns the
+         motion and the other is dropped before anything else reads it, so
+         the dominant axis is re-decided on every move. ⌥ keeps the drag free
+         — and ⌥⇧ is the duplicate gesture, which is never a constraint. */
+      const axisLock: 'x' | 'y' | null =
+        mode === 'move' && ev.shiftKey && !ev.altKey ? (Math.abs(dx) >= Math.abs(dy) ? 'y' : 'x') : null
+      const mdx = axisLock === 'x' ? 0 : dx
+      const mdy = axisLock === 'y' ? 0 : dy
       const from = base.rect
       const raw =
         mode === 'move'
-          ? { ...from, x: Math.round(from.x + dx), y: Math.round(from.y + dy) }
+          ? { ...from, x: Math.round(from.x + mdx), y: Math.round(from.y + mdy) }
           : {
               ...from,
               width: Math.max(120, Math.round(from.width + dx)),
@@ -301,7 +309,17 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
       /* edges pull onto neighbouring frames' edges/centers; ⌥ drags free.
          Frames riding along in the group are not neighbours. */
       const others = useStore.getState().canvas?.frames.filter((f) => !groupIds.has(f.id)) ?? []
-      const snapped = ev.altKey ? { ...raw, guides: [] } : snapFrame(mode, raw, others, zoom)
+      const pulled = ev.altKey ? { ...raw, guides: [] } : snapFrame(mode, raw, others, zoom)
+      /* snapping answers the free axis too, and would pull a ⇧-drag off its
+         line; the locked axis goes back to where the drag started — which
+         also makes the group's delta along it exactly zero — and the guide
+         it aimed at a line the frame is no longer on goes with it */
+      const snapped =
+        axisLock === 'x'
+          ? { ...pulled, x: orig.x, guides: pulled.guides.filter((g) => g.axis !== 'v') }
+          : axisLock === 'y'
+            ? { ...pulled, y: orig.y, guides: pulled.guides.filter((g) => g.axis !== 'h') }
+            : pulled
       useStore.getState().setSnapGuides(snapped.guides)
       if (mode === 'move') {
         /* the snapped delta of the dragged frame moves the whole group */
@@ -348,6 +366,49 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
       else if (moved) closePopovers()
       /* a click (no drag) on the frame name opens the details panel */
       if (!moved && panelOnClick) useStore.getState().setInspectorOpen(true)
+    }
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
+  }
+
+  /* The rotate handle above a selected frame. The wrapper it hangs off is
+     the element that carries the frame's own `rotate()`, and a rotation about
+     its center never moves that center — so the wrapper's bounding box is the
+     right pivot even while the frame is already turned. Almost all of the
+     arc is churn: only the pointer-up is a save, and only a real change of
+     angle is an undo entry. */
+  function startRotate(e: React.PointerEvent) {
+    if (e.button !== 0) return
+    /* as the move/resize drag does: a press that turns into a drag must not
+       drag a text selection across the canvas on the way */
+    e.preventDefault()
+    const box = e.currentTarget.parentElement?.getBoundingClientRect()
+    if (!box) return
+    const cx = box.left + box.width / 2
+    const cy = box.top + box.height / 2
+    const startRotation = frame.rotation
+    const pointerId = e.pointerId
+    let rotation = startRotation
+
+    function onMove(ev: PointerEvent) {
+      if (ev.pointerId !== pointerId) return
+      /* pointer straight above the center reads 0°; ⇧ snaps the drag to the
+         same 15° ladder the Rotation field steps by */
+      const angle = (Math.atan2(ev.clientY - cy, ev.clientX - cx) * 180) / Math.PI + 90
+      const next = ev.shiftKey ? Math.round(angle / 15) * 15 : Math.round(angle)
+      rotation = Math.min(360, Math.max(-360, next))
+      useStore.getState().patchFrameLocal(frame.id, { rotation })
+    }
+    function onUp() {
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+      /* a click on the handle that never moved the frame writes nothing */
+      if (rotation === startRotation) return
+      api
+        .updateFrame(frame.id, { rotation }, { expectedUpdatedAt: frame.updatedAt })
+        .then(noteOwnWrite)
+        .catch(console.error)
+      recordUpdate(frame.id, { rotation: startRotation }, { rotation })
     }
     window.addEventListener('pointermove', onMove)
     window.addEventListener('pointerup', onUp)
@@ -1266,6 +1327,22 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
               </div>
             )
           })()}
+
+          {/* the rotate handle sits in the band the frame name occupies, so it
+              only shows for a frame that can actually turn: the same lock and
+              read-only gates the corner resize handle obeys */}
+          {selected && !readOnly && !frame.locked && (
+            <div
+              className="absolute -top-[26px] left-1/2 grid h-3.5 w-3.5 -translate-x-1/2 cursor-grab place-items-center rounded-full border-[1.5px] border-ink bg-surface text-ink-soft shadow-card"
+              title="Drag to rotate — hold ⇧ for 15° steps"
+              onPointerDown={(e) => {
+                e.stopPropagation()
+                startRotate(e)
+              }}
+            >
+              <RotateIcon width={10} height={10} />
+            </div>
+          )}
 
           <div
             className={cn(

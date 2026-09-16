@@ -165,18 +165,31 @@ export function recordCreates(frames: Frame[]) {
   push(entries.length === 1 && first ? first : { type: 'group', entries })
 }
 
-/** Delete a frame through the API, remembering enough to bring it back. */
-export function deleteFrameTracked(frame: Frame) {
-  deleteFramesTracked([frame])
+/** Delete a frame through the API, remembering enough to bring it back.
+ *  Resolves with the number of frames the server actually removed — the count
+ *  the caller reports as moved to trash. */
+export function deleteFrameTracked(frame: Frame): Promise<number> {
+  return deleteFramesTracked([frame])
 }
 
-/** Delete several frames as one undo step. */
-export function deleteFramesTracked(frames: Frame[]) {
+/** Delete several frames as one undo step. Resolves with how many of the
+ *  deletes the server accepted — a frame somebody else already removed is not
+ *  one of them, so the count is the server's answer rather than the size of
+ *  the group the caller asked for. An empty group removes nothing and is not
+ *  an undo step at all. */
+export function deleteFramesTracked(frames: Frame[]): Promise<number> {
   const entries: Entry[] = frames.map((f) => ({ type: 'delete', frameId: f.id, snapshot: snapshot(f) }))
   const [first, ...rest] = entries
-  if (!first) return
+  if (!first) return Promise.resolve(0)
   push(rest.length ? { type: 'group', entries } : first)
-  for (const f of frames) api.deleteFrame(f.id).catch(console.error)
+  return Promise.allSettled(frames.map((f) => api.deleteFrame(f.id))).then((results) => {
+    let deleted = 0
+    for (const r of results) {
+      if (r.status === 'fulfilled') deleted++
+      else console.error(r.reason)
+    }
+    return deleted
+  })
 }
 
 /* undoing a delete recreates the frame under a fresh server id — every

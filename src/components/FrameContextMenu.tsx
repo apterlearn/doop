@@ -27,7 +27,13 @@ export function FrameContextMenu({ frame, at }: { frame: Frame; at: MutableRefOb
     return s.canvas?.frames.filter((f) => ids.includes(f.id)) ?? [frame]
   }
   function deleteSelection() {
+    /* the count is the server's: part of a group may already be gone, and
+       naming how many frames actually left is the whole of the confirmation */
     deleteFramesTracked(groupFrames())
+      .then((n) => {
+        if (n > 0) showToast(`${n} frame${n === 1 ? '' : 's'} moved to trash — undo with ⌘Z`)
+      })
+      .catch(console.error)
   }
   function showToast(message: string) {
     setToast(message)
@@ -170,7 +176,7 @@ export function FrameContextMenu({ frame, at }: { frame: Frame; at: MutableRefOb
         )}
         <ContextMenuSeparator />
         <ContextMenuItem tone="danger" onSelect={deleteSelection}>
-          {groupSize > 1 ? `Delete ${groupSize} frames` : 'Delete frame'}
+          {groupSize > 1 ? `Move ${groupSize} frames to trash` : 'Move to trash'}
           <MenuHint>⌫</MenuHint>
         </ContextMenuItem>
       </ContextMenuContent>
