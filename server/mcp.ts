@@ -11,7 +11,7 @@ import { z } from 'zod'
 import { store } from './store.ts'
 import * as persist from './db/persist.ts'
 import * as actions from './actions.ts'
-import { canAccessCanvas, hasDurableCanvasAccess } from './access.ts'
+import { canvasAccess, hasDurableCanvasAccess, intentAtLeast, type CanvasIntent } from './access.ts'
 import { auth, getUserName, isBanned, PUBLIC_ORIGIN } from './auth.ts'
 import { capture, captureThrottled } from './analytics.ts'
 import {
@@ -740,6 +740,32 @@ export const MUTATING_TOOLS: Record<string, true> = {
 }
 
 /**
+ * What each tool needs from the caller before the wrapper will run it.
+ *
+ * Reach is `canvasFor`'s question — can this account see the canvas at all —
+ * and this is authority. A viewer-role member and a live view share link both
+ * reach the canvas, which is exactly why their agent may read it, and neither
+ * may write to it. The comment tools write conversation rather than design, so
+ * they need `comment`: that is what lets an invited commenter leave a note
+ * without touching a frame. Every other tool that changes state needs `edit`,
+ * and that half is derived from MUTATING_TOOLS rather than listed again, so a
+ * write added there is covered the day it is added.
+ *
+ * A name missing from this map is the third case: reach is its whole
+ * requirement, and `view` is the floor every access already confers. That is
+ * the reads, and `wait_for_events`, which changes nothing but does not declare
+ * itself read-only because its answer is a time window.
+ */
+export const TOOL_INTENT: Record<string, CanvasIntent> = {
+  ...Object.fromEntries(Object.keys(MUTATING_TOOLS).map((name): [string, CanvasIntent] => [name, 'edit'])),
+  add_comment: 'comment',
+  claim_comment: 'comment',
+  fail_comment: 'comment',
+  reply_to_comment: 'comment',
+  resolve_comment: 'comment',
+}
+
+/**
  * What each tool is FOR, so get_capabilities can answer "what can I do here"
  * without an agent reading 100 descriptions. One entry per registered tool —
  * a name missing from this map would read as "other" in the catalog, which is
@@ -1239,11 +1265,14 @@ export function buildMcpServer(
   const actorFrom = (agent_name?: string) =>
     actions.resolveActor({ name: agent_name, kind: 'agent', owner, ownerId, clientId })
   /* Canvas access for agents mirrors the web UI: the OAuth user's id runs
-     through the same canAccessCanvas gate as browser sessions. Every tool
-     that takes a canvas or frame id resolves it through these. */
+     through the same canvasAccess gate as browser sessions, as the owner (edit)
+     or as the member role they were granted. Every tool that takes a canvas or
+     frame id resolves it through these; the wrapper separately refuses a call
+     the caller's intent does not cover. */
   const canvasFor = (canvasId: string) => {
     const c = store.getCanvas(canvasId)
-    return c && canAccessCanvas(ownerId, c) ? c : undefined
+    if (!c || canvasAccess(ownerId, c) === null) return undefined
+    return c
   }
   const frameFor = (frameId: string) => {
     const f = store.getFrame(frameId)
@@ -1259,7 +1288,8 @@ export function buildMcpServer(
      canvas — an ambiguous name is an error naming the candidate ids. */
   const pageForId = (pageId: string) => {
     const found = store.getPage(pageId)
-    return found && canAccessCanvas(ownerId, found.canvas) ? found : undefined
+    if (!found || canvasAccess(ownerId, found.canvas) === null) return undefined
+    return found
   }
   const resolvePage = (
     canvasId: string,
@@ -1434,6 +1464,16 @@ export function buildMcpServer(
     if (typeof args.page_id === 'string') return store.getPage(args.page_id)?.canvas.id
     return undefined
   }
+
+  /** The canvas the intent check is about: what the call names, or the canvas
+   *  the comment it names belongs to — the comment tools take a comment id
+   *  instead of a canvas, and a gate a comment id can sidestep is not a gate.
+   *  A tool that names no canvas at all (create_canvas, list_canvases) has
+   *  nothing to be checked against, and an id nobody can resolve is left to the
+   *  handler, which answers it with its own not_found. */
+  const intentCanvasOf = (args: Record<string, unknown>): string | undefined =>
+    canvasArgOf(args) ??
+    (typeof args.comment_id === 'string' ? actions.findComment(args.comment_id)?.canvasId : undefined)
 
   /**
    * The session's context, applied to a call that omitted it.
@@ -1620,6 +1660,41 @@ export function buildMcpServer(
   }
 
   /**
+   * A call this connection's access does not cover, refused before the handler
+   * runs.
+   *
+   * Reaching a canvas and being allowed to change it are different questions,
+   * and only the second is about the tool: a viewer-role member and a live view
+   * share link reach the canvas — which is what lets their agent read it — and
+   * must not be able to write to it. What a tool needs is its own declaration
+   * (TOOL_INTENT), and the check sits in the wrapper so no handler can be
+   * written past it.
+   *
+   * A caller with NO access is left to the handler: it answers with the same
+   * not_found it always has, which says nothing about what exists here.
+   */
+  const intentRefusal = (name: string, need: CanvasIntent, args: unknown): CallToolResult | undefined => {
+    /* `view` is the floor every access confers, so a read has nothing to be
+       refused for — and a call that only reads is not worth the canvas lookup */
+    if (need === 'view' || !args || typeof args !== 'object') return undefined
+    const canvasId = intentCanvasOf(args as Record<string, unknown>)
+    if (!canvasId) return undefined
+    const canvas = store.getCanvas(canvasId)
+    if (!canvas) return undefined
+    const held = canvasAccess(ownerId, canvas)
+    if (held === null || intentAtLeast(held, need)) return undefined
+    return err('forbidden', `${name} needs ${need} access to canvas ${canvasId}; this connection holds ${held}`, {
+      intent: held,
+      required_intent: need,
+      hint: `this account can read the canvas: use get_canvas and get_frame to follow the design. ${
+        need === 'comment'
+          ? 'Ask the owner to raise the role to commenter to leave notes on it.'
+          : 'Ask the owner to raise the role to editor to design on it.'
+      }`,
+    })
+  }
+
+  /**
    * The version a frame-writing step started from, read before the handler
    * runs. `revert_run` needs it to know what the frame looked like before the
    * run touched it, so this is the caller's half of the replay cursor; the
@@ -1724,6 +1799,10 @@ export function buildMcpServer(
        once so no tool can forget it — a write an agent cannot safely retry is
        a write it must re-read the canvas to check. */
     if (MUTATING_TOOLS[name] && !('op_id' in registered)) registered.op_id = opId
+    /* What this call must hold to run at all: TOOL_INTENT for the tools that
+       write, and plain reach for every other one — a read reaches the canvas or
+       it does not, which is the gate canvasFor already applies. */
+    const requiredIntent: CanvasIntent = TOOL_INTENT[name] ?? 'view'
     /* `agent_name` stays required where the identity IS the call */
     for (const key of IDENTITY_TOOLS[name] ? (['canvas_id'] as const) : (['canvas_id', 'agent_name'] as const)) {
       const field = registered[key]
@@ -1760,6 +1839,22 @@ export function buildMcpServer(
           recordToolCall(name, false, Date.now() - started, 'stopped')
           recordRunEvent(name, args, false, Date.now() - started, 'refused: a human stopped the run')
           return stopped
+        }
+        /* Authority, and before anything can be touched — a replay included,
+           which answers with a write's result and so is a write's answer. Reach
+           is a different question and keeps its own answer: a canvas the caller
+           cannot see at all is still the handler's not_found. */
+        const denied = intentRefusal(name, requiredIntent, args)
+        if (denied) {
+          recordToolCall(name, false, Date.now() - started, 'forbidden')
+          recordRunEvent(
+            name,
+            args,
+            false,
+            Date.now() - started,
+            `refused: this connection does not hold ${requiredIntent} access`,
+          )
+          return denied
         }
         const opKey = opIdOf(name, args)
         if (opKey) {
@@ -7745,7 +7840,7 @@ export function buildMcpServer(
      A client can attach a canvas as context without spending a tool call on it,
      which is what makes Doop usable from a chat client that reads resources.
      Every read resolves through the same canvasFor closure the tools use, so
-     canAccessCanvas stays the single authorization answer. */
+     the one canvasAccess gate stays the single authorization answer. */
   server.registerResource(
     'doop-guide',
     'doop://guide',
