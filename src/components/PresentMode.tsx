@@ -40,6 +40,7 @@ export function PresentMode({ frameId, onClose }: { frameId: string; onClose: ()
      re-renders on every store update (the trap FrameView documents). */
   const canvas = useStore((s) => s.canvas)
   const activePageId = useStore((s) => s.activePageId)
+  const pages = canvas?.pages
   const deck = useMemo(() => visibleFrames({ canvas, activePageId }).filter((f) => !f.hidden), [canvas, activePageId])
   /* Seeded once from the frame the canvas opened us on; every step after that
      is internal, so the caller keeps its single `presenting` flag. */
@@ -52,6 +53,19 @@ export function PresentMode({ frameId, onClose }: { frameId: string; onClose: ()
   /* the deck shrinks under us when a frame is deleted or hidden mid-show */
   const at = Math.min(index, Math.max(0, deck.length - 1))
   const frame = deck[at] ?? null
+  /* a one-page canvas has nowhere to go, so the control only shows when there
+     is more than one page to present. An unset active page reads as the first
+     one, the same fallback the page tabs use */
+  const showPages = (pages?.length ?? 0) > 1
+  const shownPageId = activePageId ?? pages?.[0]?.id ?? ''
+  /* switching page restarts the deck: the index counts frames of the page
+     being viewed, so carrying it over would land the show mid-page (or past
+     the new page's last frame). setActivePage is the frame tabs' own call, so
+     the canvas behind the deck follows and keeps its selection */
+  function changePage(pageId: string) {
+    setIndex(0)
+    useStore.getState().setActivePage(pageId)
+  }
   const iframeRef = useRef<HTMLIFrameElement>(null)
   const [ready, setReady] = useState(false)
   const [viewport, setViewport] = useState(() => ({ w: window.innerWidth, h: window.innerHeight }))
@@ -155,6 +169,22 @@ export function PresentMode({ frameId, onClose }: { frameId: string; onClose: ()
           {at + 1} / {deck.length}
         </span>
         {deck.length > 1 && <span className="text-white/45">←/→</span>}
+        {/* the only clickable thing in a container that is otherwise
+            click-through, so the frame keeps every click that misses it */}
+        {showPages && (
+          <select
+            aria-label="Presented page"
+            className="pointer-events-auto cursor-pointer rounded-full bg-white/15 px-2 py-px font-mono text-[10.5px] font-medium text-white outline-none"
+            value={shownPageId}
+            onChange={(event) => changePage(event.target.value)}
+          >
+            {(pages ?? []).map((page) => (
+              <option key={page.id} value={page.id} className="bg-ink text-white">
+                {page.name}
+              </option>
+            ))}
+          </select>
+        )}
       </div>
       <Button
         variant="inverse"

@@ -18,6 +18,7 @@ import {
 } from '../lib/api'
 import { authClient } from '../lib/auth'
 import { posthog } from '../lib/posthog'
+import { useStore } from '../lib/store'
 import { timeAgo } from '../lib/time'
 import { ConfirmDialog } from './ui/alert-dialog'
 import { Avatar } from './ui/avatar'
@@ -79,9 +80,10 @@ const ROLE_LABELS: Record<CanvasRole, string> = {
   admin: 'Admin',
 }
 
-/* `admin` is not something this form hands out: only whoever the server
-   already calls an admin may show (and keep) that role. */
-const ASSIGNABLE_ROLES: CanvasRole[] = ['viewer', 'commenter', 'editor']
+/* Roles this form hands out. `admin` is one of them now that the server gives
+   it the job its name promises (member and invitation management); the owner
+   row itself is never re-roled by anyone. */
+const ASSIGNABLE_ROLES: CanvasRole[] = ['viewer', 'commenter', 'editor', 'admin']
 
 /** The four link modes, most closed first. The labels are the whole sentence
  *  because that sentence is the difference between them. */
@@ -100,7 +102,7 @@ const LINK_MODES: Record<LinkAccess, { label: string; blurb: string }> = {
   },
   edit: {
     label: 'Anyone with the link can edit',
-    blurb: 'Full design access: visitors edit frames the way an invited editor does.',
+    blurb: 'Account needed to edit: visitors signed in to doop edit frames; signed-out visitors read and comment.',
   },
 }
 
@@ -223,7 +225,10 @@ export function ShareModal({
     try {
       let member: CanvasMember
       try {
-        member = await api.inviteMember(canvas.id, clean)
+        /* the role rides on the add itself: a second request to apply it could
+           fail and leave the person on the server's default, with the form
+           still reporting success */
+        member = await api.inviteMember(canvas.id, clean, inviteRole)
       } catch (caught) {
         if (!(caught instanceof ApiError) || caught.status !== 404) throw caught
         const invitation = await api.createInvite(canvas.id, clean, inviteRole)
@@ -232,16 +237,15 @@ export function ShareModal({
         setEmail('')
         return
       }
-      /* inviteMember names no role, so a choice other than the row's own is
-         applied to the membership it just created */
-      const added = member.role === inviteRole ? member : await api.setMemberRole(canvas.id, member.userId, inviteRole)
+      /* inviteMember answers with the membership it created; a re-add of
+         somebody already on the canvas keeps the role they already had */
       setPeople((current) =>
-        current?.some((person) => person.userId === added.userId)
-          ? current.map((person) => (person.userId === added.userId ? added : person))
-          : [...(current ?? []), added],
+        current?.some((person) => person.userId === member.userId)
+          ? current.map((person) => (person.userId === member.userId ? member : person))
+          : [...(current ?? []), member],
       )
-      if (!canvas.memberIds?.includes(added.userId)) {
-        onChange({ memberIds: [...(canvas.memberIds ?? []), added.userId] })
+      if (!canvas.memberIds?.includes(member.userId)) {
+        onChange({ memberIds: [...(canvas.memberIds ?? []), member.userId] })
       }
       setEmail('')
     } catch (caught) {
@@ -482,12 +486,7 @@ export function ShareModal({
                         disabled={busy}
                         onChange={(event) => changeRole(person, event.target.value as CanvasRole)}
                       >
-                        {/* admin is offered only on a row the server already
-                            calls admin: nobody hands it out from this form */}
-                        {(person.role === 'admin'
-                          ? [...ASSIGNABLE_ROLES, 'admin' as CanvasRole]
-                          : ASSIGNABLE_ROLES
-                        ).map((role) => (
+                        {ASSIGNABLE_ROLES.map((role) => (
                           <option key={role} value={role}>
                             {ROLE_LABELS[role]}
                           </option>
@@ -866,16 +865,17 @@ function ShipSection({
     }
   }
 
-  /** One PNG of every visible frame on the page, laid out where the stage has
-   *  them. Rendered on the server (the client cannot composite a sandboxed
-   *  iframe), so this is the same asset-URL download the archives use. */
+  /** One PNG of every visible frame on the page being viewed, laid out where
+   *  the stage has them. Rendered on the server (the client cannot composite a
+   *  sandboxed iframe), so this is the same asset-URL download the archives
+   *  use; with no page active the server falls back to the canvas's first. */
   async function exportImage() {
     if (busy) return
     setBusy('image')
     setError(null)
     setNotice(null)
     try {
-      const { url } = await api.exportCanvasImage(canvas.id)
+      const { url } = await api.exportCanvasImage(canvas.id, useStore.getState().activePageId)
       const link = document.createElement('a')
       link.href = url
       link.download = `${canvas.name}.png`

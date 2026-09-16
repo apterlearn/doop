@@ -184,6 +184,12 @@ interface State {
    *  the link's canvas in the store, so a read-only canvas renders before
    *  the room answers the join. */
   setGuestSession(guest: GuestSession | null): void
+  /** a renewed link ticket for the guest already reading this canvas. The
+   *  canvas and the access mode are unchanged — only the credential the ws
+   *  join and the public comment route carry — so this patches the ticket
+   *  alone. Going through setGuestSession here would re-run setCanvas and
+   *  throw away the live canvas state the visitor is already reading. */
+  setGuestTicket(ticket: string): void
   setImpersonating(v: boolean): void
   /** Post a note on a frame through whichever path this client may use: a
    *  guest's ticket posts to the public comment route, everyone else through
@@ -421,6 +427,12 @@ export const useStore = create<State>((set, get) => ({
   setGuestSession: (guest) => {
     set({ guest })
     if (guest) get().setCanvas(guest.canvas)
+  },
+  /* no guest means nothing to renew: a session user's join never carried a
+     ticket, so a stale renewal answer must not invent a guest session */
+  setGuestTicket: (ticket) => {
+    const { guest } = get()
+    if (guest) set({ guest: { ...guest, ticket } })
   },
   setImpersonating: (impersonating) => set({ impersonating }),
   postElementComment: (frameId, input) => {

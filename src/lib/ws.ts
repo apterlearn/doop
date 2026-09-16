@@ -7,6 +7,12 @@ let currentCanvasId: string | null = null
 /* the share-link ticket this client joined with, when it has no session;
    kept beside the canvas id so a reconnect rejoins the same way */
 let currentTicket: string | null = null
+/* the ticket whose renewal this page has already spent. A room that refuses
+   the ticket it just minted would otherwise be asked again on every close,
+   which is a refresh loop with a reload's consequences; keying it by the
+   ticket string rather than a flag is what lets a genuinely new ticket — the
+   next link open, a rejoin — be renewed in its turn. */
+let refreshedTicket: string | null = null
 let retryTimer: number | null = null
 /* the server build this page first connected under; survives reconnects */
 let loadedBuild: string | null = null
@@ -108,6 +114,18 @@ function open() {
       retryTimer = null
     }
     if (ev.code === 4401) {
+      /* 4401 is the room finding neither a session nor a ticket that still
+         verifies, and a ticket holder is the one caller that can be let back
+         in without the sign-in page: the ticket is the credential, the server
+         re-checks the link's live mode before minting another, and no password
+         is ever held here. Once per ticket — the fallthrough below is where a
+         refused renewal, and every session user, still lands. */
+      const ticket = currentTicket
+      const canvasId = currentCanvasId
+      if (ticket && canvasId && refreshedTicket !== ticket) {
+        void refreshTicket(s, canvasId, ticket)
+        return
+      }
       /* session expired or missing — reload lands on the sign-in page */
       currentCanvasId = null
       location.reload()
@@ -141,6 +159,57 @@ function open() {
       retryTimer = window.setTimeout(open, 1200)
     }
   }
+}
+
+/** Trade the ticket this page joined with for another half hour, then reopen
+ *  the room under it. The route is public and session-free — the ticket is the
+ *  whole credential — so this is a bare fetch, the same shape the share link
+ *  itself was opened with. `dead` is the socket whose close asked for this: if
+ *  it is no longer the current one by the time the answer lands, something
+ *  else already reconnected this page and this answer is stale, exactly as the
+ *  socket's own handlers decide. */
+async function refreshTicket(dead: WebSocket, canvasId: string, ticket: string) {
+  let next: string | null = null
+  try {
+    const res = await fetch(`/api/public/canvases/${canvasId}/guest-ticket/refresh`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ticket }),
+    })
+    if (res.ok) {
+      const body = (await res.json()) as { ticket?: unknown }
+      if (typeof body.ticket === 'string') next = body.ticket
+    } else {
+      /* 401 the link is off or the ticket was refused, 403 the link's mode was
+         narrowed below this ticket's, 429 this address has asked too often —
+         none of them is worth a second request */
+      const detail = (await res.json().catch(() => null)) as { code?: string } | null
+      console.error(
+        `doop: the room would not renew this link's ticket (${res.status}${detail?.code ? ` ${detail.code}` : ''}) — reloading lands on the sign-in page`,
+      )
+    }
+  } catch (err) {
+    console.error("doop: could not reach the server to renew this link's ticket — reloading", err)
+  }
+  if (socket !== dead) return
+  if (!next) {
+    /* every refusal ends where 4401 always ended: nothing left to show, and a
+       reload that lands on the sign-in page (or back on the link that brought
+       this visitor here) */
+    currentCanvasId = null
+    location.reload()
+    return
+  }
+  /* the new ticket is the guard as well as the credential: were the room to
+     refuse it too, the next 4401 finds it already renewed and reloads instead
+     of asking again */
+  refreshedTicket = next
+  currentTicket = next
+  /* the ws join is not the only carrier of this credential: the public
+     comment route reads the ticket off the stored guest session, so without
+     this the visitor's next comment would still send the refused string */
+  useStore.getState().setGuestTicket(next)
+  open()
 }
 
 function handle(msg: ServerMessage) {
