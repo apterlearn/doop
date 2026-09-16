@@ -24,6 +24,9 @@ export interface ElementInfo {
   flexDirection: string
   width: number | null
   height: number | null
+  /** the computed offsets of a positioned element, in px; null when it is `auto` */
+  left: number | null
+  top: number | null
   minWidth: string
   rowGap: number | null
   columnGap: number | null

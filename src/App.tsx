@@ -9,9 +9,13 @@ import { authClient } from './lib/auth'
 import { setName } from './lib/identity'
 import { posthog, syncReplayForUser, suspendAnalyticsWhileImpersonating } from './lib/posthog'
 import { useMe } from './lib/me'
-import { adminApi } from './lib/api'
+import { adminApi, api, ApiError, type PublicCanvas } from './lib/api'
+import { useStore } from './lib/store'
 import { Button } from './components/ui/button'
 import { AuthScreen } from './components/ui/screen'
+import { Wordmark } from './components/ui/wordmark'
+import { GuestPasswordPrompt } from './components/GuestBar'
+import { InviteAccept } from './components/InviteAccept'
 import { DesktopTabs, ShellDragBar } from './components/DesktopTabs'
 import { setTabsUser } from './lib/desktop'
 import { isDesktopShell } from './lib/shell'
@@ -81,6 +85,26 @@ export function App() {
     if (session?.user?.name) setName(session.user.name)
   }, [session?.user?.name])
 
+  /* A borrowed "view as" session is read-only. The banner says so to the
+     admin; the store flag is how the canvas's own affordances find out, since
+     nothing else in the app can tell an impersonated session from a real one. */
+  useEffect(() => {
+    useStore.getState().setImpersonating(!!me?.impersonating)
+  }, [me])
+
+  /* An invitation link is signed out for most people who receive it, and the
+     sign-in form comes first. AuthPage already knows how to come back to a
+     deep link — it resumes ?redirect_to after signing in or signing up — so
+     the invite records itself there before the form renders, and a new
+     account lands on the invitation instead of its own first canvas. */
+  useEffect(() => {
+    if (isPending || session || !/^\/invite\//.test(path)) return
+    const url = new URL(location.href)
+    if (url.searchParams.get('redirect_to') === path) return
+    url.searchParams.set('redirect_to', path)
+    history.replaceState(null, '', url)
+  }, [path, session, isPending])
+
   /* the desktop tab strip is per-account state: restore this user's tabs,
      and clear the strip the moment the session goes away */
   useEffect(() => {
@@ -94,17 +118,24 @@ export function App() {
         <AuthScreen />
       </>
     )
-  /* signed out: every path lands on the sign-in form. The marketing site is
-     a separate service that owns `/` for visitors; share links (/c/…) and
-     interrupted MCP OAuth redirects keep their URL so the deep link / resume
-     logic survives the sign-in. */
-  if (!session)
+
+  const canvasId = path.match(/^\/c\/([^/]+)/)?.[1]
+  const inviteToken = path.match(/^\/invite\/([^/]+)/)?.[1]
+
+  /* Signed out, a share link is the one path that does NOT land on the form:
+     /c/<id> opens the canvas itself when the owner's link allows it, which is
+     the whole point of a view or comment link. Everything else — /admin, an
+     interrupted MCP OAuth resume, an invitation (which authenticates first,
+     then comes back to its own URL) — keeps today's rule. */
+  if (!session) {
+    if (canvasId) return <GuestCanvas canvasId={canvasId} key={canvasId} />
     return (
       <>
         <ShellDragBar />
         <AuthPage />
       </>
     )
+  }
 
   /* /admin waits for /api/me: before it answers we can't tell an admin from
      a borrowed "view as" session, and rendering Admin in the latter flashes
@@ -112,8 +143,11 @@ export function App() {
      session back and reloads. */
   if (path.startsWith('/admin') && (!me || returningToAdmin)) return <div className="auth-page" />
 
-  const canvasId = path.match(/^\/c\/([^/]+)/)?.[1]
-  const page = canvasId ? (
+  const page = inviteToken ? (
+    /* an invitation somebody opened while signed in: the token is the
+       capability, the panel accepts or declines it */
+    <InviteAccept token={inviteToken} key={inviteToken} />
+  ) : canvasId ? (
     <CanvasPage canvasId={canvasId} key={canvasId} />
   ) : path.startsWith('/admin') ? (
     <Admin />
@@ -145,6 +179,118 @@ export function App() {
     </>
   ) : (
     page
+  )
+}
+
+/** One question, asked of the server: may this visitor read this canvas, with
+ *  or without a password? It returns the answer rather than acting on it, so
+ *  the effect that opens a share link can ask without setting any state of its
+ *  own, and the retry after a wrong password shares the same reading. */
+async function attemptLink(canvasId: string, password?: string): Promise<{ opened?: PublicCanvas; code?: string }> {
+  try {
+    return { opened: await api.openPublicCanvas(canvasId, password) }
+  } catch (err) {
+    return { code: err instanceof ApiError ? String(err.body.code ?? '') : '' }
+  }
+}
+
+/* The share-link visitor's path through the app: try the link, then either
+   hand over to the canvas (read-only, on the ticket the link minted), ask for
+   the password the owner set, or fall back to the sign-in form exactly as
+   every other signed-out URL does. There is no session anywhere in here — the
+   ticket is the whole capability. */
+function GuestCanvas({ canvasId }: { canvasId: string }) {
+  const [phase, setPhase] = useState<'opening' | 'password' | 'canvas' | 'closed'>('opening')
+  const [error, setError] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  function apply(result: { opened?: PublicCanvas; code?: string }, password?: string) {
+    if (result.opened) {
+      useStore.getState().setGuestSession({
+        ticket: result.opened.ticket,
+        access: result.opened.access,
+        canvas: result.opened.canvas,
+      })
+      setPhase('canvas')
+      return
+    }
+    /* `password_required` is the one answer worth a retry: the link is real,
+       the visitor just has not proved they were sent it. A link that is off, a
+       canvas that is gone, and an unreachable server all land on the sign-in
+       form — the page this URL showed before share links could be read. */
+    if (result.code === 'password_required') {
+      setPhase('password')
+      if (password) setError('That password is not right.')
+      return
+    }
+    setPhase('closed')
+  }
+
+  /* the retry after a wrong password comes from a click, so it may show its
+     own progress and clear the previous failure */
+  async function unlock(password: string) {
+    setBusy(true)
+    setError(null)
+    try {
+      apply(await attemptLink(canvasId, password), password)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  useEffect(() => {
+    let live = true
+    void attemptLink(canvasId).then((result) => live && apply(result))
+    /* leaving the share link drops the capability with it — the ticket never
+       outlives the URL it came from */
+    return () => {
+      live = false
+      useStore.getState().setGuestSession(null)
+    }
+  }, [canvasId])
+
+  if (phase === 'canvas') {
+    const canvas = (
+      <CanvasPage
+        canvasId={canvasId}
+        key={canvasId}
+        onSignIn={() => {
+          /* the form appears at the same URL, so signing in lands right back
+             on this canvas — now as a real session, which is what turns the
+             read-only view into an editable one */
+          useStore.getState().setGuestSession(null)
+          setPhase('closed')
+        }}
+      />
+    )
+    /* the desktop shell's overlay title bar needs its drag handle and its
+       --app-inset (the contract the fixed canvas layer offsets itself by),
+       exactly as the signed-in branch supplies them — without the tab strip,
+       which is an account's own state */
+    return isDesktopShell() ? (
+      <>
+        <ShellDragBar />
+        <div className="h-dvh overflow-auto pt-10 [--app-inset:40px]">{canvas}</div>
+      </>
+    ) : (
+      canvas
+    )
+  }
+  if (phase === 'password') return <GuestPasswordPrompt onUnlock={unlock} error={error} busy={busy} />
+  if (phase === 'opening')
+    return (
+      <AuthScreen>
+        <div className="flex flex-col items-center gap-3 text-center">
+          <Wordmark />
+          <p className="text-[13px] text-ink-soft">Opening the shared canvas…</p>
+        </div>
+      </AuthScreen>
+    )
+  return (
+    <>
+      <ShellDragBar />
+      <AuthPage />
+    </>
   )
 }
 

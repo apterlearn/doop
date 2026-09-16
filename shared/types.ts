@@ -10,6 +10,16 @@ export interface Frame {
   createdAt: number
   updatedAt: number
   updatedBy: string
+  /** stacking within its page; higher renders in front; ties break by array order */
+  z: number
+  /** user-set lock: blocks content writes from humans and agents */
+  locked: boolean
+  /** user-set hide: not rendered on the stage, still listed in Layers */
+  hidden: boolean
+  /** clockwise degrees, render-only */
+  rotation: number
+  /** 0..1, render-only */
+  opacity: number
   /** the page this frame sits on (Canvas.pages); always set after boot backfill */
   pageId?: string
   /** product-made onboarding/example content (welcome demo, seeded frames) —
@@ -267,9 +277,14 @@ export interface Canvas {
   name: string
   ownerId?: string
   /** what the share link grants people who are not the owner or invited:
-   *  'edit' (anyone with the link collaborates) or 'none' (private — the
-   *  default; unset means 'none'). */
-  linkAccess?: 'edit' | 'none'
+   *  'view' (read only), 'comment' (read and leave notes), 'edit' (full
+   *  design access) or 'none' (private — the default; unset means 'none'). */
+  linkAccess?: 'none' | 'view' | 'comment' | 'edit'
+  /** the share link carries a password. The hash itself never leaves the
+   *  server, so this flag is all a client can know — and all it needs. */
+  linkPasswordSet?: boolean
+  /** when the share link stops working (epoch ms); unset = no expiry */
+  linkExpiresAt?: number
   /** user ids invited to collaborate (the owner is not listed) */
   memberIds?: string[]
   /** set while the owner lists this canvas in the community gallery. The
@@ -514,8 +529,10 @@ export interface RunEvent {
   runId: string
   agentName: string
   at: number
-  /** always 'tool' — the one kind the MCP surface records */
-  kind: 'tool'
+  /** what this step is: a tool call (the common case), a status line the
+   *  server or an agent recorded ('implementing attempt 2/3'), an error, or
+   *  the stop that ended the run */
+  kind: 'tool' | 'status' | 'error' | 'stop'
   /** the tool the agent called */
   name?: string
   ok?: boolean
@@ -539,6 +556,32 @@ export type AgentEventKind =
   /** a human wrote to a frame an agent had just written — the agent must
    *  re-read it before its next write lands on a base it never saw */
   | 'frame_edited'
+  /** a human told this agent to stop: its next tool call is refused and the
+   *  run ends. Delivered immediately to a parked agent, and remembered for a
+   *  caller that is between calls. */
+  | 'stop'
+  /** a human redirected a running agent — `data` carries `{ message }`. The
+   *  agent reads it on its next call and adjusts. */
+  | 'steer'
+
+/** A free-form message between a human and an agent on a canvas — the chat
+ *  channel. Distinct from a comment (which is pinned to an element) and from
+ *  a question (which blocks the agent until answered): this is the queue an
+ *  agent reads when it has nothing else to do, and how a human parks a
+ *  thought for an agent that is not connected yet. */
+export interface AgentMessage {
+  id: string
+  canvasId: string
+  /** who wrote it; an agent's `name` is the `agent_name` it calls tools with */
+  authorName: string
+  authorKind: ActorKind
+  authorColor: string
+  /** the agent or role this message is addressed to (`@copy`), when the body
+   *  named one — what makes a message routable instead of broadcast */
+  to?: string
+  body: string
+  at: number
+}
 
 /** A buffered event an agent receives from a long-poll call. `targetAgent`
  *  scopes it to one agent; unset means every agent on the canvas may see it. */
@@ -673,7 +716,11 @@ export interface ActivityItem {
 /* ---- websocket protocol ---- */
 
 export type ClientMessage =
-  | { type: 'join'; canvasId: string; clientId: string; name: string; kind: ActorKind }
+  /** `ticket` is a share-link visitor's proof they may read this canvas: it
+   *  is minted by POST /api/public/canvases/:id and stands in for the session
+   *  cookie, which a signed-out visitor does not have. A ticket holder is a
+   *  reader — the room ignores their cursor/editing/focus messages. */
+  | { type: 'join'; canvasId: string; clientId: string; name: string; kind: ActorKind; ticket?: string }
   | { type: 'cursor'; x: number; y: number }
   | { type: 'editing'; frameId: string | null }
   | { type: 'frame:drag'; frameId: string; x: number; y: number; width: number; height: number }
@@ -713,6 +760,9 @@ export type ServerMessage =
       approvalTools?: string[]
       /** the canvas component library, as the components panel lists it */
       components?: ComponentSummary[]
+      /** the recent chat between humans and agents (newest last), so a client
+       *  joining now can read the conversation it missed */
+      messages?: AgentMessage[]
       /** per-agent tool-call timeline, newest first (a bounded recent window) */
       runEvents: RunEvent[]
       /** frames an agent is mid-edit on, so a client joining now sees the holder */
@@ -728,6 +778,10 @@ export type ServerMessage =
   | { type: 'frame:created'; frame: Frame; actor: Actor }
   | { type: 'frame:updated'; frame: Frame; actor: Actor }
   | { type: 'frame:deleted'; frameId: string; actor: Actor }
+  /** a page's frames were re-stacked: `frames` is that page's full list in
+   *  front-to-back order (index 0 = frontmost), the order the stage paints
+   *  and the Layers rail lists */
+  | { type: 'frames:reordered'; pageId: string; frames: Frame[]; actor: Actor }
   | {
       type: 'frame:streaming'
       frameId: string
@@ -761,6 +815,8 @@ export type ServerMessage =
   | { type: 'canvasProposal'; proposal: CanvasProposal }
   /** an agent asked a question, or a human answered it */
   | { type: 'question'; question: AgentQuestion }
+  /** a chat message was posted (human→agent or agent→human), or deleted */
+  | { type: 'agentMessage'; message: AgentMessage | null; messageId: string }
   /** an MCP agent recorded a tool call on the canvas run timeline */
   | { type: 'run:event'; event: RunEvent }
   /** review mode was toggled */

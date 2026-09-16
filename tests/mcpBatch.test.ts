@@ -42,6 +42,22 @@ vi.mock('../server/db/persist.ts', () => ({
   saveReference: () => {},
   deleteReference: () => {},
   deleteCanvas: () => {},
+  deleteComponentRow: () => {},
+  releaseFrames: () => [],
+  freezeFrames: () => [],
+  MAX_CANVAS_VERSIONS: 50,
+  saveCanvasVersion: () => {},
+  listCanvasVersions: async () => [],
+  getCanvasVersion: async () => undefined,
+  summarizeCanvasVersion: () => ({ id: '', cause: 'auto', createdAt: 0, createdBy: '', frameCount: 0 }),
+  deleteCanvasVersion: () => {},
+  pruneCanvasVersions: () => {},
+  restoreFrameRow: () => {},
+  restoreCanvasRow: () => {},
+  hardDeleteFrame: () => {},
+  hardDeleteCanvas: () => {},
+  purgeTrash: () => {},
+  TRASH_RETENTION_DAYS: 30,
 }))
 
 const OWNER_ID = 'batch-owner'
@@ -125,6 +141,11 @@ function seedCanvas(): Frame {
     createdAt: 0,
     updatedAt: 1,
     updatedBy: 'alice',
+    z: 0,
+    locked: false,
+    hidden: false,
+    rotation: 0,
+    opacity: 1,
     pageId: 'p-batch',
   }
   const canvas: Canvas = {
@@ -438,7 +459,7 @@ describe('apply_ops', () => {
     }
   })
 
-  it('brings back a frame the batch deleted, naming the id it returns with', async () => {
+  it('brings back a frame the batch deleted under its own id', async () => {
     const { client, close } = await connect()
     try {
       const before = await readFrame(client, FRAME_ID)
@@ -462,15 +483,51 @@ describe('apply_ops', () => {
       expect(isError).toBe(true)
       const failure = parsed.error as unknown as RollbackError
       expect(failure).toMatchObject({ stopped_at: 1, applied_before_failure: 1, rolled_back: true })
-      expect(failure.recreated).toHaveLength(1)
-      const recreated = failure.recreated![0]!
-      expect(recreated.name).toBe(before.name)
-      expect(recreated.from).toBe(FRAME_ID)
-      /* the design came back whole, under the id the error names */
-      const back = await readFrame(client, recreated.to)
+      /* a delete is a trash, not a drop: the frame comes back as ITSELF, so
+         nothing is reported as recreated and the id an agent holds — in its
+         comments, its history and its version rows — is still valid */
+      expect(failure.recreated).toBeUndefined()
+      expect(failure.restored).toContain(FRAME_ID)
+      const back = await readFrame(client, FRAME_ID)
+      expect(back.name).toBe(before.name)
       expect(back.html).toBe(before.html)
-      expect(store.getCanvas(CANVAS_ID)!.frames.map((f) => f.id)).toEqual([recreated.to])
-      expect(failure.message).toContain(recreated.to)
+      expect(store.getCanvas(CANVAS_ID)!.frames.map((f) => f.id)).toEqual([FRAME_ID])
+      expect(store.getTrashedFrame(FRAME_ID)).toBeUndefined()
+    } finally {
+      await close()
+    }
+  })
+
+  it('rolls a deleted frame back to the pre-image, not to the copy the trash holds', async () => {
+    const { client, close } = await connect()
+    try {
+      const before = await readFrame(client, FRAME_ID)
+      const { parsed, isError } = await callTool(client, 'apply_ops', {
+        canvas_id: CANVAS_ID,
+        atomic: true,
+        agent_name: 'Claude',
+        ops: [
+          { op: 'set_frame_html', frame_id: FRAME_ID, html: '<h1>batch edit</h1>', agent_name: 'Claude' },
+          { op: 'delete_frame', frame_id: FRAME_ID, agent_name: 'Claude' },
+          /* this op read the frame before the batch touched it, so it fails
+             while applying — pre-flight saw the frame still there */
+          {
+            op: 'set_frame_html',
+            frame_id: FRAME_ID,
+            html: '<h1>never</h1>',
+            expected_updated_at: before.updatedAt,
+            agent_name: 'Claude',
+          },
+        ],
+      })
+      expect(isError).toBe(true)
+      const failure = parsed.error as unknown as RollbackError
+      expect(failure).toMatchObject({ stopped_at: 2, applied_before_failure: 2, rolled_back: true })
+      /* the trashed row carries the batch's edit; a rollback puts back what the
+         canvas held before the batch, not what the batch left behind */
+      const back = await readFrame(client, FRAME_ID)
+      expect(back.html).toBe(before.html)
+      expect(store.getTrashedFrame(FRAME_ID)).toBeUndefined()
     } finally {
       await close()
     }

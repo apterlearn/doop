@@ -7,7 +7,15 @@ import {
   type CommunityCategory,
 } from '../../shared/types'
 import { navigate } from '../App'
-import { api, ApiError, type CanvasMember, type GithubConnectionInfo } from '../lib/api'
+import {
+  api,
+  ApiError,
+  type CanvasInvite,
+  type CanvasMember,
+  type CanvasRole,
+  type GithubConnectionInfo,
+  type LinkAccess,
+} from '../lib/api'
 import { authClient } from '../lib/auth'
 import { posthog } from '../lib/posthog'
 import { timeAgo } from '../lib/time'
@@ -16,12 +24,12 @@ import { Avatar } from './ui/avatar'
 import { Button } from './ui/button'
 import { Checkbox } from './ui/checkbox'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from './ui/collapsible'
-import { GithubIcon, XIcon } from './ui/icons'
+import { ChevronDownIcon, GithubIcon, XIcon } from './ui/icons'
 import { Input } from './ui/input'
 import { Modal, ModalTitle } from './ui/modal'
 import { Note } from './ui/note'
 import { Textarea } from './ui/textarea'
-import { ToggleChipGroup, ToggleChipItem } from './ui/toggle-chip'
+import { ToggleChip, ToggleChipGroup, ToggleChipItem } from './ui/toggle-chip'
 
 type ShareableCanvas = Pick<
   Canvas,
@@ -29,6 +37,8 @@ type ShareableCanvas = Pick<
   | 'name'
   | 'ownerId'
   | 'linkAccess'
+  | 'linkPasswordSet'
+  | 'linkExpiresAt'
   | 'memberIds'
   | 'publishedAt'
   | 'description'
@@ -36,7 +46,17 @@ type ShareableCanvas = Pick<
   | 'publishedReleaseId'
 >
 type SharePatch = Partial<
-  Pick<ShareableCanvas, 'linkAccess' | 'memberIds' | 'publishedAt' | 'description' | 'category' | 'publishedReleaseId'>
+  Pick<
+    ShareableCanvas,
+    | 'linkAccess'
+    | 'linkPasswordSet'
+    | 'linkExpiresAt'
+    | 'memberIds'
+    | 'publishedAt'
+    | 'description'
+    | 'category'
+    | 'publishedReleaseId'
+  >
 >
 
 /* The gallery pin's "no release" choice. Release ids are nanoids, so this can
@@ -44,11 +64,68 @@ type SharePatch = Partial<
 const LIVE_PIN = 'live'
 
 /** One ship action at a time; the value is also the busy button's label key. */
-type ShipBusy = 'zip' | 'code' | 'pull' | 'update' | 'freeze' | null
+type ShipBusy = 'zip' | 'code' | 'image' | 'pull' | 'update' | 'freeze' | null
 
 /** How many releases a collapsed list shows before the rest go behind a
  *  disclosure — the modal is a fixed-height card, not a page. */
 const SHOWN_RELEASES = 3
+
+/** What each role is allowed to do, in the words the invite pickers and the
+ *  collaborator rows use. */
+const ROLE_LABELS: Record<CanvasRole, string> = {
+  viewer: 'Can view',
+  commenter: 'Can comment',
+  editor: 'Can edit',
+  admin: 'Admin',
+}
+
+/* `admin` is not something this form hands out: only whoever the server
+   already calls an admin may show (and keep) that role. */
+const ASSIGNABLE_ROLES: CanvasRole[] = ['viewer', 'commenter', 'editor']
+
+/** The four link modes, most closed first. The labels are the whole sentence
+ *  because that sentence is the difference between them. */
+const LINK_MODES: Record<LinkAccess, { label: string; blurb: string }> = {
+  none: {
+    label: 'Private',
+    blurb: 'Only you and the people you invite can open this canvas.',
+  },
+  view: {
+    label: 'Anyone with the link can view',
+    blurb: 'Read-only: visitors can look, but they cannot edit frames or leave comments.',
+  },
+  comment: {
+    label: 'Anyone with the link can comment',
+    blurb: 'Read-only plus notes: visitors can leave comments, but they cannot edit frames.',
+  },
+  edit: {
+    label: 'Anyone with the link can edit',
+    blurb: 'Full design access: visitors edit frames the way an invited editor does.',
+  },
+}
+
+/** The order those four are offered in: closed to open. */
+const LINK_MODE_ORDER: LinkAccess[] = ['none', 'view', 'comment', 'edit']
+
+/** A day, month and (when it is not this year) year — an expiry reads as
+ *  "Aug 3", never as a wall of digits. */
+function shortDate(ts: number): string {
+  const date = new Date(ts)
+  return date.toLocaleDateString(
+    undefined,
+    date.getFullYear() === new Date().getFullYear()
+      ? { month: 'short', day: 'numeric' }
+      : { month: 'short', day: 'numeric', year: 'numeric' },
+  )
+}
+
+/** Epoch ms as the `datetime-local` input's own value format (local time, to
+ *  the minute — the control has no seconds). */
+function toLocalInput(ts: number): string {
+  const date = new Date(ts)
+  const pad = (value: number) => String(value).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
 
 /* One sharing surface for the canvas and dashboard. The caller owns canvas
    state; this component reports optimistic access changes back to it. */
@@ -66,14 +143,38 @@ export function ShareModal({
   const { data: session } = authClient.useSession()
   const meId = session?.user?.id
   const isOwner = !!canvas.ownerId && canvas.ownerId === meId
-  const linkEdits = canvas.linkAccess === 'edit'
+  const linkAccess: LinkAccess = canvas.linkAccess ?? 'none'
   const [people, setPeople] = useState<CanvasMember[] | null>(null)
+  /* invitations to people who had no account to invite yet — owner-only, the
+     same way the people list is */
+  const [invites, setInvites] = useState<CanvasInvite[] | null>(null)
   /* frozen snapshots, newest first — the ship section lists them and the
      listing's pin picker chooses among them, so both read this one copy */
   const [releases, setReleases] = useState<CanvasRelease[] | null>(null)
   const [email, setEmail] = useState('')
+  const [inviteRole, setInviteRole] = useState<CanvasRole>('editor')
+  /* the invitation this session created: its link is the only copy of that
+     capability, so it stays on screen until it is revoked */
+  const [created, setCreated] = useState<CanvasInvite | null>(null)
+  const [copied, setCopied] = useState<string | null>(null)
+  /* link protection. The password is write-only — a save clears the field and
+     `passwordSet` says what happened to it; nothing ever reads it back. */
+  const [password, setPassword] = useState('')
+  const [passwordSet, setPasswordSet] = useState(false)
+  const [expiry, setExpiry] = useState(canvas.linkExpiresAt ? toLocalInput(canvas.linkExpiresAt) : '')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+
+  const mode = LINK_MODES[linkAccess]
+  const createdLink = created ? (created.url.startsWith('/') ? location.origin + created.url : created.url) : null
+  /* the datetime-local draft as epoch ms; null while the field is empty or
+     holds something that is not a date */
+  const expiryDraft = expiry ? new Date(expiry).getTime() : null
+  /* what the link currently asks for, as the one line under its controls */
+  const gateParts = [
+    ...(canvas.linkPasswordSet ? ['Password protected'] : []),
+    ...(canvas.linkExpiresAt ? [`Expires ${shortDate(canvas.linkExpiresAt)}`] : []),
+  ]
 
   useEffect(() => {
     let active = true
@@ -90,6 +191,18 @@ export function ShareModal({
     if (!isOwner) return
     let active = true
     api
+      .listInvites(canvas.id)
+      .then((list) => active && setInvites(list))
+      .catch(() => active && setInvites([]))
+    return () => {
+      active = false
+    }
+  }, [canvas.id, isOwner])
+
+  useEffect(() => {
+    if (!isOwner) return
+    let active = true
+    api
       .listReleases(canvas.id)
       .then((list) => active && setReleases(list))
       .catch(() => active && setReleases([]))
@@ -98,24 +211,44 @@ export function ShareModal({
     }
   }, [canvas.id, isOwner])
 
+  /* Invite by email. An address that already has an account becomes a member
+     on the spot; one that does not is a 404 from the server, and the way in
+     for those people is the invitation link the server mints instead. */
   async function invite() {
     const clean = email.trim()
     if (!clean || busy || people === null) return
     setBusy(true)
     setError(null)
+    setCreated(null)
     try {
-      const member = await api.inviteMember(canvas.id, clean)
+      let member: CanvasMember
+      try {
+        member = await api.inviteMember(canvas.id, clean)
+      } catch (caught) {
+        if (!(caught instanceof ApiError) || caught.status !== 404) throw caught
+        const invitation = await api.createInvite(canvas.id, clean, inviteRole)
+        setInvites((current) => [invitation, ...(current ?? [])])
+        setCreated(invitation)
+        setEmail('')
+        return
+      }
+      /* inviteMember names no role, so a choice other than the row's own is
+         applied to the membership it just created */
+      const added = member.role === inviteRole ? member : await api.setMemberRole(canvas.id, member.userId, inviteRole)
       setPeople((current) =>
-        current?.some((person) => person.userId === member.userId) ? current : [...(current ?? []), member],
+        current?.some((person) => person.userId === added.userId)
+          ? current.map((person) => (person.userId === added.userId ? added : person))
+          : [...(current ?? []), added],
       )
-      if (!canvas.memberIds?.includes(member.userId)) {
-        onChange({ memberIds: [...(canvas.memberIds ?? []), member.userId] })
+      if (!canvas.memberIds?.includes(added.userId)) {
+        onChange({ memberIds: [...(canvas.memberIds ?? []), added.userId] })
       }
       setEmail('')
     } catch (caught) {
       setError(caught instanceof ApiError ? String(caught.body.error ?? 'invite failed') : 'invite failed')
+    } finally {
+      setBusy(false)
     }
-    setBusy(false)
   }
 
   async function remove(userId: string) {
@@ -134,20 +267,114 @@ export function ShareModal({
     }
   }
 
-  async function toggleLink(next: boolean) {
-    if (busy) return
-    const linkAccess = next ? 'edit' : 'none'
+  /* The link's four modes. The server owns what each one grants; this only
+     reports which one the owner picked. */
+  async function changeLink(next: LinkAccess) {
+    if (busy || next === linkAccess) return
     setBusy(true)
     setError(null)
     try {
-      await api.setLinkAccess(canvas.id, linkAccess)
-      onChange({ linkAccess })
+      await api.setLinkAccess(canvas.id, next)
+      onChange({ linkAccess: next })
     } catch (caught) {
       setError(
         caught instanceof ApiError ? String(caught.body.error ?? 'access update failed') : 'access update failed',
       )
     } finally {
       setBusy(false)
+    }
+  }
+
+  /* A role change answers with the membership as it now stands, so the row is
+     rebuilt from the server's member rather than from what was asked for. */
+  async function changeRole(person: CanvasMember, role: CanvasRole) {
+    if (busy || role === person.role) return
+    setBusy(true)
+    setError(null)
+    try {
+      const updated = await api.setMemberRole(canvas.id, person.userId, role)
+      setPeople((current) => current?.map((row) => (row.userId === updated.userId ? updated : row)) ?? null)
+    } catch (caught) {
+      setError(caught instanceof ApiError ? String(caught.body.error ?? 'role change failed') : 'role change failed')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  /* Password and expiry ride the same PATCH; its response is the canvas as it
+     now stands, and that answer is what the modal reports back. */
+  async function saveSharing(patch: { password?: string | null; expiresAt?: number | null }): Promise<boolean> {
+    if (busy) return false
+    setBusy(true)
+    setError(null)
+    try {
+      const updated = await api.setLinkSharing(canvas.id, patch)
+      onChange({ linkPasswordSet: updated.linkPasswordSet, linkExpiresAt: updated.linkExpiresAt })
+      return true
+    } catch (caught) {
+      setError(
+        caught instanceof ApiError
+          ? String(caught.body.error ?? 'the link settings were not saved')
+          : 'the link settings were not saved',
+      )
+      return false
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function setLinkPassword() {
+    const next = password.trim()
+    if (!next || !(await saveSharing({ password: next }))) return
+    /* the field is cleared rather than echoed: the server keeps the hash, and
+       the summary line above reports that one is now in force */
+    setPassword('')
+    setPasswordSet(true)
+  }
+
+  async function clearLinkPassword() {
+    if (!(await saveSharing({ password: null }))) return
+    setPassword('')
+    setPasswordSet(false)
+  }
+
+  async function setLinkExpiry() {
+    if (expiryDraft === null || !Number.isFinite(expiryDraft)) return
+    await saveSharing({ expiresAt: expiryDraft })
+  }
+
+  async function clearLinkExpiry() {
+    if (await saveSharing({ expiresAt: null })) setExpiry('')
+  }
+
+  async function revoke(invitation: CanvasInvite) {
+    if (busy) return
+    setBusy(true)
+    setError(null)
+    try {
+      await api.revokeInvite(canvas.id, invitation.id)
+      setInvites((current) => current?.filter((row) => row.id !== invitation.id) ?? null)
+      /* a revoked link must not stay on screen as though it still worked */
+      setCreated((current) => (current?.id === invitation.id ? null : current))
+    } catch (caught) {
+      setError(
+        caught instanceof ApiError
+          ? String(caught.body.error ?? 'the invitation was not revoked')
+          : 'the invitation was not revoked',
+      )
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function copyCreated() {
+    if (!created || !createdLink) return
+    setError(null)
+    try {
+      await navigator.clipboard.writeText(createdLink)
+      setCopied(created.id)
+    } catch {
+      setError('Couldn’t copy the link. Select the URL above and copy it instead.')
     }
   }
 
@@ -192,6 +419,40 @@ export function ShareModal({
                 Invite
               </Button>
             </div>
+            <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1.5">
+              <span className="text-[12px] text-ink-faint">Invite as</span>
+              <ToggleChipGroup
+                aria-label="Role for new invitations"
+                className="gap-1.5"
+                value={inviteRole}
+                onValueChange={(next) => setInviteRole(next as CanvasRole)}
+              >
+                {ASSIGNABLE_ROLES.map((role) => (
+                  <ToggleChipItem key={role} value={role} className="px-2 py-0.5 text-[12px]" disabled={busy}>
+                    {ROLE_LABELS[role]}
+                  </ToggleChipItem>
+                ))}
+              </ToggleChipGroup>
+            </div>
+            {created && createdLink && (
+              <div className="mt-2.5 flex flex-col gap-1.5 rounded-[10px] border border-line-soft bg-paper px-2.5 py-2">
+                <Note tone="success" size="sm">
+                  Invitation created — share this link with {created.email}.
+                </Note>
+                <div className="flex flex-col items-stretch gap-2 sm:flex-row">
+                  <Input
+                    className="flex-1 rounded-[10px] bg-paper text-[13px] focus:ring-0"
+                    readOnly
+                    aria-label="Invitation link"
+                    value={createdLink}
+                    onFocus={(event) => event.currentTarget.select()}
+                  />
+                  <Button className="justify-center" onClick={copyCreated}>
+                    {copied === created.id ? 'Copied' : '⧉ Copy'}
+                  </Button>
+                </div>
+              </div>
+            )}
           </>
         )}
         {error && <p className="mx-[2px] mt-2 text-[12px] text-accent-ink">{error}</p>}
@@ -210,41 +471,167 @@ export function ShareModal({
               </span>
               {person.owner ? (
                 <span className="flex-none text-[12px] text-ink-faint">Owner</span>
-              ) : isOwner || person.userId === meId ? (
-                <Button
-                  variant="bare"
-                  size="icon-sm"
-                  className="flex-none text-[13px] hover:bg-accent-ink/10 hover:text-accent-ink"
-                  title={person.userId === meId ? 'Leave this canvas' : 'Remove'}
-                  disabled={busy}
-                  onClick={() => remove(person.userId)}
-                >
-                  ✕
-                </Button>
               ) : (
-                <span className="flex-none text-[12px] text-ink-faint">Can edit</span>
+                <>
+                  {isOwner ? (
+                    <span className="relative flex flex-none items-center">
+                      <select
+                        aria-label={`Role for ${person.name}`}
+                        className="h-7 cursor-pointer appearance-none rounded-md border border-line bg-surface pl-2 pr-6 text-base font-medium text-ink outline-none transition-[border-color] focus:border-ink disabled:cursor-not-allowed disabled:opacity-60 md:text-xs"
+                        value={person.role}
+                        disabled={busy}
+                        onChange={(event) => changeRole(person, event.target.value as CanvasRole)}
+                      >
+                        {/* admin is offered only on a row the server already
+                            calls admin: nobody hands it out from this form */}
+                        {(person.role === 'admin'
+                          ? [...ASSIGNABLE_ROLES, 'admin' as CanvasRole]
+                          : ASSIGNABLE_ROLES
+                        ).map((role) => (
+                          <option key={role} value={role}>
+                            {ROLE_LABELS[role]}
+                          </option>
+                        ))}
+                      </select>
+                      <ChevronDownIcon
+                        width={10}
+                        height={10}
+                        className="pointer-events-none absolute right-2 text-ink-faint"
+                      />
+                    </span>
+                  ) : (
+                    <span className="flex-none text-[12px] text-ink-faint">{ROLE_LABELS[person.role]}</span>
+                  )}
+                  {(isOwner || person.userId === meId) && (
+                    <Button
+                      variant="bare"
+                      size="icon-sm"
+                      className="flex-none text-[13px] hover:bg-accent-ink/10 hover:text-accent-ink"
+                      title={person.userId === meId ? 'Leave this canvas' : 'Remove'}
+                      disabled={busy}
+                      onClick={() => remove(person.userId)}
+                    >
+                      ✕
+                    </Button>
+                  )}
+                </>
               )}
             </div>
           ))}
           {people === null && <p className="text-[12px] text-ink-faint">Loading…</p>}
-        </div>
-        <div className="mt-2.5 flex flex-col items-stretch justify-between gap-2.5 border-t border-line-soft pt-3.5 sm:flex-row sm:items-center">
-          {isOwner ? (
-            <label
-              className="relative flex cursor-pointer items-center gap-2 text-[13px] font-medium text-ink"
-              title="Off = only you and invited people can open this canvas"
-            >
-              <Checkbox checked={linkEdits} disabled={busy} onChange={(event) => toggleLink(event.target.checked)} />
-              Anyone with the link can edit
-            </label>
-          ) : (
-            <span className="text-xs text-ink-faint">
-              {linkEdits ? 'Anyone with the link can edit' : 'Invite-only canvas'}
-            </span>
+          {isOwner && (invites?.length ?? 0) > 0 && (
+            <div className="mt-1.5 flex flex-col gap-[2px] border-t border-line-soft pt-1.5">
+              <span className="px-[2px] text-[12px] font-semibold text-ink-soft">Pending invitations</span>
+              {(invites ?? []).map((invitation) => (
+                <div key={invitation.id} className="flex items-center gap-2.5 px-[2px] py-1.5">
+                  <span className="flex min-w-0 flex-1 flex-col leading-[1.3]">
+                    <b className="overflow-hidden whitespace-nowrap text-ellipsis text-[13px] font-semibold">
+                      {invitation.email}
+                    </b>
+                    <span className="overflow-hidden whitespace-nowrap text-ellipsis text-[12px] text-ink-faint">
+                      {ROLE_LABELS[invitation.role]} · Expires {shortDate(invitation.expiresAt)}
+                    </span>
+                  </span>
+                  <Button
+                    variant="bare"
+                    size="icon-sm"
+                    className="flex-none text-[13px] hover:bg-accent-ink/10 hover:text-accent-ink"
+                    title={`Revoke the invitation for ${invitation.email}`}
+                    disabled={busy}
+                    onClick={() => revoke(invitation)}
+                  >
+                    ✕
+                  </Button>
+                </div>
+              ))}
+            </div>
           )}
-          <Button className="justify-center" onClick={copy}>
-            ⧉ Copy link
-          </Button>
+        </div>
+        <div className="mt-2.5 flex flex-col gap-2.5 border-t border-line-soft pt-3.5">
+          <div className="flex flex-wrap items-center justify-between gap-2.5">
+            <span className="text-[12px] font-semibold text-ink-soft">Link access</span>
+            <Button className="justify-center" onClick={copy}>
+              ⧉ Copy link
+            </Button>
+          </div>
+          {isOwner ? (
+            <>
+              <ToggleChipGroup
+                aria-label="What the share link grants"
+                className="gap-1.5"
+                value={linkAccess}
+                onValueChange={(next) => changeLink(next as LinkAccess)}
+              >
+                {LINK_MODE_ORDER.map((value) => (
+                  <ToggleChipItem key={value} value={value} className="px-2.5 py-1 text-[12px]" disabled={busy}>
+                    {LINK_MODES[value].label}
+                  </ToggleChipItem>
+                ))}
+              </ToggleChipGroup>
+              <Note>{mode.blurb}</Note>
+            </>
+          ) : (
+            <>
+              <ToggleChip state="idle" className="self-start px-2.5 py-1 text-[12px]">
+                {mode.label}
+              </ToggleChip>
+              <Note>{mode.blurb}</Note>
+            </>
+          )}
+          {/* a private canvas has no link to protect: the gate only means
+              something once the link opens the canvas */}
+          {isOwner && linkAccess !== 'none' && (
+            <div className="flex flex-col gap-2 border-t border-line-soft pt-2.5">
+              <Note>{gateParts.join(' · ') || 'No password, no expiry.'}</Note>
+              <div className="flex flex-col items-stretch gap-2 sm:flex-row">
+                <Input
+                  className="flex-1 rounded-[10px] bg-paper focus:ring-0"
+                  type="password"
+                  autoComplete="new-password"
+                  aria-label="Link password"
+                  placeholder="Password"
+                  value={password}
+                  disabled={busy}
+                  onChange={(event) => {
+                    setPassword(event.target.value)
+                    setPasswordSet(false)
+                  }}
+                  onKeyDown={(event) => event.key === 'Enter' && setLinkPassword()}
+                />
+                <Button className="justify-center" disabled={busy || !password.trim()} onClick={setLinkPassword}>
+                  Set password
+                </Button>
+                {canvas.linkPasswordSet && (
+                  <Button variant="danger" className="justify-center" disabled={busy} onClick={clearLinkPassword}>
+                    Remove
+                  </Button>
+                )}
+              </div>
+              <div className="flex flex-col items-stretch gap-2 sm:flex-row">
+                <Input
+                  className="flex-1 rounded-[10px] bg-paper focus:ring-0"
+                  type="datetime-local"
+                  aria-label="Link expiry"
+                  value={expiry}
+                  disabled={busy}
+                  onChange={(event) => setExpiry(event.target.value)}
+                />
+                <Button
+                  className="justify-center"
+                  disabled={busy || expiryDraft === null || !Number.isFinite(expiryDraft)}
+                  onClick={setLinkExpiry}
+                >
+                  Set expiry
+                </Button>
+                {canvas.linkExpiresAt !== undefined && (
+                  <Button variant="danger" className="justify-center" disabled={busy} onClick={clearLinkExpiry}>
+                    Clear
+                  </Button>
+                )}
+              </div>
+              {passwordSet && <Note tone="success">Password set — it can’t be shown again.</Note>}
+            </div>
+          )}
         </div>
         {isOwner && (
           <CommunityListing
@@ -479,6 +866,30 @@ function ShipSection({
     }
   }
 
+  /** One PNG of every visible frame on the page, laid out where the stage has
+   *  them. Rendered on the server (the client cannot composite a sandboxed
+   *  iframe), so this is the same asset-URL download the archives use. */
+  async function exportImage() {
+    if (busy) return
+    setBusy('image')
+    setError(null)
+    setNotice(null)
+    try {
+      const { url } = await api.exportCanvasImage(canvas.id)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = `${canvas.name}.png`
+      link.rel = 'noopener'
+      document.body.append(link)
+      link.click()
+      link.remove()
+    } catch (caught) {
+      setError(caught instanceof ApiError ? String(caught.body.error ?? 'the export failed') : 'the export failed')
+    } finally {
+      setBusy(null)
+    }
+  }
+
   async function openPull() {
     if (busy || !connection) return
     setBusy('pull')
@@ -631,10 +1042,13 @@ function ShipSection({
           <Button size="sm" className="px-2.5 text-xs" disabled={!!busy} onClick={() => exportAs('code')}>
             {busy === 'code' ? 'Exporting…' : 'Export code'}
           </Button>
+          <Button size="sm" className="px-2.5 text-xs" disabled={!!busy} onClick={() => exportImage()}>
+            {busy === 'image' ? 'Rendering…' : 'Export image'}
+          </Button>
         </div>
         <Note>
           The ZIP is the canvas as one self-contained page; Export code is the repository file set a pull request
-          commits.
+          commits; Export image is a single PNG of the page as the stage lays it out.
         </Note>
       </div>
 

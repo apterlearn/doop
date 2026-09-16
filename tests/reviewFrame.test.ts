@@ -39,6 +39,11 @@ function frame(html: string): Frame {
     createdAt: 0,
     updatedAt: 1,
     updatedBy: 'alice',
+    z: 0,
+    locked: false,
+    hidden: false,
+    rotation: 0,
+    opacity: 1,
   }
 }
 

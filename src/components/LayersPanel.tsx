@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useRef, useState, type HTMLAttributes, type KeyboardEvent, type ReactNode } from 'react'
 import type { Frame } from '../../shared/types'
-import { useStore, visibleFrames } from '../lib/store'
+import { isReadOnly, useStore, visibleFrames } from '../lib/store'
+import { api } from '../lib/api'
+import { setFrameStackOrder } from '../lib/frameOrder'
 import { getIdentity } from '../lib/identity'
-import { deleteFramesTracked } from '../lib/history'
-import { ancestorsOf, buildLayerTree, elementHtml, filterLayers, type LayerNode } from '../lib/layers'
-import { deleteLayer, duplicateLayer } from '../lib/layerEdits'
+import { caughtStaleWrite, deleteFramesTracked, noteOwnWrite, recordUpdate } from '../lib/history'
+import { ancestorsOf, buildLayerTree, elementHtml, filterLayers, renameElement, type LayerNode } from '../lib/layers'
+import { deleteLayer, duplicateLayer, replaceLayerHtml } from '../lib/layerEdits'
 import { cn } from '@/lib/utils'
 import { AgentIcon } from './AgentIcon'
 import { LayerKindIcon } from './LayerKindIcon'
@@ -25,12 +27,16 @@ import {
   ChevronDownIcon,
   ChevronRightIcon,
   CollapseAllIcon,
+  EyeIcon,
+  EyeOffIcon,
   FrameIcon,
   LayersIcon,
+  LockIcon,
   PanelCollapseIcon,
   PanelExpandIcon,
   PlusIcon,
   SearchIcon,
+  UnlockIcon,
 } from './ui/icons'
 
 /* the tree indents 18px per level; frame rows sit at depth 0 */
@@ -89,13 +95,41 @@ function visibleRows(frames: Frame[], query: string, expanded: Set<string>): Vis
 export function LayersPanel({ onAddFrame }: { onAddFrame: () => void }) {
   const canvas = useStore((s) => s.canvas)
   const activePageId = useStore((s) => s.activePageId)
-  /* the tree lists the page being viewed, like the stage */
-  const frames = useMemo(() => visibleFrames({ canvas, activePageId }), [canvas, activePageId])
+  /* the tree lists the page being viewed, like the stage — front-to-back, so
+     the topmost frame is the rail's first row. Reversing before the (stable)
+     sort makes a z tie fall the stage's way: the later array item paints in
+     front, so it reads first here too. */
+  const frames = useMemo(
+    () =>
+      visibleFrames({ canvas, activePageId })
+        .slice()
+        .reverse()
+        .sort((a, b) => b.z - a.z),
+    [canvas, activePageId],
+  )
   const selectedId = useStore((s) => s.selectedId)
   const selectedElement = useStore((s) => s.selectedElement)
   const setLayersOpen = useStore((s) => s.setLayersOpen)
+  /* the tree stays a tree for a viewer — selecting, folding and searching all
+     work — but every edit it offers (adding, reordering, locking, hiding,
+     deleting, renaming) is gone */
+  const readOnly = useStore(isReadOnly)
   const [query, setQuery] = useState('')
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set())
+  /* a frame drag in flight: which row is moving, and which edge of which row
+     the pointer is over. The refs carry the same facts for the handlers —
+     dragstart, dragover and drop can land in one task, before React has
+     re-rendered the callbacks — while the state only paints the drag */
+  const dragFrom = useRef<string | null>(null)
+  const dragEdge = useRef<{ id: string; edge: 'before' | 'after' } | null>(null)
+  const [dragId, setDragId] = useState<string | null>(null)
+  const [dropAt, setDropAt] = useState<{ id: string; edge: 'before' | 'after' } | null>(null)
+  function endDrag() {
+    dragFrom.current = null
+    dragEdge.current = null
+    setDragId(null)
+    setDropAt(null)
+  }
 
   /* the selected frame opens on its own, and a selection made inside a frame
      opens every row above it — derived from the selection during render, not
@@ -128,6 +162,26 @@ export function LayersPanel({ onAddFrame }: { onAddFrame: () => void }) {
       else next.delete(key)
       return next
     })
+  }
+
+  /* a frame dragged onto another's half lands on that side of it, and the
+     whole page goes out as one front-to-back order — the rail's own order is
+     what the write wants, so no geometry is involved */
+  function dropFrame(fromId: string, targetId: string, edge: 'before' | 'after') {
+    if (fromId === targetId) return
+    const ids = frames.map((f) => f.id)
+    const from = ids.indexOf(fromId)
+    const target = ids.indexOf(targetId)
+    if (from < 0 || target < 0) return
+    ids.splice(from, 1)
+    /* the target's index moves with the removal when it sat behind the source */
+    ids.splice((from < target ? target - 1 : target) + (edge === 'after' ? 1 : 0), 0, fromId)
+    if (ids.every((id, i) => id === frames[i]?.id)) return
+    const pageId = activePageId ?? frames[0]?.pageId
+    if (!pageId) return
+    /* the module logs its own failures: a lost write is a late paint, never
+       lost work, since the server's broadcast settles every client */
+    void setFrameStackOrder(pageId, ids)
   }
 
   const q = query.trim().toLowerCase()
@@ -176,6 +230,9 @@ export function LayersPanel({ onAddFrame }: { onAddFrame: () => void }) {
         break
       case 'Backspace':
       case 'Delete':
+        /* no row is deleted for a viewer: the key falls through unhandled
+           rather than deleting something the server would refuse anyway */
+        if (readOnly) return
         if (row?.kind === 'frame') deleteFramesTracked([row.frame])
         else if (row) deleteLayer(row.frame, row.node.selector)
         break
@@ -231,17 +288,23 @@ export function LayersPanel({ onAddFrame }: { onAddFrame: () => void }) {
               <CollapseAllIcon width={12} height={12} />
             </Button>
           </Tooltip>
-          <Tooltip label="New frame" side="bottom" align="end">
-            <Button variant="bare" size="icon-sm" className={sectionBtn} aria-label="New frame" onClick={onAddFrame}>
-              <PlusIcon width={12} height={12} />
-            </Button>
-          </Tooltip>
+          {readOnly ? (
+            <span className="self-center pr-1 text-ink-faint" title="Read only — sign in to edit this canvas">
+              Read only
+            </span>
+          ) : (
+            <Tooltip label="New frame" side="bottom" align="end">
+              <Button variant="bare" size="icon-sm" className={sectionBtn} aria-label="New frame" onClick={onAddFrame}>
+                <PlusIcon width={12} height={12} />
+              </Button>
+            </Tooltip>
+          )}
         </span>
       </div>
       <PanelBody className="px-2 pb-2 outline-none" role="tree" tabIndex={0} onKeyDown={onKeyDown}>
         {frames.length === 0 && (
           <div className="px-3 py-6 text-center text-[12.5px] text-ink-faint">
-            No frames yet. Press + to add one, or ask the agent for a design.
+            {readOnly ? 'No frames on this page.' : 'No frames yet. Press + to add one, or ask the agent for a design.'}
           </div>
         )}
         {frames.length > 0 && rows.length === 0 && (
@@ -254,6 +317,25 @@ export function LayersPanel({ onAddFrame }: { onAddFrame: () => void }) {
               row={row}
               selected={row.frame.id === selectedId && !selectedElement}
               current={row.frame.id === selectedId}
+              dragging={row.frame.id === dragId}
+              dropEdge={dropAt?.id === row.frame.id ? dropAt.edge : null}
+              onDragStart={() => {
+                dragFrom.current = row.frame.id
+                setDragId(row.frame.id)
+              }}
+              onDragOverRow={(edge) => {
+                dragEdge.current = { id: row.frame.id, edge }
+                setDropAt((prev) =>
+                  prev?.id === row.frame.id && prev.edge === edge ? prev : { id: row.frame.id, edge },
+                )
+              }}
+              onDropRow={() => {
+                const from = dragFrom.current
+                const at = dragEdge.current
+                if (from) dropFrame(from, row.frame.id, at?.id === row.frame.id ? at.edge : 'before')
+                endDrag()
+              }}
+              onDragEnd={endDrag}
               onToggle={() => setOpen(row.key, !row.open)}
               onActivate={() => activate(row)}
             />
@@ -330,6 +412,12 @@ function FrameRow({
   row,
   selected,
   current,
+  dragging,
+  dropEdge,
+  onDragStart,
+  onDragOverRow,
+  onDropRow,
+  onDragEnd,
   onToggle,
   onActivate,
 }: {
@@ -337,16 +425,50 @@ function FrameRow({
   selected: boolean
   /** the frame is selected, whether or not an element inside it is */
   current: boolean
+  /** this row is the one being dragged */
+  dragging: boolean
+  /** which side of this row a drop would land on */
+  dropEdge: 'before' | 'after' | null
+  onDragStart: () => void
+  onDragOverRow: (edge: 'before' | 'after') => void
+  onDropRow: () => void
+  onDragEnd: () => void
   onToggle: () => void
   onActivate: () => void
 }) {
   const { frame } = row
   const stream = useStore((s) => s.streams[frame.id])
   const presences = useStore((s) => s.presences)
+  const readOnly = useStore(isReadOnly)
   const me = getIdentity().clientId
   const editors = Object.values(presences).filter(
     (p) => p.activeFrameId === frame.id && p.clientId !== me && p.name !== stream?.name,
   )
+  /* Drag is the reorder, so a viewer's rows start no drag and take no drop —
+     without the handlers, a drag from anywhere else cannot raise a drop
+     indicator over them either. */
+  const drag: Pick<RowProps, 'draggable' | 'onDragStart' | 'onDragOver' | 'onDrop' | 'onDragEnd'> = readOnly
+    ? {}
+    : {
+        draggable: true,
+        onDragStart: (e) => {
+          e.dataTransfer.effectAllowed = 'move'
+          /* a drag with no data set is cancelled by some browsers */
+          e.dataTransfer.setData('text/plain', frame.id)
+          onDragStart()
+        },
+        onDragOver: (e) => {
+          e.preventDefault()
+          e.dataTransfer.dropEffect = 'move'
+          const box = e.currentTarget.getBoundingClientRect()
+          onDragOverRow(e.clientY < box.top + box.height / 2 ? 'before' : 'after')
+        },
+        onDrop: (e) => {
+          e.preventDefault()
+          onDropRow()
+        },
+        onDragEnd,
+      }
   /* Paste from this menu lands mid-stage rather than under the rail */
   const pasteAt = useRef({ x: 0, y: 0 })
   return (
@@ -359,8 +481,17 @@ function FrameRow({
             onCaret={onToggle}
             icon={<FrameIcon width={13} height={13} />}
             label={frame.name}
-            className={cn('font-semibold', current && !selected && 'text-brand [&_[data-icon]]:text-brand')}
+            className={cn(
+              'font-semibold',
+              current && !selected && 'text-brand [&_[data-icon]]:text-brand',
+              /* a hidden frame still owns its row, so the row says so */
+              frame.hidden && 'text-ink-faint',
+              dropEdge === 'before' && 'shadow-[inset_0_2px_0_var(--brand)]',
+              dropEdge === 'after' && 'shadow-[inset_0_-2px_0_var(--brand)]',
+              dragging && 'opacity-40',
+            )}
             selected={selected}
+            {...drag}
             onClick={onActivate}
             onDoubleClick={() => useStore.getState().requestFlyTo(frame.id)}
             onContextMenu={() => {
@@ -381,6 +512,7 @@ function FrameRow({
                     {p.name}
                   </span>
                 ))}
+                <FrameFlags frame={frame} />
               </>
             }
           />
@@ -390,6 +522,81 @@ function FrameRow({
       {row.empty && <div className="py-1 pl-[42px] text-[11.5px] text-ink-faint">empty frame</div>}
     </>
   )
+}
+
+/* The row's padlock and eye. They sit inside the row's click target, so their
+   own clicks stop there — toggling a frame's state must not also select it.
+   Of the tree's keys, ↵ (fly to) and ⌫ (delete) must not fire while a toggle
+   has focus, either; the arrow keys still walk the tree from here. */
+function FrameFlags({ frame }: { frame: Frame }) {
+  /* both buttons write a frame property, so a viewer is offered neither — the
+     row then carries only the frame's name and its presence chips */
+  const readOnly = useStore(isReadOnly)
+  const flag = 'shrink-0 text-ink-faint hover:bg-paper-deep hover:text-ink'
+  if (readOnly) return null
+  return (
+    <span
+      className="flex flex-none items-center gap-0.5"
+      onClick={(e) => e.stopPropagation()}
+      onDoubleClick={(e) => e.stopPropagation()}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === 'Backspace' || e.key === 'Delete') e.stopPropagation()
+      }}
+    >
+      <Tooltip label={frame.locked ? 'Unlock frame' : 'Lock frame'} side="left">
+        <Button
+          variant="bare"
+          size="icon-sm"
+          className={cn(flag, 'size-5 rounded-[5px]', frame.locked && 'text-ink')}
+          aria-label={frame.locked ? 'Unlock frame' : 'Lock frame'}
+          aria-pressed={frame.locked}
+          onClick={() => toggleFrameFlag(frame, 'locked')}
+        >
+          {frame.locked ? <LockIcon width={12} height={12} /> : <UnlockIcon width={12} height={12} />}
+        </Button>
+      </Tooltip>
+      <Tooltip label={frame.hidden ? 'Show frame' : 'Hide frame'} side="left">
+        <Button
+          variant="bare"
+          size="icon-sm"
+          className={cn(flag, 'size-5 rounded-[5px]', frame.hidden && 'text-ink')}
+          aria-label={frame.hidden ? 'Show frame' : 'Hide frame'}
+          aria-pressed={frame.hidden}
+          onClick={() => toggleFrameFlag(frame, 'hidden')}
+        >
+          {frame.hidden ? <EyeOffIcon width={12} height={12} /> : <EyeIcon width={12} height={12} />}
+        </Button>
+      </Tooltip>
+    </span>
+  )
+}
+
+/* Lock and visibility are two more frame properties, so they save like any
+   other frame edit: the row flips at once, the write follows, and the pair
+   lands in undo with everything else. The row's own copy is the version the
+   write preconditions on — someone else's newer frame refuses the toggle
+   rather than have it flipped out from under them. */
+function toggleFrameFlag(frame: Frame, key: 'locked' | 'hidden') {
+  const before = key === 'locked' ? { locked: frame.locked } : { hidden: frame.hidden }
+  const after = key === 'locked' ? { locked: !frame.locked } : { hidden: !frame.hidden }
+  recordUpdate(frame.id, before, after)
+  useStore.getState().patchFrameLocal(frame.id, after)
+  api
+    .updateFrame(frame.id, after, { expectedUpdatedAt: frame.updatedAt })
+    .then(noteOwnWrite)
+    .catch((err: unknown) => {
+      const conflict = caughtStaleWrite(err)
+      if (conflict) console.error(conflict.error)
+    })
+}
+
+/* The row's name lives on the element itself, so renaming is an html edit
+   like duplicate or delete: it saves through the frame and lands in undo. */
+function renameLayer(frame: Frame, selector: string, name: string) {
+  const html = renameElement(frame.html, selector, name)
+  if (html === null) return
+  const outer = elementHtml(html, selector)
+  if (outer !== null) replaceLayerHtml(frame, selector, outer)
 }
 
 function NodeRow({
@@ -404,7 +611,10 @@ function NodeRow({
   onActivate: () => void
 }) {
   const { frame, node } = row
+  const readOnly = useStore(isReadOnly)
   const hasChildren = node.children.length > 0
+  /* the row being renamed swaps its label for the field */
+  const [renaming, setRenaming] = useState(false)
   return (
     <ContextMenu>
       <ContextMenuTrigger asChild>
@@ -413,10 +623,24 @@ function NodeRow({
           caret={<Caret open={row.open} present={hasChildren} />}
           onCaret={hasChildren ? onToggle : undefined}
           icon={<LayerKindIcon kind={node.kind} />}
-          label={node.label}
-          detail={node.detail}
+          label={
+            renaming ? (
+              <InlineRename
+                initial={node.label}
+                onCommit={(name) => {
+                  setRenaming(false)
+                  if (name !== node.label) renameLayer(frame, node.selector, name)
+                }}
+                onCancel={() => setRenaming(false)}
+              />
+            ) : (
+              node.label
+            )
+          }
+          detail={renaming ? undefined : node.detail}
           selected={selected}
           onClick={onActivate}
+          onDoubleClick={readOnly ? undefined : () => setRenaming(true)}
           onContextMenu={onActivate}
         />
       </ContextMenuTrigger>
@@ -432,14 +656,63 @@ function NodeRow({
         <ContextMenuItem onSelect={() => navigator.clipboard.writeText(node.selector).catch(console.error)}>
           Copy selector
         </ContextMenuItem>
-        <ContextMenuItem onSelect={() => duplicateLayer(frame, node.selector)}>Duplicate</ContextMenuItem>
-        <ContextMenuSeparator />
-        <ContextMenuItem tone="danger" onSelect={() => deleteLayer(frame, node.selector)}>
-          Delete element
-          <MenuHint>⌫</MenuHint>
-        </ContextMenuItem>
+        {/* Rename, Duplicate and Delete all rewrite the frame's html; a viewer
+            keeps the two copies and is offered none of them */}
+        {!readOnly && (
+          <>
+            <ContextMenuItem onSelect={() => setRenaming(true)}>Rename</ContextMenuItem>
+            <ContextMenuItem onSelect={() => duplicateLayer(frame, node.selector)}>Duplicate</ContextMenuItem>
+            <ContextMenuSeparator />
+            <ContextMenuItem tone="danger" onSelect={() => deleteLayer(frame, node.selector)}>
+              Delete element
+              <MenuHint>⌫</MenuHint>
+            </ContextMenuItem>
+          </>
+        )}
       </ContextMenuContent>
     </ContextMenu>
+  )
+}
+
+/** Renaming happens in the row: the field replaces the label, ↵ or a click
+ *  away commits it. Escape drops the edit, and its own blur must not then
+ *  commit what Escape just discarded. */
+function InlineRename({
+  initial,
+  onCommit,
+  onCancel,
+}: {
+  initial: string
+  onCommit: (name: string) => void
+  onCancel: () => void
+}) {
+  const [draft, setDraft] = useState(initial)
+  const cancelled = useRef(false)
+  const ref = useRef<HTMLInputElement>(null)
+  useEffect(() => ref.current?.select(), [])
+  return (
+    <Input
+      ref={ref}
+      variant="bare"
+      inputSize="auto"
+      autoFocus
+      className="h-[22px] w-full rounded-[5px] border border-ink bg-paper px-1 font-mono text-[11.5px] md:text-[11.5px]"
+      value={draft}
+      aria-label="Layer name"
+      onClick={(e) => e.stopPropagation()}
+      onChange={(e) => setDraft(e.target.value)}
+      onKeyDown={(e) => {
+        e.stopPropagation()
+        if (e.key === 'Enter') onCommit(draft.trim())
+        if (e.key === 'Escape') {
+          cancelled.current = true
+          onCancel()
+        }
+      }}
+      onBlur={() => {
+        if (!cancelled.current) onCommit(draft.trim())
+      }}
+    />
   )
 }
 
@@ -451,7 +724,8 @@ type RowProps = Omit<HTMLAttributes<HTMLDivElement>, 'onClick'> & {
   caret: ReactNode
   onCaret?: () => void
   icon: ReactNode
-  label: string
+  /** the row's name; a renaming row swaps in the field */
+  label: ReactNode
   detail?: string
   selected: boolean
   trailing?: ReactNode

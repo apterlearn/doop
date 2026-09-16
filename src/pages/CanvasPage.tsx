@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { useStore } from '../lib/store'
+import { isReadOnly, useStore, visibleFrames } from '../lib/store'
 import { connect, disconnect, sendWs } from '../lib/ws'
 import {
   api,
@@ -10,6 +10,7 @@ import {
   type InstallationRepo,
   type RepoManifest,
   type RepoScreen,
+  type StaleFrameConflict,
   type SyncKeyInfo,
 } from '../lib/api'
 import { navigate } from '../App'
@@ -24,8 +25,12 @@ import { ConnectModal } from '../components/ConnectModal'
 import { SideRail } from '../components/SideRail'
 import { LayersPanel, LayersRailToggle } from '../components/LayersPanel'
 import { Onboarding } from '../components/Onboarding'
+import { GuestBar } from '../components/GuestBar'
 import { ShareModal } from '../components/ShareModal'
 import { PresentMode } from '../components/PresentMode'
+import { requestFrameEdit } from '../lib/frameRuntime'
+import { FindReplaceModal } from '../components/FindReplaceModal'
+import { ShortcutSheet } from '../components/ShortcutSheet'
 import { BrainIcon } from '../components/BrainIcon'
 import { getIdentity, setName } from '../lib/identity'
 import {
@@ -36,7 +41,18 @@ import {
   pasteImagesCentered,
   stageCenterWorld,
 } from '../lib/frameClipboard'
-import { clearHistory, deleteFramesTracked, recordCreate, redo, undo } from '../lib/history'
+import {
+  caughtStaleWrite,
+  clearHistory,
+  deleteFramesTracked,
+  noteOwnWrite,
+  recordCreate,
+  recordUpdates,
+  redo,
+  trackSave,
+  undo,
+} from '../lib/history'
+import { moveFrameInStack, type ZDir } from '../lib/frameOrder'
 import { authClient } from '../lib/auth'
 import { posthog } from '../lib/posthog'
 import { useIsMobile } from '../hooks/use-mobile'
@@ -51,6 +67,7 @@ import {
   PulseIcon,
   ShieldIcon,
   SparkIcon,
+  TextIcon,
 } from '../components/ui/icons'
 import { Badge } from '../components/ui/badge'
 import { Input } from '../components/ui/input'
@@ -83,15 +100,62 @@ const STARTER_HTML = `<!doctype html>
 </body>
 </html>`
 
+/* The text tool's frame: one text block, sized like the line of type it starts
+   as, and the caret lands in it (see addTextFrame). The block holds a word
+   because the runtime only makes an element with its own text editable — an
+   empty div would be a frame nothing could be typed into. */
+const TEXT_PRESET = { width: 320, height: 60 }
+
+const TEXT_STARTER_HTML = `<!doctype html>
+<html>
+<head>
+<style>
+  * { margin: 0; box-sizing: border-box; }
+  body { font-family: system-ui, sans-serif; background: #fafafa; }
+</style>
+</head>
+<body>
+  <div style="width: 320px; height: 60px; padding: 8px 10px; font-size: 16px; line-height: 1.4; color: #1c1a15;">Type something…</div>
+</body>
+</html>`
+
 /* Small captions the import flow repeats under its fields. */
 const importNoteCls = 'mt-2.5 text-[11.5px] leading-[1.4] text-ink-faint'
 const errorNoteCls = 'mt-2.5 text-[13px] text-accent-ink'
 
-export function CanvasPage({ canvasId }: { canvasId: string }) {
+/* Arrow-key nudge: a pixel, or a ⇧-held grid step — see the frame shortcut
+   handler below, which is the only reader. */
+const NUDGE: Record<string, [number, number]> = {
+  ArrowUp: [0, -1],
+  ArrowDown: [0, 1],
+  ArrowLeft: [-1, 0],
+  ArrowRight: [1, 0],
+}
+
+/* ⇧ prints the brace pair on a US layout, and a ⌘-held chord may still hand
+   back the unshifted key depending on the platform — so both spellings mean
+   the same direction: ⌘] forward, ⌘[ backward, ⇧ to jump the whole way. */
+const Z_STEP: Record<string, [ZDir, ZDir]> = {
+  ']': ['forward', 'front'],
+  '}': ['forward', 'front'],
+  '[': ['backward', 'back'],
+  '{': ['backward', 'back'],
+}
+
+/** `onSignIn` is set only on the share-link path: it is how a read-only
+ *  visitor swaps the canvas for the sign-in form without losing the URL, so
+ *  the same canvas is there (editable, this time) once they have an account. */
+export function CanvasPage({ canvasId, onSignIn }: { canvasId: string; onSignIn?: () => void }) {
   const canvas = useStore((s) => s.canvas)
   const reviewMode = useStore((s) => s.reviewMode)
   const { data: session } = authClient.useSession()
   const isOwner = !!canvas?.ownerId && canvas.ownerId === session?.user?.id
+  /* A share-link visitor (and an admin's borrowed "view as" session) reads
+     this canvas: no create, no edit, no review switches. One flag from the
+     store gates every affordance below, so there is a single place to audit
+     rather than a check per control. */
+  const readOnly = useStore(isReadOnly)
+  const guest = useStore((s) => s.guest)
   const connected = useStore((s) => s.connected)
   const presences = useStore((s) => s.presences)
   const selectedId = useStore((s) => s.selectedId)
@@ -101,6 +165,11 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
   const [showConnect, setShowConnect] = useState(false)
   const [showShare, setShowShare] = useState(false)
   const [presenting, setPresenting] = useState(false)
+  const [showFindReplace, setShowFindReplace] = useState(false)
+  const [showShortcuts, setShowShortcuts] = useState(false)
+  /* the page the find-and-replace sweep is scoped to, and its name for the
+     modal's scope line; unset on a canvas that has no pages yet */
+  const activePageId = useStore((s) => s.activePageId)
   /* returning from a GitHub App install: the setup redirect appends a signed
      pass — pull it off the URL and open the import modal on the repo picker */
   const [ghInstallPass, setGhInstallPass] = useState<string | null>(() => {
@@ -129,7 +198,11 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
   }, [canvas, canvasId])
 
   useEffect(() => {
-    connect(canvasId)
+    /* a share-link visitor has no session cookie for the room to check, so
+       the link's ticket rides the join and the room takes them as a reader.
+       Read from the store rather than the render closure: App only mounts
+       this page once the guest session is in place. */
+    connect(canvasId, useStore.getState().guest?.ticket)
     return () => {
       disconnect()
       useStore.getState().setCanvas(null)
@@ -148,28 +221,114 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
     function onKey(e: KeyboardEvent) {
       const t = e.target as HTMLElement
       if (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable) return
+      /* `?` — ⇧/ — open the cheat sheet: a reading aid, so it is the one
+         shortcut a read-only visitor keeps */
+      if (e.key === '?' && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        e.preventDefault()
+        setShowShortcuts((open) => !open)
+        return
+      }
+      /* Read-only (a share-link visitor, or an admin's "view as") has no
+         writes at all: every branch below ends in one. Esc still clears the
+         selection, which is navigation, and the Stage keeps its own pan and
+         zoom keys. */
+      if (readOnly) {
+        if (e.key === 'Escape') select(null)
+        return
+      }
       const selectedIds = useStore.getState().selectedIds
       if ((e.key === 'Delete' || e.key === 'Backspace') && selectedIds.length) {
         e.preventDefault()
         const frames = useStore.getState().canvas?.frames.filter((f) => selectedIds.includes(f.id)) ?? []
         deleteFramesTracked(frames)
       }
+      /* arrows nudge the selection (⇧ moves a grid step). A locked frame never
+         moves; a selection that is entirely locked falls through untouched. */
+      const nudge = NUDGE[e.key]
+      if (nudge && !e.metaKey && !e.ctrlKey && !e.altKey && selectedIds.length) {
+        const frames = useStore.getState().canvas?.frames.filter((f) => selectedIds.includes(f.id) && !f.locked) ?? []
+        if (frames.length) {
+          e.preventDefault()
+          const step = e.shiftKey ? 10 : 1
+          const dx = nudge[0] * step
+          const dy = nudge[1] * step
+          const updates: {
+            frameId: string
+            before: { x: number; y: number }
+            after: { x: number; y: number }
+            base: number
+          }[] = frames.map((f) => {
+            const after = { x: f.x + dx, y: f.y + dy }
+            useStore.getState().patchFrameLocal(f.id, after)
+            return { frameId: f.id, before: { x: f.x, y: f.y }, after, base: f.updatedAt }
+          })
+          /* the whole selection is one undo step, the way a group drag is */
+          recordUpdates(updates)
+          /* each write preconditions on the frame it was nudged from: one that
+             moved under somebody else's hand stays where they put it and the
+             refusal is reported, rather than being dragged back into line */
+          for (const u of updates) {
+            trackSave(
+              api
+                .updateFrame(u.frameId, u.after, { expectedUpdatedAt: u.base })
+                .then(noteOwnWrite)
+                .catch((err: unknown) => {
+                  const conflict = caughtStaleWrite(err)
+                  if (conflict) showToast(conflict.error)
+                }),
+            )
+          }
+        }
+      }
       if (e.key === 'Escape') select(null)
       if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === 'z') {
         e.preventDefault()
-        if (e.shiftKey) void redo()
-        else void undo()
+        void replayStep(e.shiftKey ? redo() : undo())
         return
       }
       if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'y') {
         e.preventDefault()
-        void redo()
+        void replayStep(redo())
+        return
+      }
+      /* ⌘F: find and replace across the canvas. Ahead of the bare `f` below,
+         which would otherwise read the shortcut as "new frame". */
+      if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'f') {
+        e.preventDefault()
+        setShowShortcuts(false)
+        setShowFindReplace(true)
         return
       }
       if (e.key.toLowerCase() === 'f') {
         e.preventDefault()
         void addFrame({ width: 640, height: 480 })
         return
+      }
+      /* T: a frame with a text block in it, already in edit mode — the bare
+         key, the way F makes an empty frame. Modifiers are excluded so the
+         chord never doubles as the browser's own new-tab. */
+      if (e.key.toLowerCase() === 't' && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        e.preventDefault()
+        void addTextFrame()
+        return
+      }
+      /* ⌘A: everything on the page being viewed, not the frames parked on
+         other pages of the same canvas */
+      if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'a') {
+        e.preventDefault()
+        const ids = visibleFrames(useStore.getState()).map((f) => f.id)
+        if (ids.length) useStore.getState().selectMany(ids)
+        return
+      }
+      /* ⌘] / ⌘[: restack the primary selection — one slot, or ⇧ for the end
+         of the stack. The chord is ours either way, so the browser never
+         reads it as forward/back. */
+      const zStep = (e.metaKey || e.ctrlKey) && !e.altKey ? Z_STEP[e.key] : undefined
+      if (zStep) {
+        e.preventDefault()
+        const s = useStore.getState()
+        const frame = s.canvas?.frames.find((f) => f.id === s.selectedId)
+        if (frame) void moveFrameInStack(frame, e.shiftKey ? zStep[1] : zStep[0])
       }
       if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey) {
         /* ⌘C and ⌘D act on the whole selection */
@@ -181,19 +340,23 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
           duplicateFrames(frames)
         }
       }
+      /* ? — ⇧/ — opens the cheat sheet; handled at the top of this listener,
+         ahead of the read-only gate */
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [canvasId]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [canvasId, readOnly]) // eslint-disable-line react-hooks/exhaustive-deps
 
   /* ⌘V lands here as a real paste event: clipboard images upload and drop in
      as frames; otherwise a copied frame (⌘C) pastes centered. Handled on
      'paste' rather than keydown so the browser hands us the clipboard bytes
-     without a permission prompt. */
+     without a permission prompt. A read-only visitor keeps the browser's own
+     paste behaviour instead: both branches below are frame writes. */
   useEffect(() => {
     function onPaste(e: ClipboardEvent) {
       const t = e.target as HTMLElement
       if (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable) return
+      if (readOnly) return
       const images = [...(e.clipboardData?.files ?? [])].filter((f) => f.type.startsWith('image/'))
       if (images.length) {
         e.preventDefault()
@@ -208,11 +371,22 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
     }
     window.addEventListener('paste', onPaste)
     return () => window.removeEventListener('paste', onPaste)
-  }, [canvasId])
+  }, [canvasId, readOnly])
 
   function showToast(msg: string) {
     setToast(msg)
     window.setTimeout(() => setToast(null), 2000)
+  }
+
+  /** One undo or redo, and the one refusal worth words: the frame it would put
+   *  back had moved on since (someone else's edit, an agent's stream), so the
+   *  server left it alone and history kept the entry on the stack. The frame
+   *  was repainted from the server's copy on the way here, so naming the frame
+   *  and who moved it is the whole of the catch-up — try the same undo again
+   *  and it lands. */
+  async function replayStep(step: Promise<StaleFrameConflict | undefined>) {
+    const conflict = await step
+    if (conflict) showToast(conflict.error)
   }
 
   /* a pending Memory suggestion gets its own toast beside the side panel;
@@ -310,7 +484,14 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
     }
   }, [latestDecision])
 
-  async function addFrame(preset?: { width: number; height: number }) {
+  async function addFrame(preset?: { width: number; height: number }, html = STARTER_HTML) {
+    /* one gate for every "new frame" entry point — the F key, the toolbar's
+       + Frame, the Layers rail's, and the Stage's own preset strip. A
+       read-only visitor gets the reason rather than a dead button. */
+    if (readOnly) {
+      showToast('Sign in to add frames to this canvas')
+      return null
+    }
     const s = useStore.getState()
     const n = (canvas?.frames.length ?? 0) + 1
     /* a preset lands centered in the view on the page being watched; without
@@ -327,7 +508,7 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
     try {
       const frame = await api.createFrame(canvasId, {
         name: `Frame ${n}`,
-        html: STARTER_HTML,
+        html,
         ...preset,
         ...centered,
         ...(pageId ? { pageId } : {}),
@@ -335,12 +516,24 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
       posthog.capture('frame_created')
       recordCreate(frame)
       select(frame.id)
+      return frame
     } catch (err) {
       /* an unhandled rejection here was a silent no-op: the button looked
          broken rather than the request having failed */
       console.error(err)
       showToast('Couldn’t create the frame — try again')
+      return null
     }
+  }
+
+  /* The text tool: the frame T and the toolbar's Text make is the ordinary one
+     with a text starter in it, asked to open already in edit mode. The request
+     goes through frameRuntime's queue rather than a prop, because the FrameView
+     that consumes it is mounted by Stage — a prop would drag a component this
+     change does not own into it. */
+  async function addTextFrame() {
+    const frame = await addFrame(TEXT_PRESET, TEXT_STARTER_HTML)
+    if (frame) requestFrameEdit(frame.id)
   }
 
   const me = getIdentity()
@@ -397,23 +590,29 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
               reconnecting…
             </Badge>
           )}
+          {guest && <GuestBar className="ml-1.5" onSignIn={onSignIn} />}
         </div>
         <div className="ml-auto flex items-center gap-2.5 max-md:hidden">
-          <Button
-            variant="bare"
-            className="h-8 px-2.5 text-[12.5px] font-medium"
-            onClick={() => setShowImport(true)}
-            title="Import a live web page as a frame"
-          >
-            <ImportIcon className="size-[13px]" />
-            Import
-          </Button>
-          <BarDivider />
+          {!readOnly && (
+            <>
+              <Button
+                variant="bare"
+                className="h-8 px-2.5 text-[12.5px] font-medium"
+                onClick={() => setShowImport(true)}
+                title="Import a live web page as a frame"
+              >
+                <ImportIcon className="size-[13px]" />
+                Import
+              </Button>
+              <BarDivider />
+            </>
+          )}
           <div className="flex items-center px-0.5" title={others.map((p) => p.name).join(', ') || 'Just you here'}>
             <Button
               variant="bare"
-              className="p-0 hover:bg-transparent"
-              title={`You are “${me.name}” — click to change your name`}
+              className="p-0 hover:bg-transparent disabled:opacity-100"
+              title={readOnly ? 'You are reading this canvas' : `You are “${me.name}” — click to change your name`}
+              disabled={readOnly}
               onClick={() => setRenaming(true)}
             >
               <Avatar name={me.name} kind="user" stacked />
@@ -423,7 +622,26 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
             ))}
           </div>
           <BarDivider />
-          <Tooltip label={selectedId ? 'Present this frame' : 'Select a frame to present'} side="bottom">
+          {/* the toolbar's other frame tool: the same starter T makes, in the
+              one place a pointer-only user can reach it. Hidden for a
+              read-only viewer with every other write. */}
+          {!readOnly && (
+            <Tooltip label="Text frame — a frame with a text block, ready to type (T)" side="bottom">
+              <Button
+                variant="ghost"
+                size="icon"
+                className="size-[34px] rounded-[7px] bg-surface hover:border-ink-faint hover:bg-paper-deep"
+                aria-label="New text frame"
+                onClick={() => void addTextFrame()}
+              >
+                <TextIcon className="size-3.5" />
+              </Button>
+            </Tooltip>
+          )}
+          <Tooltip
+            label={selectedId ? 'Present this page — step through its frames with ←/→' : 'Select a frame to present'}
+            side="bottom"
+          >
             <Button
               variant="ghost"
               size="icon"
@@ -435,54 +653,61 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
               <PlayIcon className="size-3.5" />
             </Button>
           </Tooltip>
-          <Tooltip
-            label={
-              isOwner
-                ? reviewMode
-                  ? 'Review mode is on — agent changes need your approval. Click to turn it off'
-                  : 'Review mode — agent changes wait for your approval'
-                : `Review mode is ${reviewMode ? 'on' : 'off'} — only the canvas owner can change it`
-            }
-            side="bottom"
-          >
-            <Button
-              variant="ghost"
-              size="icon"
-              className={cn(
-                'size-[34px] rounded-[7px] bg-surface hover:border-ink-faint hover:bg-paper-deep',
-                reviewMode && 'border-brand text-brand hover:border-brand hover:text-brand',
-              )}
-              aria-label="Review mode"
-              aria-pressed={reviewMode}
-              disabled={!isOwner}
-              onClick={() =>
-                api
-                  .setReviewMode(canvasId, !reviewMode)
-                  .then((next) => useStore.getState().setReviewModeLocal(next.reviewMode))
-                  .catch(console.error)
-              }
-            >
-              <ShieldIcon className="size-3.5" />
-            </Button>
-          </Tooltip>
-          <Button
-            variant="ghost"
-            className="h-[34px] rounded-[7px] bg-surface px-[17px] text-[12.5px] font-semibold hover:border-ink-faint hover:bg-paper-deep"
-            onClick={() => setShowShare(true)}
-          >
-            Share
-          </Button>
-          <Button
-            variant="primary"
-            className="h-[34px] rounded-[7px] px-[13px] text-[12.5px]"
-            onClick={() => {
-              posthog.capture('agent_connection_opened')
-              setShowConnect(true)
-            }}
-          >
-            <SparkIcon className="size-3" />
-            Connect AI
-          </Button>
+          {/* Review mode changes what the canvas accepts from agents, so it is
+              a write like any other: hidden rather than disabled for a
+              read-only visitor, who has no path to permission either. */}
+          {!readOnly && (
+            <>
+              <Tooltip
+                label={
+                  isOwner
+                    ? reviewMode
+                      ? 'Review mode is on — agent changes need your approval. Click to turn it off'
+                      : 'Review mode — agent changes wait for your approval'
+                    : `Review mode is ${reviewMode ? 'on' : 'off'} — only the canvas owner can change it`
+                }
+                side="bottom"
+              >
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className={cn(
+                    'size-[34px] rounded-[7px] bg-surface hover:border-ink-faint hover:bg-paper-deep',
+                    reviewMode && 'border-brand text-brand hover:border-brand hover:text-brand',
+                  )}
+                  aria-label="Review mode"
+                  aria-pressed={reviewMode}
+                  disabled={!isOwner}
+                  onClick={() =>
+                    api
+                      .setReviewMode(canvasId, !reviewMode)
+                      .then((next) => useStore.getState().setReviewModeLocal(next.reviewMode))
+                      .catch(console.error)
+                  }
+                >
+                  <ShieldIcon className="size-3.5" />
+                </Button>
+              </Tooltip>
+              <Button
+                variant="ghost"
+                className="h-[34px] rounded-[7px] bg-surface px-[17px] text-[12.5px] font-semibold hover:border-ink-faint hover:bg-paper-deep"
+                onClick={() => setShowShare(true)}
+              >
+                Share
+              </Button>
+              <Button
+                variant="primary"
+                className="h-[34px] rounded-[7px] px-[13px] text-[12.5px]"
+                onClick={() => {
+                  posthog.capture('agent_connection_opened')
+                  setShowConnect(true)
+                }}
+              >
+                <SparkIcon className="size-3" />
+                Connect AI
+              </Button>
+            </>
+          )}
         </div>
         <div className="ml-auto hidden items-center gap-1.5 max-md:flex max-xs:order-3">
           <div
@@ -494,18 +719,20 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
               <Avatar key={p.clientId} name={p.name} color={p.color} kind={p.kind} owner={p.owner} stacked />
             ))}
           </div>
-          <Button
-            variant="primary"
-            className="h-[34px] rounded-[7px] px-[13px] text-[12.5px]"
-            onClick={() => {
-              posthog.capture('agent_connection_opened')
-              setShowConnect(true)
-            }}
-          >
-            <SparkIcon className="size-3" />
-            <span className="max-sm:hidden">Connect AI</span>
-            <span className="sm:hidden">AI</span>
-          </Button>
+          {!readOnly && (
+            <Button
+              variant="primary"
+              className="h-[34px] rounded-[7px] px-[13px] text-[12.5px]"
+              onClick={() => {
+                posthog.capture('agent_connection_opened')
+                setShowConnect(true)
+              }}
+            >
+              <SparkIcon className="size-3" />
+              <span className="max-sm:hidden">Connect AI</span>
+              <span className="sm:hidden">AI</span>
+            </Button>
+          )}
           <Tooltip label="Canvas actions" side="bottom" align="end">
             <Button
               variant="ghost"
@@ -648,26 +875,40 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
                 </SheetDescription>
               </div>
               <div className="grid gap-2 p-4">
-                <Button
-                  variant="ghost"
-                  className="h-11 justify-start border-line bg-surface px-4"
-                  onClick={() => {
-                    setShowMobileActions(false)
-                    setShowImport(true)
-                  }}
-                >
-                  ⤓ Import website
-                </Button>
-                <Button
-                  variant="ghost"
-                  className="h-11 justify-start border-line bg-surface px-4"
-                  onClick={() => {
-                    setShowMobileActions(false)
-                    setShowShare(true)
-                  }}
-                >
-                  Share canvas
-                </Button>
+                {!readOnly && (
+                  <>
+                    <Button
+                      variant="ghost"
+                      className="h-11 justify-start border-line bg-surface px-4"
+                      onClick={() => {
+                        setShowMobileActions(false)
+                        setShowImport(true)
+                      }}
+                    >
+                      ⤓ Import website
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      className="h-11 justify-start border-line bg-surface px-4"
+                      onClick={() => {
+                        setShowMobileActions(false)
+                        void addTextFrame()
+                      }}
+                    >
+                      <TextIcon className="size-4" /> Text frame
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      className="h-11 justify-start border-line bg-surface px-4"
+                      onClick={() => {
+                        setShowMobileActions(false)
+                        setShowShare(true)
+                      }}
+                    >
+                      Share canvas
+                    </Button>
+                  </>
+                )}
                 <Button
                   variant="ghost"
                   className="h-11 justify-start border-line bg-surface px-4"
@@ -678,13 +919,15 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
                 >
                   <PulseIcon /> Agents & activity
                 </Button>
-                <Button
-                  variant="ghost"
-                  className="h-11 justify-start px-4 text-ink-soft"
-                  onClick={() => navigate('/settings')}
-                >
-                  Settings
-                </Button>
+                {!readOnly && (
+                  <Button
+                    variant="ghost"
+                    className="h-11 justify-start px-4 text-ink-soft"
+                    onClick={() => navigate('/settings')}
+                  >
+                    Settings
+                  </Button>
+                )}
               </div>
             </SheetContent>
           </Sheet>
@@ -716,10 +959,23 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
         </>
       )}
 
-      {renaming && <RenameSelfModal current={me.name} onClose={() => setRenaming(false)} />}
-      {showConnect && <ConnectModal canvasId={canvasId} onClose={() => setShowConnect(false)} />}
+      {/* Every one of these either writes or needs a session, so a read-only
+          visitor never has them mounted — the buttons that open them are
+          hidden too, and this is the belt to that pair of braces. */}
+      {!readOnly && renaming && <RenameSelfModal current={me.name} onClose={() => setRenaming(false)} />}
+      {!readOnly && showConnect && <ConnectModal canvasId={canvasId} onClose={() => setShowConnect(false)} />}
+      {!readOnly && showFindReplace && (
+        <FindReplaceModal
+          canvasId={canvasId}
+          pageId={activePageId}
+          pageName={canvas?.pages?.find((p) => p.id === activePageId)?.name}
+          onToast={showToast}
+          onClose={() => setShowFindReplace(false)}
+        />
+      )}
+      {showShortcuts && <ShortcutSheet onClose={() => setShowShortcuts(false)} />}
       {presenting && selectedId && <PresentMode frameId={selectedId} onClose={() => setPresenting(false)} />}
-      {showShare && canvas && (
+      {!readOnly && showShare && canvas && (
         <ShareModal
           key={canvas.id}
           canvas={canvas}
@@ -734,7 +990,7 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
           }}
         />
       )}
-      {showImport && (
+      {!readOnly && showImport && (
         <ImportModal
           canvasId={canvasId}
           installPass={ghInstallPass}
@@ -1669,9 +1925,18 @@ const canvasNameCls = 'min-w-0 max-w-[240px] sm:min-w-[60px] sm:max-w-[320px]'
 
 function CanvasName() {
   const canvas = useStore((s) => s.canvas)
+  /* a read-only visitor reads the title, they do not rename it — the field
+     collapses to plain text rather than inviting an edit the server refuses */
+  const readOnly = useStore(isReadOnly)
   const [draft, setDraft] = useState<string | null>(null)
   if (!canvas)
     return <span className={cn(canvasNameCls, 'px-2 py-[5px] font-display text-[15px] font-semibold')}>…</span>
+  if (readOnly)
+    return (
+      <span className={cn(canvasNameCls, 'truncate px-2 py-[5px] font-display text-[15px] font-semibold text-ink')}>
+        {canvas.name}
+      </span>
+    )
   return (
     <Input
       variant="title"

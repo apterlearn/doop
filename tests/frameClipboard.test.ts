@@ -34,7 +34,21 @@ const history = await import('../src/lib/history')
 const clipboard = await import('../src/lib/frameClipboard')
 
 function frame(id: string, x = 0, y = 0, width = 100, height = 100): Frame {
-  return { id, canvasId: 'c1', name: id, html: `<p>${id}</p>`, x, y, width, height } as Frame
+  return {
+    id,
+    canvasId: 'c1',
+    name: id,
+    html: `<p>${id}</p>`,
+    z: 0,
+    locked: false,
+    hidden: false,
+    rotation: 0,
+    opacity: 1,
+    x,
+    y,
+    width,
+    height,
+  } as Frame
 }
 
 function seed(...frames: Frame[]) {

@@ -228,10 +228,19 @@ describe('the design workflow loop', () => {
     expect(judgeCalls[0]?.system).toContain('advisory findings are never blockers')
     expect(judgeCalls[0]?.system).toContain('empty space and not a defect')
 
-    /* the run's own timeline entry belongs to the MCP wrapper, which records
-       exactly one kind: 'tool' event per call — the engine writes none */
-    expect(runLog.getRunEvents(canvasId)).toEqual([])
-    expect(room.filter((entry) => entry.message.type === 'run:event')).toHaveLength(0)
+    /* the engine's own lines: what each attempt is doing as it does it, then
+       how the run ended. The MCP wrapper records its own kind: 'tool' event on
+       top of these — this is about the engine's half. */
+    const events = runLog.getRunEvents(canvasId)
+    expect(events.map((event) => `${event.kind}: ${event.summary}`)).toEqual([
+      'status: the design meets the brief',
+      'status: judge reviewing attempt 2',
+      'status: implementing attempt 2/3',
+      'status: judge reviewing attempt 1',
+      'status: implementing attempt 1/3',
+    ])
+    expect(events[0]?.ok).toBe(true)
+    expect(room.filter((entry) => entry.message.type === 'run:event')).toHaveLength(events.length)
 
     const pinned = actions.getComments(canvasId).filter((comment) => comment.frameId === result.frameId)
     expect(pinned).toHaveLength(1)
@@ -270,10 +279,18 @@ describe('the design workflow loop', () => {
     const implementerCalls = scripted.calls.filter((call) => call.model === scripted.implementer)
     expect(implementerCalls[1]?.prompt).toContain('loosen the spacing')
 
-    /* a failed run reports through the frame comment and its result, and
-       leaves the timeline entry to the wrapper */
-    expect(runLog.getRunEvents(canvasId)).toEqual([])
-    expect(room.filter((entry) => entry.message.type === 'run:event')).toHaveLength(0)
+    /* a failed run reports through the frame comment and its result, and its
+       last line on the timeline is the error that ended it */
+    const events = runLog.getRunEvents(canvasId)
+    expect(events.map((event) => `${event.kind}: ${event.summary}`)).toEqual([
+      'error: still cramped',
+      'status: judge reviewing attempt 2',
+      'status: implementing attempt 2/2',
+      'status: judge reviewing attempt 1',
+      'status: implementing attempt 1/2',
+    ])
+    expect(events[0]?.ok).toBe(false)
+    expect(room.filter((entry) => entry.message.type === 'run:event')).toHaveLength(events.length)
   })
 
   it('refuses a reply the provider cut off at the token budget instead of writing half a document', async () => {
@@ -390,7 +407,7 @@ describe('the design workflow loop', () => {
     expect(scripted.calls.filter((call) => call.model === scripted.judge)).toHaveLength(0)
   })
 
-  it('records no run event of its own when the judge never answers', async () => {
+  it('ends on an error line when the judge never answers', async () => {
     const canvasId = 'c-silent-judge'
     seed(canvasId)
     scripted.replies.implementer.push('<h1>written</h1>')
@@ -412,10 +429,14 @@ describe('the design workflow loop', () => {
     expect(result.issues).toEqual([{ attempt: 1, judgeFeedback: 'judge reply was not valid JSON: ' }])
     /* the design still landed for a human to look at */
     expect(store.getFrame(result.frameId)?.html).toBe('<h1>written</h1>')
-    /* the run's timeline entry is the MCP wrapper's: one kind: 'tool' event
-       per call, and none from the engine */
-    expect(runLog.getRunEvents(canvasId)).toEqual([])
-    expect(room.filter((entry) => entry.message.type === 'run:event')).toHaveLength(0)
+    /* the judge never answered, so the run's last line is the error saying so */
+    const events = runLog.getRunEvents(canvasId)
+    expect(events.map((event) => `${event.kind}: ${event.summary}`)).toEqual([
+      'error: judge reply was not valid JSON:',
+      'status: judge reviewing attempt 1',
+      'status: implementing attempt 1/1',
+    ])
+    expect(room.filter((entry) => entry.message.type === 'run:event')).toHaveLength(events.length)
   })
 
   it('hands the judge the HTML alone when the host has no renderer', async () => {

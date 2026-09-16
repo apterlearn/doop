@@ -122,6 +122,7 @@ import type {
   MemoryReference,
   UserMemory,
   Page,
+  ServerMessage,
 } from '../shared/types.ts'
 import { recordToolCall } from './mcpStats.ts'
 
@@ -236,8 +237,17 @@ function resolveViewport(
 /** A frame write can lose a race two ways: another agent holds the lock, or the
  *  caller's read of the frame is stale. Both are `conflict` — retryable once
  *  the caller re-reads or takes the frame over — and both are structured, so an
- *  agent can branch on them instead of parsing prose. */
+ *  agent can branch on them instead of parsing prose. A frame its human locked
+ *  is the third: no retry helps, so the refusal says whose lock it is and what
+ *  a caller can still do about it. */
 function lockConflict(e: unknown) {
+  if (e instanceof actions.FrameLockedByUserError) {
+    return err('conflict', e.message, {
+      frame_id: e.frameId,
+      holder: 'the user',
+      hint: 'this frame is locked in the editor — ask the human to unlock it, or write to another frame',
+    })
+  }
   if (!(e instanceof frameLocks.FrameLockedError)) return undefined
   const until = new Date(e.holder.expiresAt).toISOString()
   return err('conflict', `frame ${e.holder.frameId} is being edited by ${e.holder.agentName} until ${until}`, {
@@ -507,6 +517,36 @@ Your design's base changed: the HTML you are appending to is no longer what you 
   return result
 }
 
+/** One field out of a bus event's `data`, without trusting the shape of the
+ *  rest: every producer pushes a plain object with its own keys, so a reader
+ *  asking for one of them must not assume the others are there. */
+function eventField(data: unknown, field: string): unknown {
+  if (data === null || typeof data !== 'object' || !(field in data)) return undefined
+  return (data as Record<string, unknown>)[field]
+}
+
+/** A human redirected this agent's run — "use the brand blue", "stop after the
+ *  hero". MCP is pull-based and the endpoint is stateless, so a steer has to
+ *  ride a call the agent is already making: this is the notice that carries it,
+ *  on the first call that lands after the human typed it. Consumed as it is
+ *  handed over — the call that reads a steer is the call it was meant to
+ *  change — and only attached to a result that landed, so a refused call does
+ *  not swallow the instruction. */
+function withSteers<T extends CallToolResult>(result: T, canvasId: string, agentName: string): T {
+  const steers = agentEvents.takeSteers(canvasId, agentName)
+  if (steers.length === 0) return result
+  const lines = steers.map(
+    (steer) => `- ${steer.by} at ${new Date(steer.at).toISOString()}: ${steer.message || '(no message)'}`,
+  )
+  result.content.push({
+    type: 'text' as const,
+    text: `STEERED — a human redirected this run while it was in progress:
+${lines.join('\n')}
+Adjust what you are doing to follow that instruction now. If it changes what you already built, fix it with an ordinary edit rather than starting over silently, and say what you changed in the canvas chat (send_message).`,
+  })
+  return result
+}
+
 /* Rate limits live in server/limits.ts: one definition, enforced here and
    reported by get_capabilities. The hit maps are per connecting user. */
 const uploadHits = new Map<string, number[]>()
@@ -665,6 +705,7 @@ export const MUTATING_TOOLS: Record<string, true> = {
   rename_canvas: true,
   rename_page: true,
   rename_release: true,
+  reorder_frame: true,
   replace_in_frames: true,
   reply_to_comment: true,
   resolve_canvas_proposal: true,
@@ -673,11 +714,13 @@ export const MUTATING_TOOLS: Record<string, true> = {
   resolve_frame_proposals: true,
   restore_release: true,
   revert_frame: true,
+  revert_run: true,
   review_canvas: true,
   review_frame: true,
   run_design_workflow: true,
   run_frame_script: true,
   save_decision: true,
+  send_message: true,
   set_breakpoints: true,
   set_frame_css: true,
   set_frame_html: true,
@@ -761,6 +804,7 @@ export const TOOL_DOMAINS: Record<string, string> = {
   get_guidelines: 'canvas',
   get_job: 'web',
   get_memory: 'discovery',
+  get_messages: 'comments',
   get_motion_context: 'verify',
   get_pull_request_review: 'handoff',
   get_reference: 'canvas',
@@ -798,6 +842,7 @@ export const TOOL_DOMAINS: Record<string, string> = {
   rename_canvas: 'canvas',
   rename_page: 'canvas',
   rename_release: 'canvas',
+  reorder_frame: 'frame',
   replace_in_frames: 'canvas',
   reply_to_comment: 'comments',
   resolve_canvas_proposal: 'review',
@@ -806,6 +851,7 @@ export const TOOL_DOMAINS: Record<string, string> = {
   resolve_frame_proposals: 'review',
   restore_release: 'canvas',
   revert_frame: 'frame',
+  revert_run: 'run',
   review_canvas: 'verify',
   review_frame: 'verify',
   run_design_workflow: 'frame',
@@ -817,6 +863,7 @@ export const TOOL_DOMAINS: Record<string, string> = {
   search_images: 'assets',
   search_inspiration: 'web',
   search_logos: 'assets',
+  send_message: 'comments',
   set_breakpoints: 'canvas',
   set_frame_css: 'frame',
   set_frame_html: 'frame',
@@ -934,7 +981,7 @@ const guidelineSummaryShape = {
 type CanvasViewWithBreakpoints = CanvasView & {
   breakpoints?: { name: string; min_width: number }[]
   review_mode?: boolean
-  link_access?: 'edit' | 'none'
+  link_access?: 'none' | 'view' | 'comment' | 'edit'
 }
 
 const canvasViewShape = {
@@ -952,7 +999,12 @@ const canvasViewShape = {
   breakpoints: z.array(z.object({ name: z.string(), min_width: z.number() })).optional(),
   tokens_present: z.boolean(),
   review_mode: z.boolean().optional(),
-  link_access: z.enum(['edit', 'none']).optional(),
+  link_access: z
+    .enum(['none', 'view', 'comment', 'edit'])
+    .optional()
+    .describe(
+      'What the share link grants an uninvited visitor: none = private, view = read-only, comment = read-only plus element notes, edit = full design access. Invited members are unaffected.',
+    ),
   note: z.string().optional(),
 }
 
@@ -1094,6 +1146,18 @@ function frameSummary(
        (append &download, or .jpg?quality=90 for JPEG) */
     image_url: `${PUBLIC_ORIGIN}/i/${f.id}.png?scale=2`,
   }
+}
+
+/** Where an MCP-authored chat message is announced to the canvas's ws room.
+ *  index.ts owns the room, so it wires this at boot exactly the way it wires
+ *  runLog's and actions' broadcasters; the no-op default keeps the tools
+ *  usable with no room attached (module tests, a worker process). */
+export type CanvasBroadcast = (canvasId: string, message: ServerMessage) => void
+
+let broadcast: CanvasBroadcast = () => {}
+
+export function wireBroadcast(b: CanvasBroadcast): void {
+  broadcast = b
 }
 
 /** What one connected account's session remembers between calls. The
@@ -1443,6 +1507,9 @@ export function buildMcpServer(
     let out = result
     if (typeof record.agent_name === 'string') {
       const canvasId = canvasArgOf(record)
+      /* A human's steer outranks the focus nudge: one is the run being
+         redirected, the other is where someone's cursor is. */
+      if (canvasId) out = withSteers(out, canvasId, record.agent_name)
       if (canvasId) out = withFocusNudge(out, canvasId, session)
     }
     /* A canvas-scoped call is where attribution matters, so an unresolved name
@@ -1496,6 +1563,7 @@ export function buildMcpServer(
     ms: number,
     summary: string,
     result?: CallToolResult,
+    versions?: { beforeVersionId?: string; afterVersionId?: string },
   ) => {
     if (!args || typeof args !== 'object') return
     const record = args as Record<string, unknown>
@@ -1517,7 +1585,97 @@ export function buildMcpServer(
       ms,
       summary: summary.slice(0, 200),
       frameId: runEventFrameId(record, result, ok, WRITE_OPS.has(name)),
+      /* the replay cursor: which versions of that frame this step started from
+         and produced. `revert_run` walks the run's events by these. */
+      ...(versions?.beforeVersionId ? { beforeVersionId: versions.beforeVersionId } : {}),
+      ...(versions?.afterVersionId ? { afterVersionId: versions.afterVersionId } : {}),
     })
+  }
+
+  /**
+   * A human's stop, as this agent's next call sees it.
+   *
+   * MCP is pull-based: a human pressing stop cannot interrupt a call in flight,
+   * so `agentEvents` remembers the stop and this is where it lands — the call
+   * about to run is refused instead, which ends the run the way the human
+   * asked. Consumed as it is delivered (`clearStop`), so the stop that ended
+   * one run never refuses the next one's first call.
+   */
+  const stopRefusal = (args: unknown): CallToolResult | undefined => {
+    if (!args || typeof args !== 'object') return undefined
+    const record = args as Record<string, unknown>
+    if (typeof record.agent_name !== 'string') return undefined
+    /* the canvas this call is about, or the one the session is working — a
+       stopped agent is stopped on any call, not only one that names its canvas */
+    const canvasId = canvasFor(canvasArgOf(record) ?? session.lastCanvasId ?? '')?.id
+    if (!canvasId) return undefined
+    const stop = agentEvents.pendingStop(canvasId, record.agent_name)
+    if (!stop) return undefined
+    agentEvents.clearStop(canvasId, record.agent_name, session.runId)
+    return err('stopped', `this run was stopped by ${stop.by}`, {
+      stopped_by: stop.by,
+      stopped_at: new Date(stop.at).toISOString(),
+      hint: 'the run is over — stop calling tools. Report where you got to with send_message, and wait for a human to tell you what to do next (wait_for_events) before starting anything else.',
+    })
+  }
+
+  /**
+   * The version a frame-writing step started from, read before the handler
+   * runs. `revert_run` needs it to know what the frame looked like before the
+   * run touched it, so this is the caller's half of the replay cursor; the
+   * other half is captured after the call lands.
+   *
+   * Only for a write op that names its frame in the arguments: a frame id that
+   * only exists in the result (create_frame) has no "before" to point at, and a
+   * tool that touches no frame has no version at all.
+   */
+  const beforeVersionOf = async (
+    name: string,
+    args: Record<string, unknown>,
+  ): Promise<{ frameId: string; versionId?: string } | undefined> => {
+    if (!WRITE_OPS.has(name)) return undefined
+    const frameId = runEventFrameId(args, undefined, true, true)
+    if (!frameId) return undefined
+    try {
+      const versionId = await persist.latestFrameVersionId(frameId)
+      return { frameId, ...(versionId ? { versionId } : {}) }
+    } catch {
+      /* a version read that fails must never fail the write it describes */
+      return { frameId }
+    }
+  }
+
+  /** What the write produced, read after it landed — and only then committed
+   *  to the database, so the version row this step created is the one the next
+   *  step reads back as its "before". Without the flush the frame row (and its
+   *  version) would still be sitting in the write-behind debounce, and the step
+   *  would be recorded against a stale version — which `revert_run` would then
+   *  refuse as "someone wrote since". */
+  const afterVersionOf = async (
+    name: string,
+    args: Record<string, unknown>,
+    result: CallToolResult | undefined,
+    before: { frameId: string; versionId?: string } | undefined,
+  ): Promise<{ beforeVersionId?: string; afterVersionId?: string } | undefined> => {
+    if (!before) return undefined
+    /* A streamed frame writes on every chunk and the version history is
+       deliberately debounced through the reveal; the stream's last chunk is
+       where its document is complete, so that is the step worth recording. */
+    if (name === 'append_frame_html' && args.done !== true) return undefined
+    const written = runEventFrameId(args, result, true, true)
+    /* a step whose result names a different frame wrote more than one frame:
+       there is no single before/after pair to record for it */
+    if (written !== before.frameId) return undefined
+    try {
+      await persist.flushFrame(before.frameId)
+      const after = await persist.latestFrameVersionId(before.frameId)
+      /* no new version means the write changed nothing versionable (a rename, a
+         move, a dry run): there is nothing to revert to, so no cursor */
+      if (!after || after === before.versionId) return undefined
+      return { ...(before.versionId ? { beforeVersionId: before.versionId } : {}), afterVersionId: after }
+    } catch {
+      return undefined
+    }
   }
 
   /** The interruption notice rides on any successful call that names a canvas,
@@ -1594,6 +1752,15 @@ export function buildMcpServer(
            that omits the canvas or the name still finds its record. The replay
            is post-processed like the call it replays: the session's
            substitutions are reported again rather than baked into the record. */
+        /* A human's stop ends the run here, before the call can touch anything:
+           a replay included — the run is over either way, and the human asked
+           for it to stop. */
+        const stopped = stopRefusal(args)
+        if (stopped) {
+          recordToolCall(name, false, Date.now() - started, 'stopped')
+          recordRunEvent(name, args, false, Date.now() - started, 'refused: a human stopped the run')
+          return stopped
+        }
         const opKey = opIdOf(name, args)
         if (opKey) {
           const replayed = recall(opIdOwner(name), opKey)
@@ -1604,10 +1771,22 @@ export function buildMcpServer(
             return contextNotices(args, interruptedResult(args, replayed), used, declared)
           }
         }
+        /* Read before the handler runs: the frame's version now is the state
+           this step starts from. */
+        const before = await beforeVersionOf(name, (args ?? {}) as Record<string, unknown>)
         try {
           const result = await (cb as unknown as ToolHandler)(args, extra)
-          recordToolCall(name, !result?.isError, Date.now() - started)
-          recordRunEvent(name, args, !result?.isError, Date.now() - started, resultSummary(result), result)
+          const ok = !result?.isError
+          recordToolCall(name, ok, Date.now() - started)
+          recordRunEvent(
+            name,
+            args,
+            ok,
+            Date.now() - started,
+            resultSummary(result),
+            result,
+            ok ? await afterVersionOf(name, (args ?? {}) as Record<string, unknown>, result, before) : undefined,
+          )
           /* only a result that landed is remembered: a refused write's key
              stays free, so the retry of a failure still runs */
           if (opKey && result && !result.isError) remember(opIdOwner(name), opKey, result)
@@ -3077,6 +3256,43 @@ export function buildMcpServer(
   )
 
   tool(
+    'reorder_frame',
+    {
+      annotations: { readOnlyHint: false, destructiveHint: false },
+      description:
+        'Change where a frame sits in its page’s stack: dir "front" brings it above every other frame, "back" drops it behind them all, "forward"/"backward" move it one slot. A frame’s z is its stacking height (higher paints in front) and stays on the canvas for every viewer, so this is how you fix "the modal is behind the page" without touching the design. Returns the page’s frames front to back.',
+      inputSchema: {
+        frame_id: z.string(),
+        dir: z
+          .enum(['front', 'back', 'forward', 'backward'])
+          .describe('Where the frame ends up: front/back all the way, forward/backward one slot'),
+        agent_name: agentName.optional(),
+      },
+      outputSchema: {
+        ok: z.literal(true),
+        page_id: z.string(),
+        frames: z.array(z.object({ id: z.string(), name: z.string(), z: z.number() })),
+      },
+    },
+    async ({ frame_id, dir, agent_name }) => {
+      const f = frameFor(frame_id)
+      if (!f) return noFrame(frame_id)
+      arrive(f.canvasId, agent_name)
+      const frames = actions.reorderFrame(frame_id, dir, actorFrom(agent_name))
+      if (!frames) return err('not_found', 'could not restack the frame — check the frame id with get_canvas')
+      return withGuidelinesNudge(
+        structured({
+          ok: true as const,
+          page_id: frames[0]?.pageId ?? f.pageId ?? '',
+          frames: frames.map((frame) => ({ id: frame.id, name: frame.name, z: frame.z })),
+        }),
+        f.canvasId,
+        actorFrom(agent_name),
+      )
+    },
+  )
+
+  tool(
     'duplicate_frame',
     {
       annotations: { readOnlyHint: false, destructiveHint: false },
@@ -3161,6 +3377,14 @@ export function buildMcpServer(
           height: source.height,
           html: source.html,
           ...(pageId ? { pageId } : {}),
+          /* the copy carries the original's lock, visibility, rotation and
+             opacity, so it arrives looking and behaving like what was copied;
+             its stacking is fresh, landing at the front of the destination
+             page */
+          locked: source.locked,
+          hidden: source.hidden,
+          rotation: source.rotation,
+          opacity: source.opacity,
         },
         actor,
       )
@@ -3355,6 +3579,117 @@ export function buildMcpServer(
       }
       if (!frame) return noFrame(frame_id)
       return structured({ ok: true as const, frame: frameSummary(frame), restored_from: version_id })
+    },
+  )
+
+  tool(
+    'revert_run',
+    {
+      annotations: { readOnlyHint: false, destructiveHint: true },
+      title: 'Undo everything one run changed',
+      description:
+        'Undo a whole run: every frame that run wrote goes back to the version it held before the run started, so a run that went the wrong way is one call to undo instead of a frame-by-frame walk through get_frame_history. Get run_id from get_run_events. Each restore is an ordinary edit — it lands live for everyone, it is logged, and it can be undone in turn. A frame someone (or something) has written since the run finished is REFUSED and reported in `skipped`, never clobbered; the same is true of a frame another agent holds the edit lock on. Frames the run created are skipped too: there is no version from before the run to go back to, so delete them explicitly if that is what you want.',
+      inputSchema: {
+        canvas_id: z.string(),
+        run_id: z.string().describe('The run to undo, from get_run_events'),
+        agent_name: agentName,
+      },
+      outputSchema: {
+        reverted: z.array(z.object({ frame_id: z.string(), name: z.string() })),
+        skipped: z.array(z.object({ frame_id: z.string(), name: z.string(), reason: z.string() })),
+      },
+    },
+    async ({ canvas_id, run_id, agent_name }) => {
+      const canvas = canvasFor(canvas_id)
+      if (!canvas) return noCanvas(canvas_id)
+      arrive(canvas_id, agent_name)
+      const actor = actorFrom(agent_name)
+      /* newest first, the ring's order; the run is read oldest first below */
+      const events = runLog.getRunEvents(canvas_id, { runId: run_id, limit: RUN_EVENT_SCAN })
+      if (events.length === 0) return err('not_found', `no run with id ${run_id} in this canvas’s recent timeline`)
+
+      /* Two pointers per frame, both from that frame's own steps: the version it
+         held before the run (its EARLIEST step's before — every later step of
+         the same frame points at a state the run itself produced), and the
+         version the run's LAST finished write produced, which is what says
+         whether anyone has written since. A step mid-stream records neither. */
+      const touched = new Set<string>()
+      const before = new Map<string, string>()
+      const produced = new Map<string, string>()
+      for (const event of [...events].reverse()) {
+        if (!event.frameId) continue
+        touched.add(event.frameId)
+        if (event.beforeVersionId && !before.has(event.frameId)) before.set(event.frameId, event.beforeVersionId)
+        if (event.afterVersionId) produced.set(event.frameId, event.afterVersionId)
+      }
+
+      const reverted: { frame_id: string; name: string }[] = []
+      const skipped: { frame_id: string; name: string; reason: string }[] = []
+      for (const frameId of touched) {
+        const name = store.getFrame(frameId)?.name ?? frameId
+        const pre = before.get(frameId)
+        if (!pre) {
+          skipped.push({
+            frame_id: frameId,
+            name,
+            reason:
+              'the run recorded no version from before it touched this frame — a frame the run created, or a stream it never finished',
+          })
+          continue
+        }
+        if (!frameFor(frameId)) {
+          skipped.push({ frame_id: frameId, name, reason: 'the frame no longer exists on this canvas' })
+          continue
+        }
+        const runProduced = produced.get(frameId)
+        if (!runProduced) {
+          skipped.push({
+            frame_id: frameId,
+            name,
+            reason: 'the run recorded no finished write for this frame, so there is no way to tell what it changed',
+          })
+          continue
+        }
+        let newest: string | undefined
+        try {
+          newest = await persist.latestFrameVersionId(frameId)
+        } catch {
+          skipped.push({ frame_id: frameId, name, reason: 'the frame’s version history could not be read' })
+          continue
+        }
+        if (newest !== runProduced) {
+          skipped.push({
+            frame_id: frameId,
+            name,
+            reason: `“${name}” was written after this run finished, so reverting it would discard that work — its current state is no longer the one this run produced`,
+          })
+          continue
+        }
+        let restored: Frame | undefined
+        try {
+          restored = await actions.revertFrame(frameId, pre, actor)
+        } catch (e) {
+          const conflict = lockConflict(e)
+          if (conflict) {
+            /* one locked frame must not throw away the frames already reverted:
+               they are live, and a retry would revert them again */
+            skipped.push({
+              frame_id: frameId,
+              name,
+              reason:
+                'another agent holds the edit lock on this frame — wait for it to expire, or take it over and call revert_frame',
+            })
+            continue
+          }
+          throw e
+        }
+        if (!restored) {
+          skipped.push({ frame_id: frameId, name, reason: 'the version this run started from no longer exists' })
+          continue
+        }
+        reverted.push({ frame_id: frameId, name: restored.name })
+      }
+      return structured({ reverted, skipped })
     },
   )
 
@@ -5035,7 +5370,11 @@ export function buildMcpServer(
   tool(
     'search_images',
     {
-      annotations: { readOnlyHint: true, destructiveHint: false },
+      /* a read of Pexels, but not a free one: it spends the shared quota the
+         whole server draws on, so the hint warns a client. No review policy
+         refuses it: the call fetches a page of results and mutates nothing,
+         so there is no gate here to pass through */
+      annotations: { readOnlyHint: true, destructiveHint: true, openWorldHint: true },
       title: 'Search stock photos',
       description:
         'Search free stock photography (Pexels) and get back candidate photos WITH visual thumbnails — look at them and pick the one that fits the frame\'s mood, palette and crop. Use concrete, scene-level queries ("team collaborating loft office", not "business"). Embed the returned image_url directly in frame HTML (hotlinking is fine and license-safe), or pass it to upload_asset source_url for a permanent copy on this origin. Always write a real alt text.',
@@ -5246,7 +5585,9 @@ export function buildMcpServer(
   tool(
     'generate_image',
     {
-      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+      /* destructive: it spends the account's provider budget and leaves a
+         stored asset behind, so a canvas on the `destructive` policy gates it */
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
       title: 'Generate an image',
       description:
         'Generate images from a prompt through the configured provider and store them as canvas assets with permanent /a/ URLs ready for <img src>. Real imagery beats placeholder tiles; reference_asset_ids (existing canvas assets) steer composition and style. The provider bill follows the connected account, else the server key. Generation takes tens of seconds per image.',
@@ -5279,6 +5620,7 @@ export function buildMcpServer(
     },
     async ({ canvas_id, prompt, size, count, reference_asset_ids, style, agent_name, op_id }) => {
       if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      actions.assertAgentToolAllowed(canvas_id, actorFrom(agent_name), 'generate_image', { destructive: true })
       if (imageProvider() === 'none')
         return err(
           'unsupported',
@@ -5326,7 +5668,9 @@ export function buildMcpServer(
   tool(
     'upload_font',
     {
-      annotations: { readOnlyHint: false, destructiveHint: false },
+      /* destructive: it stores an asset and fetches remote bytes, so a canvas
+         on the `destructive` policy gates it */
+      annotations: { readOnlyHint: false, destructiveHint: true },
       title: 'Upload a font',
       description:
         "Store a font file (woff2/woff/ttf, max 5 MB) as a canvas asset and get back a ready-to-paste @font-face block plus the permanent /a/ URL — put it in set_frame_css or the frame's own <style> and the family renders on the canvas. Exactly one of source_url (remote file) or data (base64) names where the bytes come from.",
@@ -5351,6 +5695,7 @@ export function buildMcpServer(
     },
     async ({ canvas_id, source_url, data, family, weight, style, agent_name, op_id }) => {
       if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      actions.assertAgentToolAllowed(canvas_id, actorFrom(agent_name), 'upload_font', { destructive: true })
       const provided = [source_url, data].filter(Boolean).length
       if (provided !== 1)
         return err('invalid_input', 'provide exactly one of source_url (remote file) or data (base64)')
@@ -5713,6 +6058,11 @@ export function buildMcpServer(
             width: page.width,
             height: page.height,
             html: page.html,
+            z: 0,
+            locked: false,
+            hidden: false,
+            rotation: 0,
+            opacity: 1,
             createdAt: 0,
             updatedAt: 0,
             updatedBy: actor.name,
@@ -6693,7 +7043,8 @@ export function buildMcpServer(
     'update_frame',
     {
       annotations: { readOnlyHint: false, destructiveHint: false },
-      description: 'Update frame metadata: rename it or move/resize it on the canvas.',
+      description:
+        'Update frame metadata: rename it, move/resize it, or change how it presents (stacking z, locked, hidden, rotation degrees, opacity) on the canvas. A frame a human locked refuses name/size/content writes, but its presentation fields still move.',
       inputSchema: {
         frame_id: z.string(),
         name: z.string().max(200).optional(),
@@ -6701,6 +7052,24 @@ export function buildMcpServer(
         y: z.number().min(-1_000_000).max(1_000_000).optional(),
         width: z.number().min(1).max(20_000).optional(),
         height: z.number().min(1).max(20_000).optional(),
+        z: z
+          .number()
+          .int()
+          .min(0)
+          .max(10_000)
+          .optional()
+          .describe(
+            'Stacking height within the frame’s page — higher paints in front. Prefer reorder_frame, which renumbers a whole page densely',
+          ),
+        locked: z.boolean().optional().describe('A locked frame refuses name/size/content writes until it is unlocked'),
+        hidden: z.boolean().optional().describe('Hidden frames stay on the canvas but render nothing'),
+        rotation: z
+          .number()
+          .min(-3600)
+          .max(3600)
+          .optional()
+          .describe('Rotation in degrees, applied as a CSS transform'),
+        opacity: z.number().min(0).max(1).optional().describe('0 = invisible, 1 = fully opaque'),
         expected_updated_at: z
           .string()
           .optional()
@@ -6789,9 +7158,11 @@ export function buildMcpServer(
     'append_frame_html',
     'update_frame',
     'move_frame',
+    'reorder_frame',
     'delete_frame',
     'duplicate_frame',
     'revert_frame',
+    'revert_run',
     'undo_last_change',
     'create_page',
     'rename_page',
@@ -6892,9 +7263,13 @@ export function buildMcpServer(
     const canvas = store.getCanvas(canvasId)
     if (!canvas) throw new Error(`canvas ${canvasId} is gone`)
     const restored: string[] = []
-    /* A frame the batch deleted comes back through createFrame, which mints a
-       new id — the old one went with the frame. Named here so the caller is
-       not left looking for an id that no longer exists. */
+    /* A frame the batch deleted comes back as ITSELF: delete_frame trashes the
+       row instead of dropping it, so the id survives the round trip — and the
+       id is the frame's identity to every comment, version row and agent
+       holding it. Named here only for the frame that is neither live nor in the
+       trash, where nothing kept the id and createFrame has to mint one; the
+       caller is then told which id came back so it is not left looking for the
+       one that is gone. */
     const recreated: { name: string; from: string; to: string }[] = []
 
     /* frames the batch created did not exist before it ran: take them out. The
@@ -6909,10 +7284,27 @@ export function buildMcpServer(
     for (const [id, was] of before.frames) {
       const now = store.getFrame(id)
       if (!now) {
-        const back = actions.createFrame(canvasId, { ...was }, actor)
+        /* The pre-image is what has to come back, not the row in the trash: a
+           batch that edited a frame and then deleted it left the edited copy
+           behind. The trashed row carries what a content rollback does not
+           touch (z, the lock, rotation, opacity), so it is the base the
+           pre-image's fields are written onto; the helper consumes the trash
+           entry, so the frame is not duplicated, and refuses when the id is
+           live — which is the patch path below. `undefined` here means neither
+           live nor trashed, the one case where the id cannot be preserved. */
+        const trashed = store.getTrashedFrame(id)
+        const back = trashed ? store.restoreFrameFromSnapshot({ ...trashed.frame, ...was }, actor.name) : undefined
         if (back) {
+          /* the room saw the delete, so it has to see the frame come back
+             under the same id — the store call is the persistence half only */
+          broadcast(canvasId, { type: 'frame:created', frame: back, actor })
           restored.push(back.id)
-          recreated.push({ name: was.name, from: id, to: back.id })
+          continue
+        }
+        const fresh = actions.createFrame(canvasId, { ...was }, actor)
+        if (fresh) {
+          restored.push(fresh.id)
+          recreated.push({ name: was.name, from: id, to: fresh.id })
         }
         continue
       }
@@ -7090,6 +7482,10 @@ export function buildMcpServer(
         not_rolled_back: z.array(z.number()).optional(),
         rolled_back: z.literal(true).optional(),
         restored: z.array(z.string()).optional(),
+        /* only for a frame the rollback could not bring back under its own id —
+           neither live nor in the trash — so it was created fresh: this is the
+           id it landed with, so the caller is not left holding the one the
+           batch destroyed */
         recreated: z.array(z.object({ name: z.string(), from: z.string(), to: z.string() })).optional(),
         rollback_failed: z.string().optional(),
         dry_run: z.literal(true).optional(),
@@ -7289,7 +7685,7 @@ export function buildMcpServer(
             }
             const back = rollback.recreated.length
               ? ` Frame${rollback.recreated.length === 1 ? '' : 's'} ${rollback.recreated
-                  .map((f) => `“${f.name}” came back as ${f.to} (a deleted frame cannot keep its id)`)
+                  .map((f) => `“${f.name}” came back as ${f.to} (its id could not be preserved)`)
                   .join('; ')}.`
               : ''
             return err(
@@ -7625,6 +8021,147 @@ export function buildMcpServer(
     },
   )
 
+  /* ---- the chat channel: the canvas's work queue ---- */
+
+  /* Chat is where a human tells an agent what to do when there is no element
+     to comment on ("when you're done, the CTA copy is wrong") and where an
+     agent reports back without pinning a note. Unlike a comment it is not
+     anchored to anything, and unlike a question it never blocks: it is a
+     queue, and the agent reads it on its own schedule. */
+
+  /** Does this message reach this agent? A message with no `to` is for
+   *  everyone; one with a `to` is for the agent or the role it names — the
+   *  same resolution the event bus uses (`addressedTo`), so a human who
+   *  @mentions a role in chat and in a comment reaches the same agent.
+   *  Written through the bus helper rather than a second matcher, or the two
+   *  channels would drift. */
+  const messageForMe = (message: { to?: string; at: number }, me: agentEvents.WaiterIdentity): boolean =>
+    agentEvents.addressedTo(
+      { seq: 0, at: message.at, kind: 'comment', ...(message.to ? { targetAgent: message.to } : {}) },
+      me,
+    )
+
+  /** How many messages a read returns unless the caller asks for fewer. */
+  const CHAT_DEFAULT_LIMIT = 50
+
+  tool(
+    'get_messages',
+    {
+      annotations: { readOnlyHint: true, destructiveHint: false },
+      title: 'Read the canvas chat — your work queue',
+      description:
+        'Read the canvas chat: the WORK QUEUE for this canvas. A human posts what they want done here (and answers you here), so an agent that just connected should read it FIRST, before touching any frame, and read it again between tasks. Returns messages addressed to you, to the role you work, or to everyone — oldest first, and never the notes routed to another agent. Pass `since` (the `at` of the last message you read) to get only what is new; it is an epoch-ms cursor, so pass it back verbatim. has_more is true when older unread messages were cut by the limit. Post your own with send_message, and treat a message here exactly like a comment: do the work, then answer in the chat.',
+      inputSchema: {
+        canvas_id: z.string(),
+        since: z
+          .number()
+          .optional()
+          .describe('Epoch-ms cursor: only messages at or after this time (the `at` of the last one you read)'),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(200)
+          .default(CHAT_DEFAULT_LIMIT)
+          .describe('How many messages to return, newest of the window first — default 50, max 200'),
+        role: z
+          .string()
+          .optional()
+          .describe(
+            'The role you are working, as an id or a name (e.g. "a11y" or "Accessibility") — messages addressed to that role reach you. Pass it unless your agent_name is already the role you work.',
+          ),
+        agent_name: agentName,
+      },
+      outputSchema: {
+        messages: z.array(
+          z.object({
+            id: z.string(),
+            author_name: z.string(),
+            author_kind: z.enum(['user', 'agent']),
+            to: z.string().optional(),
+            body: z.string(),
+            at: z.number(),
+          }),
+        ),
+        has_more: z.boolean().describe('Older messages were left out by the limit'),
+      },
+    },
+    async ({ canvas_id, since, limit, role, agent_name }) => {
+      const c = canvasFor(canvas_id)
+      if (!c) return noCanvas(canvas_id)
+      if (agent_name) arrive(canvas_id, agent_name)
+      const wanted = roleFor(role)
+      if (role && !wanted)
+        return err('invalid_input', `no role "${role}" — the roles are ${AGENT_ROLES.map((r) => r.id).join(', ')}`)
+      const me: agentEvents.WaiterIdentity = {
+        agentName: actorFrom(agent_name).name,
+        ...(wanted ? { role: wanted.id } : {}),
+      }
+      const mine = persist
+        .getAgentMessages(canvas_id, { ...(since !== undefined ? { since } : {}) })
+        .filter((m) => messageForMe(m, me))
+      const messages = mine.slice(-limit)
+      return structured({
+        messages: messages.map((m) => ({
+          id: m.id,
+          author_name: m.authorName,
+          author_kind: m.authorKind,
+          ...(m.to ? { to: m.to } : {}),
+          body: m.body,
+          at: m.at,
+        })),
+        has_more: mine.length > messages.length,
+      })
+    },
+  )
+
+  tool(
+    'send_message',
+    {
+      annotations: { readOnlyHint: false, destructiveHint: false },
+      title: 'Post to the canvas chat',
+      description:
+        'Post a message to the canvas chat — how an agent reports back to the humans without pinning a note to an element: a question that is not worth blocking on, what you changed and why, what you need next. Pass `to` to route it (@mention an agent name or a role id like "a11y"); omit it and everyone on the canvas sees it in the chat. The message lands live for every viewer. Use ask_human instead when you need an answer before continuing, and reply_to_comment when answering a note on an element.',
+      inputSchema: {
+        canvas_id: z.string(),
+        body: z.string().min(1).max(4000).describe('The message. Plain text; it renders as one paragraph block.'),
+        to: z
+          .string()
+          .max(60)
+          .optional()
+          .describe(
+            'Route it to an agent name or a role id ("copy", "Accessibility"); omit to address the whole canvas',
+          ),
+        agent_name: agentName,
+      },
+      outputSchema: {
+        ok: z.literal(true),
+        message_id: z.string(),
+        at: z.number(),
+      },
+    },
+    async ({ canvas_id, body, to, agent_name }) => {
+      const c = canvasFor(canvas_id)
+      if (!c) return noCanvas(canvas_id)
+      arrive(canvas_id, agent_name)
+      const actor = actorFrom(agent_name)
+      const message = persist.recordAgentMessage({
+        id: nanoid(10),
+        canvasId: c.id,
+        authorName: actor.name,
+        authorKind: 'agent',
+        authorColor: actor.color,
+        ...(to ? { to } : {}),
+        body,
+        at: Date.now(),
+      })
+      /* the room hears it the same way it hears a human's message, so the chat
+         panel needs no special case for who wrote it */
+      broadcast(c.id, { type: 'agentMessage', message, messageId: message.id })
+      return structured({ ok: true as const, message_id: message.id, at: message.at })
+    },
+  )
+
   /* ---- ask_human: the blocking question ---- */
 
   tool(
@@ -7633,7 +8170,7 @@ export function buildMcpServer(
       annotations: { readOnlyHint: false, destructiveHint: false },
       title: 'Ask the human a question',
       description:
-        'Ask the humans on this canvas a question and WAIT for the answer (up to the wait_seconds you pass). Use it when a request is genuinely ambiguous or implies a destructive choice you cannot settle from the canvas — which palette direction, whether replacing a whole frame is intended, whether to delete something. Pass choices (2–6 short options) when the answer is one of a few directions: the client asks with those options, and the canvas shows them as buttons. When your client supports questions in its own UI the user is asked there and you get the answer directly (status "answered", via "elicitation"); otherwise the question appears live on the canvas and in the Review panel for the humans in the room. Either way the exchange is recorded on the canvas. If the wait expires you get status "open" plus the question id — carry on with your best judgement and check get_answers later, and do not ask the same question twice. Do not use it for information the canvas already answers.',
+        'Ask the humans on this canvas a question and WAIT for the answer (up to the wait_seconds you pass). Use it when a request is genuinely ambiguous or implies a destructive choice you cannot settle from the canvas — which palette direction, whether replacing a whole frame is intended, whether to delete something. Pass choices (2–6 short options) when the answer is one of a few directions: the client asks with those options, and the canvas shows them as buttons. When your client supports questions in its own UI the user is asked there and you get the answer directly (status "answered", via "elicitation"); otherwise the question appears live on the canvas and in the Review panel for the humans in the room. Either way the exchange is recorded on the canvas. If the wait expires you get status "open" plus the question id — carry on with your best judgement and check get_answers later, and do not ask the same question twice. Do not use it for information the canvas already answers. A human who stops or steers the run reaches you here too: the wait returns at once, with status "stopped" (stop working, report, and park in wait_for_events) or with the steer quoted in the result.',
       inputSchema: {
         canvas_id: z.string(),
         text: z
@@ -7785,13 +8322,18 @@ export function buildMcpServer(
       if (!question) return noCanvas(canvas_id)
       actions.markAgentWaiting(canvas_id, actorFrom(agent_name).name, true)
       const remaining = Math.max(0, question.expiresAt - Date.now())
+      /* A stop or a steer has to be able to reach an agent parked on a
+         question: a human who has decided the run should end must not have to
+         wait out the question's timeout to be obeyed. Both arrive here as
+         events, and the question itself is left OPEN — a human may still
+         answer it, and get_answers will show what they said. */
       const events =
         waitMs > 0
           ? await agentEvents.wait(canvas_id, {
               agentName: actorFrom(agent_name).name,
               cursor: 0,
               timeoutMs: Math.min(waitMs, remaining),
-              kinds: ['question_answer'],
+              kinds: ['question_answer', 'stop', 'steer'],
             })
           : []
       const answer = events.find(
@@ -7808,13 +8350,35 @@ export function buildMcpServer(
           answered_by: (question as { answeredBy?: string }).answeredBy,
         })
       }
-      return structured({
-        question_id: question.id,
-        status: 'open' as const,
-        ...(question.choices?.length ? { choices: question.choices } : {}),
-        ...(question.multi ? { multi: true } : {}),
-        hint: 'Nobody answered yet. Continue with your best judgement; check get_answers later for this question_id.',
-      })
+      const stopped = events.find((e) => e.kind === 'stop')
+      if (stopped) {
+        const who = eventField(stopped.data, 'by')
+        const by = typeof who === 'string' && who ? who : 'a human'
+        return structuredWithNudge(
+          { question_id: question.id, status: 'stopped' as const, stopped_by: by },
+          `${by} STOPPED THIS RUN while you were waiting for an answer. Stop working now: do not start new tool calls. Say where you got to with send_message, then park in wait_for_events until a human tells you what to do next.`,
+        )
+      }
+      const steered = events.filter((e) => e.kind === 'steer')
+      return structuredWithNudge(
+        {
+          question_id: question.id,
+          status: 'open' as const,
+          ...(question.choices?.length ? { choices: question.choices } : {}),
+          ...(question.multi ? { multi: true } : {}),
+        },
+        steered.length
+          ? `A human steered this run while you were waiting for an answer: ${steered
+              .map((e) => {
+                const message = eventField(e.data, 'message')
+                const by = eventField(e.data, 'by')
+                return `${typeof by === 'string' ? by : 'a human'} — ${typeof message === 'string' ? message : ''}`
+              })
+              .join(
+                '; ',
+              )}. Follow that instruction. Your question is still open (get_answers later for the answer); judge whether it is still worth asking.`
+          : 'Nobody answered yet. Continue with your best judgement; check get_answers later for this question_id.',
+      )
     },
   )
 
@@ -8785,8 +9349,15 @@ export function buildMcpServer(
       const asset = await assets.getCanvasAsset(canvas_id, asset_id)
       if (!asset) return err('not_found', `no asset with id ${asset_id} on this canvas`)
       /* HTML is the ground truth for what references an asset, so this reads
-         the frames rather than the asset_refs projection */
-      const referencing = await assets.framesReferencingAsset(canvas_id, asset_id)
+         the frames rather than the asset_refs projection — and both views of
+         them: the ledger can name a frame this process has not flushed yet,
+         the live store cannot see another process's frame */
+      const referencing = [
+        ...new Set([
+          ...(await assets.framesReferencingAsset(canvas_id, asset_id)),
+          ...store.framesReferencingAsset(canvas_id, asset_id),
+        ]),
+      ]
       if (referencing.length && !force)
         return err(
           'conflict',
@@ -8820,7 +9391,9 @@ export function buildMcpServer(
   tool(
     'open_pull_request',
     {
-      annotations: { readOnlyHint: false, destructiveHint: false },
+      /* destructive: it writes commits to a real repository and opens a PR
+         under the connected account, so the `destructive` policy gates it */
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
       title: 'Open a pull request with the canvas design',
       description:
         'Hand the design to a developer: write the exported frames (design/<frame-name>.html, its React component, its build spec, the design system and the assets that travel as text) to a branch in a connected GitHub repo and open a pull request. The title and body come from the handoff itself; message overrides the title. Requires a GitHub connection with contents:write and pull_requests:write — check get_capabilities first, github is "none" when no connection is configured. Every non-demo frame on the canvas must hold a CURRENT passing review or the handoff is refused with conflict, naming the frames; run review_canvas to clear them, or force: true to ship an unverified canvas deliberately.',
@@ -8846,6 +9419,7 @@ export function buildMcpServer(
     async ({ canvas_id, repo, branch, base, message, release_id, force, agent_name, op_id }) => {
       const c = canvasFor(canvas_id)
       if (!c) return noCanvas(canvas_id)
+      actions.assertAgentToolAllowed(canvas_id, actorFrom(agent_name), 'open_pull_request', { destructive: true })
       arrive(canvas_id, agent_name)
       const withOp = replayAsync(ownerId ?? '', op_id ?? '', async () => {
         const gated = reviewGate(canvas_id)
@@ -8898,7 +9472,8 @@ export function buildMcpServer(
   tool(
     'update_pull_request',
     {
-      annotations: { readOnlyHint: false, destructiveHint: false },
+      /* destructive: pushes commits to a branch and comments on a real PR */
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
       title: 'Push an update to an open handoff pull request',
       description:
         'Re-commit the canvas onto the branch a previous handoff opened and post a summary comment on its pull request — the "send the client an update" path. The branch defaults to doop/<canvas-id> and the base to the repository connection’s own branch, so a caller that handed off with open_pull_request passes neither. The pull request must already exist for that branch pair; when none does, this refuses with not_found rather than quietly opening one.',
@@ -8923,6 +9498,7 @@ export function buildMcpServer(
     async ({ canvas_id, repo, branch, base, message, release_id, agent_name, op_id }) => {
       const c = canvasFor(canvas_id)
       if (!c) return noCanvas(canvas_id)
+      actions.assertAgentToolAllowed(canvas_id, actorFrom(agent_name), 'update_pull_request', { destructive: true })
       arrive(canvas_id, agent_name)
       const withOp = replayAsync(ownerId ?? '', op_id ?? '', async () => {
         const gated = reviewGate(canvas_id)
@@ -8995,7 +9571,9 @@ export function buildMcpServer(
   tool(
     'comment_pull_request',
     {
-      annotations: { readOnlyHint: false, destructiveHint: false },
+      /* destructive: it posts under the connected account to a real
+         repository's pull request — outside this server's undo */
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
       title: 'Comment on a handoff pull request',
       description:
         'Say something on a pull request this canvas opened: a comment in the conversation, or — with in_reply_to — an answer on one of the inline review comments, which keeps the reply attached to the file and line the reviewer asked about. Read the thread first with get_pull_request_review.',
@@ -9017,6 +9595,7 @@ export function buildMcpServer(
     },
     async ({ canvas_id, repo, pull, body, in_reply_to, agent_name }) => {
       if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      actions.assertAgentToolAllowed(canvas_id, actorFrom(agent_name), 'comment_pull_request', { destructive: true })
       arrive(canvas_id, agent_name)
       try {
         const created = await commentPullRequest({
@@ -9424,6 +10003,11 @@ export function buildMcpServer(
           x: f.x,
           y: f.y,
           html: f.html,
+          z: f.z,
+          locked: f.locked,
+          hidden: f.hidden,
+          rotation: f.rotation,
+          opacity: f.opacity,
           ...(f.pageId ? { pageId: f.pageId } : {}),
         })),
         ...(c.tokens ? { tokens: c.tokens } : {}),
@@ -9591,11 +10175,15 @@ export function buildMcpServer(
       const actor = actorFrom(agent_name)
       const restored: { frame_id: string; name: string; created: boolean }[] = []
       const skipped: { name: string; reason: string }[] = []
-      for (const snapshot of release.frames) {
+      for (const [i, snapshot] of release.frames.entries()) {
         const live = store.getFrame(snapshot.id)
         if (!live) {
           /* through actions, like every other creation: the room has to see
-             the frame appear, and review mode has to be able to refuse it */
+             the frame appear, and review mode has to be able to refuse it.
+             The snapshot's stacking, lock, visibility, rotation and opacity
+             ride along, so a frame that was frozen hidden or rotated comes
+             back that way; a release predating those fields stacks by its own
+             array order. */
           let created: Frame | undefined
           try {
             created = actions.createFrame(
@@ -9606,6 +10194,11 @@ export function buildMcpServer(
                 width: snapshot.width,
                 height: snapshot.height,
                 ...(snapshot.pageId ? { pageId: snapshot.pageId } : {}),
+                z: snapshot.z ?? i,
+                locked: snapshot.locked ?? false,
+                hidden: snapshot.hidden ?? false,
+                rotation: snapshot.rotation ?? 0,
+                opacity: snapshot.opacity ?? 1,
               },
               actor,
             )
@@ -9622,16 +10215,26 @@ export function buildMcpServer(
           restored.push({ frame_id: created.id, name: created.name, created: true })
           continue
         }
-        if (live.html === snapshot.html) {
+        /* a missing field leaves the live frame as it is rather than resetting
+           it to the column default — a release made before the frame model
+           carried these says nothing about them */
+        const next = {
+          html: snapshot.html,
+          name: snapshot.name,
+          width: snapshot.width,
+          height: snapshot.height,
+          z: snapshot.z ?? live.z,
+          locked: snapshot.locked ?? live.locked,
+          hidden: snapshot.hidden ?? live.hidden,
+          rotation: snapshot.rotation ?? live.rotation,
+          opacity: snapshot.opacity ?? live.opacity,
+        }
+        if ((Object.keys(next) as (keyof typeof next)[]).every((k) => live[k] === next[k])) {
           skipped.push({ name: snapshot.name, reason: 'already matches the release' })
           continue
         }
         try {
-          actions.updateFrame(
-            snapshot.id,
-            { html: snapshot.html, name: snapshot.name, width: snapshot.width, height: snapshot.height },
-            actor,
-          )
+          actions.updateFrame(snapshot.id, next, actor)
           restored.push({ frame_id: snapshot.id, name: snapshot.name, created: false })
         } catch (e) {
           const conflict = lockConflict(e)
@@ -9837,14 +10440,18 @@ export function buildMcpServer(
     {
       title: 'Set what the share link grants',
       description:
-        'Set the canvas\'s share-link policy (owner-only). "edit" lets anyone holding the link open and edit the canvas; "none" makes it private to the owner and invited members. Invited members keep access either way.',
+        'Set the canvas\'s share-link policy (owner-only). "view" lets anyone holding the link read the canvas, "comment" adds element notes on top of read-only, "edit" lets them open and edit it, and "none" makes it private to the owner and invited members. Invited members keep their own access either way.',
       annotations: { readOnlyHint: false, destructiveHint: false },
       inputSchema: {
         canvas_id: z.string(),
-        mode: z.enum(['none', 'edit']).describe('"edit" = anyone with the link collaborates, "none" = private'),
+        mode: z
+          .enum(['none', 'view', 'comment', 'edit'])
+          .describe(
+            '"view" = read-only for anyone with the link, "comment" = read-only plus element notes, "edit" = they collaborate, "none" = private',
+          ),
         agent_name: agentName,
       },
-      outputSchema: { ok: z.literal(true), link_access: z.enum(['edit', 'none']) },
+      outputSchema: { ok: z.literal(true), link_access: z.enum(['none', 'view', 'comment', 'edit']) },
     },
     async ({ canvas_id, mode, agent_name }) => {
       const c = canvasFor(canvas_id)
@@ -9852,13 +10459,15 @@ export function buildMcpServer(
       arrive(canvas_id, agent_name)
       const denied = ownerOnly(c, 'change link access')
       if (denied) return denied
-      if (!store.setLinkAccess(canvas_id, mode)) return noCanvas(canvas_id)
+      if (!store.setLink(canvas_id, { access: mode })) return noCanvas(canvas_id)
       /* no canvas:linkAccess wire message exists, so the activity feed is where
          this lands for everyone watching — a policy change is worth a line */
       actions.logActivity(
         canvas_id,
         actorFrom(agent_name),
-        mode === 'edit' ? 'turned on the share link — anyone with it can edit' : 'turned off the share link',
+        mode === 'none'
+          ? 'turned off the share link'
+          : `set the share link so anyone with it can ${mode === 'edit' ? 'edit' : mode === 'comment' ? 'read and comment' : 'read'}`,
       )
       return structured({ ok: true as const, link_access: mode })
     },
@@ -9869,11 +10478,11 @@ export function buildMcpServer(
     {
       title: 'Delete a canvas',
       description:
-        'Permanently delete this canvas with its frames, pages, guides, references and comments (owner-only). Irreversible: pass confirm: true. Take a release first (create_release) if you may need the design again.',
+        'Delete this canvas with its frames, pages, guides, references and comments (owner-only, confirm: true). Nothing is destroyed: the canvas leaves every listing and waits in the owner’s trash, where the owner can restore it until the retention window passes (30 days by default). Take a release first (create_release) if the design may be wanted back sooner — restoring from the trash is not something an agent can do.',
       annotations: { readOnlyHint: false, destructiveHint: true },
       inputSchema: {
         canvas_id: z.string(),
-        confirm: z.literal(true).describe('Must be true — the deletion cannot be undone'),
+        confirm: z.literal(true).describe('Must be true — the canvas moves to the trash instead of being destroyed'),
         agent_name: agentName,
       },
       outputSchema: { ok: z.literal(true), deleted: z.string() },
@@ -9885,7 +10494,10 @@ export function buildMcpServer(
       const denied = ownerOnly(c, 'delete a canvas')
       if (denied) return denied
       if (confirm !== true)
-        return err('invalid_input', 'deleting a canvas is irreversible — pass confirm: true to go ahead')
+        return err(
+          'invalid_input',
+          'deleting a canvas empties it out of every listing — pass confirm: true to go ahead',
+        )
       const name = c.name
       if (!actions.deleteCanvas(canvas_id)) return noCanvas(canvas_id)
       return structured({ ok: true as const, deleted: name })
@@ -9903,7 +10515,7 @@ export function buildMcpServer(
     {
       title: 'Read a run’s timeline',
       description:
-        'The run timeline, newest first: one entry per tool call an agent made on this canvas, with the agent, the outcome and how long it took. Filter to one run with run_id, or read the canvas’s whole recent history. Page with cursor: pass the previous next_offset back as cursor.',
+        'The run timeline, newest first: one entry per step an agent took on this canvas — its tool calls (kind "tool", each with the tool `name`, the outcome `ok`, the duration `ms` and a summary, plus the frame it touched when it wrote one), the status lines it reported (kind "status", e.g. "judge reviewing attempt 2/3"), the failures (kind "error") and the stop that ended a run (kind "stop"). Only "tool" steps carry a `name`; the others carry a `summary` alone. A step that wrote a frame also carries the frame\'s version before and after it (beforeVersionId / afterVersionId) — pass that run to revert_run to undo the whole run in one call. Filter to one run with run_id, or read the canvas’s whole recent history. Page with cursor: pass the previous next_offset back as cursor.',
       annotations: { readOnlyHint: true, destructiveHint: false },
       inputSchema: {
         canvas_id: z.string(),
@@ -9936,6 +10548,9 @@ export function buildMcpServer(
           ...(event.ok !== undefined ? { ok: event.ok } : {}),
           ...(event.ms !== undefined ? { ms: event.ms } : {}),
           ...(event.summary ? { summary: event.summary } : {}),
+          ...(event.frameId ? { frame_id: event.frameId } : {}),
+          ...(event.beforeVersionId ? { before_version_id: event.beforeVersionId } : {}),
+          ...(event.afterVersionId ? { after_version_id: event.afterVersionId } : {}),
         })),
         total_shown: events.length,
         has_more: next < all.length,

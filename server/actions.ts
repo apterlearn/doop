@@ -1,6 +1,7 @@
 import { nanoid } from 'nanoid'
 import { store } from './store.ts'
 import * as persist from './db/persist.ts'
+import * as assets from './assets.ts'
 import * as frameLocks from './frameLocks.ts'
 import * as agentEvents from './agentEvents.ts'
 import * as thumbs from './thumbs.ts'
@@ -29,6 +30,7 @@ import type {
   GuidelineDoc,
   MemoryProposal,
   MemoryReference,
+  Page,
   ServerMessage,
   ReviewPolicy,
   UserMemory,
@@ -267,6 +269,41 @@ function assertUnlocked(frameId: string, actor: Actor) {
   if (holder) throw new frameLocks.FrameLockedError(holder)
 }
 
+/** A frame's content is frozen by its user lock; the write is refused whole
+ *  rather than applied in part. Typed so every caller can answer with the
+ *  frame's name — a 423 over REST, a `conflict` result to an agent — instead
+ *  of parsing prose. */
+export class FrameLockedByUserError extends Error {
+  constructor(
+    readonly frameId: string,
+    readonly frameName: string,
+  ) {
+    super(`frame “${frameName}” is locked`)
+    this.name = 'FrameLockedByUserError'
+  }
+}
+
+/** The fields a user lock protects: content, and the page the frame lives on
+ *  (moving a frame between pages is a write to its document's context, not a
+ *  presentation tweak). Stacking, lock, visibility, rotation and opacity stay
+ *  writable on a locked frame — that is what lets the client that locked it
+ *  still unlock, hide or restack it. */
+const USER_LOCKED_FIELDS = ['name', 'x', 'y', 'width', 'height', 'html', 'pageId'] as const
+
+/** Refuse a content write to a frame the user locked. update_frame is the one
+ *  path that can carry content and presentation together, so the rule lives
+ *  here: a patch that touches any protected field is refused whole, and one
+ *  that touches only the editor fields is what lets the client that locked the
+ *  frame unlock, hide or restack it. The streaming append has no presentation
+ *  half and refuses a locked frame outright, and so do the paths that would
+ *  remove or move one (delete_frame, delete_page, move_frame). */
+function assertUserUnlocked(frame: Frame, patch: Partial<Pick<Frame, (typeof USER_LOCKED_FIELDS)[number]>>) {
+  if (!frame.locked) return
+  for (const key of USER_LOCKED_FIELDS) {
+    if (patch[key] !== undefined) throw new FrameLockedByUserError(frame.id, frame.name)
+  }
+}
+
 export class ReviewModeError extends Error {
   readonly canvasId: string
   /** the tool the caller invoked, so an agent reading the refusal sees the
@@ -301,6 +338,11 @@ const TOOL_NAME = {
   renamePage: 'rename_page',
   deletePage: 'delete_page',
   moveFrameToPage: 'move_frame',
+  reorderFrame: 'reorder_frame',
+  /* the explicit-order write the Layers rail drags through. It has no MCP tool
+     of its own — agents restack one frame at a time with reorder_frame — but
+     the review gate and the approval list still speak a tool name. */
+  setFrameOrder: 'set_frame_order',
   setTokens: 'set_tokens',
   setGuideline: 'set_guidelines',
   recordChatDecision: 'save_decision',
@@ -338,6 +380,19 @@ function assertAgentWriteAllowed(
   const canvas = store.getCanvas(canvasId)
   if (!policyRequiresApproval(canvas, toolName, opts.destructive ?? false)) return
   throw new ReviewModeError(canvasId, toolName, canvas!.reviewMode ? 'all_writes' : (canvas!.reviewPolicy ?? 'off'))
+}
+
+/** The single approval gate: every mutating or side-effecting tool passes
+ *  through here, and a tool's own annotations are declarations a client reads,
+ *  never enforcement. Throws the ReviewModeError the tool wrapper maps to its
+ *  typed refusal. */
+export function assertAgentToolAllowed(
+  canvasId: string,
+  actor: Actor,
+  toolName: string,
+  opts: { destructive?: boolean } = {},
+): void {
+  assertAgentWriteAllowed(canvasId, actor, toolName, opts)
 }
 
 /** Whether the canvas's policy would refuse an agent write through any of
@@ -1086,6 +1141,9 @@ export function appendFrameHtml(
   const before = store.getFrame(frameId)
   if (!before) return undefined
   assertAgentWriteAllowed(before.canvasId, actor, TOOL_NAME.appendFrameHtml)
+  /* an append is content with no presentation half: a user-locked frame
+     refuses it outright */
+  if (before.locked) throw new FrameLockedByUserError(before.id, before.name)
   /* A streaming agent keeps its own lock alive chunk by chunk; a writer who
      holds no lock (the common case) is unaffected. */
   assertUnlocked(frameId, actor)
@@ -1119,6 +1177,7 @@ export function appendFrameHtml(
   if (opts.done) finishStream(frameId, true)
 
   touch(frame.canvasId, actor, frameId)
+  noteFrameWrite(frame.canvasId, actor.name)
   return frame
 }
 
@@ -1135,6 +1194,14 @@ export function createFrame(
     html?: string
     demo?: boolean
     pageId?: string
+    /** presentation a copy or a snapshot restore carries (see store.createFrame):
+     *  omitted fields take the fresh defaults, and an absent `z` lands the
+     *  frame at the front of its page */
+    z?: number
+    locked?: boolean
+    hidden?: boolean
+    rotation?: number
+    opacity?: number
   },
   actor: Actor,
 ): Frame | undefined {
@@ -1159,12 +1226,15 @@ export function createFrame(
 
 export function updateFrame(
   frameId: string,
-  patch: Partial<Pick<Frame, 'name' | 'x' | 'y' | 'width' | 'height' | 'html'>>,
+  patch: Partial<
+    Pick<Frame, 'name' | 'x' | 'y' | 'width' | 'height' | 'html' | 'z' | 'locked' | 'hidden' | 'rotation' | 'opacity'>
+  >,
   actor: Actor,
 ): Frame | undefined {
   const before = store.getFrame(frameId)
   if (!before) return undefined
   assertAgentWriteAllowed(before.canvasId, actor, TOOL_NAME.updateFrame)
+  assertUserUnlocked(before, patch)
   assertUnlocked(frameId, actor)
   frameLocks.refresh(frameId, actor.name)
   if (patch.html !== undefined) patch = { ...patch, html: stripTokenStyle(repairEscapedHtml(patch.html)) }
@@ -1238,6 +1308,7 @@ export function updateFrame(
   }
 
   touch(frame.canvasId, actor, frame.id)
+  noteFrameWrite(frame.canvasId, actor.name)
   return frame
 }
 
@@ -1246,6 +1317,13 @@ export function deleteFrame(frameId: string, actor: Actor): Frame | undefined {
   if (existing) {
     assertAgentWriteAllowed(existing.canvasId, actor, TOOL_NAME.deleteFrame, { destructive: true })
     assertUnlocked(frameId, actor)
+    /* a delete destroys the document as surely as an overwrite does, so a
+       frame its human locked refuses it for the same reason update_frame does */
+    if (existing.locked) throw new FrameLockedByUserError(existing.id, existing.name)
+    /* the snapshot is taken while the frame is still there: "restore the
+       canvas as it was before I deleted this" is the thing a delete needs
+       history for */
+    snapshotCanvas(existing.canvasId, 'delete', actor.name)
   }
   /* close any live stream or playback while the frame still exists,
      so their auto “Designing…” tasks end with it */
@@ -1262,22 +1340,240 @@ export function deleteFrame(frameId: string, actor: Actor): Frame | undefined {
   return frame
 }
 
-/** Remove a canvas with everything attached to it; viewers are told to leave. */
-export function deleteCanvas(canvasId: string): boolean {
-  const c = store.deleteCanvas(canvasId)
-  if (!c) return false
-  for (const f of c.frames) thumbs.purge(f.id)
-  broadcast(canvasId, { type: 'canvas:deleted' })
+/* ------------------------------------------------------------------ */
+/* Canvas history: the snapshots a canvas can be rolled back to.       */
+/*                                                                     */
+/* A snapshot is taken on a cadence (every CANVAS_SNAPSHOT_EVERY        */
+/* durable frame writes), on a delete, on an explicit save and on a     */
+/* restore itself — so the state a restore replaced is recoverable too. */
+/* ------------------------------------------------------------------ */
+
+/** How many durable frame writes one canvas takes before its history is
+ *  snapshotted. Env-tunable so a self-hoster can trade space for granularity. */
+const CANVAS_SNAPSHOT_EVERY = (() => {
+  const raw = Number(process.env.CANVAS_SNAPSHOT_EVERY)
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 25
+})()
+
+/** Freeze the canvas as it stands now into its history: the frames, the tokens
+ *  and who asked. Persisted through the write-through helper and mirrored into
+ *  the store's ring, so the timeline has it before the DB write lands. */
+export function snapshotCanvas(
+  canvasId: string,
+  cause: persist.CanvasVersionCause,
+  by: string,
+): persist.CanvasVersionSummary | undefined {
+  const c = store.getCanvas(canvasId)
+  if (!c) return undefined
+  /* Strictly after the previous snapshot of this canvas. Two snapshots can land
+     in the same millisecond (a delete right after a cadence, two clients
+     hitting "save version" together), and `createdAt` is the only thing that
+     orders the timeline — from it, the DB's newest-first read, and the prune
+     that keeps the newest 50 all have to agree, or the ring could offer a
+     version the prune had already dropped. */
+  const previous = store.getCanvasVersions(canvasId)[0]?.createdAt ?? 0
+  const version: persist.CanvasVersion = {
+    id: nanoid(10),
+    canvasId,
+    cause,
+    frames: persist.freezeFrames(c.frames),
+    ...(c.tokens ? { tokens: c.tokens } : {}),
+    createdAt: Math.max(Date.now(), previous + 1),
+    createdBy: by,
+  }
+  persist.saveCanvasVersion(version)
+  const summary: persist.CanvasVersionSummary = {
+    id: version.id,
+    cause: version.cause,
+    createdAt: version.createdAt,
+    createdBy: version.createdBy,
+    frameCount: version.frames.length,
+  }
+  store.addCanvasVersion(canvasId, summary)
+  return summary
+}
+
+/** Count a durable frame write and snapshot when the cadence comes round.
+ *  Called after the write landed, never from a snapshot: a snapshot writes no
+ *  frame, so the count cannot feed itself. */
+function noteFrameWrite(canvasId: string, by: string) {
+  if (store.countFrameWrite(canvasId) < CANVAS_SNAPSHOT_EVERY) return
+  store.clearFrameWrites(canvasId)
+  snapshotCanvas(canvasId, 'auto', by)
+}
+
+/** Put a snapshot back on the live canvas, as ordinary writes. Frames the
+ *  snapshot holds come back with their ids — the id is the frame's identity to
+ *  every agent and version row holding it, so a missing one is recreated under
+ *  that same id rather than a fresh one. Frames added since the snapshot are
+ *  left alone: a restore is a rollback of what the snapshot knew, never a
+ *  demolition of what came after. The restore records its own snapshot, so the
+ *  state it replaced is one click away. */
+export async function restoreCanvasVersion(
+  canvasId: string,
+  versionId: string,
+  actor: Actor,
+): Promise<{ restored: number; created: number } | undefined> {
+  const c = store.getCanvas(canvasId)
+  if (!c) return undefined
+  const version = await persist.getCanvasVersion(versionId)
+  if (!version || version.canvasId !== canvasId) return undefined
+  let restored = 0
+  let created = 0
+  for (const snapshot of persist.releaseFrames(version)) {
+    const live = store.getFrame(snapshot.id)
+    if (!live) {
+      const revived = store.restoreFrameFromSnapshot(snapshot, actor.name)
+      if (!revived) continue
+      broadcast(canvasId, { type: 'frame:created', frame: revived, actor })
+      restored += 1
+      created += 1
+      continue
+    }
+    const next = {
+      name: snapshot.name,
+      x: snapshot.x,
+      y: snapshot.y,
+      width: snapshot.width,
+      height: snapshot.height,
+      html: snapshot.html,
+      z: snapshot.z,
+      locked: snapshot.locked,
+      hidden: snapshot.hidden,
+      rotation: snapshot.rotation,
+      opacity: snapshot.opacity,
+      /* a snapshot with no page leaves the live frame's page alone rather than
+         clearing it — the same rule the release-restore route documents for a
+         field a snapshot predates */
+      ...(snapshot.pageId ? { pageId: snapshot.pageId } : {}),
+    }
+    const changed = (Object.keys(next) as (keyof typeof next)[]).some((k) => live[k] !== next[k])
+    if (!changed) continue
+    /* straight through the store: a restore is a repair of the whole canvas, so
+       it deliberately does not run the per-frame write gates (a frame locked
+       since the snapshot is part of what is being rolled back), and it
+       announces itself once below rather than once per frame */
+    const updated = store.updateFrame(snapshot.id, next, actor.name)!
+    broadcast(canvasId, { type: 'frame:updated', frame: updated, actor })
+    restored += 1
+  }
+  if (version.tokens) store.setTokens(canvasId, version.tokens, actor.name)
+  snapshotCanvas(canvasId, 'restore', actor.name)
+  logActivity(canvasId, actor, `restored a version from ${new Date(version.createdAt).toLocaleString()}`)
+  return { restored, created }
+}
+
+/* ------------------------------------------------------------------ */
+/* Trash                                                              */
+/* ------------------------------------------------------------------ */
+
+/** Undo a canvas delete. */
+export function restoreCanvas(canvasId: string): Canvas | undefined {
+  return store.restoreCanvas(canvasId)
+}
+
+/** Undo a frame delete: the frame comes back on its canvas, so the room is
+ *  told about it the way it hears about any create. */
+export function restoreFrame(frameId: string, actor: Actor): Frame | undefined {
+  const frame = store.restoreFrame(frameId)
+  if (!frame) return undefined
+  broadcast(frame.canvasId, { type: 'frame:created', frame, actor })
+  logActivity(frame.canvasId, actor, `restored frame “${frame.name}” from the trash`, frame.id)
+  return frame
+}
+
+/** Empty a trashed frame out for good. Its room is still live, so it hears
+ *  about it. */
+export function purgeFrame(frameId: string, actor: Actor): boolean {
+  const frame = store.purgeFrame(frameId)
+  if (!frame) return false
+  thumbs.purge(frameId)
+  logActivity(frame.canvasId, actor, `permanently deleted frame “${frame.name}”`)
+  return true
+}
+
+/** Everything a canvas keeps outside the store: the thumbnail cache and the
+ *  in-memory logs keyed by canvas id. Shared by the trash purge and the
+ *  account wipe — both end with a canvas that no longer exists, and a log left
+ *  keyed to it is memory nothing can ever read or release. */
+function forgetCanvasLogs(canvasId: string, frames: Frame[]): void {
+  for (const f of frames) thumbs.purge(f.id)
   commentLog.delete(canvasId)
   activityLog.delete(canvasId)
   decisionLog.delete(canvasId)
   proposalLog.delete(canvasId)
+  questionLog.delete(canvasId)
   for (const [frameId, record] of interruptedStreams) {
     if (record.canvasId === canvasId) interruptedStreams.delete(frameId)
   }
   for (const [frameId, record] of frameEditNotices) {
     if (record.canvasId === canvasId) frameEditNotices.delete(frameId)
   }
+}
+
+/** Empty a trashed canvas out for good. Nothing survives to be told: the room
+ *  was closed when it was trashed, and its logs go with it. */
+export function purgeCanvas(canvasId: string): boolean {
+  const c = store.purgeCanvas(canvasId)
+  if (!c) return false
+  forgetCanvasLogs(canvasId, c.frames)
+  return true
+}
+
+/* ------------------------------------------------------------------ */
+/* Account deletion                                                    */
+/* ------------------------------------------------------------------ */
+
+/** Erase an account's own data, without the trash in the middle: every canvas
+ *  it owns (hard-deleted, live and trashed alike — the only account that could
+ *  ever empty that trash is the one going away), its memberships on other
+ *  people's canvases, and the assets it uploaded.
+ *
+ *  Deliberately split from persist.hardDeleteUser, which runs after this and
+ *  owns the rows better-auth and the user-keyed tables (sessions, credentials,
+ *  OAuth grants, memory, model accounts, preferences). One function per
+ *  ownership domain, so neither has to know the other's tables. */
+export async function deleteAccountData(userId: string): Promise<{ canvases: number; assets: number }> {
+  let canvases = 0
+  /* the store's map is the live truth, and the copy is what makes deleting
+     from it safe while iterating */
+  for (const canvas of [...store.canvases.values()]) {
+    if (canvas.ownerId === userId) {
+      store.hardDeleteCanvas(canvas.id)
+      forgetCanvasLogs(canvas.id, canvas.frames)
+      canvases += 1
+    } else if (canvas.memberIds?.includes(userId)) {
+      store.removeMember(canvas.id, userId)
+    }
+  }
+  for (const entry of store.listTrash(userId).canvases) {
+    const canvas = store.purgeCanvas(entry.id)
+    if (!canvas) continue
+    forgetCanvasLogs(entry.id, canvas.frames)
+    canvases += 1
+  }
+  /* assets last: the frames that referenced them are already gone, and the
+     bytes are keyed by id in object storage, which only assets.ts knows how
+     to reach */
+  const owned = await persist.listOwnedAssetIds(userId)
+  for (const id of owned) await assets.deleteAsset(id)
+  return { canvases, assets: owned.length }
+}
+
+/** Move a canvas to the trash; viewers are told to leave. Nothing is unlinked:
+ *  the frames, pages, components and history stay with the canvas, which is
+ *  what makes /api/trash able to put it back whole. The logs stay too — they
+ *  are keyed by canvas id and a restore should find the canvas as it was.
+ *  Durable rows are removed for good by purgeCanvas (the retention job, or the
+ *  owner emptying the trash). */
+export function deleteCanvas(canvasId: string, by?: string): boolean {
+  /* the snapshot records the canvas WITH the frames it had: a canvas deleted
+     and restored, then rolled back, must not come back empty. A caller that
+     knows who asked passes them; the MCP path has no user to name. */
+  if (store.getCanvas(canvasId)) snapshotCanvas(canvasId, 'delete', by ?? 'doop')
+  const deleted = store.deleteCanvas(canvasId)
+  if (!deleted) return false
+  broadcast(canvasId, { type: 'canvas:deleted' })
   return true
 }
 
@@ -1324,9 +1620,23 @@ export function reorderPage(pageId: string, position: number, actor: Actor) {
   return pages
 }
 
-export function deletePage(pageId: string, actor: Actor) {
-  const owner = store.getPage(pageId)?.canvas.id
-  if (owner) assertAgentWriteAllowed(owner, actor, TOOL_NAME.deletePage, { destructive: true })
+/** What a page delete answers with: the page that went, and the frames it took
+ *  with it (so the caller can drop their cached previews and tell the room). */
+export interface DeletedPage {
+  page: Page
+  deletedFrameIds: string[]
+}
+
+export function deletePage(pageId: string, actor: Actor): DeletedPage | undefined {
+  const found = store.getPage(pageId)
+  if (found) {
+    assertAgentWriteAllowed(found.canvas.id, actor, TOOL_NAME.deletePage, { destructive: true })
+    /* deleting a page deletes the frames on it, so a locked frame on the page
+       refuses the whole operation — the same rule update_frame and delete_frame
+       apply, one level up */
+    const locked = found.canvas.frames.find((f) => f.pageId === pageId && f.locked)
+    if (locked) throw new FrameLockedByUserError(locked.id, locked.name)
+  }
   const result = store.deletePage(pageId)
   if (!result) return undefined
   const { canvas, page, frames } = result
@@ -1351,13 +1661,47 @@ export function duplicatePage(pageId: string, actor: Actor) {
 
 export function moveFrameToPage(frameId: string, pageId: string, actor: Actor) {
   const moving = store.getFrame(frameId)
-  if (moving) assertAgentWriteAllowed(moving.canvasId, actor, TOOL_NAME.moveFrameToPage)
+  if (moving) {
+    assertAgentWriteAllowed(moving.canvasId, actor, TOOL_NAME.moveFrameToPage)
+    /* moving a frame rewrites the page it belongs to — the same content write
+       update_frame refuses on a locked frame, so it is refused here too. A
+       page delete that carried the frame along would be the same write by
+       another route, which is why delete_page checks its frames as well. */
+    if (moving.locked) throw new FrameLockedByUserError(moving.id, moving.name)
+  }
   const frame = store.moveFrameToPage(frameId, pageId)
   if (!frame) return undefined
   const page = store.getPage(pageId)!.page
   broadcast(frame.canvasId, { type: 'frame:updated', frame, actor })
   logActivity(frame.canvasId, actor, `moved frame “${frame.name}” to page “${page.name}”`)
   return frame
+}
+
+/* Stacking is layout, not design work: a reorder broadcasts the page's new
+   front-to-back order and nothing else — no activity row, no agent presence,
+   and deliberately not through updateFrame, which would fire a frame:updated
+   per frame, log each one and re-run the review gate per frame. */
+export function reorderFrame(
+  frameId: string,
+  dir: 'front' | 'back' | 'forward' | 'backward',
+  actor: Actor,
+): Frame[] | undefined {
+  const moving = store.getFrame(frameId)
+  if (!moving) return undefined
+  assertAgentWriteAllowed(moving.canvasId, actor, TOOL_NAME.reorderFrame)
+  if (!moving.pageId) return undefined
+  const frames = store.moveFrameZ(moving.canvasId, frameId, dir, actor.name)
+  if (!frames) return undefined
+  broadcast(moving.canvasId, { type: 'frames:reordered', pageId: moving.pageId, frames, actor })
+  return frames
+}
+
+export function setFrameOrder(canvasId: string, pageId: string, order: string[], actor: Actor): Frame[] | undefined {
+  assertAgentWriteAllowed(canvasId, actor, TOOL_NAME.setFrameOrder)
+  const frames = store.applyFrameOrder(canvasId, pageId, order, actor.name)
+  if (!frames) return undefined
+  broadcast(canvasId, { type: 'frames:reordered', pageId, frames, actor })
+  return frames
 }
 
 export function duplicateFrame(
@@ -1377,6 +1721,13 @@ export function duplicateFrame(
       height: source.height,
       html: source.html,
       pageId: source.pageId,
+      /* the copy keeps how the original looked and who may touch it; its
+         stacking is fresh, so a duplicate lands at the front of the page it
+         was duplicated onto */
+      locked: source.locked,
+      hidden: source.hidden,
+      rotation: source.rotation,
+      opacity: source.opacity,
     },
     actor,
   )

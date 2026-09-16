@@ -8,6 +8,7 @@ import { Logo } from '../components/Logo'
 import { timeAgo } from '../lib/time'
 import { AgentIcon } from '../components/AgentIcon'
 import { ShareModal } from '../components/ShareModal'
+import { TrashPanel } from '../components/TrashPanel'
 import {
   AccountMenu,
   ConnectCard,
@@ -54,7 +55,7 @@ import { cn } from '@/lib/utils'
 /** an agent that worked this recently is treated as still at the desk */
 const LIVE_WINDOW = 5 * 60 * 1000
 
-type Scope = 'all' | 'mine' | 'shared'
+type Scope = 'all' | 'mine' | 'shared' | 'trash'
 
 /* a canvas tile: the Card surface, made clickable */
 const cardCls = cn(
@@ -222,6 +223,12 @@ export function Home() {
             on={scope === 'shared'}
             go={() => setScope('shared')}
           />
+          <NavItem
+            icon={<TrashIcon width={15} height={15} />}
+            label="Trash"
+            on={scope === 'trash'}
+            go={() => setScope('trash')}
+          />
         </nav>
 
         <DashSectionLabel>Explore</DashSectionLabel>
@@ -342,19 +349,21 @@ export function Home() {
                     }${agents.length ? ` · ${agents.length} ${agents.length === 1 ? 'agent' : 'agents'}` : ''}`}
               </DashSubtitle>
             </div>
-            <SegmentedIcons
-              className="ml-auto flex-none"
-              aria-label="View"
-              value={view}
-              onValueChange={(next) => setView(next as 'grid' | 'list')}
-            >
-              <SegmentedIconItem value="grid" aria-label="Grid view">
-                <IconGrid />
-              </SegmentedIconItem>
-              <SegmentedIconItem value="list" aria-label="List view">
-                <IconList />
-              </SegmentedIconItem>
-            </SegmentedIcons>
+            {scope !== 'trash' && (
+              <SegmentedIcons
+                className="ml-auto flex-none"
+                aria-label="View"
+                value={view}
+                onValueChange={(next) => setView(next as 'grid' | 'list')}
+              >
+                <SegmentedIconItem value="grid" aria-label="Grid view">
+                  <IconGrid />
+                </SegmentedIconItem>
+                <SegmentedIconItem value="list" aria-label="List view">
+                  <IconList />
+                </SegmentedIconItem>
+              </SegmentedIcons>
+            )}
           </div>
 
           <div className="mt-4 flex items-center gap-2 md:hidden">
@@ -363,6 +372,7 @@ export function Home() {
                 <TabsTrigger value="all">All · {counts.all}</TabsTrigger>
                 <TabsTrigger value="mine">Mine · {counts.mine}</TabsTrigger>
                 <TabsTrigger value="shared">Shared · {counts.shared}</TabsTrigger>
+                <TabsTrigger value="trash">Trash</TabsTrigger>
               </TabsList>
             </Tabs>
             <Button variant="ghost" className="h-10 flex-none gap-1.5" onClick={() => navigate('/community')}>
@@ -370,7 +380,11 @@ export function Home() {
             </Button>
           </div>
 
-          {empty ? (
+          {scope === 'trash' ? (
+            /* Deleting is recoverable now, and this is where it is recovered:
+               the trash lists what was deleted and puts it back. */
+            <TrashPanel onRestored={reload} />
+          ) : empty ? (
             <Card className="mt-7 max-w-[560px] rounded-[18px] px-5 pb-6 pt-5 sm:px-7 sm:pb-7 sm:pt-[26px]">
               <h3 className="font-display text-[20px] font-extrabold tracking-[-0.02em]">Start your first canvas</h3>
               <p className="mb-[18px] mt-2.5 text-sm leading-[1.6] text-ink-soft">
@@ -514,11 +528,11 @@ export function Home() {
         open={!!deleteCanvas}
         onOpenChange={(open) => !open && setDeleteCanvas(null)}
         title={`Delete “${deleteCanvas?.name ?? 'canvas'}”?`}
-        description="This permanently deletes the canvas and everything in it. This can’t be undone."
-        confirmLabel="Delete canvas"
+        description="The canvas moves to the Trash — you can restore it from there whenever you like. Anything left in the Trash for 30 days is cleared out for good."
+        confirmLabel="Move to trash"
         destructive
         onConfirm={() => {
-          if (deleteCanvas) remove(deleteCanvas.id, reload)
+          if (deleteCanvas) remove(deleteCanvas.id, reload, () => showToast('Moved to trash'))
           setDeleteCanvas(null)
         }}
       />
@@ -527,13 +541,17 @@ export function Home() {
   )
 }
 
-function remove(id: string, done: () => void) {
+/* Deleting no longer destroys anything: the canvas is marked deleted, leaves
+   the dashboard, and waits in the Trash to be restored. `done` keeps the list
+   honest either way, and `moved` only congratulates a delete that landed. */
+function remove(id: string, done: () => void, moved: () => void) {
   api
     .deleteCanvas(id)
     .then(() => {
       posthog.capture('canvas_deleted')
       /* a deleted canvas has no tab to come back to (desktop shell) */
       closeTab(id, location.pathname)
+      moved()
     })
     .catch(console.error)
     .finally(done)

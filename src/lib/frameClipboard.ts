@@ -7,6 +7,13 @@ import { recordCreate, recordCreates } from './history'
 /** Same-origin frame clipboard: survives canvas switches and browser tabs. */
 const CLIP_KEY = 'doop:frame-clipboard'
 
+/** The drag type a component row carries to the canvas. A custom MIME — rather
+ *  than text/plain alone — is what lets the Stage tell a component dragged out
+ *  of the library from a file dragged in from the desktop; the row puts the
+ *  component's id under it. Both the panel and the stage import this so the
+ *  two halves cannot drift. */
+export const COMPONENT_DRAG_MIME = 'application/x-doop-component'
+
 /** One copied frame, positioned relative to the top-left of the copied group
  *  so a multi-frame paste keeps the frames' layout. */
 interface ClipFrame {
@@ -179,12 +186,16 @@ function imageSize(blob: Blob): Promise<{ width: number; height: number }> {
 const IMAGE_ROW_GAP = 40
 
 /** Upload images and drop them as frames laid out in a row, centered as a
- *  group in the current view (one image lands dead-center). Sizes are read
- *  first so differently-sized images sit side by side, never stacked. */
+ *  group. Sizes are read first so differently-sized images sit side by side,
+ *  never stacked. `origin` is the world point the row centers on: absent, the
+ *  intake is a paste and lands in the middle of the view; given, it is a drop
+ *  and lands where the files were let go — the caller converts the screen
+ *  point the same way it converts a right-click paste. */
 export async function uploadImageFrames(
   canvasId: string,
   files: File[],
   fallbackName = 'Pasted image',
+  origin?: { x: number; y: number },
 ): Promise<Frame[]> {
   const dims = await Promise.all(files.map((f) => imageSize(f)))
   const scaled = dims.map((d) => {
@@ -192,8 +203,8 @@ export async function uploadImageFrames(
     return { width: Math.max(40, Math.round(d.width * scale)), height: Math.max(40, Math.round(d.height * scale)) }
   })
   const vp = useStore.getState().viewport
-  const cx = (window.innerWidth / 2 - vp.x) / vp.zoom
-  const cy = (window.innerHeight / 2 - vp.y) / vp.zoom
+  const cx = origin?.x ?? (window.innerWidth / 2 - vp.x) / vp.zoom
+  const cy = origin?.y ?? (window.innerHeight / 2 - vp.y) / vp.zoom
   const totalW = scaled.reduce((sum, s) => sum + s.width, 0) + IMAGE_ROW_GAP * (scaled.length - 1)
   let x = cx - totalW / 2
   const placed = scaled.map((size) => {
@@ -220,12 +231,26 @@ export async function uploadImageFrames(
   )
 }
 
-export async function pasteImagesCentered(canvasId: string, files: File[]) {
-  const frames = await uploadImageFrames(canvasId, files)
-  posthog.capture('image_pasted', { count: frames.length })
+/** The tail both gestures share once the frames exist: they are one undo step
+ *  together, and the last one becomes the selection. */
+function selectNewFrames(frames: Frame[]) {
   frames.forEach(recordCreate)
   const last = frames[frames.length - 1]
   if (last) useStore.getState().select(last.id)
+}
+
+export async function pasteImagesCentered(canvasId: string, files: File[]) {
+  const frames = await uploadImageFrames(canvasId, files)
+  posthog.capture('image_pasted', { count: frames.length })
+  selectNewFrames(frames)
+}
+
+/** Images dragged onto the canvas — from the desktop, or from the Assets
+ *  panel — land around the world point they were dropped on. */
+export async function dropImagesAt(canvasId: string, files: File[], world: { x: number; y: number }) {
+  const frames = await uploadImageFrames(canvasId, files, 'Dropped image', world)
+  posthog.capture('image_dropped', { count: frames.length })
+  selectNewFrames(frames)
 }
 
 /** Duplicate frames 40px down-right of the originals, keeping their layout;

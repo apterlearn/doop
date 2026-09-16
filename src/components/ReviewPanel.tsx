@@ -8,7 +8,7 @@ import type {
   ReviewPolicy,
 } from '../../shared/types'
 import { colorFor } from '../../shared/types'
-import { useStore } from '../lib/store'
+import { canComment, isReadOnly, useStore } from '../lib/store'
 import { api, ApiError } from '../lib/api'
 import { authClient } from '../lib/auth'
 import { timeAgo } from '../lib/time'
@@ -145,6 +145,9 @@ export function ReviewPanel() {
   const canvasId = useStore((s) => s.canvas?.id)
   const ownerId = useStore((s) => s.canvas?.ownerId)
   const reviewPolicy = useStore((s) => s.reviewPolicy)
+  /* The queue is a write surface: a viewer reads the proposals, the diffs and
+     the history, and every decision that would land a change is not rendered. */
+  const readOnly = useStore(isReadOnly)
   const approvalTools = useStore((s) => s.approvalTools)
   const proposals = useStore((s) => s.frameProposals)
   const canvasProposals = useStore((s) => s.canvasProposals)
@@ -257,80 +260,89 @@ export function ReviewPanel() {
             <p className="mt-1 text-[11.5px] leading-[1.45] text-ink-soft">{policyBlurb[reviewPolicy]}</p>
           </div>
         </div>
-        <ToggleChipGroup
-          className="mt-3"
-          value={reviewPolicy}
-          aria-label="Review policy"
-          disabled={!isOwner || savingPolicy}
-          title={isOwner ? undefined : OWNER_ONLY}
-          onValueChange={(next) => {
-            /* off gates nothing, so it names no tools — the server clears the
-               list with the policy, and the optimistic write says the same */
-            if (isReviewPolicy(next)) savePolicy(next, next === 'off' ? [] : approvalTools)
-          }}
-        >
-          {POLICIES.map((policy) => (
-            <ToggleChipItem
-              key={policy}
-              value={policy}
-              className="text-[12px]"
-              title={isOwner ? policyChipTitle[policy] : OWNER_ONLY}
+        {/* The policy is the owner's write and a read-only viewer's click
+            could never land. The heading and blurb above still say what the
+            canvas is set to; the switch itself is not rendered. */}
+        {readOnly ? (
+          <p className="mt-2.5 text-[11.5px] leading-[1.45] text-ink-soft">Read only — sign in to edit this canvas.</p>
+        ) : (
+          <>
+            <ToggleChipGroup
+              className="mt-3"
+              value={reviewPolicy}
+              aria-label="Review policy"
+              disabled={!isOwner || savingPolicy}
+              title={isOwner ? undefined : OWNER_ONLY}
+              onValueChange={(next) => {
+                /* off gates nothing, so it names no tools — the server clears the
+                   list with the policy, and the optimistic write says the same */
+                if (isReviewPolicy(next)) savePolicy(next, next === 'off' ? [] : approvalTools)
+              }}
             >
-              {policyChipLabel[policy]}
-            </ToggleChipItem>
-          ))}
-        </ToggleChipGroup>
-        {reviewPolicy !== 'off' && (
-          <Field
-            label={reviewPolicy === 'destructive' ? 'Also gate these tools' : 'Extra gated tools'}
-            htmlFor="review-approval-tools"
-            hint={
-              reviewPolicy === 'destructive'
-                ? 'Tool names gated on top of the ones that declare themselves destructive. Enter adds one; ✕ removes it.'
-                : 'Every write is gated already — these names stay gated if you narrow the policy to destructive. Enter adds one; ✕ removes it.'
-            }
-            className="mt-3"
-          >
-            <div className="flex flex-wrap items-center gap-1.5 rounded-md border border-line bg-surface px-2 py-1.5 focus-within:border-ink">
-              {approvalTools.map((tool) => (
-                <Badge key={tool} className="gap-1 pr-1">
-                  {tool}
-                  <button
-                    type="button"
-                    className="text-ink-faint hover:text-accent-ink"
-                    aria-label={`Stop gating ${tool}`}
-                    disabled={!isOwner || savingPolicy}
-                    onClick={() =>
-                      savePolicy(
-                        reviewPolicy,
-                        approvalTools.filter((t) => t !== tool),
-                      )
-                    }
-                  >
-                    ✕
-                  </button>
-                </Badge>
+              {POLICIES.map((policy) => (
+                <ToggleChipItem
+                  key={policy}
+                  value={policy}
+                  className="text-[12px]"
+                  title={isOwner ? policyChipTitle[policy] : OWNER_ONLY}
+                >
+                  {policyChipLabel[policy]}
+                </ToggleChipItem>
               ))}
-              <Input
-                id="review-approval-tools"
-                variant="bare"
-                inputSize="sm"
-                className="min-w-[104px] flex-1 font-mono md:text-[12px]"
-                value={toolDraft}
-                placeholder="tool_name"
-                spellCheck={false}
-                disabled={!isOwner || savingPolicy}
-                onBlur={addApprovalTool}
-                onChange={(e) => setToolDraft(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' || e.key === ',') {
-                    e.preventDefault()
-                    addApprovalTool()
-                  }
-                }}
-              />
-            </div>
-          </Field>
+            </ToggleChipGroup>
+            {reviewPolicy !== 'off' && (
+              <Field
+                label={reviewPolicy === 'destructive' ? 'Also gate these tools' : 'Extra gated tools'}
+                htmlFor="review-approval-tools"
+                hint={
+                  reviewPolicy === 'destructive'
+                    ? 'Tool names gated on top of the ones that declare themselves destructive. Enter adds one; ✕ removes it.'
+                    : 'Every write is gated already — these names stay gated if you narrow the policy to destructive. Enter adds one; ✕ removes it.'
+                }
+                className="mt-3"
+              >
+                <div className="flex flex-wrap items-center gap-1.5 rounded-md border border-line bg-surface px-2 py-1.5 focus-within:border-ink">
+                  {approvalTools.map((tool) => (
+                    <Badge key={tool} className="gap-1 pr-1">
+                      {tool}
+                      <button
+                        type="button"
+                        className="text-ink-faint hover:text-accent-ink"
+                        aria-label={`Stop gating ${tool}`}
+                        disabled={!isOwner || savingPolicy}
+                        onClick={() =>
+                          savePolicy(
+                            reviewPolicy,
+                            approvalTools.filter((t) => t !== tool),
+                          )
+                        }
+                      >
+                        ✕
+                      </button>
+                    </Badge>
+                  ))}
+                  <Input
+                    id="review-approval-tools"
+                    variant="bare"
+                    inputSize="sm"
+                    className="min-w-[104px] flex-1 font-mono md:text-[12px]"
+                    value={toolDraft}
+                    placeholder="tool_name"
+                    spellCheck={false}
+                    disabled={!isOwner || savingPolicy}
+                    onBlur={addApprovalTool}
+                    onChange={(e) => setToolDraft(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ',') {
+                        e.preventDefault()
+                        addApprovalTool()
+                      }
+                    }}
+                  />
+                </div>
+              </Field>
+            )}
+          </>
         )}
         {policyError && <p className="mt-2 text-[11.5px] leading-[1.45] text-accent-ink">{policyError}</p>}
       </div>
@@ -453,6 +465,9 @@ function QuestionRow({ canvasId, question }: { canvasId: string; question: Agent
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
   const frameName = useStore((s) => s.canvas?.frames.find((f) => f.id === question.frameId)?.name)
+  /* Answering is a comment-level write — the server takes the answer at that
+     intent — so a viewer without it reads the question and only that. */
+  const canNote = useStore(canComment)
   /* picks win over a typed answer: a choice question's answer is the choice */
   const text = choices.length ? picked.join(', ') : answer.trim()
 
@@ -502,7 +517,7 @@ function QuestionRow({ canvasId, question }: { canvasId: string; question: Agent
           {question.agentName} stopped waiting for this. An answer still reaches it on its next tool call.
         </p>
       )}
-      {choices.length > 0 && (
+      {canNote && choices.length > 0 && (
         <div className="mt-2.5 flex flex-wrap gap-1.5">
           {choices.map((choice) => (
             <Button
@@ -518,7 +533,7 @@ function QuestionRow({ canvasId, question }: { canvasId: string; question: Agent
           ))}
         </div>
       )}
-      {choices.length === 0 || question.allowOther ? (
+      {canNote && (choices.length === 0 || question.allowOther) ? (
         <Field label={choices.length ? 'Other' : 'Your answer'} className="mt-2.5">
           <Textarea
             className="min-h-[52px] text-[13px]"
@@ -540,11 +555,17 @@ function QuestionRow({ canvasId, question }: { canvasId: string; question: Agent
         </Field>
       ) : null}
       {error && <div className="mt-2 text-[11.5px] text-accent-ink">{error}</div>}
-      <div className="mt-2.5 flex justify-end">
-        <Button variant="primary" size="sm" className="text-[11.5px]" disabled={!text || busy} onClick={submit}>
-          Answer
-        </Button>
-      </div>
+      {canNote ? (
+        <div className="mt-2.5 flex justify-end">
+          <Button variant="primary" size="sm" className="text-[11.5px]" disabled={!text || busy} onClick={submit}>
+            Answer
+          </Button>
+        </div>
+      ) : (
+        <p className="mt-2.5 text-[11.5px] leading-[1.45] text-ink-soft">
+          Read only — sign in to comment on this canvas.
+        </p>
+      )}
     </div>
   )
 }
@@ -588,6 +609,9 @@ function ProposalCard({
    *  card is gone the moment the proposal resolves */
   onSkipped: (agentName: string, skipped: { index: number; reason: string }[]) => void
 }) {
+  /* Deciding a proposal is a write, so a viewer reads the summary, the diff
+     and the hunks, and is offered no accept, no reject and no hunk choice. */
+  const readOnly = useStore(isReadOnly)
   const frame = useStore((s) => s.canvas?.frames.find((f) => f.id === proposal.frameId))
   const width = proposal.width ?? frame?.width ?? 640
   const height = proposal.height ?? frame?.height ?? 480
@@ -646,6 +670,8 @@ function ProposalCard({
   function onKeyDown(e: KeyboardEvent<HTMLDivElement>) {
     const t = e.target as HTMLElement
     if (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable) return
+    /* A and R are the decision keys: a viewer's card has no decision to take */
+    if (readOnly) return
     if (e.metaKey || e.ctrlKey || e.altKey || busy) return
     const key = e.key.toLowerCase()
     if (key !== 'a' && key !== 'r') return

@@ -18,3 +18,7 @@ desktop/src-tauri/gen
 .omp/
 mcp-dev/
 q-inspect.mts
+
+# scripts/backup.sh's default output: a full database dump, which is the
+# deployment's data and not this repository's.
+backups/

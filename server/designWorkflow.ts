@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import * as actions from './actions.ts'
 import { DesignLlmError, designComplete } from './designLlm.ts'
 import * as frameLocks from './frameLocks.ts'
@@ -5,7 +6,9 @@ import { MAX_FRAME_HTML_BYTES } from './limits.ts'
 import { reviewFrame } from './review.ts'
 import { findBrowserPath, VIEWPORTS } from './screenshot.ts'
 import { store } from './store.ts'
+import * as runLog from './runLog.ts'
 import { cssForTokens } from '../shared/tokens.ts'
+import type { NotificationPhase } from './notifications.ts'
 import type { Actor, DesignTokens, Frame } from '../shared/types.ts'
 
 /**
@@ -16,6 +19,9 @@ import type { Actor, DesignTokens, Frame } from '../shared/types.ts'
  * [OI]-compatible endpoint, and every attempt lands through actions.ts — so
  * the frame persists, versions and broadcasts exactly as a hand-written one
  * does, and a human in the room watches the design build attempt by attempt.
+ * The run narrates itself on the canvas timeline while it works (each attempt
+ * as it starts, the judge's pass over it, then how the run ended) and mails
+ * that ending to the humans who opted into agent mail.
  *
  * The judge reads the frame's HTML and the review's findings, never a
  * screenshot. A render is the most expensive thing the server does, and it is
@@ -282,7 +288,12 @@ async function withPresence<T>(canvasId: string, actor: Actor, work: () => Promi
   }
 }
 
-export async function runDesignWorkflow(input: {
+/** What a run is given. `runId` names that run on the canvas timeline: the MCP
+ *  wrapper's session run id when the caller has one, so the engine's lines land
+ *  in the same run as the tool call that started it. A caller with no run id of
+ *  its own gets a fresh one per call — the timeline groups by run id and
+ *  nothing else, and a run whose lines carry none would be unreadable. */
+interface DesignWorkflowInput {
   canvasId: string
   brief: string
   frameName: string
@@ -291,7 +302,56 @@ export async function runDesignWorkflow(input: {
   actor: Actor
   maxAttempts?: number
   frameId?: string
-}): Promise<WorkflowResult> {
+  runId?: string
+}
+
+/** The one mail a run sends: how it ended. Fire-and-forget through a dynamic
+ *  import, exactly like actions.ts's askQuestion — a mail that cannot go out
+ *  (no SMTP, nobody opted in) is not the run's business, and the engine does
+ *  not carry notifications.ts's part of the graph for it. `stop` is the closest
+ *  kind the union has to a run being over; `phase` is what decides both the
+ *  switch and the label, so the mail reads "finished its run" or "failed its
+ *  run" whatever the kind. */
+function notifyRunEnd(canvasId: string, agentName: string, frameName: string, phase: NotificationPhase): void {
+  const ending = phase === 'finished' ? 'finished' : 'failed'
+  import('./notifications.ts')
+    .then((n) =>
+      n.notifyAgentEvent(canvasId, 'stop', `${agentName} ${ending} the design run for “${frameName}”`, { phase }),
+    )
+    .catch(() => {})
+}
+
+/** Run the workflow and report it. The run's own lines are the engine's, not
+ *  the caller's single tool event: the loop writes one per attempt as it starts
+ *  it, and this writes the ending — which is why the ending is here, where the
+ *  result and the throw both arrive. */
+export async function runDesignWorkflow(input: DesignWorkflowInput): Promise<WorkflowResult> {
+  const runId = input.runId ?? randomUUID()
+  try {
+    const result = await runDesignLoop({ ...input, runId })
+    runLog.recordStatus(input.canvasId, runId, input.actor.name, result.ok ? 'status' : 'error', result.judgeSummary, {
+      ok: result.ok,
+      ...(result.frameId ? { frameId: result.frameId } : {}),
+    })
+    notifyRunEnd(input.canvasId, input.actor.name, input.frameName, result.ok ? 'finished' : 'failed')
+    return result
+  } catch (error) {
+    runLog.recordStatus(
+      input.canvasId,
+      runId,
+      input.actor.name,
+      'error',
+      error instanceof Error ? error.message : 'the design workflow failed',
+      { ok: false },
+    )
+    notifyRunEnd(input.canvasId, input.actor.name, input.frameName, 'failed')
+    throw error
+  }
+}
+
+/** The loop itself: one frame written from the brief, reviewed and judged, until
+ *  the judge passes it or the attempt budget runs out. */
+async function runDesignLoop(input: DesignWorkflowInput & { runId: string }): Promise<WorkflowResult> {
   const budget = clampAttempts(input.maxAttempts)
   const issues: WorkflowIssue[] = []
   let frameId = input.frameId ?? ''
@@ -307,6 +367,15 @@ export async function runDesignWorkflow(input: {
 
   for (let attempt = 1; attempt <= budget; attempt++) {
     attempts = attempt
+    /* the run timeline is where a human watches this happen, and an attempt is
+       minutes of model time: it says so before the call, not after */
+    runLog.recordStatus(
+      input.canvasId,
+      input.runId,
+      input.actor.name,
+      'status',
+      `implementing attempt ${attempt}/${budget}`,
+    )
     const previous = issues.length ? issues[issues.length - 1]!.judgeFeedback : ''
     const canvas = store.getCanvas(input.canvasId)
     /* the artboard the design must fit: a redesign answers to the frame that is
@@ -433,6 +502,7 @@ export async function runDesignWorkflow(input: {
        place rather than replacing it — so this measures the canvas as it stands
        at review time, agreeing with the `review_frame` a human runs next */
     const evidence = await reviewEvidence(frame, canvas?.tokens, breakpoints)
+    runLog.recordStatus(input.canvasId, input.runId, input.actor.name, 'status', `judge reviewing attempt ${attempt}`)
     let judgeReply: { text: string; truncated: boolean }
     try {
       judgeReply = await calls.judge(html, evidence)
@@ -482,9 +552,9 @@ export async function runDesignWorkflow(input: {
   const attemptWord = attempts === 1 ? 'attempt' : 'attempts'
 
   /* The comment is a report ON the run — the frame is already written and the
-     result already decided, so it may not fail it. The run's own timeline
-     entry is not written here: the MCP tool wrapper records exactly one
-     kind: 'tool' event per call, with this same summary. */
+     result already decided, so it may not fail it. The run's terminal timeline
+     line is not written here: the entry point records this same summary once
+     the run is over, as a status when it passed and an error when it did not. */
   if (frameId) {
     try {
       actions.addElementComment(

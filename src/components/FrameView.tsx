@@ -1,16 +1,17 @@
 import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import type { AgentQuestion, ElementComment, Frame } from '../../shared/types'
 import { colorFor } from '../../shared/types'
-import { checkVerdict, useStore, type StreamEndReason } from '../lib/store'
+import { canComment, checkVerdict, isReadOnly, useStore, type StreamEndReason } from '../lib/store'
 import { registerFrameWindow, unregisterFrameWindow } from '../lib/frameBridge'
 import { api } from '../lib/api'
 import { sendWs } from '../lib/ws'
 import { throttle } from '../lib/throttle'
 import { timeAgo } from '../lib/time'
 import { getIdentity } from '../lib/identity'
-import { FRAME_BOOTSTRAP } from '../lib/frameRuntime'
+import { FRAME_BOOTSTRAP, takeFrameEditRequest } from '../lib/frameRuntime'
+import { RichTextToolbar, type FormatCommand } from './RichTextToolbar'
 import { stripTokenStyle, withTokenStyle } from '../../shared/tokens'
-import { recordCreate, recordUpdate, recordUpdates, trackSave } from '../lib/history'
+import { caughtStaleWrite, noteOwnWrite, recordCreate, recordUpdate, recordUpdates, trackSave } from '../lib/history'
 import { snapFrame } from '../lib/snap'
 import { gesture } from '../lib/gesture'
 import { FrameContextMenu } from './FrameContextMenu'
@@ -30,7 +31,7 @@ import { Button } from './ui/button'
 import { Input } from './ui/input'
 import { Textarea } from './ui/textarea'
 import { Tooltip } from './ui/tooltip'
-import { GithubIcon, SyncIcon } from './ui/icons'
+import { EyeOffIcon, GithubIcon, LockIcon, SyncIcon } from './ui/icons'
 import { isSyncedFrame } from '../lib/sync'
 import { isGithubFrame, isGithubPlaceholder } from '../lib/github'
 import { AgentIcon } from './AgentIcon'
@@ -142,6 +143,13 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
      fails — the panel's own load will try again. */
   const review = useStore((s) => s.frameReviews[frame.id])
   const setFrameReview = useStore((s) => s.setFrameReview)
+  /* A share-link visitor and a borrowed "view as" session change nothing: the
+     frame's geometry and its document are frozen exactly as a locked one's
+     are, so the same refusals below cover both. */
+  const readOnly = useStore(isReadOnly)
+  /* whether this client may leave a note on an element — false for a
+     view-only link, true for everyone signed in */
+  const canNote = useStore(canComment)
   const askedForReview = useRef(false)
   useEffect(() => {
     /* demo frames are product onboarding: nothing checks them, so asking
@@ -220,6 +228,19 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
       /* clicking a frame already in a group keeps the group — the drag
          moves all of them */
       select(frame.id)
+    }
+    /* a locked frame is frozen: the press still selects it, opens its details
+       and probes its elements (all read-only), but it never drags, resizes or
+       spins up an ⌥⇧ duplicate — the geometry write would be refused by the
+       server anyway, so refusing it here keeps the frame from jumping and
+       snapping back. A read-only visitor gets the same treatment for every
+       frame: someone else's share link is not where they move things. */
+    if (frame.locked || readOnly) {
+      if (mode === 'move') {
+        if (probeOnClick) probeAt(e.nativeEvent.offsetX, e.nativeEvent.offsetY)
+        else if (panelOnClick) useStore.getState().setInspectorOpen(true)
+      }
+      return
     }
     setDragging(true)
     clearHover()
@@ -310,7 +331,12 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
         const f = live.find((x) => x.id === g.id)
         if (!f) continue
         const after = { x: f.x, y: f.y, width: f.width, height: f.height }
-        trackSave(api.updateFrame(f.id, after).catch(console.error))
+        /* No precondition on a drag: the frames written here are exactly the
+           ones the user just moved by hand, and where they were let go IS the
+           new truth — a copy that moved under the pointer while the drag was
+           in flight is the one that gets superseded, not the drag. The next
+           edit after the drag does precondition, on this write's answer. */
+        trackSave(api.updateFrame(f.id, after).then(noteOwnWrite).catch(console.error))
         updates.push({ frameId: f.id, before: g.orig, after })
       }
       const [only, ...more] = updates
@@ -359,6 +385,24 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
     registerFrameWindow(frame.id, win)
     return () => unregisterFrameWindow(frame.id, win)
   }, [runtimeReady, frame.id])
+  /* The text tool creates a frame that must open already in edit mode. The
+     request rides frameRuntime's queue rather than a prop — FrameView is
+     mounted by Stage, which this change does not own — and is spent here, on
+     the runtime's own readiness signal, through the same enterEdit() a
+     double-click uses: a locked frame or a read-only viewer gets the same
+     gates, and the request is claimed exactly once.
+
+     The document is posted first, explicitly: the runtime ignores `doop:html`
+     once editing is on (a streamed update must not clobber the element under
+     the caret), so a caret session opened on an unseeded frame would show the
+     freshly made frame blank. Sending it here keeps that order independent of
+     how the two effects are laid out. */
+  useEffect(() => {
+    if (!runtimeReady) return
+    if (!takeFrameEditRequest(frame.id)) return
+    iframeRef.current?.contentWindow?.postMessage({ type: 'doop:html', html }, '*')
+    enterEdit()
+  }, [runtimeReady]) // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     if (!runtimeReady || editing || suspendPost) return
     iframeRef.current?.contentWindow?.postMessage({ type: 'doop:html', html }, '*')
@@ -592,9 +636,15 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
   }, [selected]) // eslint-disable-line react-hooks/exhaustive-deps
 
   /* ---- inline text editing ---- */
-  const canEdit = !!frame.html && !stream && !/<script/i.test(frame.html)
+  /* a locked frame's document is frozen — the same rule the server states
+     with a 423 on a content write, said here so the editor never opens on
+     one. A read-only visitor's frames are all frozen that way. */
+  const canEdit = !!frame.html && !stream && !frame.locked && !readOnly && !/<script/i.test(frame.html)
 
   function enterEdit() {
+    /* double-click, the element toolbar and the text tool all land here:
+       one gate, so a locked frame can never reach the editable document */
+    if (frame.locked || readOnly) return
     select(frame.id)
     closePopovers()
     clearHover()
@@ -611,6 +661,14 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
     window.setTimeout(() => setSuspendPost(false), 500)
   }
 
+  /* The mini toolbar's commands cross into the sandboxed document as messages
+     (nothing else can reach it): the runtime applies the command to the element
+     being edited and saves the result through the same serialized-edit path a
+     keystroke takes — see doop:format. */
+  function sendFormat(command: FormatCommand, value?: string) {
+    iframeRef.current?.contentWindow?.postMessage({ type: 'doop:format', command, ...(value ? { value } : {}) }, '*')
+  }
+
   /* serialized edits stream out of the iframe; save through the human path */
   useEffect(() => {
     function onMsg(ev: MessageEvent) {
@@ -620,10 +678,21 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
            included — strip it so the injected style never becomes part of the
            frame, in the store, the history or the server */
         const next = stripTokenStyle(ev.data.html)
-        const before = useStore.getState().canvas?.frames.find((f) => f.id === frame.id)?.html
+        /* the live copy is both the document this edit started from and the
+           version the write preconditions on: an agent that streamed into the
+           frame while the user was typing refuses the edit rather than have
+           its design replaced by one built on the old text, and the refusal
+           repaints the frame from the server's copy */
+        const live = useStore.getState().canvas?.frames.find((f) => f.id === frame.id)
         useStore.getState().patchFrameLocal(frame.id, { html: next })
-        api.updateFrame(frame.id, { html: next }).catch(console.error)
-        if (before !== undefined) recordUpdate(frame.id, { html: before }, { html: next })
+        api
+          .updateFrame(frame.id, { html: next }, live ? { expectedUpdatedAt: live.updatedAt } : undefined)
+          .then(noteOwnWrite)
+          .catch((err: unknown) => {
+            const conflict = caughtStaleWrite(err)
+            if (conflict) console.error(conflict.error)
+          })
+        if (live) recordUpdate(frame.id, { html: live.html }, { html: next })
       }
       if (ev.data?.type === 'doop:edit-esc') {
         setEditing(false)
@@ -680,6 +749,14 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
               top: frame.y,
               width: frame.width,
               height: frame.height,
+              /* render-only, exactly as the model says: x/y/width/height keep
+                 their axis-aligned meaning, so hit testing, snapping and the
+                 marquee stay plain boxes while the frame is drawn turned.
+                 Both properties are inline (not classes) because they are
+                 per-frame values. */
+              opacity: frame.opacity,
+              transform: `rotate(${frame.rotation}deg)`,
+              transformOrigin: 'center',
               '--editing-color': stream?.color ?? remoteEditor?.color ?? flash?.color,
             } as React.CSSProperties
           }
@@ -728,6 +805,24 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
               </Tooltip>
             )}
             <span className="overflow-hidden text-ellipsis">{frame.name}</span>
+            {/* the frame's own lock state, where its name is: the padlock is
+                the reason dragging and editing do nothing here */}
+            {frame.locked && (
+              <Tooltip label="Locked — unlock it to move, resize or edit this frame" side="top" align="start">
+                <span className="flex shrink-0 items-center text-ink-faint" aria-label="Locked">
+                  <LockIcon width={11} height={11} />
+                </span>
+              </Tooltip>
+            )}
+            {/* a hidden frame is off the stage (Stage filters it out); should
+                one ever be rendered anyway, its label says why it looks odd */}
+            {frame.hidden && (
+              <Tooltip label="Hidden — shown in the Layers rail only" side="top" align="start">
+                <span className="flex shrink-0 items-center text-ink-faint" aria-label="Hidden">
+                  <EyeOffIcon width={11} height={11} />
+                </span>
+              </Tooltip>
+            )}
             {/* the frame's own answer to "did this pass" — a dot, so the
                 verdict sits with the frame and not only in the Checks tab */}
             {check && (
@@ -874,6 +969,9 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
               )}
               onPointerDown={(e) => e.stopPropagation()}
             >
+              {/* rich text for the element the caret is in; dim until one is */}
+              <RichTextToolbar onFormat={sendFormat} ready={!!activeHit} />
+              <span className="h-3.5 w-px bg-white/20" />
               Click any text to edit
               <Button
                 variant="primary"
@@ -932,7 +1030,13 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
                           {anchor === 'ambiguous' ? '⚠' : '⌫'} {c.text}
                         </button>
                         {open && (
-                          <CommentThread thread={thread} onReply={onReply} onResolve={onResolve} onRetry={onRetry} />
+                          <CommentThread
+                            thread={thread}
+                            canReply={canNote}
+                            onReply={onReply}
+                            onResolve={onResolve}
+                            onRetry={onRetry}
+                          />
                         )}
                       </div>
                     )
@@ -968,7 +1072,13 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
                     >
                       {agentItem?.failedAt ? '!' : working ? '✦' : '💬'}
                       {open && (
-                        <CommentThread thread={thread} onReply={onReply} onResolve={onResolve} onRetry={onRetry} />
+                        <CommentThread
+                          thread={thread}
+                          canReply={canNote}
+                          onReply={onReply}
+                          onResolve={onResolve}
+                          onRetry={onRetry}
+                        />
                       )}
                     </div>
                   )
@@ -990,6 +1100,7 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
                         onPointerDown={(e) => e.stopPropagation()}
                         onClick={(e) => {
                           e.stopPropagation()
+                          if (!canNote) return
                           setAnswerDraft('')
                           setAnsweringId(answeringId === q.id ? null : q.id)
                         }}
@@ -1009,14 +1120,20 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
                             title={`${q.agentName} asks: ${q.text}`}
                             onClick={(e) => {
                               e.stopPropagation()
+                              /* answering is a write the server takes only from
+                                 someone with comment intent: a view-only guest
+                                 reads the question and the Review tab link */
+                              if (!canNote) return
                               setAnswerDraft('')
                               setAnsweringId(answeringId === q.id ? null : q.id)
                             }}
                           >
                             <span className="truncate">{q.text}</span>
-                            <span className="flex-none text-accent-ink">
-                              {answeringId === q.id ? 'Cancel' : 'Answer'}
-                            </span>
+                            {canNote && (
+                              <span className="flex-none text-accent-ink">
+                                {answeringId === q.id ? 'Cancel' : 'Answer'}
+                              </span>
+                            )}
                           </Button>
                           {/* the Review tab stays reachable: a question that
                               offered choices is answered there */}
@@ -1032,7 +1149,7 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
                             Review →
                           </Button>
                         </div>
-                        {answeringId === q.id && (
+                        {answeringId === q.id && canNote && (
                           <div className="flex items-center gap-1">
                             <Input
                               inputSize="sm"
@@ -1077,28 +1194,32 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
                           <span className="rounded-[5px] bg-white/[0.14] px-[5px] py-px text-[11px] font-bold text-white [font-family:ui-monospace,monospace]">
                             {anchor.tag}
                           </span>
-                          <Button
-                            variant="inverse"
-                            className={EL_TOOLBAR_BTN}
-                            onClick={() => {
-                              setComposePrefill('')
-                              setComposing(true)
-                            }}
-                          >
-                            💬 Comment
-                          </Button>
-                          <Button
-                            variant="inverse"
-                            className={EL_TOOLBAR_BTN}
-                            onClick={() => {
-                              /* pre-mentioned → the comment dispatches as an agent
-                             job scoped to this element's selector + snippet */
-                              setComposePrefill(`@${DEFAULT_ROLE_ID} `)
-                              setComposing(true)
-                            }}
-                          >
-                            ✦ Ask AI
-                          </Button>
+                          {canNote && (
+                            <>
+                              <Button
+                                variant="inverse"
+                                className={EL_TOOLBAR_BTN}
+                                onClick={() => {
+                                  setComposePrefill('')
+                                  setComposing(true)
+                                }}
+                              >
+                                💬 Comment
+                              </Button>
+                              <Button
+                                variant="inverse"
+                                className={EL_TOOLBAR_BTN}
+                                onClick={() => {
+                                  /* pre-mentioned → the comment dispatches as an agent
+                                 job scoped to this element's selector + snippet */
+                                  setComposePrefill(`@${DEFAULT_ROLE_ID} `)
+                                  setComposing(true)
+                                }}
+                              >
+                                ✦ Ask AI
+                              </Button>
+                            </>
+                          )}
                           <Button
                             variant="inverse"
                             className={EL_TOOLBAR_BTN}
@@ -1124,8 +1245,9 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
                       <CommentComposer
                         initialText={composePrefill}
                         onSubmit={(text) => {
-                          api
-                            .addComment(frame.id, {
+                          useStore
+                            .getState()
+                            .postElementComment(frame.id, {
                               selector: anchor.selector,
                               snippet: anchor.snippet,
                               text,
@@ -1255,12 +1377,16 @@ function agentStatus(c: ElementComment): string | null {
 
 function CommentThread({
   thread,
+  canReply,
   onReply,
   onResolve,
   onRetry,
 }: {
   /** root comment first, then its replies oldest → newest */
   thread: ElementComment[]
+  /** false for a view-only guest: the thread stays readable, but replying,
+   *  resolving and retrying are all writes the server will not take from them */
+  canReply: boolean
   /** rejects when the reply did not land — the draft is kept for a retry */
   onReply: (text: string) => Promise<unknown>
   onResolve: () => void
@@ -1320,71 +1446,77 @@ function CommentThread({
               {c.failedAt ? (
                 <div className="mt-1 flex items-center gap-2 text-[11px] leading-[1.4] text-accent-ink">
                   <span>{c.failureReason ?? 'The agent did not finish.'}</span>
-                  <Button
-                    variant="danger-solid"
-                    size="pill"
-                    className="shrink-0 px-[9px] py-[3px] text-[11px]"
-                    onClick={() => onRetry(c.id)}
-                  >
-                    ↻ Retry
-                  </Button>
+                  {canReply && (
+                    <Button
+                      variant="danger-solid"
+                      size="pill"
+                      className="shrink-0 px-[9px] py-[3px] text-[11px]"
+                      onClick={() => onRetry(c.id)}
+                    >
+                      ↻ Retry
+                    </Button>
+                  )}
                 </div>
               ) : null}
             </div>
           )
         })}
       </div>
-      <Textarea
-        variant="bare"
-        className="mt-2 min-h-[38px] md:text-[13px]"
-        value={reply}
-        placeholder="Reply… (@doop to ask the agent)"
-        onChange={(e) => setReply(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) send()
-        }}
-      />
-      {failed && (
-        <div className="mt-1 text-[11px] leading-[1.4] text-accent-ink">
-          That reply did not go through — it may be resolved already. Try again.
-        </div>
+      {canReply && (
+        <>
+          <Textarea
+            variant="bare"
+            className="mt-2 min-h-[38px] md:text-[13px]"
+            value={reply}
+            placeholder="Reply… (@doop to ask the agent)"
+            onChange={(e) => setReply(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) send()
+            }}
+          />
+          {failed && (
+            <div className="mt-1 text-[11px] leading-[1.4] text-accent-ink">
+              That reply did not go through — it may be resolved already. Try again.
+            </div>
+          )}
+          <div className="mt-1.5 flex items-center gap-1.5">
+            <Button
+              variant="ghost"
+              size="pill"
+              className="px-2.5 text-ink-soft hover:border-ink-soft hover:bg-transparent hover:text-ink"
+              onClick={onResolve}
+            >
+              ✓ Resolve
+            </Button>
+            {mentioned && (
+              <span
+                className="ml-auto inline-flex min-w-0 items-center gap-1 truncate text-[11px] font-semibold text-brand"
+                title={`${mentioned.name} will pick this up`}
+              >
+                <RoleMark role={mentioned} size={13} />
+                <span className="truncate">{mentioned.name}</span>
+              </span>
+            )}
+            {mentionedOutside && (
+              <span
+                className="ml-auto inline-flex min-w-0 items-center gap-1 truncate text-[11px] font-semibold text-brand"
+                title={`${mentionedOutside} will pick this up`}
+              >
+                <span className="truncate">{mentionedOutside}</span>
+              </span>
+            )}
+            <Button
+              variant="solid"
+              size="pill"
+              className={cn('px-3 py-[4px] text-xs', !mentioned && 'ml-auto')}
+              disabled={!reply.trim() || sending}
+              onClick={send}
+            >
+              {sending ? 'Posting…' : 'Reply'}
+            </Button>
+          </div>
+        </>
       )}
-      <div className="mt-1.5 flex items-center gap-1.5">
-        <Button
-          variant="ghost"
-          size="pill"
-          className="px-2.5 text-ink-soft hover:border-ink-soft hover:bg-transparent hover:text-ink"
-          onClick={onResolve}
-        >
-          ✓ Resolve
-        </Button>
-        {mentioned && (
-          <span
-            className="ml-auto inline-flex min-w-0 items-center gap-1 truncate text-[11px] font-semibold text-brand"
-            title={`${mentioned.name} will pick this up`}
-          >
-            <RoleMark role={mentioned} size={13} />
-            <span className="truncate">{mentioned.name}</span>
-          </span>
-        )}
-        {mentionedOutside && (
-          <span
-            className="ml-auto inline-flex min-w-0 items-center gap-1 truncate text-[11px] font-semibold text-brand"
-            title={`${mentionedOutside} will pick this up`}
-          >
-            <span className="truncate">{mentionedOutside}</span>
-          </span>
-        )}
-        <Button
-          variant="solid"
-          size="pill"
-          className={cn('px-3 py-[4px] text-xs', !mentioned && 'ml-auto')}
-          disabled={!reply.trim() || sending}
-          onClick={send}
-        >
-          {sending ? 'Posting…' : 'Reply'}
-        </Button>
-      </div>
     </div>
   )
 }

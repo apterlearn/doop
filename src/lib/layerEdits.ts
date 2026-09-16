@@ -1,7 +1,7 @@
 import type { Frame } from '../../shared/types'
 import { useStore } from './store'
 import { api } from './api'
-import { recordUpdate } from './history'
+import { caughtStaleWrite, noteOwnWrite, recordUpdate } from './history'
 import { duplicateElement, removeElement, replaceElement } from './layers'
 
 /* ---- element edits shared by the Layers rail and the element panel ---- */
@@ -9,7 +9,18 @@ import { duplicateElement, removeElement, replaceElement } from './layers'
 export function saveFrameHtml(frame: Frame, html: string) {
   recordUpdate(frame.id, { html: frame.html }, { html })
   useStore.getState().patchFrameLocal(frame.id, { html })
-  api.updateFrame(frame.id, { html }).catch(console.error)
+  /* The html the caller worked from is the version this write expects to
+     replace: an agent that streamed into the frame in the meantime refuses it
+     whole rather than have its design overwritten by an edit built on text
+     that is no longer there. A refusal paints the server's copy back over the
+     local one — the element edit visibly comes undone — and says why. */
+  api
+    .updateFrame(frame.id, { html }, { expectedUpdatedAt: frame.updatedAt })
+    .then(noteOwnWrite)
+    .catch((err: unknown) => {
+      const conflict = caughtStaleWrite(err)
+      if (conflict) console.error(conflict.error)
+    })
 }
 
 export function deleteLayer(frame: Frame, selector: string) {

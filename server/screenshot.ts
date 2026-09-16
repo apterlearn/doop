@@ -262,11 +262,17 @@ export async function renderFrame(
     clip?: { x: number; y: number; width: number; height: number }
     /** render the element `selector` names in this pseudo-class state */
     state?: InteractionState
+    /** Bind these tokens into the document instead of resolving the canvas's
+     *  current ones, under the same rule as loadFramePage: absent means "ask
+     *  the store", `null` means "render the frame's own document verbatim".
+     *  A frozen snapshot (release, canvas version, archive) must render with
+     *  the tokens it was frozen under — the live canvas has moved on. */
+    tokens?: DesignTokens | null
   } = {},
 ): Promise<Buffer> {
   const width = Math.max(1, Math.round(opts.viewport?.width ?? frame.width))
   const height = Math.max(1, Math.round(opts.viewport?.height ?? frame.height))
-  const loaded = await loadFramePage(frame, { viewport: { width, height } })
+  const loaded = await loadFramePage(frame, { viewport: { width, height }, tokens: opts.tokens })
   const { page } = loaded
   try {
     await page.setViewport({ width, height, deviceScaleFactor: scale })

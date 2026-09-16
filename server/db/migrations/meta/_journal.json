@@ -239,6 +239,34 @@
       "when": 1789385686392,
       "tag": "0033_wise_the_fallen",
       "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "7",
+      "when": 1789482466865,
+      "tag": "0034_bumpy_crusher_hogan",
+      "breakpoints": true
+    },
+    {
+      "idx": 35,
+      "version": "7",
+      "when": 1789487759403,
+      "tag": "0035_cuddly_thunderbolts",
+      "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "7",
+      "when": 1789491999787,
+      "tag": "0036_flimsy_the_hunter",
+      "breakpoints": true
+    },
+    {
+      "idx": 37,
+      "version": "7",
+      "when": 1789514518886,
+      "tag": "0037_mysterious_violations",
+      "breakpoints": true
     }
   ]
 }

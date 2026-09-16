@@ -30,6 +30,11 @@ const frame = (id: string): Frame =>
     html: '',
     updatedAt: 1,
     updatedBy: 't',
+    z: 0,
+    locked: false,
+    hidden: false,
+    rotation: 0,
+    opacity: 1,
   }) as Frame
 
 function deferredRenders() {

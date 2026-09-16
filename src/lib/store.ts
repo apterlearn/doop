@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import type {
   ActivityItem,
+  AgentMessage,
   AgentQuestion,
   Canvas,
   CanvasFocus,
@@ -23,12 +24,48 @@ import type {
   RunEvent,
 } from '../../shared/types'
 import type { SnapGuide } from './snap'
+import { api } from './api'
+import type { CanvasVersionSummary } from './api'
+
+/** What a signed-out visitor holds while reading a shared canvas. `ticket` is
+ *  the short-lived proof the ws join carries in place of the session cookie
+ *  the visitor does not have, and `canvas` is the copy the share link handed
+ *  back — a guest never receives a ws `init` for a canvas they have no
+ *  session on, so the link's payload is what fills the store. */
+export interface GuestSession {
+  ticket: string
+  /** what the link allows: `view` and `comment` read, `edit` is what signing
+   *  in would grant. A guest has no session, so all three render read-only
+   *  and only commenting differs — see `isReadOnly`/`canComment`. */
+  access: 'view' | 'comment' | 'edit'
+  canvas: Canvas
+}
+
+/** A note as the element composer submits it: where in the frame it is
+ *  anchored, and what it says. */
+export interface ElementCommentInput {
+  selector: string
+  snippet: string
+  text: string
+  stableKey?: string
+}
 
 /** Why a frame's design stream ended, as the server reports it. */
 export type StreamEndReason = 'done' | 'idle' | 'taken over' | 'replaced'
 
 /** Which tab the side panel shows. */
-export type PanelTab = 'activity' | 'memory' | 'tokens' | 'agents' | 'review' | 'checks' | 'components' | 'run'
+export type PanelTab =
+  | 'activity'
+  | 'memory'
+  | 'tokens'
+  | 'agents'
+  | 'review'
+  | 'checks'
+  | 'components'
+  | 'assets'
+  | 'run'
+  | 'chat'
+  | 'history'
 
 export interface Viewport {
   x: number
@@ -38,6 +75,13 @@ export interface Viewport {
 
 interface State {
   canvas: Canvas | null
+  /** the share-link session, when this client is a signed-out visitor — null
+   *  for everyone with an account. Its canvas lands in `canvas` like any
+   *  other, through `setCanvas`. */
+  guest: GuestSession | null
+  /** this session is an admin's "view as" — /api/me reports it, the banner
+   *  says so, and the canvas refuses every write under it */
+  impersonating: boolean
   presences: Record<string, Presence>
   /** what each connected client is looking at, keyed by clientId — how a
    *  human points at "this" element without typing a selector */
@@ -77,6 +121,14 @@ interface State {
   components: ComponentSummary[]
   /** the agent run timeline: one entry per MCP tool call, newest first */
   runEvents: RunEvent[]
+  /** the human↔agent chat, oldest first. Distinct from `comments` (pinned to
+   *  an element) and `questions` (blocking): this is the channel an agent
+   *  reads when it has nothing else to do, and where a human parks a thought
+   *  for an agent that is not connected yet. */
+  messages: AgentMessage[]
+  /** the canvas's checkpoints (newest first), as the History tab lists them.
+   *  No ws message drives this: the tab fetches on open and after a restore. */
+  canvasVersions: CanvasVersionSummary[]
   /** which tab the side panel shows — in the store so a Memory-suggestion
    *  toast anywhere in the app can jump straight to the Memory tab */
   panelTab: PanelTab
@@ -128,6 +180,15 @@ interface State {
   activePageId?: string
 
   setCanvas(c: Canvas | null): void
+  /** open (or close, with null) the share-link session. Opening also puts
+   *  the link's canvas in the store, so a read-only canvas renders before
+   *  the room answers the join. */
+  setGuestSession(guest: GuestSession | null): void
+  setImpersonating(v: boolean): void
+  /** Post a note on a frame through whichever path this client may use: a
+   *  guest's ticket posts to the public comment route, everyone else through
+   *  the session. One funnel, so the frame's composer never branches. */
+  postElementComment(frameId: string, input: ElementCommentInput): Promise<unknown>
   setConnected(v: boolean): void
   setUpdateReady(v: boolean): void
   setPresences(list: Presence[]): void
@@ -147,6 +208,9 @@ interface State {
   upsertFrame(f: Frame): void
   patchFrameLocal(frameId: string, patch: Partial<Frame>): void
   removeFrame(frameId: string): void
+  /** apply a page's new stacking order (a ws 'frames:reordered' broadcast):
+   *  the page's frames replace their own slots, front-to-back */
+  applyFrameOrderLocal(pageId: string, frames: Frame[]): void
   renameCanvasLocal(name: string): void
   /** upsert (doc set) or remove (doc null) a style guide on the open canvas */
   setGuidelineLocal(name: string, doc: GuidelineDoc | null): void
@@ -188,6 +252,17 @@ interface State {
   setRunEvents(events: RunEvent[]): void
   /** prepend one timeline entry, keeping the list bounded like the server's ring */
   pushRunEvent(event: RunEvent): void
+  /** replace the chat log (the room's init, oldest first) */
+  setMessages(list: AgentMessage[]): void
+  /** upsert one chat message by id — replace it in place, append a new one,
+   *  or drop it when it was deleted (`message` null). `messageId` names the
+   *  row being replaced, which is how a send swaps its optimistic copy for
+   *  the server's */
+  upsertMessage(message: AgentMessage | null, messageId: string): void
+  /** the canvas's checkpoints, newest first, as the History tab loaded them */
+  setCanvasVersions(list: CanvasVersionSummary[]): void
+  /** prepend one checkpoint (a manual save), bounded like the server's list */
+  pushCanvasVersion(summary: CanvasVersionSummary): void
   /** open the side panel on a tab from anywhere (a question pin, a toast) */
   requestPanel(tab: PanelTab): void
   clearPanelRequest(): void
@@ -232,8 +307,25 @@ export function checkVerdict(review: FrameReview & { current: boolean }, frame: 
   return review.verdict
 }
 
-const LAYERS_OPEN_KEY = 'doop:layers-open'
+/** True when this client must not change the canvas. Two cases, one rule: an
+ *  admin's "view as" session is read-only by design, and a share-link visitor
+ *  has no session at all — the room takes their ticket as a reader and every
+ *  write route wants a cookie, so a guest reads whatever the link says (a
+ *  view link and an edit link differ only in what signing in would grant).
+ *  Every mutating affordance in the app reads this one flag. */
+export function isReadOnly(s: { guest: GuestSession | null; impersonating: boolean }): boolean {
+  return s.impersonating || !!s.guest
+}
 
+/** Whether this client may leave a note. A guest may unless the link is
+ *  view-only — the mirror of the public comment route, which 403s a view
+ *  ticket. A borrowed "view as" session leaves no trace behind either. */
+export function canComment(s: { guest: GuestSession | null; impersonating: boolean }): boolean {
+  if (s.impersonating) return false
+  return !s.guest || s.guest.access !== 'view'
+}
+
+const LAYERS_OPEN_KEY = 'doop:layers-open'
 function readLayersOpen(): boolean {
   try {
     return localStorage.getItem(LAYERS_OPEN_KEY) !== '0'
@@ -242,8 +334,15 @@ function readLayersOpen(): boolean {
   }
 }
 
+/** How much of the chat the client keeps. The tab reads a conversation, not an
+ *  archive: the room's init carries a recent window, and one longer here would
+ *  only hold messages the tab can no longer reach. The newest is what stays. */
+const MESSAGE_LIMIT = 200
+
 export const useStore = create<State>((set, get) => ({
   canvas: null,
+  guest: null,
+  impersonating: false,
   presences: {},
   focus: {},
   cursors: {},
@@ -264,6 +363,8 @@ export const useStore = create<State>((set, get) => ({
   approvalTools: [],
   components: [],
   runEvents: [],
+  messages: [],
+  canvasVersions: [],
   panelRequest: null,
   selectedIds: [],
   selectedId: null,
@@ -295,8 +396,12 @@ export const useStore = create<State>((set, get) => ({
                another canvas's checks and tool calls beside its frames. Both
                are guarded on the id: setCanvas also carries an in-place patch
                of the canvas being viewed (a share toggle, a rename), and that
-               must not wipe what the panel is showing. */
-            ...(s.canvas && s.canvas.id !== canvas.id ? { runEvents: [], frameReviews: {} } : {}),
+               must not wipe what the panel is showing. The checkpoint list is
+               fetched per canvas the same way, and is dropped with them; the
+               chat is one canvas's conversation, so it goes too. */
+            ...(s.canvas && s.canvas.id !== canvas.id
+              ? { runEvents: [], messages: [], frameReviews: {}, canvasVersions: [] }
+              : {}),
           }
         : {
             canvas: null,
@@ -306,8 +411,25 @@ export const useStore = create<State>((set, get) => ({
             frameReviews: {},
             streamEnds: {},
             runEvents: [],
+            messages: [],
+            canvasVersions: [],
           },
     ),
+  /* Opening a guest session also loads the canvas the link returned: a
+     visitor with no session never gets a ws `init` for it, so without this
+     the read-only canvas would stay blank until the room answers. */
+  setGuestSession: (guest) => {
+    set({ guest })
+    if (guest) get().setCanvas(guest.canvas)
+  },
+  setImpersonating: (impersonating) => set({ impersonating }),
+  postElementComment: (frameId, input) => {
+    const { guest } = get()
+    if (!guest) return api.addComment(frameId, input)
+    /* the ticket stands in for the session the visitor does not have, and
+       names the canvas it was minted for — the frame route would 401 */
+    return api.commentAsGuest(guest.canvas.id, { ticket: guest.ticket, frameId, ...input })
+  },
   setFrameLocks: (frameLocks) => set({ frameLocks }),
   setActivePage: (activePageId) => set({ activePageId }),
   setPagesLocal: (pages) =>
@@ -391,6 +513,20 @@ export const useStore = create<State>((set, get) => ({
         },
       }
     }),
+  /* the broadcast carries the page's frames front-to-back with their new z,
+     and z is what the stage and the Layers rail sort on: patching the matching
+     frames is enough, and the rest of the canvas list stays untouched */
+  applyFrameOrderLocal: (pageId, ordered) =>
+    set((s) => {
+      if (!s.canvas) return {}
+      const incoming = new Set(ordered.map((f) => f.id))
+      let next = 0
+      const frames = s.canvas.frames.map((f) => {
+        if (f.pageId !== pageId || !incoming.has(f.id)) return f
+        return ordered[next++] ?? f
+      })
+      return { canvas: { ...s.canvas, frames } }
+    }),
   removeFrame: (frameId) =>
     set((s) => {
       if (!s.canvas) return {}
@@ -472,6 +608,39 @@ export const useStore = create<State>((set, get) => ({
   /* the server sends the timeline newest-first, so a live entry goes on the
      front and the oldest falls off the end of the same bounded window */
   pushRunEvent: (event) => set((s) => ({ runEvents: [event, ...s.runEvents].slice(0, 200) })),
+  /* the room's init is the whole conversation as it stands: oldest first, and
+     sorted here so the panel can read the list in order however the route
+     ordered it */
+  setMessages: (list) => {
+    const messages = (list ?? []).slice().sort((a, b) => a.at - b.at)
+    set({ messages: messages.length > MESSAGE_LIMIT ? messages.slice(-MESSAGE_LIMIT) : messages })
+  },
+  /* One row per message, whichever way it reached the client: a live broadcast,
+     a delete, the optimistic copy an author posts before the server has
+     answered, and the answer itself. `messageId` names the row being replaced,
+     and a message whose own id is already in the list replaces it in place
+     rather than doubling it — a broadcast that beats the POST reply lands
+     first, and the reply then has to fold into the row it already created. */
+  upsertMessage: (message, messageId) =>
+    set((s) => {
+      const rest = s.messages.filter((m) => m.id !== messageId && m.id !== message?.id)
+      if (!message) return { messages: rest }
+      const was = s.messages.findIndex((m) => m.id === messageId)
+      /* an update keeps the row where it was: chat reads chronologically, and a
+         replaced row that jumped to the end would read as a new message */
+      const messages = was < 0 ? [...rest, message] : [...rest.slice(0, was), message, ...rest.slice(was)]
+      return { messages: messages.length > MESSAGE_LIMIT ? messages.slice(-MESSAGE_LIMIT) : messages }
+    }),
+  /* the list is a window, not a log: 50 is the cap the server keeps, and a
+     longer one here would only show checkpoints that can no longer be read */
+  setCanvasVersions: (list) => set({ canvasVersions: (list ?? []).slice(0, 50) }),
+  /* a manual checkpoint goes on the front, where the server sorts it; ids are
+     unique, so a re-save of one the list already holds replaces rather than
+     duplicates it */
+  pushCanvasVersion: (summary) =>
+    set((s) => ({
+      canvasVersions: [summary, ...s.canvasVersions.filter((v) => v.id !== summary.id)].slice(0, 50),
+    })),
   requestPanel: (tab) => set({ panelRequest: { tab, at: Date.now() } }),
   clearPanelRequest: () => set({ panelRequest: null }),
   renameCanvasLocal: (name) => set((s) => (s.canvas ? { canvas: { ...s.canvas, name } } : {})),

@@ -29,6 +29,11 @@ const FRAME_A: Frame = {
   createdAt: 0,
   updatedAt: 0,
   updatedBy: 'alice',
+  z: 0,
+  locked: false,
+  hidden: false,
+  rotation: 0,
+  opacity: 1,
 }
 
 const FRAME_B: Frame = {
@@ -43,6 +48,11 @@ const FRAME_B: Frame = {
   createdAt: 0,
   updatedAt: 0,
   updatedBy: 'alice',
+  z: 0,
+  locked: false,
+  hidden: false,
+  rotation: 0,
+  opacity: 1,
 }
 
 function comment(overrides: Partial<ElementComment> & { id: string }): ElementComment {

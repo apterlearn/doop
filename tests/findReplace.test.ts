@@ -57,6 +57,11 @@ function frame(id: string, name: string, html: string, opts: { pageId?: string; 
     createdAt: 0,
     updatedAt: 1,
     updatedBy: 'alice',
+    z: 0,
+    locked: false,
+    hidden: false,
+    rotation: 0,
+    opacity: 1,
     pageId: opts.pageId ?? PAGE,
     ...(opts.demo ? { demo: true } : {}),
   }

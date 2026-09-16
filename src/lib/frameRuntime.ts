@@ -105,8 +105,22 @@ export const FRAME_BOOTSTRAP = `<!doctype html>
      caret placed at the click point. Edits debounce-serialize back to the
      parent, which saves them through the normal frame-update path. */
   var editing = false
+  /* the parent marks this document as the presentation ("doop:present"), which
+     is the one thing that turns on the deck's key relays below */
+  var presenting = false
   var activeEl = null
   var editTimer = null
+  /* An element the mini toolbar has made rich carries data-v-rich: plain
+     typing stays contentEditable 'plaintext-only' — a design's markup should
+     not fall to a careless keystroke — and a format command is the one thing
+     that turns markup on. The marker stays on the element for the session (a
+     re-activated element comes back rich, see activate) and serialize() strips
+     it, so it never reaches a saved document. */
+  /* The last selection inside the active element. The toolbar lives in the
+     parent document, so pressing one of its buttons can blur this document and
+     collapse the selection the command was meant to act on; a command restores
+     this range first. */
+  var lastRange = null
 
   var EDIT_CSS =
     '[data-v-hover]{outline:1.5px dashed rgba(39,67,238,0.75)!important;outline-offset:2px;cursor:text}' +
@@ -140,6 +154,7 @@ export const FRAME_BOOTSTRAP = `<!doctype html>
     activeEl.removeAttribute('contenteditable')
     activeEl.removeAttribute('data-v-active')
     activeEl = null
+    lastRange = null // it pointed into the element that just lost the caret
     postActive()
   }
 
@@ -174,7 +189,11 @@ export const FRAME_BOOTSTRAP = `<!doctype html>
       activeEl = el
       el.removeAttribute('data-v-hover')
       el.setAttribute('data-v-active', '1')
-      try { el.contentEditable = 'plaintext-only' } catch (e) { el.contentEditable = 'true' }
+      /* plain typing is plaintext-only; an element the toolbar has already
+         made rich (see applyFormat) keeps taking markup */
+      try {
+        el.contentEditable = el.hasAttribute('data-v-rich') ? 'true' : 'plaintext-only'
+      } catch (e) { el.contentEditable = 'true' }
       el.focus({ preventScroll: true })
       postActive()
     }
@@ -197,6 +216,11 @@ export const FRAME_BOOTSTRAP = `<!doctype html>
       marked[j].removeAttribute('data-v-active')
       marked[j].removeAttribute('data-v-hover')
     }
+    /* the toolbar's rich marker outlives deactivation by design (an element
+       stays rich for the session), so it is stripped document-wide rather than
+       only on whichever element happens to be active right now */
+    var rich = root.querySelectorAll('[data-v-rich]')
+    for (var k = 0; k < rich.length; k++) rich[k].removeAttribute('data-v-rich')
     root.style.removeProperty('zoom') // crisp-render zoom is ours, not the design's
     if (!root.getAttribute('style')) root.removeAttribute('style')
     return '<!doctype html>\\n' + root.outerHTML
@@ -226,6 +250,152 @@ export const FRAME_BOOTSTRAP = `<!doctype html>
     }
   }
 
+  /* ---- rich text (the mini toolbar) ----
+     Edit mode types as plain text so a design's markup cannot fall to a
+     careless keystroke, but a format command IS the explicit request for
+     markup: it upgrades the element it acts on to contentEditable='true' and
+     marks it data-v-rich, which is what tells activate() to bring the element
+     back rich when it is selected again (see the marker note above).
+     The toolbar lives in the parent document, so the selection is remembered
+     here and put back before a command runs — pressing a toolbar button would
+     otherwise collapse the very words the command is about. */
+  var FORMAT_TAGS = { bold: 'STRONG', italic: 'EM', underline: 'U' }
+
+  function upgradeRich(el) {
+    if (el.hasAttribute('data-v-rich')) return
+    el.setAttribute('data-v-rich', '1')
+    try { el.contentEditable = 'true' } catch (e) { /* keep whatever it had */ }
+  }
+
+  function selectionInside() {
+    var s = getSelection()
+    if (!s || !s.rangeCount || !activeEl) return null
+    var n = s.anchorNode
+    return activeEl === n || activeEl.contains(n) ? s : null
+  }
+
+  function saveRange() {
+    if (!editing) return
+    var s = selectionInside()
+    if (s) lastRange = s.getRangeAt(0).cloneRange()
+  }
+
+  /* the live selection when there still is one, the remembered one otherwise */
+  function restoreRange() {
+    var s = selectionInside()
+    if (s) return s.getRangeAt(0)
+    if (!lastRange) return null
+    var sel = getSelection()
+    sel.removeAllRanges()
+    sel.addRange(lastRange)
+    return lastRange
+  }
+
+  function selectRange(r) {
+    var s = getSelection()
+    s.removeAllRanges()
+    s.addRange(r)
+    lastRange = r.cloneRange()
+  }
+
+  /* Range fallback for bold/italic/underline: wrap the selected words in the
+     tag, or lift them back out of it when they already sit inside one. */
+  function wrapSelection(tag) {
+    var r = restoreRange()
+    if (!r || r.collapsed) return false
+    var start = r.commonAncestorContainer
+    var node = start.nodeType === 3 ? start.parentNode : start
+    var holder = null
+    while (node && node !== activeEl && node.nodeType === 1) {
+      if (node.nodeName === tag) { holder = node; break }
+      node = node.parentNode
+    }
+    if (holder && holder.parentNode) {
+      var parent = holder.parentNode
+      while (holder.firstChild) parent.insertBefore(holder.firstChild, holder)
+      parent.removeChild(holder)
+      return true
+    }
+    var frag = r.extractContents()
+    var wrap = document.createElement(tag)
+    wrap.appendChild(frag)
+    r.insertNode(wrap)
+    var after = document.createRange()
+    after.selectNodeContents(wrap)
+    selectRange(after)
+    return true
+  }
+
+  /* Range fallback for the link button: selected words gain the anchor, a bare
+     caret gets the url as the link's own text. */
+  function insertLink(href) {
+    var r = restoreRange()
+    if (!r) return false
+    var node = r.commonAncestorContainer
+    var inline = node.nodeType === 3 ? node.parentElement : node
+    var existing = inline && inline.closest ? inline.closest('a') : null
+    if (existing && existing !== activeEl && activeEl.contains(existing)) {
+      existing.setAttribute('href', href)
+      return true
+    }
+    var a = document.createElement('a')
+    a.setAttribute('href', href)
+    if (r.collapsed) a.textContent = href
+    else a.appendChild(r.extractContents())
+    r.insertNode(a)
+    var after = document.createRange()
+    after.setStartAfter(a)
+    after.collapse(true)
+    selectRange(after)
+    return true
+  }
+
+  /* Range fallback for the list buttons: the selection becomes the first item,
+     a bare caret gets an empty one to type into. */
+  function insertList(tag) {
+    var r = restoreRange()
+    if (!r) return false
+    var list = document.createElement(tag)
+    var item = document.createElement('li')
+    list.appendChild(item)
+    if (r.collapsed) item.appendChild(document.createElement('br'))
+    else item.appendChild(r.extractContents())
+    r.insertNode(list)
+    var after = document.createRange()
+    after.selectNodeContents(item)
+    after.collapse(false)
+    selectRange(after)
+    return true
+  }
+
+  function applyFormat(command, value) {
+    if (!editing || !activeEl) return false
+    upgradeRich(activeEl)
+    restoreRange()
+    var ok = false
+    try {
+      /* execCommand is deprecated but still the only path that carries the
+         browser's own markup rules (nesting, toggling off); the Range code
+         above is the fallback for the commands it refuses. */
+      ok = document.execCommand(command === 'link' ? 'createLink' : command, false, command === 'link' ? value : null)
+    } catch (e) { ok = false }
+    if (!ok) {
+      var tag = FORMAT_TAGS[command]
+      if (tag) ok = wrapSelection(tag)
+      else if (command === 'link' && typeof value === 'string' && value) ok = insertLink(value)
+      else if (command === 'insertUnorderedList') ok = insertList('UL')
+      else if (command === 'insertOrderedList') ok = insertList('OL')
+    }
+    /* a formatted word saves through the normal frame-update path, exactly as
+       a typed one does */
+    if (ok) postEdited()
+    return ok
+  }
+
+  /* remember where the caret is: a command can arrive after the toolbar has
+     taken focus out of this document */
+  document.addEventListener('selectionchange', saveRange)
+
   /* capture-phase: no link navigation or button handlers while editing */
   document.addEventListener('click', function (ev) {
     if (!editing) return
@@ -250,16 +420,30 @@ export const FRAME_BOOTSTRAP = `<!doctype html>
     editTimer = setTimeout(postEdited, 400)
   })
 
-  /* Escape pressed with focus inside the frame: the parent never sees the
-     key event itself, so relay it (present mode closes on it) */
+  /* Keys pressed with focus inside the frame never reach the parent window,
+     so Escape is relayed out of here. The parent also says when this document
+     IS the presentation (doop:present), and the deck's stepping keys are
+     relayed the same way — focus lands in here the moment anyone clicks the
+     deck, and a presenter who clicks must not lose their arrows. */
+  var NAV_KEYS = { ArrowLeft: -1, ArrowRight: 1, PageUp: -1, PageDown: 1 }
+
   document.addEventListener('keydown', function (ev) {
-    if (ev.key !== 'Escape') return
-    if (editing) {
-      setEdit(false)
-      parent.postMessage({ type: 'doop:edit-esc' }, '*')
-    } else {
-      parent.postMessage({ type: 'doop:esc' }, '*')
+    if (ev.key === 'Escape') {
+      if (editing) {
+        setEdit(false)
+        parent.postMessage({ type: 'doop:edit-esc' }, '*')
+      } else {
+        parent.postMessage({ type: 'doop:esc' }, '*')
+      }
+      return
     }
+    if (!presenting || editing) return
+    var dir = NAV_KEYS[ev.key]
+    if (ev.key === ' ' || ev.key === 'Spacebar') dir = ev.shiftKey ? -1 : 1
+    if (!dir) return
+    /* stepping must not also scroll the deck */
+    ev.preventDefault()
+    parent.postMessage({ type: 'doop:present-key', dir: dir }, '*')
   })
 
   /* ---- element probe + locate (comments) ----
@@ -327,6 +511,7 @@ export const FRAME_BOOTSTRAP = `<!doctype html>
       nodes[i].removeAttribute('data-v-ran')
       nodes[i].removeAttribute('data-v-hover')
       nodes[i].removeAttribute('data-v-active')
+      nodes[i].removeAttribute('data-v-rich')
       nodes[i].removeAttribute('contenteditable')
     }
     var html = c.outerHTML
@@ -383,6 +568,8 @@ export const FRAME_BOOTSTRAP = `<!doctype html>
       flexDirection: cs.flexDirection,
       width: px(cs.width),
       height: px(cs.height),
+      left: px(cs.left),
+      top: px(cs.top),
       minWidth: cs.minWidth,
       rowGap: px(cs.rowGap),
       columnGap: px(cs.columnGap),
@@ -440,6 +627,13 @@ export const FRAME_BOOTSTRAP = `<!doctype html>
     }
     if (d.type === 'doop:html' && typeof d.html === 'string' && !editing) render(d.html)
     if (d.type === 'doop:edit') setEdit(!!d.on)
+    /* the mini toolbar's commands: applied to the active editable element, then
+       saved by applyFormat through postEdited() */
+    if (d.type === 'doop:format' && typeof d.command === 'string') {
+      applyFormat(d.command, typeof d.value === 'string' ? d.value : null)
+    }
+    /* present mode on/off: only the presentation relays the stepping keys */
+    if (d.type === 'doop:present') presenting = !!d.on
     if (d.type === 'doop:probe') {
       parent.postMessage({ type: 'doop:probe-result', reqId: d.reqId, hit: probe(d.x, d.y) }, '*')
     }
@@ -493,3 +687,25 @@ export const FRAME_BOOTSTRAP = `<!doctype html>
   parent.postMessage({ type: 'doop:frame-ready' }, '*')
 })()
 </script></body></html>`
+
+/* ---- frame edit requests (the text tool) ----
+   A frame can be created on purpose in edit mode — T, or the toolbar's Text
+   entry makes a frame and wants the caret in it. The frame's own FrameView is
+   mounted by Stage, which this change does not own, so a prop threaded down to
+   it would drag two other components along. The creator parks the frame id
+   here instead and the FrameView claims it the moment its runtime answers
+   ("doop:frame-ready"), then calls its own enterEdit() — the same entry point
+   a double-click uses, so the lock and read-only gates still apply, unchanged.
+
+   Entries only ever wait for their frame's runtime to boot, which happens once
+   per frame iframe: a claim removes what it hands over, so nothing accumulates
+   and a request nobody claims (a frame deleted before it mounted) is dropped. */
+const pendingFrameEdits = new Set<string>()
+
+export function requestFrameEdit(frameId: string): void {
+  pendingFrameEdits.add(frameId)
+}
+
+export function takeFrameEditRequest(frameId: string): boolean {
+  return pendingFrameEdits.delete(frameId)
+}

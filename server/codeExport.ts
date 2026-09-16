@@ -764,6 +764,11 @@ export async function htmlToReact(
     createdAt: 0,
     updatedAt: 0,
     updatedBy: 'export',
+    z: 0,
+    locked: false,
+    hidden: false,
+    rotation: 0,
+    opacity: 1,
   }
   const { css: unscopedCss, jsx, notes } = await extract(frame)
   const scoped = options.scopedCss === true

@@ -288,3 +288,44 @@ export function ArrowUpIcon(props: SVGProps<SVGSVGElement>) {
     </svg>
   )
 }
+
+/** A closed padlock — the frame refuses content edits. */
+export function LockIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg {...iconProps} {...props}>
+      <rect x="4.5" y="10.5" width="15" height="9.5" rx="1.8" />
+      <path d="M8 10.5V8a4 4 0 0 1 8 0v2.5" />
+    </svg>
+  )
+}
+
+/** A padlock whose shackle hangs open — the frame accepts edits again. */
+export function UnlockIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg {...iconProps} {...props}>
+      <rect x="4.5" y="10.5" width="15" height="9.5" rx="1.8" />
+      <path d="M8 10.5V8a4 4 0 0 1 7.8-1.3" />
+    </svg>
+  )
+}
+
+/** An eye — the frame renders on the stage. */
+export function EyeIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg {...iconProps} {...props}>
+      <path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z" />
+      <circle cx="12" cy="12" r="2.8" />
+    </svg>
+  )
+}
+
+/** The same eye struck through — the frame is hidden but still listed. */
+export function EyeOffIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg {...iconProps} {...props}>
+      <path d="M2.5 12S6 5.5 12 5.5c1.5 0 2.8.4 4 1M21.5 12s-1.1 2-3.2 3.7" />
+      <path d="M9.6 9.7a2.8 2.8 0 0 0 3.9 3.9" />
+      <path d="M5.3 6.6 18.7 17.4" />
+    </svg>
+  )
+}

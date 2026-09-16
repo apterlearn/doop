@@ -283,6 +283,11 @@ describe('describeSyncFlow', () => {
       createdAt: 0,
       updatedAt: 0,
       updatedBy: 't',
+      z: 0,
+      locked: false,
+      hidden: false,
+      rotation: 0,
+      opacity: 1,
     }) as Frame
 
   it('renders edges most-traveled first, dedupes links by label', () => {

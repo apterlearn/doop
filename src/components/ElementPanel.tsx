@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import type { Frame } from '../../shared/types'
-import { useStore } from '../lib/store'
+import { isReadOnly, useStore } from '../lib/store'
 import { inspectElement, onFrameReady, styleElement, type ElementInfo, type StylePatch } from '../lib/frameBridge'
 import { ancestorsOf, buildLayerTree, elementHtml, type LayerNode } from '../lib/layers'
 import { replaceLayerHtml } from '../lib/layerEdits'
@@ -65,6 +65,9 @@ export function ElementPanel({ frame, selector, className }: { frame: Frame; sel
      view must not snap back to Design on every row */
   const [tab, setTab] = useState<Tab>(readTab)
   const [info, setInfo] = useState<ElementInfo | null>(null)
+  /* a viewer reads the element's properties and markup; every control that
+     would write them is not rendered */
+  const readOnly = useStore(isReadOnly)
 
   const tree = useMemo(() => buildLayerTree(frame.html), [frame.html])
   const node = useMemo(() => findNode(tree, selector), [tree, selector])
@@ -154,11 +157,16 @@ export function ElementPanel({ frame, selector, className }: { frame: Frame; sel
             </Tooltip>
           )}
         </div>
+        {readOnly && (
+          <p className="flex-none border-b border-line-soft px-3 py-2 text-[11.5px] leading-[1.45] text-ink-soft">
+            Read only — sign in to edit this canvas.
+          </p>
+        )}
         <PanelTabPanel value="design">
-          <PanelBody>{info ? <DesignTab info={info} apply={apply} /> : <Waiting />}</PanelBody>
+          <PanelBody>{info ? <DesignTab info={info} apply={apply} readOnly={readOnly} /> : <Waiting />}</PanelBody>
         </PanelTabPanel>
         <PanelTabPanel value="html">
-          <HtmlTab key={selector} frame={frame} selector={selector} />
+          <HtmlTab key={selector} frame={frame} selector={selector} readOnly={readOnly} />
         </PanelTabPanel>
       </PanelTabsRoot>
     </Panel>
@@ -212,12 +220,39 @@ function parentLayout(info: ElementInfo): string {
   return p.display
 }
 
-function DesignTab({ info, apply }: { info: ElementInfo; apply: (styles: StylePatch) => void }) {
+function DesignTab({
+  info,
+  apply,
+  readOnly,
+}: {
+  info: ElementInfo
+  apply: (styles: StylePatch) => void
+  /** a viewer who cannot write reads the same rows, each field as its value */
+  readOnly: boolean
+}) {
   const visible = info.visibility !== 'hidden'
+  /* only a positioned element has left/top for the browser to resolve, so the
+     geometry rows are shown for everything but a static one */
+  const positioned = info.position !== 'static'
   const fill = rgbToHex(info.backgroundColor)
   const borderColor = rgbToHex(info.borderColor)
   const gapMixed = info.rowGap !== info.columnGap
   const border = borderSummary(info.borderWidths)
+  const display = displayValue(info)
+  const widthMode = sizeMode(info.inline['width'])
+  const heightMode = sizeMode(info.inline['height'])
+  /* The one branch of this tab's render: a field the viewer cannot write
+     becomes the value that field holds, in the same row and the same shell.
+     The element still reports itself; nothing on the tab can be typed into. */
+  const field = (edit: ReactNode, value: ReactNode, unit?: ReactNode) =>
+    readOnly ? (
+      <StaticField>
+        {value}
+        {unit !== undefined && <FieldUnit>{unit}</FieldUnit>}
+      </StaticField>
+    ) : (
+      edit
+    )
   function setSize(axis: 'width' | 'height', mode: SizeMode) {
     if (mode === 'fixed') apply({ [axis]: `${info[axis] ?? 0}px` })
     else if (mode === 'fill') apply({ [axis]: '100%' })
@@ -227,11 +262,14 @@ function DesignTab({ info, apply }: { info: ElementInfo; apply: (styles: StylePa
     <>
       <PropertySection title="Position">
         <PropertyRow label="Type">
-          <SelectField
-            value={info.position}
-            options={POSITIONS.map((p) => ({ value: p, label: p }))}
-            onChange={(v) => apply({ position: v === 'static' ? null : v })}
-          />
+          {field(
+            <SelectField
+              value={info.position}
+              options={POSITIONS.map((p) => ({ value: p, label: p }))}
+              onChange={(v) => apply({ position: v === 'static' ? null : v })}
+            />,
+            info.position,
+          )}
         </PropertyRow>
         <PropertyRow label="Order">
           <StaticField>
@@ -243,130 +281,227 @@ function DesignTab({ info, apply }: { info: ElementInfo; apply: (styles: StylePa
           </StaticField>
         </PropertyRow>
       </PropertySection>
+      {positioned && (
+        <PropertySection title="Geometry">
+          <PropertyRow label="X">
+            {field(
+              <NumberField value={info.left} unit="px" onCommit={(v) => apply({ left: `${v}px` })} />,
+              info.left ?? '—',
+              'px',
+            )}
+          </PropertyRow>
+          <PropertyRow label="Y">
+            {field(
+              <NumberField value={info.top} unit="px" onCommit={(v) => apply({ top: `${v}px` })} />,
+              info.top ?? '—',
+              'px',
+            )}
+          </PropertyRow>
+          <PropertyRow label="Width">
+            {field(
+              <NumberField value={info.width} unit="px" onCommit={(v) => apply({ width: `${v}px` })} />,
+              info.width ?? '—',
+              'px',
+            )}
+          </PropertyRow>
+          <PropertyRow label="Height">
+            {field(
+              <NumberField value={info.height} unit="px" onCommit={(v) => apply({ height: `${v}px` })} />,
+              info.height ?? '—',
+              'px',
+            )}
+          </PropertyRow>
+        </PropertySection>
+      )}
       <PropertySection title="Size">
         <PropertyRow label="Width">
-          <NumberField value={info.width} unit="px" onCommit={(v) => apply({ width: `${v}px` })} />
-          <SelectField
-            className="flex-[0_0_66px]"
-            value={sizeMode(info.inline['width'])}
-            options={SIZE_MODES}
-            onChange={(v) => setSize('width', v)}
-          />
+          {field(
+            <NumberField value={info.width} unit="px" onCommit={(v) => apply({ width: `${v}px` })} />,
+            info.width ?? '—',
+            'px',
+          )}
+          {field(
+            <SelectField
+              className="flex-[0_0_66px]"
+              value={widthMode}
+              options={SIZE_MODES}
+              onChange={(v) => setSize('width', v)}
+            />,
+            SIZE_MODES.find((m) => m.value === widthMode)?.label ?? widthMode,
+          )}
         </PropertyRow>
         <PropertyRow label="Height">
-          <NumberField value={info.height} unit="px" onCommit={(v) => apply({ height: `${v}px` })} />
-          <SelectField
-            className="flex-[0_0_66px]"
-            value={sizeMode(info.inline['height'])}
-            options={SIZE_MODES}
-            onChange={(v) => setSize('height', v)}
-          />
+          {field(
+            <NumberField value={info.height} unit="px" onCommit={(v) => apply({ height: `${v}px` })} />,
+            info.height ?? '—',
+            'px',
+          )}
+          {field(
+            <SelectField
+              className="flex-[0_0_66px]"
+              value={heightMode}
+              options={SIZE_MODES}
+              onChange={(v) => setSize('height', v)}
+            />,
+            SIZE_MODES.find((m) => m.value === heightMode)?.label ?? heightMode,
+          )}
         </PropertyRow>
         <PropertyRow label="Min width">
-          <TextField
-            value={info.inline['min-width'] ?? (info.minWidth === '0px' ? '' : info.minWidth)}
-            placeholder="auto"
-            onCommit={(v) => apply({ 'min-width': lengthValue(v) })}
-          />
+          {field(
+            <TextField
+              value={info.inline['min-width'] ?? (info.minWidth === '0px' ? '' : info.minWidth)}
+              placeholder="auto"
+              onCommit={(v) => apply({ 'min-width': lengthValue(v) })}
+            />,
+            info.inline['min-width'] || (info.minWidth === '0px' ? 'auto' : info.minWidth),
+          )}
         </PropertyRow>
       </PropertySection>
       <PropertySection title="Layout">
         <PropertyRow label="Display">
-          <SelectField
-            value={displayValue(info)}
-            options={DISPLAYS}
-            onChange={(v) =>
-              v.startsWith('flex-')
-                ? apply({ display: 'flex', 'flex-direction': v === 'flex-column' ? 'column' : 'row' })
-                : apply({ display: v, 'flex-direction': null })
-            }
-          />
+          {field(
+            <SelectField
+              value={display}
+              options={DISPLAYS}
+              onChange={(v) =>
+                v.startsWith('flex-')
+                  ? apply({ display: 'flex', 'flex-direction': v === 'flex-column' ? 'column' : 'row' })
+                  : apply({ display: v, 'flex-direction': null })
+              }
+            />,
+            DISPLAYS.find((d) => d.value === display)?.label ?? display,
+          )}
         </PropertyRow>
         <PropertyRow label="Gap">
-          <NumberField
-            value={info.rowGap ?? 0}
-            unit={gapMixed ? 'row' : 'px'}
-            onCommit={(v) => apply({ gap: `${v}px` })}
-          />
-          <TextField
-            className="flex-[0_0_78px]"
-            value={compactBox(info.padding)}
-            unit="pad"
-            onCommit={(v) => apply({ padding: shorthandValue(v) })}
-          />
+          {field(
+            <NumberField
+              value={info.rowGap ?? 0}
+              unit={gapMixed ? 'row' : 'px'}
+              onCommit={(v) => apply({ gap: `${v}px` })}
+            />,
+            info.rowGap ?? 0,
+            gapMixed ? 'row' : 'px',
+          )}
+          {field(
+            <TextField
+              className="flex-[0_0_78px]"
+              value={compactBox(info.padding)}
+              unit="pad"
+              onCommit={(v) => apply({ padding: shorthandValue(v) })}
+            />,
+            compactBox(info.padding),
+            'pad',
+          )}
         </PropertyRow>
       </PropertySection>
       <PropertySection title="Styles">
         <PropertyRow label="Opacity">
-          <NumberField
-            className="flex-[0_0_52px]"
-            value={info.opacity === null ? null : Math.round(info.opacity * 100)}
-            unit="%"
-            onCommit={(v) => apply({ opacity: String(Math.min(100, Math.max(0, v)) / 100) })}
-          />
-          <input
-            type="range"
-            min={0}
-            max={100}
-            aria-label="Opacity"
-            className="h-6 min-w-0 flex-1 accent-ink"
-            value={info.opacity === null ? 100 : Math.round(info.opacity * 100)}
-            onChange={(e) => apply({ opacity: String(Number(e.target.value) / 100) })}
-          />
+          {field(
+            <NumberField
+              className="flex-[0_0_52px]"
+              value={info.opacity === null ? null : Math.round(info.opacity * 100)}
+              unit="%"
+              onCommit={(v) => apply({ opacity: String(Math.min(100, Math.max(0, v)) / 100) })}
+            />,
+            info.opacity === null ? '—' : Math.round(info.opacity * 100),
+            '%',
+          )}
+          {/* the slider is the same write as the field above it */}
+          {!readOnly && (
+            <input
+              type="range"
+              min={0}
+              max={100}
+              aria-label="Opacity"
+              className="h-6 min-w-0 flex-1 accent-ink"
+              value={info.opacity === null ? 100 : Math.round(info.opacity * 100)}
+              onChange={(e) => apply({ opacity: String(Number(e.target.value) / 100) })}
+            />
+          )}
         </PropertyRow>
         <PropertyRow label="Visible">
-          <ToggleField
-            value={visible}
-            labels={['Yes', 'No']}
-            onChange={(on) => apply({ visibility: on ? null : 'hidden' })}
-          />
+          {field(
+            <ToggleField
+              value={visible}
+              labels={['Yes', 'No']}
+              onChange={(on) => apply({ visibility: on ? null : 'hidden' })}
+            />,
+            visible ? 'Yes' : 'No',
+          )}
         </PropertyRow>
         <PropertyRow label="Fill">
-          <ColorField value={fill} onCommit={(v) => apply({ 'background-color': v ?? 'transparent' })} />
+          {field(
+            <ColorField value={fill} onCommit={(v) => apply({ 'background-color': v ?? 'transparent' })} />,
+            fill || 'none',
+          )}
         </PropertyRow>
         <PropertyRow label="Border">
-          <ColorField
-            value={borderColor}
-            onCommit={(v) =>
-              apply({ 'border-color': v, ...(v && info.borderStyle === 'none' ? { 'border-style': 'solid' } : {}) })
-            }
-          />
-          <NumberField
-            className="flex-[0_0_78px]"
-            value={border.width}
-            unit={border.sides || 'px'}
-            onCommit={(v) =>
-              apply({
-                'border-width': `${v}px`,
-                ...(v > 0 && info.borderStyle === 'none' ? { 'border-style': 'solid' } : {}),
-              })
-            }
-          />
+          {field(
+            <ColorField
+              value={borderColor}
+              onCommit={(v) =>
+                apply({ 'border-color': v, ...(v && info.borderStyle === 'none' ? { 'border-style': 'solid' } : {}) })
+              }
+            />,
+            borderColor || 'none',
+          )}
+          {field(
+            <NumberField
+              className="flex-[0_0_78px]"
+              value={border.width}
+              unit={border.sides || 'px'}
+              onCommit={(v) =>
+                apply({
+                  'border-width': `${v}px`,
+                  ...(v > 0 && info.borderStyle === 'none' ? { 'border-style': 'solid' } : {}),
+                })
+              }
+            />,
+            border.width,
+            border.sides || 'px',
+          )}
         </PropertyRow>
         <PropertyRow label="Radius">
-          <NumberField value={info.borderRadius} unit="px" onCommit={(v) => apply({ 'border-radius': `${v}px` })} />
+          {field(
+            <NumberField value={info.borderRadius} unit="px" onCommit={(v) => apply({ 'border-radius': `${v}px` })} />,
+            info.borderRadius,
+            'px',
+          )}
         </PropertyRow>
       </PropertySection>
       {info.hasText && (
         <PropertySection title="Text">
           <PropertyRow label="Size">
-            <NumberField value={info.fontSize} unit="px" onCommit={(v) => apply({ 'font-size': `${v}px` })} />
-            <SelectField
-              className="flex-[0_0_66px]"
-              value={WEIGHTS.includes(info.fontWeight) ? info.fontWeight : '400'}
-              options={WEIGHTS.map((w) => ({ value: w, label: w }))}
-              onChange={(v) => apply({ 'font-weight': v })}
-            />
+            {field(
+              <NumberField value={info.fontSize} unit="px" onCommit={(v) => apply({ 'font-size': `${v}px` })} />,
+              info.fontSize,
+              'px',
+            )}
+            {field(
+              <SelectField
+                className="flex-[0_0_66px]"
+                value={WEIGHTS.includes(info.fontWeight) ? info.fontWeight : '400'}
+                options={WEIGHTS.map((w) => ({ value: w, label: w }))}
+                onChange={(v) => apply({ 'font-weight': v })}
+              />,
+              WEIGHTS.includes(info.fontWeight) ? info.fontWeight : '400',
+            )}
           </PropertyRow>
           <PropertyRow label="Color">
-            <ColorField value={rgbToHex(info.color)} onCommit={(v) => apply({ color: v })} />
+            {field(
+              <ColorField value={rgbToHex(info.color)} onCommit={(v) => apply({ color: v })} />,
+              rgbToHex(info.color) || 'none',
+            )}
           </PropertyRow>
           <PropertyRow label="Align">
-            <SelectField
-              value={ALIGNS.includes(info.textAlign) ? info.textAlign : 'left'}
-              options={ALIGNS.map((a) => ({ value: a, label: a }))}
-              onChange={(v) => apply({ 'text-align': v })}
-            />
+            {field(
+              <SelectField
+                value={ALIGNS.includes(info.textAlign) ? info.textAlign : 'left'}
+                options={ALIGNS.map((a) => ({ value: a, label: a }))}
+                onChange={(v) => apply({ 'text-align': v })}
+              />,
+              ALIGNS.includes(info.textAlign) ? info.textAlign : 'left',
+            )}
           </PropertyRow>
         </PropertySection>
       )}
@@ -376,7 +511,7 @@ function DesignTab({ info, apply }: { info: ElementInfo; apply: (styles: StylePa
 
 /* ---- HTML tab ---- */
 
-function HtmlTab({ frame, selector }: { frame: Frame; selector: string }) {
+function HtmlTab({ frame, selector, readOnly }: { frame: Frame; selector: string; readOnly: boolean }) {
   const source = useMemo(() => elementHtml(frame.html, selector) ?? '', [frame.html, selector])
   const [draft, setDraft] = useState(source)
   const [typing, setTyping] = useState(false)
@@ -408,6 +543,15 @@ function HtmlTab({ frame, selector }: { frame: Frame; selector: string }) {
     }
     pendingSave.current = { timer: window.setTimeout(run, HTML_SAVE_DELAY_MS), run }
   }
+
+  /* the markup is the value of this tab: a viewer reads it in the same dark
+     block with the editor gone — no field, and nothing debounced to the frame */
+  if (readOnly)
+    return (
+      <pre className="min-h-[320px] flex-1 overflow-auto bg-[#17171b] p-3 font-mono text-[11.5px] leading-[1.55] whitespace-pre-wrap text-[#e9e9ee] [tab-size:2]">
+        {source}
+      </pre>
+    )
 
   return (
     <Textarea

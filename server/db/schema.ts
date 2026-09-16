@@ -12,8 +12,17 @@ export const canvases = pgTable('canvases', {
   id: text('id').primaryKey(),
   name: text('name').notNull(),
   ownerId: text('owner_id'),
-  /** 'edit' | 'none'; null = 'none' (private — link sharing is opt-in) */
+  /** 'none' | 'view' | 'comment' | 'edit'; null = 'none' (private — link
+   *  sharing is opt-in). The mode is the MOST a link visitor may do: 'comment'
+   *  adds element comments, 'edit' full editing, all without an account. */
   linkAccess: text('link_access'),
+  /** scrypt hash of the share link's optional password (server/auth.ts
+   *  hashLinkPassword); null = the link needs no password. The hash is read by
+   *  the public link routes only and never leaves the server — a client sees
+   *  linkPasswordSet instead. */
+  linkPasswordHash: text('link_password_hash'),
+  /** epoch ms the share link stops working; null = no expiry */
+  linkExpiresAt: bigint('link_expires_at', { mode: 'number' }),
   /** set when the owner has listed this canvas in the community gallery;
    *  null = private to its collaborators. Publishing grants read-only
    *  previews and copies, never access to the canvas itself. */
@@ -41,10 +50,17 @@ export const canvases = pgTable('canvases', {
   reviewPolicy: text('review_policy').notNull().default('off'),
   /** tool names that always need approval, whatever their annotations say */
   approvalTools: jsonb('approval_tools').$type<string[]>(),
+  /** trash: epoch-ms when the owner deleted it, null = live. A trashed canvas
+   *  is out of the in-memory canvas map (so every read path stops seeing it)
+   *  and is hard-deleted by the purge job once it is past the retention
+   *  window. Its frames/pages/guidelines keep null here: they are hidden by
+   *  their canvas being trashed, not deleted one by one. */
+  deletedAt: bigint('deleted_at', { mode: 'number' }),
 })
 
 /** Users invited to collaborate on a canvas (the owner is not listed).
- *  Access = owner ∪ members ∪ (everyone, when link_access = 'edit'). */
+ *  Access = owner, or the member's `role`, or — for everyone else — the
+ *  canvas's link_access when the link is live. */
 export const canvasMembers = pgTable(
   'canvas_members',
   {
@@ -52,8 +68,37 @@ export const canvasMembers = pgTable(
     userId: text('user_id').notNull(),
     addedBy: text('added_by').notNull(),
     addedAt: bigint('added_at', { mode: 'number' }).notNull(),
+    /** 'viewer' | 'commenter' | 'editor' | 'admin'. The default is what every
+     *  membership meant before roles existed, so a row read back from an
+     *  older database keeps its full access. */
+    role: text('role').notNull().default('editor'),
   },
   (t) => [primaryKey({ columns: [t.canvasId, t.userId] })],
+)
+
+/** Pending email invitations to people who may not have an account yet.
+ *  A row is the whole invitation: the token in the URL is the credential, and
+ *  accepting it adds a canvas_members row with this role (server/index.ts).
+ *  Rows are deleted with the canvas (persist.hardDeleteCanvas) and are not
+ *  hydrated into memory — the invite surface is cold by construction. */
+export const canvasInvites = pgTable(
+  'canvas_invites',
+  {
+    id: text('id').primaryKey(),
+    canvasId: text('canvas_id').notNull(),
+    /** lowercased; the accepting account must hold it */
+    email: text('email').notNull(),
+    role: text('role').notNull(),
+    /** 'ci_' + nanoid(24) — the secret in the invite URL. Unique so a token
+     *  identifies exactly one row. */
+    token: text('token').notNull().unique(),
+    createdBy: text('created_by').notNull(),
+    createdAt: bigint('created_at', { mode: 'number' }).notNull(),
+    expiresAt: bigint('expires_at', { mode: 'number' }).notNull(),
+    acceptedAt: bigint('accepted_at', { mode: 'number' }),
+    acceptedBy: text('accepted_by'),
+  },
+  (t) => [index('canvas_invites_canvas_idx').on(t.canvasId)],
 )
 
 export const frames = pgTable(
@@ -72,8 +117,23 @@ export const frames = pgTable(
     updatedBy: text('updated_by').notNull(),
     /** product-made onboarding/example content; null = a real user frame */
     demo: boolean('demo'),
+    /** stacking within its page; higher renders in front; ties break by array order */
+    z: integer('z').notNull().default(0),
+    /** user-set lock: blocks content writes from humans and agents */
+    locked: boolean('locked').notNull().default(false),
+    /** user-set hide: not rendered on the stage, still listed in Layers */
+    hidden: boolean('hidden').notNull().default(false),
+    /** clockwise degrees, render-only */
+    rotation: integer('rotation').notNull().default(0),
+    /** 0..1, render-only */
+    opacity: doublePrecision('opacity').notNull().default(1),
     /** the page this frame sits on (pages table id); backfilled at hydrate */
     pageId: text('page_id'),
+    /** trash: epoch-ms when a frame delete moved it here, null = live. The row
+     *  survives so /api/trash can put the frame back with its identity (and
+     *  its history) intact; the purge job removes it past the retention
+     *  window. */
+    deletedAt: bigint('deleted_at', { mode: 'number' }),
   },
   (t) => [index('frames_canvas_idx').on(t.canvasId)],
 )
@@ -91,6 +151,10 @@ export const pages = pgTable(
     position: integer('position').notNull(),
     createdAt: bigint('created_at', { mode: 'number' }).notNull(),
     updatedAt: bigint('updated_at', { mode: 'number' }).notNull(),
+    /** trash: epoch-ms when the page was deleted, null = live. The page's
+     *  frames carry their own deleted_at (each is restorable on its own from
+     *  /api/trash); the purge job removes this row past the retention window. */
+    deletedAt: bigint('deleted_at', { mode: 'number' }),
   },
   (t) => [index('pages_canvas_idx').on(t.canvasId)],
 )
@@ -256,6 +320,10 @@ export const guidelines = pgTable(
     /* world position of the card on the canvas; null = auto-placed */
     x: doublePrecision('x'),
     y: doublePrecision('y'),
+    /** trash: epoch-ms when the doc was deleted, null = live. Saving the same
+     *  name again revives the row (saveGuideline clears this), so a doc name
+     *  is never held hostage by a deleted predecessor. */
+    deletedAt: bigint('deleted_at', { mode: 'number' }),
   },
   (t) => [primaryKey({ columns: [t.canvasId, t.name] })],
 )
@@ -344,6 +412,31 @@ export const canvasReleases = pgTable(
     createdBy: text('created_by').notNull(),
   },
   (t) => [index('canvas_releases_canvas_idx').on(t.canvasId, t.createdAt)],
+)
+
+/** Canvas-level history: the snapshots a canvas can be rolled back to.
+ *
+ *  Same denormalization as canvas_releases and for the same reason — a
+ *  snapshot must not change when a frame is edited or deleted afterwards. The
+ *  difference is intent: a release is a handoff artifact a human names, while
+ *  a version is automatic history (every CANVAS_SNAPSHOT_EVERY durable frame
+ *  writes, plus every delete and restore), capped at MAX_CANVAS_VERSIONS per
+ *  canvas and read only when someone opens the History tab. */
+export const canvasVersions = pgTable(
+  'canvas_versions',
+  {
+    id: text('id').primaryKey(),
+    canvasId: text('canvas_id').notNull(),
+    /** 'auto' | 'delete' | 'manual' | 'restore' — why the snapshot was taken */
+    cause: text('cause').notNull(),
+    /** the frames as they were: see ReleaseFrame in db/persist.ts */
+    frames: jsonb('frames').notNull(),
+    /** the design tokens at snapshot time, when the canvas had any */
+    tokens: jsonb('tokens'),
+    createdAt: bigint('created_at', { mode: 'number' }).notNull(),
+    createdBy: text('created_by').notNull(),
+  },
+  (t) => [index('canvas_versions_canvas_idx').on(t.canvasId, t.createdAt)],
 )
 
 /** Frames pinned to Memory as style exemplars: the HTML is a snapshot taken
@@ -580,12 +673,39 @@ export const runEvents = pgTable(
   (t) => [index('run_events_canvas_idx').on(t.canvasId)],
 )
 
-/** Per-user email notification preference for agent events. */
+/** Per-user email notification preference for agent events. One switch per
+ *  class of event: a question that is waiting on a human, and a run that
+ *  finished or failed. All default OFF — mail is opt-in. */
 export const notificationPrefs = pgTable('notification_prefs', {
   userId: text('user_id').primaryKey(),
   agentEmail: boolean('agent_email').notNull().default(false),
+  agentFinishEmail: boolean('agent_finish_email').notNull().default(false),
+  agentFailEmail: boolean('agent_fail_email').notNull().default(false),
   updatedAt: bigint('updated_at', { mode: 'number' }).notNull(),
 })
+
+/** The canvas chat channel: free-form messages between the humans and the
+ *  agents on one canvas, and the queue an agent reads first when it connects.
+ *  Distinct from comments (pinned to an element) and questions (blocking).
+ *  In-memory as a bounded per-canvas ring for every read (server/db/persist.ts),
+ *  mirrored here so a restart keeps the recent conversation. */
+export const agentMessages = pgTable(
+  'agent_messages',
+  {
+    id: text('id').primaryKey(),
+    canvasId: text('canvas_id').notNull(),
+    authorName: text('author_name').notNull(),
+    /** 'user' | 'agent' — what the chat badges the sender as */
+    authorKind: text('author_kind').notNull(),
+    authorColor: text('author_color').notNull(),
+    /** the agent name or role the message is routed to (`copy`,
+     *  `Accessibility`); null = everyone on the canvas */
+    to: text('to'),
+    body: text('body').notNull(),
+    at: bigint('at', { mode: 'number' }).notNull(),
+  },
+  (t) => [index('agent_messages_canvas_idx').on(t.canvasId, t.at)],
+)
 
 /** A reusable piece of canvas UI — the component library behind
  *  insert_component. `html` is the definition document; an instance is an
@@ -611,6 +731,10 @@ export const components = pgTable(
     updatedBy: text('updated_by').notNull(),
     createdAt: bigint('created_at', { mode: 'number' }).notNull(),
     updatedAt: bigint('updated_at', { mode: 'number' }).notNull(),
+    /** trash: epoch-ms when the component was deleted, null = live. Hidden
+     *  from the library immediately, hard-deleted by the purge job once it is
+     *  past the retention window. */
+    deletedAt: bigint('deleted_at', { mode: 'number' }),
   },
   (t) => [index('components_canvas_idx').on(t.canvasId)],
 )

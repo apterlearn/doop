@@ -87,6 +87,11 @@ const frame: Frame = {
   createdAt: 0,
   updatedAt: 1,
   updatedBy: 'Claude',
+  z: 0,
+  locked: false,
+  hidden: false,
+  rotation: 0,
+  opacity: 1,
   pageId: 'p-reviews',
 }
 

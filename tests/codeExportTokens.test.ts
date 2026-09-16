@@ -187,6 +187,11 @@ describe('asset listing', () => {
         createdAt: 1,
         updatedAt: 1,
         updatedBy: 'tester',
+        z: 0,
+        locked: false,
+        hidden: false,
+        rotation: 0,
+        opacity: 1,
       },
       true,
     )
@@ -258,6 +263,11 @@ describe('asset listing', () => {
         createdAt: 1,
         updatedAt: 1,
         updatedBy: 'tester',
+        z: 0,
+        locked: false,
+        hidden: false,
+        rotation: 0,
+        opacity: 1,
       },
       true,
     )
@@ -332,6 +342,11 @@ describe('specMd', () => {
     createdAt: 0,
     updatedAt: 1_700_000_000_000,
     updatedBy: 'Claude',
+    z: 0,
+    locked: false,
+    hidden: false,
+    rotation: 0,
+    opacity: 1,
     pageId: 'p-spec',
   }
 

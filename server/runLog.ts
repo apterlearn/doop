@@ -46,9 +46,13 @@ function writeBehind(statement: () => Promise<unknown>): void {
   }
 }
 
-/** Append one event to a canvas's timeline and return it as stored. */
-export function record(event: Omit<RunEvent, 'id' | 'at'> & { at?: number }): RunEvent {
-  const full: RunEvent = { ...event, id: nanoid(8), at: event.at ?? Date.now() }
+/** Append one event to a canvas's timeline and return it as stored. `kind`
+ *  defaults to `'tool'`, so the common case — a tool call — need not spell it
+ *  out, and the status/error/stop lines `recordStatus` writes do. */
+export function record(
+  event: Omit<RunEvent, 'id' | 'at' | 'kind'> & { kind?: RunEvent['kind']; at?: number },
+): RunEvent {
+  const full: RunEvent = { ...event, kind: event.kind ?? 'tool', id: nanoid(8), at: event.at ?? Date.now() }
   const list = runLog.get(full.canvasId) ?? []
   list.unshift(full)
   if (list.length > CAP) list.length = CAP
@@ -75,6 +79,34 @@ export function record(event: Omit<RunEvent, 'id' | 'at'> & { at?: number }): Ru
   )
   broadcast(full.canvasId, { type: 'run:event', event: full })
   return full
+}
+
+/** Record a step that is not a tool call: a status line ("implementing attempt
+ *  2/3", "judge reviewing"), a failure, or the stop that ended the run. Same
+ *  ring, write-behind and broadcast as `record`; only the fields differ.
+ *
+ *  The summary is flattened to one line and cut at 200 characters — the bound
+ *  a tool result summary carries and what the Run tab renders. A status line
+ *  is often a human's sentence and an error is often a multi-line stack;
+ *  neither should reach the ring raw. */
+export function recordStatus(
+  canvasId: string,
+  runId: string,
+  agentName: string,
+  kind: 'status' | 'error' | 'stop',
+  summary: string,
+  opts: { name?: string; ok?: boolean; frameId?: string } = {},
+): RunEvent {
+  return record({
+    canvasId,
+    runId,
+    agentName,
+    kind,
+    summary: summary.replace(/\s+/g, ' ').trim().slice(0, 200),
+    ...(opts.name ? { name: opts.name } : {}),
+    ...(opts.ok !== undefined ? { ok: opts.ok } : {}),
+    ...(opts.frameId ? { frameId: opts.frameId } : {}),
+  })
 }
 
 /** A canvas's timeline, newest first — optionally one run's, and never more

@@ -1,5 +1,7 @@
 import { betterAuth } from 'better-auth'
 import { APIError } from 'better-auth/api'
+import { hashPassword, verifyPassword } from 'better-auth/crypto'
+import { createHmac, timingSafeEqual } from 'node:crypto'
 import { eq, inArray, or, isNull, ne, and, sql } from 'drizzle-orm'
 import { admin, mcp, genericOAuth } from 'better-auth/plugins'
 import { drizzleAdapter } from 'better-auth/adapters/drizzle'
@@ -456,4 +458,94 @@ export async function isBanned(userId: string): Promise<boolean> {
   const banned = row ? !!row.banned : true
   banStates.set(userId, { banned, at: Date.now() })
   return banned
+}
+
+/* ------------------------------------------------------------------ */
+/* Share links: the link password and the guest ticket.                */
+/*                                                                     */
+/* Both are credentials that belong to a canvas rather than an account, */
+/* which is why they live here next to the signing/verifying the rest   */
+/* of the auth surface already does — and why nothing about them        */
+/* depends on a session.                                                */
+/* ------------------------------------------------------------------ */
+
+/** Account passwords are hashed with better-auth's scrypt; a share-link
+ *  password is the same kind of secret under the same threat (a stored
+ *  offline guess), so it uses the same function rather than a second
+ *  convention and a second set of parameters to get wrong. */
+export async function hashLinkPassword(password: string): Promise<string> {
+  return hashPassword(password)
+}
+
+export async function verifyLinkPassword(password: string, hash: string): Promise<boolean> {
+  /* a corrupt or empty hash must read as "wrong password", not as an
+     exception the route has to interpret */
+  if (!hash || !password) return false
+  return verifyPassword({ hash, password }).catch(() => false)
+}
+
+/** How long a guest ticket lives. Short on purpose: the ticket is a bearer
+ *  credential handed to an anonymous caller, and the link itself is what keeps
+ *  working — anyone who still has the link can mint a fresh one. 30 minutes
+ *  also bounds how long an intent outlives the owner turning the link off,
+ *  which the ws join re-checks anyway. */
+const GUEST_TICKET_TTL_MS = 30 * 60_000
+
+/** The ticket's signing key: the deployment's own secret when it has one, so a
+ *  ticket survives a restart (and is valid on every process of the same
+ *  deploy); otherwise the public origin, which is stable and per-instance.
+ *  Never the better-auth session secret in dev, where BETTER_AUTH_SECRET is
+ *  unset — a forged ticket buys nothing more than the link already grants
+ *  (view/comment/edit on ONE canvas id, which is itself the unguessable part),
+ *  and the origin keeps dev tickets stable across restarts. */
+function guestTicketKey(): string {
+  return process.env.BETTER_AUTH_SECRET || `doop-guest-ticket:${PUBLIC_ORIGIN}`
+}
+
+function signTicketPayload(payload: string): string {
+  return createHmac('sha256', guestTicketKey()).update(payload).digest('base64url')
+}
+
+/** What a verified ticket says: which canvas, how far, until when. */
+export interface GuestTicket {
+  canvasId: string
+  mode: 'view' | 'comment' | 'edit'
+  expiresAt: number
+}
+
+/** Mint a self-contained guest ticket: no table, no cleanup, and nothing to
+ *  leak if the database is dumped. Format (dot-separated, base64url-safe by
+ *  construction — the canvas id is a nanoid and the mode is a word):
+ *
+ *      g1.<canvasId>.<mode>.<expiresAtMs>.<base64url hmac-sha256 of the first four>
+ *
+ *  The signature covers the payload verbatim, so the expiry and the mode are
+ *  as tamper-proof as the canvas id. */
+export function mintGuestTicket(
+  canvasId: string,
+  mode: GuestTicket['mode'],
+  now = Date.now(),
+): { ticket: string; expiresAt: number } {
+  const expiresAt = now + GUEST_TICKET_TTL_MS
+  const payload = `g1.${canvasId}.${mode}.${expiresAt}`
+  return { ticket: `${payload}.${signTicketPayload(payload)}`, expiresAt }
+}
+
+/** Verify a ticket and answer what it grants, or null when it is malformed,
+ *  signed with another key, or past its expiry. */
+export function readGuestTicket(ticket: unknown, now = Date.now()): GuestTicket | null {
+  const parts = String(ticket ?? '').split('.')
+  if (parts.length !== 5) return null
+  const [version, canvasId, mode, rawExpiresAt, signature] = parts
+  if (version !== 'g1') return null
+  if (!canvasId || (mode !== 'view' && mode !== 'comment' && mode !== 'edit')) return null
+  const expected = signTicketPayload(parts.slice(0, 4).join('.'))
+  /* constant-time, and length-checked first: timingSafeEqual throws on a
+     length mismatch, and a comparison that leaks timing is a forgery oracle */
+  const a = Buffer.from(signature!)
+  const b = Buffer.from(expected)
+  if (a.length !== b.length || !timingSafeEqual(a, b)) return null
+  const expiresAt = Number(rawExpiresAt)
+  if (!Number.isFinite(expiresAt) || expiresAt <= now) return null
+  return { canvasId, mode, expiresAt }
 }

@@ -1,5 +1,6 @@
 import type {
   ActivityItem,
+  AgentMessage,
   AgentQuestion,
   Canvas,
   CanvasMeta,
@@ -26,6 +27,62 @@ export interface CanvasMember {
   name: string
   email: string
   owner: boolean
+  /** what this collaborator may do: a viewer reads, a commenter also leaves
+   *  notes, an editor changes the design. The owner is always an editor. */
+  role: CanvasRole
+}
+
+/** The link modes a canvas can be shared under, from most closed to most open.
+ *  `none` is private; the others are what an uninvited visitor gets. */
+export type LinkAccess = 'none' | 'view' | 'comment' | 'edit'
+
+/** What a collaborator may do on a canvas. */
+export type CanvasRole = 'viewer' | 'commenter' | 'editor' | 'admin'
+
+/** A pending invitation to somebody who may not have an account yet: the
+ *  token is the capability, the email is who it is meant for. */
+export interface CanvasInvite {
+  id: string
+  email: string
+  role: CanvasRole
+  createdAt: number
+  expiresAt: number
+  /** who sent it */
+  invitedBy: string
+  /** the link to send: /invite/<token> */
+  url: string
+}
+
+/** What an unauthenticated visitor gets for a shared canvas. `ticket` is the
+ *  short-lived proof they may read (and comment, under `comment`) without an
+ *  account — it is what the ws join carries. */
+export interface PublicCanvas {
+  canvas: Canvas
+  access: Exclude<LinkAccess, 'none'>
+  ticket: string
+  expiresAt: number
+}
+
+/** One signed-in browser/device on this account, as Settings lists it. */
+export interface AccountSession {
+  id: string
+  ipAddress?: string
+  userAgent?: string
+  createdAt: number
+  expiresAt: number
+  /** the session this page is running under */
+  current: boolean
+}
+
+/** Which agent moments this account wants emailed about. All opt-in: agents
+ *  work unattended, so the default is to interrupt nobody. */
+export interface NotificationPrefs {
+  /** an agent is blocked on a question only a human can answer */
+  agentEmail: boolean
+  /** a run (design workflow) finished */
+  agentFinishEmail: boolean
+  /** a run failed */
+  agentFailEmail: boolean
 }
 
 /** A write-only design-sync key: apps embed its secret in the doop-sync
@@ -175,6 +232,66 @@ export interface ConnectedAgent {
   /** last authenticated MCP call this process saw, ms epoch — 0 = never used */
   lastUsedAt: number
 }
+
+/** One frame as a canvas snapshot froze it: the fields a preview reads. A
+ *  checkpoint also freezes stacking, lock, visibility, rotation and opacity —
+ *  neither a thumbnail nor a restore decision here needs them. Mirrors
+ *  `ReleaseFrame` in server/db/persist.ts (the client cannot import from
+ *  server/), and neither a checkpoint's frame nor a release's is a live frame:
+ *  the frame a snapshot names may have been deleted since. */
+export interface CanvasVersionFrame {
+  id: string
+  name: string
+  width: number
+  height: number
+  x: number
+  y: number
+  html: string
+  pageId?: string
+}
+
+/** A checkpoint of the whole canvas, as the timeline lists it. `cause` is why
+ *  it was taken: automatically while the canvas is edited, before a delete, on
+ *  request, or as the state a restore came from. */
+export interface CanvasVersionSummary {
+  id: string
+  cause: 'auto' | 'delete' | 'manual' | 'restore'
+  createdAt: number
+  createdBy: string
+  frameCount: number
+}
+
+/** A checkpoint's snapshot: the frames as they stood, plus the canvas tokens
+ *  that were in force. */
+export interface CanvasVersion extends Omit<CanvasVersionSummary, 'frameCount'> {
+  canvasId: string
+  frames: CanvasVersionFrame[]
+  tokens?: DesignTokens
+}
+
+/** A deleted canvas waiting in the trash: restorable, or purgeable for good. */
+export interface TrashedCanvas {
+  id: string
+  name: string
+  deletedAt: number
+  frameCount: number
+}
+
+/** A deleted frame waiting in the trash, with the canvas it came from so a
+ *  row can say where restoring it would put it back. */
+export interface TrashedFrame {
+  id: string
+  canvasId: string
+  canvasName: string
+  name: string
+  deletedAt: number
+}
+
+/** Everything the trash holds, as the dashboard lists it. */
+export interface TrashContents {
+  canvases: TrashedCanvas[]
+  frames: TrashedFrame[]
+}
 import { getIdentity } from './identity'
 
 function actor() {
@@ -205,6 +322,134 @@ async function req<T>(url: string, init?: RequestInit): Promise<T> {
   return res.json()
 }
 
+/** A frame write the server refused because the frame had moved on since the
+ *  caller read it: the write landed nowhere, and `current` is the frame as the
+ *  server has it — what `patchFrameLocal` wants, so the client catches up
+ *  instead of keeping a copy nobody else can see. The same contract the MCP
+ *  tools' `expected_updated_at` carries. */
+export interface StaleFrameConflict {
+  code: 'stale_frame'
+  /** the server's own words: which frame, when it moved and who moved it */
+  error: string
+  current: Frame
+}
+
+/** The 409 a preconditioned frame write answers with. Anything else — another
+ *  status, another code, a body with no usable frame in it — is `undefined`:
+ *  a caller is never handed a half-read body to pretend with. */
+export function staleFrameConflict(e: unknown): StaleFrameConflict | undefined {
+  if (!(e instanceof ApiError) || e.status !== 409) return undefined
+  const { code, error, current } = e.body
+  if (code !== 'stale_frame') return undefined
+  if (typeof current !== 'object' || current === null) return undefined
+  const frame = current as Partial<Frame>
+  /* the frame the local canvas can actually take: its id is where the copy
+     goes, its updatedAt is the fresh precondition every later write needs */
+  if (typeof frame.id !== 'string' || typeof frame.updatedAt !== 'number') return undefined
+  return {
+    code: 'stale_frame',
+    error: typeof error === 'string' ? error : 'the frame changed since you read it — reload and try again',
+    current: frame as Frame,
+  }
+}
+
+/** One frame's share of a canvas-wide find & replace: `matches` is what the
+ *  find string hit in its document, `applied` whether the write landed, and
+ *  `skippedReason` why it did not — an agent holding the frame's lock. */
+export interface ReplaceResult {
+  frames: { frameId: string; name: string; matches: number; applied: boolean; skippedReason?: string }[]
+  totalMatches: number
+}
+
+/** What the find-and-replace modal sends. `pageId` unset sweeps every frame
+ *  on the canvas; `dryRun` only counts, so the modal can show a diff first. */
+export interface ReplaceInput {
+  find: string
+  replace: string
+  pageId?: string
+  regex?: boolean
+  caseSensitive?: boolean
+  dryRun?: boolean
+}
+
+/** What a component is built from: the markup that gets instanced onto the
+ *  canvas, the size it wants, and where it came from. A component with
+ *  `variantOf` is a variation on that other one rather than a fresh entry. */
+export interface ComponentInput {
+  name: string
+  html: string
+  width: number
+  height: number
+  description?: string
+  variantOf?: string
+}
+
+/** What the fields a component may be edited through. The markup is optional
+ *  so a rename does not have to replay every instance. */
+export interface ComponentPatch {
+  html?: string
+  name?: string
+  width?: number
+  height?: number
+  description?: string
+}
+
+/** What rewriting a component's instances answered: the frames the new markup
+ *  reached, and the ones it did not with the reason — an agent holding the
+ *  frame's lock. Mirrors the server's reply verbatim. */
+export interface ComponentUpdateResult {
+  component: Component
+  updated: { frameId: string; name: string }[]
+  skipped: { frameId: string; name: string; reason: string }[]
+}
+
+/** One image stored on a canvas, as the Assets panel lists it: the permanent
+ *  `/a/<id>.<ext>` URL frames embed, and the intrinsic size when the server
+ *  decoded it at upload. Assets uploaded before dimensions were recorded
+ *  carry neither, so both stay optional. */
+export interface AssetSummary {
+  id: string
+  url: string
+  mime: string
+  bytes: number
+  width?: number
+  height?: number
+  /** when it was uploaded, epoch ms */
+  at: number
+}
+
+/** A page of the canvas's image library, newest first. */
+export interface AssetPage {
+  assets: AssetSummary[]
+  total: number
+  has_more: boolean
+}
+
+/** Raw image bytes POSTed to an asset route: the body is the file itself,
+ *  typed by its own mime, and the server sniffs the bytes rather than trusting
+ *  the header. Upload and replace answer differently but fail identically, so
+ *  they share the one path — including the 413 the 5 MB cap produces, which is
+ *  worth saying in words rather than as a status code. */
+async function postAssetBytes<T>(url: string, blob: Blob): Promise<T> {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': blob.type || 'application/octet-stream' },
+    body: blob,
+  })
+  if (!res.ok) {
+    if (res.status === 413) throw new Error('image exceeds the 5 MB limit')
+    const text = await res.text()
+    let msg = `${res.status} ${text}`
+    try {
+      msg = JSON.parse(text).error || msg
+    } catch {
+      /* non-JSON error body */
+    }
+    throw new Error(msg)
+  }
+  return res.json() as Promise<T>
+}
+
 export const api = {
   listCanvases: () => req<CanvasMeta[]>('/api/canvases'),
   getCanvas: (id: string) => req<Canvas>(`/api/canvases/${id}`),
@@ -216,8 +461,48 @@ export const api = {
   renameCanvas: (id: string, name: string) =>
     req('/api/canvases/' + id, { method: 'PATCH', body: JSON.stringify({ name, actor: actor() }) }),
   /* owner-only: what the share link grants people who aren't invited */
-  setLinkAccess: (id: string, linkAccess: 'edit' | 'none') =>
+  setLinkAccess: (id: string, linkAccess: LinkAccess) =>
     req('/api/canvases/' + id, { method: 'PATCH', body: JSON.stringify({ linkAccess }) }),
+  /* owner-only link extras: a password gates the link, an expiry closes it
+     on its own. null clears either. */
+  setLinkSharing: (id: string, patch: { password?: string | null; expiresAt?: number | null }) =>
+    req<Canvas>('/api/canvases/' + id, { method: 'PATCH', body: JSON.stringify(patch) }),
+  /* collaborators and their roles */
+  setMemberRole: (canvasId: string, userId: string, role: CanvasRole) =>
+    req<CanvasMember>(`/api/canvases/${canvasId}/members/${userId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ role }),
+    }),
+  /* invitations for people who have no account yet */
+  listInvites: (canvasId: string) => req<CanvasInvite[]>(`/api/canvases/${canvasId}/invites`),
+  createInvite: (canvasId: string, email: string, role: CanvasRole) =>
+    req<CanvasInvite>(`/api/canvases/${canvasId}/invites`, {
+      method: 'POST',
+      body: JSON.stringify({ email, role }),
+    }),
+  revokeInvite: (canvasId: string, inviteId: string) =>
+    req(`/api/canvases/${canvasId}/invites/${inviteId}`, { method: 'DELETE' }),
+  getInvite: (token: string) =>
+    req<{ canvasId: string; canvasName: string; role: CanvasRole; email: string }>(`/api/invites/${token}`),
+  acceptInvite: (token: string) =>
+    req<{ ok: true; canvasId: string }>(`/api/invites/${token}/accept`, { method: 'POST' }),
+  /* the signed-out share-link surface: a password (when the owner set one)
+     buys a short-lived ticket, which is what reads and comments then use */
+  openPublicCanvas: (id: string, password?: string) =>
+    req<PublicCanvas>(`/api/public/canvases/${id}`, {
+      method: 'POST',
+      body: JSON.stringify(password ? { password } : {}),
+    }),
+  commentAsGuest: (
+    id: string,
+    input: { ticket: string; frameId: string; selector: string; snippet: string; text: string; stableKey?: string },
+  ) => req(`/api/public/canvases/${id}/comments`, { method: 'POST', body: JSON.stringify(input) }),
+  /* this account's own security surface */
+  listSessions: () => req<{ sessions: AccountSession[] }>('/api/account/sessions').then((r) => r.sessions),
+  revokeSession: (id: string) => req('/api/account/sessions/' + id, { method: 'DELETE' }),
+  revokeOtherSessions: () => req('/api/account/sessions/revoke-others', { method: 'POST' }),
+  deleteAccount: () =>
+    req('/api/account', { method: 'DELETE', body: JSON.stringify({ confirm: 'delete my account' }) }),
   /* community gallery: owner-only listing, open browsing and copying. A
      listing may pin a release, so the gallery shows and hands out that frozen
      snapshot instead of whatever the canvas says today */
@@ -355,6 +640,37 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ answer }),
     }),
+  /* the human↔agent chat: the queue an agent reads when it has nothing else
+     to do, and how a person parks a thought for an agent that is not
+     connected yet. Newest last. */
+  agentMessages: (canvasId: string, limit = 100) =>
+    req<{ messages: AgentMessage[] }>(`/api/canvases/${canvasId}/agent-messages?limit=${limit}`).then(
+      (r) => r.messages,
+    ),
+  postAgentMessage: (canvasId: string, body: string, to?: string) =>
+    req<AgentMessage>(`/api/canvases/${canvasId}/agent-messages`, {
+      method: 'POST',
+      body: JSON.stringify({ body, ...(to ? { to } : {}), actor: actor() }),
+    }),
+  deleteAgentMessage: (canvasId: string, messageId: string) =>
+    req(`/api/canvases/${canvasId}/agent-messages/${messageId}`, { method: 'DELETE' }),
+  /* stop or redirect a connected agent: the stop lands on its next tool call,
+     the steer is read there. `agentName` is the name it calls tools with. */
+  stopAgent: (canvasId: string, agentName: string) =>
+    req<{ ok: true }>(`/api/canvases/${canvasId}/agents/${encodeURIComponent(agentName)}/stop`, { method: 'POST' }),
+  steerAgent: (canvasId: string, agentName: string, message: string) =>
+    req<{ ok: true }>(`/api/canvases/${canvasId}/agents/${encodeURIComponent(agentName)}/steer`, {
+      method: 'POST',
+      body: JSON.stringify({ message }),
+    }),
+  /* take back everything one run did: the frames it touched return to the
+     version each was at before the run started. Frames changed by anyone else
+     since are refused rather than clobbered, so the response reports both. */
+  revertRun: (canvasId: string, runId: string) =>
+    req<{
+      reverted: { frameId: string; name: string }[]
+      skipped: { frameId: string; name: string; reason: string }[]
+    }>(`/api/canvases/${canvasId}/runs/${runId}/revert`, { method: 'POST' }),
   /* frame history: the same versions the MCP revert_frame tool restores */
   frameVersions: (frameId: string, limit = 20) => req<FrameVersion[]>(`/api/frames/${frameId}/versions?limit=${limit}`),
   frameVersion: (frameId: string, versionId: string) =>
@@ -381,41 +697,68 @@ export const api = {
   /* an agent holds the frame's edit lock; taking it over frees the frame */
   unlockFrame: (frameId: string) => req(`/api/frames/${frameId}/unlock`, { method: 'POST' }),
   /* raw image bytes -> permanent /a/ URL (5 MB cap, type sniffed server-side) */
-  uploadAsset: async (canvasId: string, blob: Blob) => {
-    const res = await fetch(`/api/canvases/${canvasId}/assets`, {
-      method: 'POST',
-      headers: { 'Content-Type': blob.type || 'application/octet-stream' },
-      body: blob,
-    })
-    if (!res.ok) {
-      if (res.status === 413) throw new Error('image exceeds the 5 MB limit')
-      const text = await res.text()
-      let msg = `${res.status} ${text}`
-      try {
-        msg = JSON.parse(text).error || msg
-      } catch {
-        /* non-JSON error body */
-      }
-      throw new Error(msg)
-    }
-    return res.json() as Promise<{ url: string; mime: string; size: number }>
+  uploadAsset: (canvasId: string, blob: Blob) =>
+    postAssetBytes<{ url: string; mime: string; size: number }>(`/api/canvases/${canvasId}/assets`, blob),
+  /* the canvas's image library, newest first. A page at a time, because a
+     canvas that has been importing screens for a while holds a lot of them:
+     `has_more` is what the panel's Load more reads. */
+  listAssets: (canvasId: string, opts: { limit?: number; offset?: number } = {}) => {
+    const q = new URLSearchParams()
+    if (opts.limit !== undefined) q.set('limit', String(opts.limit))
+    if (opts.offset !== undefined) q.set('offset', String(opts.offset))
+    const qs = q.toString()
+    return req<AssetPage>(`/api/canvases/${canvasId}/assets${qs ? `?${qs}` : ''}`)
   },
-  /* agent-event email, opt-in per account */
-  notifications: () => req<{ agentEmail: boolean }>('/api/settings/notifications'),
-  setNotifications: (agentEmail: boolean) =>
-    req<{ agentEmail: boolean }>('/api/settings/notifications', {
+  /* forget an image for good — unless a frame still embeds it, which the
+     server answers as a 409 rather than leaving the frame broken */
+  deleteAsset: (assetId: string) => req<{ ok: true }>(`/api/assets/${assetId}`, { method: 'DELETE' }),
+  /* swap the bytes behind an asset's URL, rewriting every frame that embeds
+     it; `frames` is how many were updated */
+  replaceAsset: (canvasId: string, assetId: string, blob: Blob) =>
+    postAssetBytes<{ url: string; mime: string; size: number; frames: number }>(
+      `/api/canvases/${canvasId}/assets/${assetId}/replace`,
+      blob,
+    ),
+  /* agent-event email, opt-in per account and per kind: a question an agent
+     is blocked on, a run that finished, and a run that failed are different
+     reasons to be interrupted */
+  notifications: () => req<NotificationPrefs>('/api/settings/notifications'),
+  setNotifications: (prefs: Partial<NotificationPrefs>) =>
+    req<NotificationPrefs>('/api/settings/notifications', {
       method: 'POST',
-      body: JSON.stringify({ agentEmail }),
+      body: JSON.stringify(prefs),
     }),
   createFrame: (canvasId: string, input: Partial<Frame> & { name: string }) =>
     req<Frame>(`/api/canvases/${canvasId}/frames`, {
       method: 'POST',
       body: JSON.stringify({ ...input, actor: actor() }),
     }),
-  updateFrame: (frameId: string, patch: Partial<Frame>) =>
-    req<Frame>('/api/frames/' + frameId, { method: 'PATCH', body: JSON.stringify({ ...patch, actor: actor() }) }),
+  /* A frame write may carry the `updatedAt` the caller read the frame at:
+     the write is then refused whole — 409 `stale_frame`, the frame in the
+     body, nothing written — when someone else got there first. See
+     staleFrameConflict. No expectation = no check, as every write before
+     this contract behaved. */
+  updateFrame: (frameId: string, patch: Partial<Frame>, opts?: { expectedUpdatedAt?: number }) =>
+    req<Frame>('/api/frames/' + frameId, {
+      method: 'PATCH',
+      body: JSON.stringify({
+        ...patch,
+        actor: actor(),
+        ...(opts?.expectedUpdatedAt !== undefined ? { expected_updated_at: opts.expectedUpdatedAt } : {}),
+      }),
+    }),
   deleteFrame: (frameId: string) =>
     req('/api/frames/' + frameId, { method: 'DELETE', body: JSON.stringify({ actor: actor() }) }),
+  /* restacking answers with the page's frames front-to-back, with their fresh
+     z: the returned order is what the client paints, not an echo of the ask */
+  moveFrameZ: (frameId: string, dir: 'front' | 'back' | 'forward' | 'backward') =>
+    req<Frame[]>('/api/frames/' + frameId + '/z', { method: 'POST', body: JSON.stringify({ dir, actor: actor() }) }),
+  /* a rail drag sends the whole explicit order; the server resolves it to z */
+  setFrameOrder: (canvasId: string, pageId: string, order: string[]) =>
+    req<Frame[]>('/api/canvases/' + canvasId + '/z-order', {
+      method: 'POST',
+      body: JSON.stringify({ pageId, order, actor: actor() }),
+    }),
   /* one component's full record: the markup the library list leaves out, so a
      row can be instanced onto the canvas as a frame */
   getComponent: (id: string) => req<Component>(`/api/components/${id}`),
@@ -424,6 +767,23 @@ export const api = {
      and a new frame broadcasts no components update, so a row refetches this
      to bring its own count up to date. */
   listComponents: (canvasId: string) => req<ComponentSummary[]>(`/api/canvases/${canvasId}/components`),
+  /* a new library entry, built from a frame's markup (the panel and the frame
+     menu both start here). The server stores the definition; instances onto
+     the canvas are frames wrapping it in data-doop-component, which is what
+     insertComponent/the panel's Insert build. */
+  createComponent: (canvasId: string, input: ComponentInput) =>
+    req<Component>(`/api/canvases/${canvasId}/components`, {
+      method: 'POST',
+      body: JSON.stringify({ ...input, actor: actor() }),
+    }),
+  /* edit a component in place. Changing the markup rewrites every instance on
+     the canvas — the answer says which frames took the change and which could
+     not (an agent holding the frame's lock), so the caller can report both. */
+  updateComponent: (componentId: string, patch: ComponentPatch) =>
+    req<ComponentUpdateResult>(`/api/components/${componentId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ ...patch, actor: actor() }),
+    }),
   /* pages: ordered sub-canvases grouping the canvas's frames */
   createPage: (canvasId: string, name: string) =>
     req<Page>(`/api/canvases/${canvasId}/pages`, {
@@ -450,6 +810,15 @@ export const api = {
     req<WebsiteImportResult>(`/api/canvases/${canvasId}/import`, {
       method: 'POST',
       body: JSON.stringify({ urls }),
+    }),
+  /** Canvas-wide find & replace — the REST twin of the MCP `replace_in_frames`
+   *  tool. Every write is the same per-frame edit the inspector makes, so each
+   *  frame keeps its own version history; `dryRun` counts matches without
+   *  writing. The route ignores `actor` here, but every canvas call sends it. */
+  findReplace: (canvasId: string, input: ReplaceInput) =>
+    req<ReplaceResult>(`/api/canvases/${canvasId}/find-replace`, {
+      method: 'POST',
+      body: JSON.stringify({ ...input, actor: actor() }),
     }),
   modelAccount: () => req<ModelAccountStatus>('/api/model-account'),
   chatgptAuthorize: () =>
@@ -480,6 +849,14 @@ export const api = {
      opened as a pull request against a connected repo */
   exportCanvas: (canvasId: string, format: 'zip' | 'code') =>
     req<{ url: string }>(`/api/canvases/${canvasId}/export`, { method: 'POST', body: JSON.stringify({ format }) }),
+  /* one PNG of the active page's visible frames, composited server-side — the
+     whole board as a picture, for a share sheet or a changelog. `pageId` picks
+     the page; the server falls back to the canvas's first one. */
+  exportCanvasImage: (canvasId: string, pageId?: string) =>
+    req<{ url: string }>(`/api/canvases/${canvasId}/export-image`, {
+      method: 'POST',
+      body: JSON.stringify(pageId ? { pageId } : {}),
+    }),
   /* `repo` names the connection to spend: the route requires it, and a canvas
      may have more than one connected repository */
   openPullRequest: (canvasId: string, opts?: { repo?: string; message?: string; base?: string }) =>
@@ -509,6 +886,30 @@ export const api = {
     }),
   restoreRelease: (canvasId: string, releaseId: string) =>
     req<{ ok: true }>(`/api/canvases/${canvasId}/releases/${releaseId}/restore`, { method: 'POST' }),
+  /* canvas history: checkpoints the server takes on its own — as the canvas is
+     edited and before every delete — that the History tab lists, previews and
+     restores. A restore is itself checkpointed, so it stays undoable here. */
+  listCanvasVersions: async (canvasId: string) => {
+    const { versions } = await req<{ versions: CanvasVersionSummary[] }>(`/api/canvases/${canvasId}/versions`)
+    return versions
+  },
+  createCanvasVersion: (canvasId: string) =>
+    req<CanvasVersionSummary>(`/api/canvases/${canvasId}/versions`, { method: 'POST' }),
+  /* a checkpoint's whole snapshot, frames and tokens — fetched when a timeline
+     row is opened, never with the list */
+  getCanvasVersion: (canvasId: string, versionId: string) =>
+    req<CanvasVersion>(`/api/canvases/${canvasId}/versions/${versionId}`),
+  restoreCanvasVersion: (canvasId: string, versionId: string) =>
+    req<{ ok: true; restored: number; created: number }>(`/api/canvases/${canvasId}/versions/${versionId}/restore`, {
+      method: 'POST',
+    }),
+  /* trash: deleting a canvas or a frame moves it here rather than destroying
+     it, so every delete is recoverable until it is purged on purpose */
+  listTrash: () => req<TrashContents>('/api/trash'),
+  restoreTrashedCanvas: (id: string) => req<{ ok: true }>(`/api/trash/canvases/${id}/restore`, { method: 'POST' }),
+  purgeTrashedCanvas: (id: string) => req<{ ok: true }>(`/api/trash/canvases/${id}`, { method: 'DELETE' }),
+  restoreTrashedFrame: (id: string) => req<{ ok: true }>(`/api/trash/frames/${id}/restore`, { method: 'POST' }),
+  purgeTrashedFrame: (id: string) => req<{ ok: true }>(`/api/trash/frames/${id}`, { method: 'DELETE' }),
   listMcpAgents: () => req<ConnectedAgent[]>('/api/mcp-agents'),
   revokeMcpAgent: (clientId: string) => req(`/api/mcp-agents/${encodeURIComponent(clientId)}`, { method: 'DELETE' }),
 }

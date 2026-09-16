@@ -106,6 +106,11 @@ function seed() {
     createdAt: 1,
     updatedAt: 1,
     updatedBy: 'alice',
+    z: 0,
+    locked: false,
+    hidden: false,
+    rotation: 0,
+    opacity: 1,
     pageId: canvas.pages![0]!.id,
   }
   canvas.frames.push(frame)

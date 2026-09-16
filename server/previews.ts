@@ -121,6 +121,11 @@ export async function renderHtmlPreview(html: string, viewport: { width: number;
     createdAt: Date.now(),
     updatedAt: Date.now(),
     updatedBy: 'system',
+    z: 0,
+    locked: false,
+    hidden: false,
+    rotation: 0,
+    opacity: 1,
   }
   /* lazy: the existing module pattern keeps puppeteer-core out of dev's
      startup; single-flight import so concurrent renders share one module */

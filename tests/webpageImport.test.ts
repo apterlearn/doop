@@ -6,7 +6,7 @@ describe('agent webpage import', () => {
   it('finds an existing snapshot by its normalized requested URL', () => {
     const html =
       '<!doctype html><html><head><meta name="doop-import-source" content="https%3A%2F%2Fexample.com%2F"></head></html>'
-    const frame = { id: 'source-1', html } as Frame
+    const frame = { id: 'source-1', html, z: 0, locked: false, hidden: false, rotation: 0, opacity: 1 } as Frame
 
     expect(findImportedWebpageFrame([frame], 'example.com')).toBe(frame)
     expect(findImportedWebpageFrame([frame], 'other.example')).toBeUndefined()
@@ -32,6 +32,11 @@ describe('agent webpage import', () => {
       createdAt: 1,
       updatedAt: 1,
       updatedBy: actor.name,
+      z: 0,
+      locked: false,
+      hidden: false,
+      rotation: 0,
+      opacity: 1,
     }
     const importPage: typeof import('../server/importer.ts').importPage = vi.fn(async () => imported)
     const createFrame: typeof import('../server/actions.ts').createFrame = vi.fn(() => frame)

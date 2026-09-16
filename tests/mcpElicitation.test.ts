@@ -44,6 +44,22 @@ vi.mock('../server/db/persist.ts', () => ({
   listFrameReviews: async () => [],
   listFrameVersions: async () => [],
   getFrameVersion: async () => undefined,
+  deleteComponentRow: () => {},
+  releaseFrames: () => [],
+  freezeFrames: () => [],
+  MAX_CANVAS_VERSIONS: 50,
+  saveCanvasVersion: () => {},
+  listCanvasVersions: async () => [],
+  getCanvasVersion: async () => undefined,
+  summarizeCanvasVersion: () => ({ id: '', cause: 'auto', createdAt: 0, createdBy: '', frameCount: 0 }),
+  deleteCanvasVersion: () => {},
+  pruneCanvasVersions: () => {},
+  restoreFrameRow: () => {},
+  restoreCanvasRow: () => {},
+  hardDeleteFrame: () => {},
+  hardDeleteCanvas: () => {},
+  purgeTrash: () => {},
+  TRASH_RETENTION_DAYS: 30,
 }))
 
 const OWNER = 'Dana'

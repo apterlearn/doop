@@ -88,6 +88,11 @@ function frame(id: string, canvasId: string, name: string, html: string, pageId 
     createdAt: 0,
     updatedAt: 1,
     updatedBy: 'Claude',
+    z: 0,
+    locked: false,
+    hidden: false,
+    rotation: 0,
+    opacity: 1,
     pageId,
   }
 }

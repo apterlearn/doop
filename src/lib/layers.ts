@@ -60,14 +60,24 @@ function detailOf(el: Element): string {
 function toNode(el: Element): LayerNode {
   const tag = el.tagName.toLowerCase()
   const base = { selector: elementPath(el), tag, detail: detailOf(el) }
-  if (el.namespaceURI === 'http://www.w3.org/2000/svg') return { ...base, label: 'svg', kind: 'svg', children: [] }
-  if (IMAGE_TAGS.has(el.tagName)) return { ...base, label: tag, kind: 'image', children: [] }
+  /* a name given to the element from the Layers rail outranks the tag or the
+     text the tree would otherwise label the row with */
+  const named = el.getAttribute('data-doop-name')?.trim()
+  if (el.namespaceURI === 'http://www.w3.org/2000/svg')
+    return { ...base, label: named || 'svg', kind: 'svg', children: [] }
+  if (IMAGE_TAGS.has(el.tagName)) return { ...base, label: named || tag, kind: 'image', children: [] }
   const children = layerChildren(el)
   const text = ownText(el)
   if (children.length === 0 && text) {
-    return { ...base, label: text.length > 60 ? text.slice(0, 57) + '…' : text, detail: '', kind: 'text', children }
+    return {
+      ...base,
+      label: named || (text.length > 60 ? text.slice(0, 57) + '…' : text),
+      detail: '',
+      kind: 'text',
+      children,
+    }
   }
-  return { ...base, label: tag, kind: 'box', children }
+  return { ...base, label: named || tag, kind: 'box', children }
 }
 
 function layerChildren(el: Element): LayerNode[] {
@@ -146,6 +156,20 @@ export function duplicateElement(html: string, selector: string): string | null 
   const copy = el.cloneNode(true) as Element
   renameIds(doc, copy)
   el.after(copy)
+  return serialize(doc)
+}
+
+/** The frame's HTML with the element's row name set to `name`, or null when
+ *  the selector no longer resolves. The name lives on the element itself
+ *  (`data-doop-name`), which is what the Layers rail shows for the row; a
+ *  blank name clears it and the row falls back to its tag or text. */
+export function renameElement(html: string, selector: string, name: string): string | null {
+  const doc = parse(html)
+  const el = find(doc, selector)
+  if (!el) return null
+  const clean = name.trim()
+  if (clean) el.setAttribute('data-doop-name', clean)
+  else el.removeAttribute('data-doop-name')
   return serialize(doc)
 }
 

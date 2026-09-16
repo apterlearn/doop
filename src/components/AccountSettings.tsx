@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { authClient } from '../lib/auth'
-import { api } from '../lib/api'
+import { api, type NotificationPrefs } from '../lib/api'
 import { posthog } from '../lib/posthog'
 import { Button } from './ui/button'
 import { Input } from './ui/input'
@@ -36,24 +36,27 @@ export function AccountSettings() {
   const [pwNote, setPwNote] = useState('')
   const [pwError, setPwError] = useState('')
 
-  /* agent-event email is opt-in per account; the server keeps the preference */
-  const [agentEmail, setAgentEmail] = useState<boolean | null>(null)
+  /* agent-event email is opt-in per account and per kind: being blocked on a
+     question, a run finishing and a run failing are different reasons to be
+     interrupted, so each has its own switch */
+  const [prefs, setPrefs] = useState<NotificationPrefs | null>(null)
   useEffect(() => {
-    api
-      .notifications()
-      .then((prefs) => setAgentEmail(prefs.agentEmail))
-      .catch(console.error)
+    api.notifications().then(setPrefs).catch(console.error)
   }, [])
 
-  function setAgentEmailOptIn(next: boolean) {
-    const was = agentEmail
-    setAgentEmail(next) // optimistic; a refused save rolls back below
+  function setPref(key: keyof NotificationPrefs, next: boolean) {
+    const was = prefs
+    if (!was) return
+    setPrefs({ ...was, [key]: next }) // optimistic; a refused save rolls back below
     api
-      .setNotifications(next)
-      .then(() => next && posthog.capture('agent_email_enabled'))
+      .setNotifications({ [key]: next })
+      .then((saved) => {
+        setPrefs(saved)
+        if (next) posthog.capture(`agent_email_enabled_${key}`)
+      })
       .catch((err) => {
         console.error(err)
-        setAgentEmail(was)
+        setPrefs(was)
       })
   }
 
@@ -215,13 +218,27 @@ export function AccountSettings() {
             something.
           </CardDescription>
         </CardHeader>
-        {agentEmail === null ? null : (
-          <CheckboxCard
-            checked={agentEmail}
-            onChange={setAgentEmailOptIn}
-            title="Email me when an agent finishes, fails or asks a question"
-            description="One message per event, sent to your sign-in address, with a link back to the canvas. In-app toasts always show these regardless."
-          />
+        {prefs === null ? null : (
+          <>
+            <CheckboxCard
+              checked={prefs.agentEmail}
+              onChange={(next) => setPref('agentEmail', next)}
+              title="An agent is waiting on a question"
+              description="The one kind that genuinely blocks: an agent cannot finish until somebody answers. In-app toasts always show these regardless."
+            />
+            <CheckboxCard
+              checked={prefs.agentFinishEmail}
+              onChange={(next) => setPref('agentFinishEmail', next)}
+              title="A run finished"
+              description="One message when a design workflow stops designing — its verdict and a link back to the frames it produced."
+            />
+            <CheckboxCard
+              checked={prefs.agentFailEmail}
+              onChange={(next) => setPref('agentFailEmail', next)}
+              title="A run failed or was stopped"
+              description="Sent when a run ends without finishing: a tool error, a failed judge check, or someone pressing Stop."
+            />
+          </>
         )}
       </Card>
     </>

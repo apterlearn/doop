@@ -1,15 +1,19 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { useStore, visibleFrames } from '../lib/store'
+import { isReadOnly, useStore, visibleFrames } from '../lib/store'
 import { sendFocus, sendWs } from '../lib/ws'
 import { throttle } from '../lib/throttle'
 import { FrameView } from './FrameView'
+import { AlignToolbar } from './AlignToolbar'
 import { FlowOverlay } from './FlowOverlay'
 import { Cursors } from './Cursors'
 import { SnapGuides } from './SnapGuides'
 import { MOD_KEY } from '../lib/keys'
 import { cn } from '../lib/utils'
 import { gesture } from '../lib/gesture'
-import { hasFrameClip, pasteFrameAtScreen } from '../lib/frameClipboard'
+import { api } from '../lib/api'
+import { recordCreate } from '../lib/history'
+import { COMPONENT_DRAG_MIME, dropImagesAt, hasFrameClip, pasteFrameAtScreen } from '../lib/frameClipboard'
+import { refreshComponents } from './ComponentsPanel'
 import { MenuHint } from './ui/menu'
 import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger } from './ui/context-menu'
 import { Toolbar, ToolbarButton, ToolbarDivider, ToolbarValue } from './ui/toolbar'
@@ -44,15 +48,33 @@ export function Stage({ onAddFrame }: { onAddFrame: (preset?: FramePreset) => vo
   const canvas = useStore((s) => s.canvas)
   const activePageId = useStore((s) => s.activePageId)
   /* the page tab filters what the stage renders — other pages' frames stay
-     in the store, out of sight */
-  const frames = useMemo(() => visibleFrames({ canvas, activePageId }), [canvas, activePageId])
+     in the store, out of sight. Hidden frames are filtered here too: they are
+     still in the store (the Layers rail lists them) but they paint nowhere.
+     Painting order is z, ascending: a higher z paints last and so sits in
+     front, whatever order the frames array holds. */
+  const frames = useMemo(
+    () =>
+      visibleFrames({ canvas, activePageId })
+        .filter((f) => !f.hidden)
+        .sort((a, b) => a.z - b.z),
+    [canvas, activePageId],
+  )
   const panMode = useStore((s) => s.panMode)
   const select = useStore((s) => s.select)
+  /* A read-only viewer keeps the whole navigation surface — pan, zoom, the
+     marquee, selection — and loses the one gesture that writes: nothing may be
+     dropped onto this stage, because every drop becomes a frame. */
+  const readOnly = useStore(isReadOnly)
   const [panning, setPanning] = useState(false)
   /* the selection rectangle being dragged out, in world coordinates */
   const [marquee, setMarquee] = useState<{ x: number; y: number; width: number; height: number } | null>(null)
   /* where the background menu opened, so Paste drops the frame there */
   const bgAt = useRef({ x: 0, y: 0 })
+  /* a drag carrying a component or image files is over the canvas: while it
+     is, a catcher covers the stage so a drop lands on it wherever the pointer
+     is — a drag over a frame's iframe goes to that iframe, not to this
+     element, and a file dropped there would navigate it */
+  const [dropActive, setDropActive] = useState(false)
   /* iframe oversampling factor — bumped only once the zoom settles */
   const [raster, setRaster] = useState(1)
   const fitted = useRef(false)
@@ -172,12 +194,16 @@ export function Stage({ onAddFrame }: { onAddFrame: (preset?: FramePreset) => vo
   const fit = useCallback(() => {
     const el = ref.current
     if (!el || !useStore.getState().canvas) return
-    const boxes = visibleFrames(useStore.getState()).map((f) => ({
-      x: f.x,
-      y: f.y - 30,
-      w: f.width,
-      h: f.height + 30,
-    }))
+    /* Fit frames what the stage shows: a hidden frame has no box there, so it
+       must not drag the camera out to empty space */
+    const boxes = visibleFrames(useStore.getState())
+      .filter((f) => !f.hidden)
+      .map((f) => ({
+        x: f.x,
+        y: f.y - 30,
+        w: f.width,
+        h: f.height + 30,
+      }))
     if (!boxes.length) {
       setViewport({ x: 80, y: 80, zoom: 1 })
       return
@@ -399,6 +425,111 @@ export function Stage({ onAddFrame }: { onAddFrame: (preset?: FramePreset) => vo
     }
   }
 
+  /* A component row dragged out of the library is a drag started in this same
+     document, so its start reaches us: the row puts the id under its MIME in
+     its own handler, and this bubbling listener — running after it — reads the
+     types back. The end of any drag puts the catcher away again. A drag of
+     image files in from the desktop has no start in this document to see, so
+     that one is caught by the stage's own dragenter below. */
+  useEffect(() => {
+    function onDragStart(e: DragEvent) {
+      if (e.dataTransfer?.types.includes(COMPONENT_DRAG_MIME)) setDropActive(true)
+    }
+    function onDragEnd() {
+      setDropActive(false)
+    }
+    window.addEventListener('dragstart', onDragStart)
+    window.addEventListener('dragend', onDragEnd)
+    window.addEventListener('drop', onDragEnd)
+    return () => {
+      window.removeEventListener('dragstart', onDragStart)
+      window.removeEventListener('dragend', onDragEnd)
+      window.removeEventListener('drop', onDragEnd)
+    }
+  }, [])
+
+  /** What a drag is carrying, for the three events that have to agree on it:
+   *  a component row out of the library, or image files in from the desktop.
+   *  Anything else — a text selection, a link — is the browser's business and
+   *  is left alone. */
+  function carriedKind(dt: DataTransfer | null): 'component' | 'files' | null {
+    const types = dt?.types
+    if (!types) return null
+    if (types.includes(COMPONENT_DRAG_MIME)) return 'component'
+    if (types.includes('Files')) return 'files'
+    return null
+  }
+
+  function onDragEnter(e: React.DragEvent) {
+    if (!carriedKind(e.dataTransfer)) return
+    e.preventDefault()
+    /* a read-only viewer gets no drop catcher: the highlight is a promise
+       that nothing here can keep */
+    if (readOnly) return
+    setDropActive(true)
+  }
+
+  function onDragOver(e: React.DragEvent) {
+    if (!carriedKind(e.dataTransfer)) return
+    /* the default for a drag nothing accepts is to refuse the drop, and for a
+       file that refusal is the browser opening it. Refusing it here — rather
+       than letting the event through — is what keeps a viewer who drags an
+       image onto a shared canvas from being navigated away to that image. */
+    e.preventDefault()
+    e.dataTransfer.dropEffect = readOnly ? 'none' : 'copy'
+  }
+
+  function onDrop(e: React.DragEvent) {
+    const kind = carriedKind(e.dataTransfer)
+    if (!kind || !canvas) return
+    e.preventDefault()
+    setDropActive(false)
+    /* nothing lands for a viewer: a component drop and an image drop are both
+       frame writes, and the server refuses them on a ticket or a borrowed
+       session. The event is still swallowed, so the browser's own fallback
+       (opening the file) does not happen either. */
+    if (readOnly) return
+    /* the drop point through the same screen→world mapping the marquee and a
+       right-click paste use */
+    const world = toWorld(e.clientX, e.clientY)
+    if (kind === 'component') {
+      const id = e.dataTransfer.getData(COMPONENT_DRAG_MIME)
+      if (id) void dropComponent(id, world)
+      return
+    }
+    const images = Array.from(e.dataTransfer.files).filter((f) => f.type.startsWith('image/'))
+    if (images.length) dropImagesAt(canvas.id, images, world).catch(console.error)
+  }
+
+  /** A component dragged out of the library lands as a frame centered on the
+   *  drop point, on the page being viewed. The markup goes in inside the same
+   *  wrapper the panel's Insert and the server's insert_component build: that
+   *  wrapper is the whole of what makes the new frame an instance, for
+   *  update_component propagation, the delete guard and instance counts. */
+  async function dropComponent(id: string, world: { x: number; y: number }) {
+    try {
+      const component = await api.getComponent(id)
+      const s = useStore.getState()
+      const frame = await api.createFrame(component.canvasId, {
+        name: component.name,
+        html: `<div data-doop-component="${component.id}">${component.html}</div>`,
+        width: component.width,
+        height: component.height,
+        x: Math.round(world.x - component.width / 2),
+        y: Math.round(world.y - component.height / 2),
+        /* the page being viewed, always: unlike a centered insert — which the
+           server may auto-place on the first page — a drop has to land where
+           the pointer was, and that is on the page the person is looking at */
+        ...(s.activePageId ? { pageId: s.activePageId } : {}),
+      })
+      recordCreate(frame)
+      useStore.getState().select(frame.id)
+      refreshComponents(component.canvasId)
+    } catch (err) {
+      console.error(err)
+    }
+  }
+
   /* space bar → pan mode: the stage drags the viewport instead of drawing a
      marquee, and frames let the press fall through to it. Held-space repeats
      must not re-trigger, and typing in a field is never a pan. */
@@ -486,7 +617,9 @@ export function Stage({ onAddFrame }: { onAddFrame: (preset?: FramePreset) => vo
         height: Math.abs(cur.y - origin.y),
       }
       setMarquee(rect)
-      const frames = visibleFrames(useStore.getState())
+      /* hit testing runs against what is on the stage: a hidden frame is not
+         painted, so it cannot be caught by a marquee dragged over its box */
+      const frames = visibleFrames(useStore.getState()).filter((f) => !f.hidden)
       const hits = frames
         .filter(
           (f) =>
@@ -533,6 +666,9 @@ export function Stage({ onAddFrame }: { onAddFrame: (preset?: FramePreset) => vo
             )}
             onPointerDown={onPointerDown}
             onPointerMove={onPointerMove}
+            onDragEnter={onDragEnter}
+            onDragOver={onDragOver}
+            onDrop={onDrop}
             onContextMenu={(e) => {
               /* frames stop the event on their own trigger, so anything arriving
                  here is the empty canvas — except a right-click on a frame's
@@ -567,6 +703,18 @@ export function Stage({ onAddFrame }: { onAddFrame: (preset?: FramePreset) => vo
                 />
               )}
             </div>
+            {/* the drag catcher: up only while a component or image files are
+              being dragged, and above the frames so the whole canvas is a drop
+              target. Below the toolbar (z-35) and the rails, which a drag never
+              aims at. */}
+            {dropActive && (
+              <div
+                className="absolute inset-0 z-30 bg-brand/[0.04] [box-shadow:inset_0_0_0_2px_var(--brand)]"
+                onDragEnter={onDragEnter}
+                onDragOver={onDragOver}
+                onDrop={onDrop}
+              />
+            )}
           </div>
         </ContextMenuTrigger>
 
@@ -614,6 +762,9 @@ export function Stage({ onAddFrame }: { onAddFrame: (preset?: FramePreset) => vo
           </ToolbarButton>
           <ToolbarDivider />
           <ToolbarButton onClick={fit}>Fit</ToolbarButton>
+          {/* the multi-selection bar: renders its own divider + buttons, and
+              nothing at all below two selected frames */}
+          <AlignToolbar />
         </Toolbar>
 
         {canvas && (

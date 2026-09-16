@@ -75,6 +75,11 @@ export async function replaceInFrames(
     regex?: boolean
     caseSensitive?: boolean
     dryRun?: boolean
+    /** Who the sweep resolves as. An agent's canvas sweep is gated by the
+     *  canvas's review policy, so that is the default; the human ⌘F replace
+     *  passes 'user', because a policy that approves agent writes must not
+     *  approve-gate the human's own edit. */
+    kind?: 'user' | 'agent'
     actor: { name: string; userId?: string }
   },
 ): Promise<ReplaceResult> {
@@ -84,12 +89,16 @@ export async function replaceInFrames(
     regex: opts.regex ?? false,
     caseSensitive: opts.caseSensitive ?? false,
   })
-  /* A canvas sweep is an agent's work, so it resolves as one: the write is
-     gated by the canvas's review policy and answers to the frame's lock,
-     exactly as the MCP edit does. The caller's userId, when it has one, is the
-     account the sweep works for — the half of an actor's identity that routes
-     its work. */
-  const actor = actions.resolveActor({ name: opts.actor.name, kind: 'agent', ownerId: opts.actor.userId })
+  /* A canvas sweep resolves as its caller: an agent's edit is gated by the
+     canvas's review policy and answers to the frame's lock, exactly as the MCP
+     edit does; a human's ⌘F replace is their own write and is never gated. The
+     caller's userId, when it has one, is the account the sweep works for — the
+     half of an actor's identity that routes its work. */
+  const actor = actions.resolveActor({
+    name: opts.actor.name,
+    kind: opts.kind ?? 'agent',
+    ownerId: opts.actor.userId,
+  })
   /* The frames the canvas shows, in canvas order — the list every canvas tool
      reads. Demo frames are product onboarding content, never the design being
      worked on, so they are not a target even when their id is listed. An id
@@ -128,10 +137,17 @@ export async function replaceInFrames(
       continue
     }
     let updated: Frame | undefined
+    let refused: string | undefined
     try {
       /* the frame object is live store state, so this reads the document the
          count above was taken from */
       updated = actions.updateFrame(frame.id, { html: pattern.replace(frame.html) }, actor)
+    } catch (e) {
+      /* the user locked this frame in the editor: the sweep reports it and
+         moves on, exactly as it steps over another agent's lock — one locked
+         frame must not cost the canvas the rest of the rename */
+      if (!(e instanceof actions.FrameLockedByUserError)) throw e
+      refused = e.message
     } finally {
       /* the sweep's claim lasts exactly as long as its write: a canvas rename
          is over when the call returns, and a claim left behind would show the
@@ -142,7 +158,13 @@ export async function replaceInFrames(
     rows.push(
       updated
         ? { frameId: frame.id, name: frame.name, matches, applied: true }
-        : { frameId: frame.id, name: frame.name, matches, applied: false, skippedReason: 'the frame no longer exists' },
+        : {
+            frameId: frame.id,
+            name: frame.name,
+            matches,
+            applied: false,
+            skippedReason: refused ?? 'the frame no longer exists',
+          },
     )
   }
   return { frames: rows, totalMatches }

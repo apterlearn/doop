@@ -1,26 +1,41 @@
 import type { ClientMessage, Component, ComponentSummary, ServerMessage } from '../../shared/types'
 import { getIdentity } from './identity'
-import { useStore } from './store'
+import { isReadOnly, useStore } from './store'
 
 let socket: WebSocket | null = null
 let currentCanvasId: string | null = null
+/* the share-link ticket this client joined with, when it has no session;
+   kept beside the canvas id so a reconnect rejoins the same way */
+let currentTicket: string | null = null
 let retryTimer: number | null = null
 /* the server build this page first connected under; survives reconnects */
 let loadedBuild: string | null = null
 
-export function connect(canvasId: string) {
+/** Open the room for a canvas. A signed-out visitor passes the ticket its
+ *  share link minted — the join is otherwise cookie-only, and the server
+ *  takes a ticket holder as a reader. */
+export function connect(canvasId: string, ticket?: string) {
   currentCanvasId = canvasId
+  currentTicket = ticket ?? null
   open()
 }
 
 export function disconnect() {
   currentCanvasId = null
+  currentTicket = null
   if (retryTimer) window.clearTimeout(retryTimer)
   socket?.close()
   socket = null
 }
 
+/* Messages that only say where this client is or what it is dragging. A
+   read-only visitor must not send them at all: the room ignores a ticket
+   holder's anyway, so sending them would only claim a presence it does not
+   have. Everything else (there is nothing else today) goes through. */
+const PRESENCE_ONLY: ClientMessage['type'][] = ['cursor', 'editing', 'focus', 'frame:drag']
+
 export function sendWs(msg: ClientMessage) {
+  if (PRESENCE_ONLY.includes(msg.type) && isReadOnly(useStore.getState())) return
   if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(msg))
 }
 
@@ -60,7 +75,14 @@ function open() {
     if (socket !== s) return
     const { clientId, name } = getIdentity()
     useStore.getState().setConnected(true)
-    sendWs({ type: 'join', canvasId, clientId, name, kind: 'user' })
+    sendWs({
+      type: 'join',
+      canvasId,
+      clientId,
+      name,
+      kind: 'user',
+      ...(currentTicket ? { ticket: currentTicket } : {}),
+    })
   }
 
   s.onmessage = (ev) => {
@@ -78,16 +100,41 @@ function open() {
     /* a superseded socket must not trigger reconnects */
     if (socket !== s) return
     useStore.getState().setConnected(false)
+    /* the retry this socket scheduled has already been spent — dropping the
+       handle here is what keeps a terminal close below from being followed
+       by one more attempt */
+    if (retryTimer) {
+      window.clearTimeout(retryTimer)
+      retryTimer = null
+    }
     if (ev.code === 4401) {
       /* session expired or missing — reload lands on the sign-in page */
       currentCanvasId = null
       location.reload()
       return
     }
-    if (ev.code === 4403) {
-      /* the owner locked this canvas — retrying would loop forever */
+    /* 4403: the owner locked this canvas. 4404: the canvas is gone from the
+       server's store — deleted, or sitting in the trash. Neither is worth a
+       retry (an open tab would hammer the room every 1.2s forever), and
+       neither has a tab to come back to, so both land on the dashboard. */
+    if (ev.code === 4403 || ev.code === 4404) {
       currentCanvasId = null
       location.href = '/'
+      return
+    }
+    /* 4409: this client sent a message past the room's payload cap, so the two
+       ends no longer agree on the protocol — and the same client would be
+       refused the same way on every reconnect. The socket state is dropped and
+       nothing is retried; `connected` is already false above, which is the
+       page's own connection line, and the reason is logged for whoever has to
+       put this client back in step. */
+    if (ev.code === 4409) {
+      currentCanvasId = null
+      currentTicket = null
+      socket = null
+      console.error(
+        `doop: the room closed this connection (4409${ev.reason ? ` ${ev.reason}` : ''}) — a message was past its size cap, so reconnecting would only be refused again`,
+      )
       return
     }
     if (currentCanvasId) {
@@ -124,6 +171,7 @@ function handle(msg: ServerMessage) {
       s.setReviewPolicyLocal(msg.reviewPolicy ?? (msg.reviewMode ? 'all_writes' : 'off'), msg.approvalTools ?? [])
       s.setComponents(msg.components ?? [])
       s.setRunEvents(msg.runEvents ?? [])
+      s.setMessages(msg.messages ?? [])
       s.setFrameLocks(msg.frameLocks ?? {})
       break
     case 'presence:join':
@@ -166,6 +214,9 @@ function handle(msg: ServerMessage) {
     case 'frame:deleted':
       s.removeFrame(msg.frameId)
       break
+    case 'frames:reordered':
+      s.applyFrameOrderLocal(msg.pageId, msg.frames)
+      break
     case 'canvas:renamed':
       s.renameCanvasLocal(msg.name)
       break
@@ -195,6 +246,11 @@ function handle(msg: ServerMessage) {
       break
     case 'question':
       s.upsertQuestion(msg.question)
+      break
+    case 'agentMessage':
+      /* the chat's one live case: a posted message, or a delete (message
+         null, id on the message either way) */
+      s.upsertMessage(msg.message, msg.messageId)
       break
     case 'canvas:reviewMode':
       s.setReviewModeLocal(msg.reviewMode)

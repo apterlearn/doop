@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from 'react'
-import { useStore } from '../lib/store'
+import { Fragment, useEffect, useRef, useState } from 'react'
+import { isReadOnly, useStore } from '../lib/store'
 import { api } from '../lib/api'
 import { cn } from '../lib/utils'
 import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger } from './ui/context-menu'
@@ -13,6 +13,9 @@ import { Modal, ModalActions, ModalEyebrow, ModalLede, ModalTitle } from './ui/m
 export function PagesBar() {
   const canvas = useStore((s) => s.canvas)
   const activePageId = useStore((s) => s.activePageId)
+  /* pages are created, renamed, moved, duplicated and deleted from these tabs'
+     menus; a viewer who cannot write keeps the tabs and loses the menus */
+  const readOnly = useStore(isReadOnly)
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null)
   const pages = canvas?.pages ?? []
@@ -30,24 +33,29 @@ export function PagesBar() {
       {pages.map((page) => {
         const count = canvas.frames.filter((f) => f.pageId === page.id).length
         const isActive = page.id === active.id
+        const tab = (
+          <button
+            type="button"
+            aria-current={isActive ? 'page' : undefined}
+            onClick={() => useStore.getState().setActivePage(page.id)}
+            className={cn(
+              'flex h-9 min-w-0 max-w-[180px] items-center gap-1.5 rounded-t-[7px] border border-b-0 px-3 font-mono text-[11px] font-medium tracking-[0.04em] transition-colors',
+              isActive
+                ? 'border-line bg-paper text-ink'
+                : 'border-transparent text-ink-faint hover:bg-paper-deep hover:text-ink',
+            )}
+          >
+            <span className="overflow-hidden text-ellipsis whitespace-nowrap">{page.name}</span>
+            <span className={cn('text-[9.5px]', isActive ? 'text-ink-faint' : 'text-ink-faint/70')}>{count}</span>
+          </button>
+        )
+        /* switching tabs and reading the names is the whole page surface a
+           viewer has: the menu that edits the page is not rendered at all, so
+           a right-click cannot open an empty one either */
+        if (readOnly) return <Fragment key={page.id}>{tab}</Fragment>
         return (
           <ContextMenu key={page.id}>
-            <ContextMenuTrigger asChild>
-              <button
-                type="button"
-                aria-current={isActive ? 'page' : undefined}
-                onClick={() => useStore.getState().setActivePage(page.id)}
-                className={cn(
-                  'flex h-9 min-w-0 max-w-[180px] items-center gap-1.5 rounded-t-[7px] border border-b-0 px-3 font-mono text-[11px] font-medium tracking-[0.04em] transition-colors',
-                  isActive
-                    ? 'border-line bg-paper text-ink'
-                    : 'border-transparent text-ink-faint hover:bg-paper-deep hover:text-ink',
-                )}
-              >
-                <span className="overflow-hidden text-ellipsis whitespace-nowrap">{page.name}</span>
-                <span className={cn('text-[9.5px]', isActive ? 'text-ink-faint' : 'text-ink-faint/70')}>{count}</span>
-              </button>
-            </ContextMenuTrigger>
+            <ContextMenuTrigger asChild>{tab}</ContextMenuTrigger>
             <ContextMenuContent>
               <ContextMenuItem onSelect={() => setRenamingId(page.id)}>Rename</ContextMenuItem>
               <ContextMenuItem
@@ -88,15 +96,18 @@ export function PagesBar() {
           </ContextMenu>
         )
       })}
-      <Button
-        variant="bare"
-        size="icon-sm"
-        className="mb-1.5 ml-1 text-ink-faint hover:bg-paper-deep hover:text-ink"
-        aria-label="Add page"
-        onClick={() => void addPage()}
-      >
-        +
-      </Button>
+      {!readOnly && (
+        <Button
+          variant="bare"
+          size="icon-sm"
+          className="mb-1.5 ml-1 text-ink-faint hover:bg-paper-deep hover:text-ink"
+          aria-label="Add page"
+          title="Add page"
+          onClick={() => void addPage()}
+        >
+          +
+        </Button>
+      )}
       {deleteTarget && (
         <DeletePageModal
           pageName={pages.find((p) => p.id === deleteTarget)?.name ?? 'page'}

@@ -15,6 +15,26 @@ vi.mock('../server/db/persist.ts', () => ({
   saveActivity: () => {},
   saveDecision: () => {},
   saveProposal: () => {},
+  deleteCanvas: () => {},
+  deleteFrame: () => {},
+  deletePage: () => {},
+  deleteComponentRow: () => {},
+  deleteGuideline: () => {},
+  releaseFrames: () => [],
+  freezeFrames: () => [],
+  MAX_CANVAS_VERSIONS: 50,
+  saveCanvasVersion: () => {},
+  listCanvasVersions: async () => [],
+  getCanvasVersion: async () => undefined,
+  summarizeCanvasVersion: () => ({ id: '', cause: 'auto', createdAt: 0, createdBy: '', frameCount: 0 }),
+  deleteCanvasVersion: () => {},
+  pruneCanvasVersions: () => {},
+  restoreFrameRow: () => {},
+  restoreCanvasRow: () => {},
+  hardDeleteFrame: () => {},
+  hardDeleteCanvas: () => {},
+  purgeTrash: () => {},
+  TRASH_RETENTION_DAYS: 30,
 }))
 
 const actions = await import('../server/actions.ts')
@@ -35,6 +55,11 @@ const FRAME: Frame = {
   createdAt: 0,
   updatedAt: 0,
   updatedBy: 'alice',
+  z: 0,
+  locked: false,
+  hidden: false,
+  rotation: 0,
+  opacity: 1,
 }
 
 beforeEach(() => {

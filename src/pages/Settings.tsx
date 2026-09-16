@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, type ReactNode } from 'react'
 import { navigate } from '../App'
 import { api } from '../lib/api'
 import { posthog } from '../lib/posthog'
@@ -6,8 +6,17 @@ import { openCanvasTab } from '../lib/desktop'
 import { ModelAccountPanel } from '../components/ModelAccount'
 import { DesignWorkflowPanel } from '../components/DesignWorkflow'
 import { AccountSettings } from '../components/AccountSettings'
+import { AccountSecurity } from '../components/AccountSecurity'
 import { ConnectedAgents } from '../components/ConnectedAgents'
-import { AccountMenu, ConnectCard, IconBack, IconChevron, IconSpark, IconUser } from '../components/DashShell'
+import {
+  AccountMenu,
+  ConnectCard,
+  IconBack,
+  IconChevron,
+  IconShield,
+  IconSpark,
+  IconUser,
+} from '../components/DashShell'
 import { Tabs, TabsList, TabsTrigger } from '../components/ui/tabs'
 import { Button } from '../components/ui/button'
 import { Wordmark } from '../components/ui/wordmark'
@@ -24,13 +33,39 @@ import {
   DashTitle,
 } from '../components/ui/dash'
 
-type Pane = 'model' | 'account' | 'agents'
+type Pane = 'model' | 'account' | 'security' | 'agents'
+
+/** The rail, the phone tab strip and this page's own heading all read the pane
+ *  table, so a pane's name and its one-line description cannot drift apart. */
+const PANES: Record<Pane, { label: string; blurb: ReactNode; icon: ReactNode }> = {
+  model: {
+    label: 'Model account',
+    blurb: 'The model account your agents use for image generation and repo recon, on every canvas.',
+    icon: <IconSpark />,
+  },
+  account: {
+    label: 'Your account',
+    blurb: 'Who you are on every canvas — and how you get back into this one.',
+    icon: <IconUser />,
+  },
+  security: {
+    label: 'Security & data',
+    blurb: 'The devices signed in as you, a copy of your data, and the way out of the account.',
+    icon: <IconShield />,
+  },
+  agents: {
+    label: 'Connected agents',
+    blurb: 'MCP clients acting as you — and how to cut one off.',
+    icon: <IconSpark />,
+  },
+}
+const PANE_ORDER: Pane[] = ['model', 'account', 'security', 'agents']
 
 /**
  * Account settings: the model account agents can use for image generation and
- * repo recon, who you are, and the MCP clients connected as you. It is the
- * account-level home for all three, so the canvas surfaces can link here
- * instead of carrying their own copy.
+ * repo recon, who you are, the devices signed in as you, and the MCP clients
+ * connected as you. It is the account-level home for all of them, so the
+ * canvas surfaces can link here instead of carrying their own copy.
  *
  * It wears the same shell as the home dashboard: same rail, same top bar, same
  * account menu. Only the rail's middle changes, to a settings sub-nav.
@@ -65,15 +100,11 @@ export function Settings() {
 
         <DashSectionLabel>Settings</DashSectionLabel>
         <nav className="flex flex-col gap-0.5">
-          <DashNavItem icon={<IconSpark />} active={pane === 'model'} onClick={() => setPane('model')}>
-            Model account
-          </DashNavItem>
-          <DashNavItem icon={<IconUser />} active={pane === 'account'} onClick={() => setPane('account')}>
-            Your account
-          </DashNavItem>
-          <DashNavItem icon={<IconSpark />} active={pane === 'agents'} onClick={() => setPane('agents')}>
-            Connected agents
-          </DashNavItem>
+          {PANE_ORDER.map((id) => (
+            <DashNavItem key={id} icon={PANES[id].icon} active={pane === id} onClick={() => setPane(id)}>
+              {PANES[id].label}
+            </DashNavItem>
+          ))}
         </nav>
 
         <div className="min-h-6 flex-1" />
@@ -105,30 +136,18 @@ export function Settings() {
         <DashContent>
           <div className="flex items-start gap-4 md:items-end">
             <div>
-              <DashTitle>
-                {pane === 'model' ? 'Model account' : pane === 'account' ? 'Your account' : 'Connected agents'}
-              </DashTitle>
-              <DashSubtitle>
-                {pane === 'model'
-                  ? 'The model account your agents use for image generation and repo recon, on every canvas.'
-                  : pane === 'account'
-                    ? 'Who you are on every canvas — and how you get back into this one.'
-                    : 'MCP clients acting as you — and how to cut one off.'}
-              </DashSubtitle>
+              <DashTitle>{PANES[pane].label}</DashTitle>
+              <DashSubtitle>{PANES[pane].blurb}</DashSubtitle>
             </div>
           </div>
 
           <Tabs value={pane} onValueChange={(next) => setPane(next as Pane)} className="mt-4 flex md:hidden">
             <TabsList className="h-10 w-full border border-line bg-surface p-1 shadow-card">
-              <TabsTrigger value="model">
-                <IconSpark /> Model account
-              </TabsTrigger>
-              <TabsTrigger value="account">
-                <IconUser /> Your account
-              </TabsTrigger>
-              <TabsTrigger value="agents">
-                <IconSpark /> Connected agents
-              </TabsTrigger>
+              {PANE_ORDER.map((id) => (
+                <TabsTrigger key={id} value={id}>
+                  {PANES[id].icon} {PANES[id].label}
+                </TabsTrigger>
+              ))}
             </TabsList>
           </Tabs>
 
@@ -158,6 +177,8 @@ export function Settings() {
             </>
           ) : pane === 'account' ? (
             <AccountSettings />
+          ) : pane === 'security' ? (
+            <AccountSecurity />
           ) : (
             <ConnectedAgents />
           )}

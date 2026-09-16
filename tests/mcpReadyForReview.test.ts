@@ -48,6 +48,22 @@ vi.mock('../server/db/persist.ts', () => {
       reviews.set(review.frameId, [review, ...(reviews.get(review.frameId) ?? [])])
     },
     listFrameReviews: async (frameId: string) => reviews.get(frameId) ?? [],
+    deleteComponentRow: () => {},
+    releaseFrames: () => [],
+    freezeFrames: () => [],
+    MAX_CANVAS_VERSIONS: 50,
+    saveCanvasVersion: () => {},
+    listCanvasVersions: async () => [],
+    getCanvasVersion: async () => undefined,
+    summarizeCanvasVersion: () => ({ id: '', cause: 'auto', createdAt: 0, createdBy: '', frameCount: 0 }),
+    deleteCanvasVersion: () => {},
+    pruneCanvasVersions: () => {},
+    restoreFrameRow: () => {},
+    restoreCanvasRow: () => {},
+    hardDeleteFrame: () => {},
+    hardDeleteCanvas: () => {},
+    purgeTrash: () => {},
+    TRASH_RETENTION_DAYS: 30,
   }
 })
 
@@ -118,6 +134,11 @@ function seedFrame(html: string, updatedBy = 'Claude'): Frame {
     createdAt: 0,
     updatedAt: 1,
     updatedBy,
+    z: 0,
+    locked: false,
+    hidden: false,
+    rotation: 0,
+    opacity: 1,
     pageId: 'p-gate',
   }
   const canvas: Canvas = {

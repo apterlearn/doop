@@ -1,14 +1,23 @@
 import type { Frame } from '../../shared/types'
-import { api } from './api'
+import { api, staleFrameConflict, type StaleFrameConflict } from './api'
 import { useStore } from './store'
 import { posthog } from './posthog'
 
 /** Local undo/redo for this client's own frame edits. Undo re-issues the
  *  inverse through the normal API, so every collaborator sees it live —
- *  remote actors' work is never undone from here. */
+ *  remote actors' work is never undone from here.
+ *
+ *  The same module keeps the bookkeeping every one of those writes needs:
+ *  `trackSave` for the ones still in flight, and the two below for what the
+ *  server's answer to a preconditioned write means. */
 
-type Patch = Partial<Pick<Frame, 'name' | 'html' | 'x' | 'y' | 'width' | 'height'>>
-type Snapshot = Pick<Frame, 'canvasId' | 'name' | 'html' | 'x' | 'y' | 'width' | 'height'> & { pageId?: string }
+type Patch = Partial<
+  Pick<Frame, 'name' | 'html' | 'x' | 'y' | 'width' | 'height' | 'z' | 'locked' | 'hidden' | 'rotation' | 'opacity'>
+>
+type Snapshot = Pick<
+  Frame,
+  'canvasId' | 'name' | 'html' | 'x' | 'y' | 'width' | 'height' | 'z' | 'locked' | 'hidden' | 'rotation' | 'opacity'
+> & { pageId?: string }
 
 type Entry =
   | { type: 'update'; frameId: string; before: Patch; after: Patch; at: number }
@@ -34,6 +43,41 @@ export function trackSave(p: Promise<unknown>) {
   inflight = inflight.then(() => p.catch(() => undefined))
 }
 
+/** A frame write's own answer says when the server now holds the frame as
+ *  changed. The local copy takes it, so this client's NEXT write preconditions
+ *  on its own last one instead of on a read that write already superseded —
+ *  whose broadcast may still be in flight, which would fire the guard against
+ *  the user's own work (a held arrow key, a burst of saves). */
+export function noteOwnWrite(saved: Frame) {
+  useStore.getState().patchFrameLocal(saved.id, { updatedAt: saved.updatedAt, updatedBy: saved.updatedBy })
+}
+
+/** The tail of a frame write this client made: a write the server refused
+ *  because the frame moved on is painted back from the server's copy — the
+ *  write landed nowhere, so the local one is what is wrong — and handed back
+ *  for the caller to report in its own words. Any other failure is logged,
+ *  exactly as the bare `.catch(console.error)` it replaces did. */
+export function caughtStaleWrite(err: unknown): StaleFrameConflict | undefined {
+  const conflict = staleFrameConflict(err)
+  if (!conflict) {
+    console.error(err)
+    return undefined
+  }
+  useStore.getState().patchFrameLocal(conflict.current.id, conflict.current)
+  return conflict
+}
+
+/* A replay the server refused because a frame it touches had moved on. The
+   entry is no longer this client's to apply, so it is neither consumed nor
+   half-applied: `step` catches this, puts the entry back where it came from,
+   and reports the conflict. */
+class StaleReplay extends Error {
+  constructor(readonly conflict: StaleFrameConflict) {
+    super(conflict.error)
+    this.name = 'StaleReplay'
+  }
+}
+
 export function clearHistory() {
   undoStack = []
   redoStack = []
@@ -54,6 +98,15 @@ function snapshot(f: Frame): Snapshot {
     y: f.y,
     width: f.width,
     height: f.height,
+    /* an undone delete recreates the frame through createFrame, which assigns
+       a fresh z at the front of the page: carrying the original's stacking,
+       lock, visibility, rotation and opacity means the frame comes back the
+       way it left, not as a default-looking copy */
+    z: f.z,
+    locked: f.locked,
+    hidden: f.hidden,
+    rotation: f.rotation,
+    opacity: f.opacity,
     pageId: f.pageId,
   }
 }
@@ -137,10 +190,33 @@ function remapId(oldId: string, newId: string) {
 }
 
 async function recreate(e: { frameId: string; snapshot: Snapshot }) {
-  const { canvasId, ...rest } = e.snapshot
+  const { canvasId, z, locked, hidden, rotation, opacity, ...rest } = e.snapshot
   const f = await api.createFrame(canvasId, rest)
+  const previousId = e.frameId
   remapId(e.frameId, f.id)
   e.frameId = f.id
+  /* createFrame places the copy at the front of the page, unlocked and
+     unrotated: the snapshot's stacking, lock, visibility, rotation and opacity
+     land in a second call, so an undone delete brings the frame back exactly as
+     it was. These five are the fields a user lock leaves writable, so a frame
+     that comes back locked still accepts this patch — and the copy is only a
+     moment old, so the precondition can only fail if something reached the new
+     frame first, which is not this entry's to overwrite. */
+  try {
+    await api.updateFrame(f.id, { z, locked, hidden, rotation, opacity }, { expectedUpdatedAt: f.updatedAt })
+  } catch (err) {
+    const conflict = staleFrameConflict(err)
+    if (!conflict) throw err
+    /* Give the entry back the id it had and take the half-made copy off the
+       canvas: a replay after the reload recreates the frame from the snapshot,
+       and a stray second frame would be a duplicate nothing points at. Every
+       other entry that followed the remap goes back to the dead id with it —
+       which is where they were, waiting for the replay that finally lands. */
+    e.frameId = previousId
+    remapId(f.id, previousId)
+    await api.deleteFrame(f.id).catch(console.error)
+    throw new StaleReplay(conflict)
+  }
 }
 
 /* the frames an applied entry brought back (a redone create, an undone
@@ -155,10 +231,20 @@ function recreatedIds(e: Entry, direction: 'undo' | 'redo'): string[] {
    frames are independent, so every member is attempted even if one fails;
    the survivors are what the opposite stack gets, so a partially failed
    group can still be reversed. Failed members are dropped, exactly as a
-   failed single entry is: the frame is gone or the canvas moved on. */
+   failed single entry is: the frame is gone or the canvas moved on — except
+   for a frame that moved on, which is refused whole and stops the step (a
+   StaleReplay: see step). */
 async function apply(e: Entry, direction: 'undo' | 'redo'): Promise<Entry | null> {
   if (e.type === 'group') {
     const results = await Promise.allSettled(e.entries.map((child) => apply(child, direction)))
+    /* one refused member stops the group rather than being dropped from it:
+       the entry goes back whole, so the next attempt is the same undo over the
+       state the reload left behind — its patches are absolute values, so a
+       member that did land is a value no-op when it is re-applied */
+    const stale = results.find(
+      (r): r is PromiseRejectedResult => r.status === 'rejected' && r.reason instanceof StaleReplay,
+    )
+    if (stale) throw stale.reason
     const ok = results.flatMap((r) => (r.status === 'fulfilled' && r.value ? [r.value] : []))
     const failed = results.find((r): r is PromiseRejectedResult => r.status === 'rejected')
     if (failed) console.error(`${direction} failed for ${e.entries.length - ok.length} frame(s)`, failed.reason)
@@ -169,10 +255,28 @@ async function apply(e: Entry, direction: 'undo' | 'redo'): Promise<Entry | null
   const forward = direction === 'redo'
   if (e.type === 'update') {
     const patch = forward ? e.after : e.before
+    /* the live copy's updatedAt is the version this entry was written against:
+       a frame that moved on since — someone else's edit, an agent's stream —
+       refuses the inverse instead of overwriting their work with a value from
+       a canvas nobody has any more. A frame the canvas no longer holds has
+       nothing to precondition on, and no local copy either. */
+    const live = useStore.getState().canvas?.frames.find((f) => f.id === e.frameId)
     useStore.getState().patchFrameLocal(e.frameId, patch)
     try {
-      await api.updateFrame(e.frameId, patch)
+      /* the answer carries the frame's new freshness, and the local copy takes
+         it: an undo and the redo that follows it are two writes to the same
+         frame, and the second must precondition on the first's, not on the
+         read before it (whose broadcast may still be in flight) */
+      const saved = await api.updateFrame(e.frameId, patch, live ? { expectedUpdatedAt: live.updatedAt } : undefined)
+      noteOwnWrite(saved)
     } catch (err) {
+      const conflict = staleFrameConflict(err)
+      if (conflict) {
+        /* the server's copy is the truth and the only thing worth painting:
+           the local patch above was never ours to keep */
+        useStore.getState().patchFrameLocal(conflict.current.id, conflict.current)
+        throw new StaleReplay(conflict)
+      }
       /* the server kept the old value — put the local copy back in step
          with it rather than leave a client-only position behind */
       useStore.getState().patchFrameLocal(e.frameId, forward ? e.before : e.after)
@@ -186,11 +290,13 @@ async function apply(e: Entry, direction: 'undo' | 'redo'): Promise<Entry | null
   return e
 }
 
-async function step(direction: 'undo' | 'redo') {
-  if (busy) return
+/** Take one step through the stacks, and report a step the server refused
+ *  because a frame it touches had moved on. */
+async function step(direction: 'undo' | 'redo'): Promise<StaleFrameConflict | undefined> {
+  if (busy) return undefined
   const [from, to] = direction === 'undo' ? [undoStack, redoStack] : [redoStack, undoStack]
   const e = from.pop()
-  if (!e) return
+  if (!e) return undefined
   busy = true
   try {
     await inflight
@@ -202,11 +308,22 @@ async function step(direction: 'undo' | 'redo') {
       posthog.capture(direction === 'undo' ? 'canvas_undo' : 'canvas_redo')
     }
   } catch (err) {
+    if (err instanceof StaleReplay) {
+      /* The entry is not this client's to apply any more, and nothing about it
+         is half-done: the local canvas was repainted from the frame the server
+         sent back. So it goes straight back on the stack it came from — the
+         last one popped, so the stacks are exactly as they were before the
+         step — rather than being consumed, and the caller gets the conflict to
+         report. A reload of the canvas, and ⌘Z again, is the retry. */
+      from.push(e)
+      return err.conflict
+    }
     /* the frame is gone or the canvas moved on — drop the entry */
     console.error(`${direction} failed`, err)
   } finally {
     busy = false
   }
+  return undefined
 }
 
 export function undo() {
