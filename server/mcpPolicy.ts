@@ -88,6 +88,7 @@ export const DESTRUCTIVE_TOOLS: readonly string[] = [
   'resolve_comment',
   'resolve_frame_proposal',
   'resolve_frame_proposals',
+  'restore_canvas_version',
   'restore_release',
   'revert_frame',
   'revert_run',
