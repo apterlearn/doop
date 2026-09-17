@@ -60,6 +60,7 @@ export type PanelTab =
   | 'tokens'
   | 'agents'
   | 'review'
+  | 'claims'
   | 'checks'
   | 'components'
   | 'assets'

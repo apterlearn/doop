@@ -9,7 +9,7 @@ import type {
 } from '../../shared/types'
 import { colorFor } from '../../shared/types'
 import { canComment, isReadOnly, useStore } from '../lib/store'
-import { api, ApiError } from '../lib/api'
+import { api, ApiError, type AgentLevel, type AgentLevelRow } from '../lib/api'
 import { authClient } from '../lib/auth'
 import { timeAgo } from '../lib/time'
 import { useHtmlPreview } from '../lib/useHtmlPreview'
@@ -20,6 +20,7 @@ import { Button } from './ui/button'
 import { Badge } from './ui/badge'
 import { Checkbox } from './ui/checkbox'
 import { Collapsible, CollapsibleContent } from './ui/collapsible'
+import { Dot } from './ui/dot'
 import { Field } from './ui/field'
 import { Input } from './ui/input'
 import { Textarea } from './ui/textarea'
@@ -70,6 +71,33 @@ const policyChipTitle: Record<ReviewPolicy, string> = {
 }
 const OWNER_ONLY = 'Only the canvas owner can change the review policy'
 
+/* The leash, next to the gate: how far each agent may go on this canvas, in
+   the owner's own words — what its chip says, what hovering it promises, and
+   the one sentence a row wears once the level is set. `full` is written as the
+   absence of a restriction, because that is what it is: the level every agent
+   has when nobody has chosen anything for it. */
+const AGENT_LEVELS: AgentLevel[] = ['full', 'propose', 'comment', 'view']
+const levelChipLabel: Record<AgentLevel, string> = {
+  full: 'Full',
+  propose: 'Propose',
+  comment: 'Comment',
+  view: 'View',
+}
+const levelBlurb: Record<AgentLevel, string> = {
+  full: 'Writes land directly — nothing this agent does waits for your approval.',
+  propose: 'Writes must come as proposals: this agent reads and asks, and its changes wait above for your decision.',
+  comment: 'May read and discuss — comments, questions and messages — but not change the frames.',
+  view: 'Read-only: this agent sees the canvas and can point at things, and changes nothing.',
+}
+const levelChipTitle: Record<AgentLevel, string> = {
+  full: 'Writes land directly',
+  propose: 'Writes arrive here as proposals',
+  comment: 'May discuss, may not change frames',
+  view: 'Read-only',
+}
+const LEVELS_BLURB =
+  'How far each agent may go here. Full is the default — an agent you have not narrowed writes to the canvas directly.'
+
 /* The tools whose own MCP annotation calls them destructive — what the editor
    offers as suggestions beside the free-text input. One list for the whole
    page load: the registry does not change while a tab is open, so opening the
@@ -106,6 +134,26 @@ function loadDestructiveTools(): Promise<string[]> {
  *  values it can carry, and the guard keeps that fact in the type. */
 function isReviewPolicy(value: string): value is ReviewPolicy {
   return (POLICIES as readonly string[]).includes(value)
+}
+
+/** The same guard for the leash, whose four settings arrive the same way. */
+function isAgentLevel(value: string): value is AgentLevel {
+  return (AGENT_LEVELS as readonly string[]).includes(value)
+}
+
+/** One row of the leash list, as the server states it plus the one thing only
+ *  the room knows: whether that agent is connected right now. A level outlives
+ *  the connection, so an agent that stepped away keeps its row — presence is
+ *  read here, never listed from. */
+type AgentLevelView = AgentLevelRow & { live: boolean }
+
+/** The list with one agent's row replaced where it stands — a save must not
+ *  reshuffle the rows under the cursor. */
+function withLevelRow(rows: AgentLevelRow[] | null, next: AgentLevelRow): AgentLevelRow[] {
+  const list = rows ?? []
+  return list.some((r) => r.agent_id === next.agent_id)
+    ? list.map((r) => (r.agent_id === next.agent_id ? next : r))
+    : [...list, next]
 }
 
 /** A decision already made, as the history section reads it: frame proposals
@@ -169,6 +217,37 @@ function Thumb({
   )
 }
 
+/* ---- bulk decisions ---- */
+
+/** One item of a bulk run: the id its resolve calls, and the headline the
+ *  failure line names it by when the server refuses it. */
+type BulkItem = { id: string; label: string }
+
+/** A proposal a bulk run could not land: which queue asked for the run, which
+ *  proposal it failed on, and what the server said about it. */
+type BulkFailure = BulkItem & { key: string; message: string }
+
+/** Hunks the server refused to apply, grouped by the agent whose patch they
+ *  came from — a bulk accept resolves a whole queue at once, so the report the
+ *  panel holds is one entry per agent, not one per decision. */
+type HunkReport = { agentName: string; skipped: { index: number; reason: string }[] }
+
+/** The proposals a bulk run could not land, listed under the header that asked
+ *  for it: each line names the proposal and why it is still in the queue, so a
+ *  refusal mid-run is read where the decision was made. */
+function BulkFailures({ failures }: { failures: BulkFailure[] }) {
+  if (!failures.length) return null
+  return (
+    <div className="mb-1.5 text-[11.5px] leading-[1.45] text-accent-ink">
+      {failures.map((failure) => (
+        <p key={failure.id}>
+          <b className="font-semibold">{failure.label}</b> — {failure.message}
+        </p>
+      ))}
+    </div>
+  )
+}
+
 /** The Review tab: what an agent write must clear before it lands (the policy,
  *  which only the owner sets), the decisions waiting — questions an agent is
  *  blocked on, canvas-level changes, frame changes — and the record of what
@@ -185,10 +264,20 @@ export function ReviewPanel() {
   const canvasProposals = useStore((s) => s.canvasProposals)
   const questions = useStore((s) => s.questions)
   const frames = useStore((s) => s.canvas?.frames)
+  /* who is in the room, to say which of the leashed agents is here — the rows
+     themselves come from the server, this only annotates them */
+  const presences = useStore((s) => s.presences)
   const { data: session } = authClient.useSession()
   const isOwner = !!ownerId && ownerId === session?.user?.id
   const [savingPolicy, setSavingPolicy] = useState(false)
   const [policyError, setPolicyError] = useState('')
+  /* The leash list, from the server rather than the room: presence carries no
+     agent id, so the GET is the only place a row and the id it is set by come
+     from together. null until the first answer — a block that has not read
+     anything yet says nothing rather than "no agents". */
+  const [agentLevelRows, setAgentLevelRows] = useState<AgentLevelRow[] | null>(null)
+  const [savingLevel, setSavingLevel] = useState<string | null>(null)
+  const [levelError, setLevelError] = useState('')
   const [toolDraft, setToolDraft] = useState('')
   /* the destructive-declaring tool names, offered under the input so an owner
      does not have to recall them. Seeded from the shared cache, so reopening
@@ -198,11 +287,15 @@ export function ReviewPanel() {
   const [historyOpen, setHistoryOpen] = useState(false)
   /* Hunks the server refused when a patch was accepted — its old_str no longer
      matched the frame, usually because the frame moved on. Held here, not on
-     the card: the card unmounts the moment its proposal resolves. */
-  const [hunkReport, setHunkReport] = useState<{
-    agentName: string
-    skipped: { index: number; reason: string }[]
-  } | null>(null)
+     the card: the card unmounts the moment its proposal resolves. One entry
+     per agent, because a bulk accept decides a whole queue at once. */
+  const [hunkReports, setHunkReports] = useState<HunkReport[]>([])
+  /* The bulk run in flight, keyed by the queue it is clearing: its own buttons
+     disable while it is out, and the other queues wait their turn. */
+  const [bulkBusy, setBulkBusy] = useState<string | null>(null)
+  /* What a bulk run could not land. Held here, not on the cards: the ones it
+     failed on are the ones still in the queue, and the line names them. */
+  const [bulkErrors, setBulkErrors] = useState<BulkFailure[]>([])
 
   /* the ws init payload may predate this panel opening; a human who came here
      to review wants the current list, not the one the socket carried. Stale
@@ -229,6 +322,33 @@ export function ReviewPanel() {
       live = false
     }
   }, [readOnly, reviewPolicy])
+
+  /* The leash list, read for the owner who sets it — and re-read when the
+     agents in the room change, so one that connects while the panel is open
+     appears without reopening it. Keyed by the agents themselves rather than
+     by presence at large, so a heartbeat is not a request. A route that is not
+     there yet answers with nothing to leash, which is the empty state rather
+     than an error: the panel has no hand in whether the server has it. */
+  const agentNamesHere = Object.values(presences)
+    .filter((p) => p.kind === 'agent')
+    .map((p) => `${p.owner ?? ''}::${p.name}`)
+    .sort()
+    .join('|')
+  useEffect(() => {
+    if (!canvasId || !isOwner) return
+    let live = true
+    void api
+      .agentLevels(canvasId)
+      .then((res) => {
+        if (live) setAgentLevelRows(res.levels)
+      })
+      .catch(() => {
+        if (live) setAgentLevelRows([])
+      })
+    return () => {
+      live = false
+    }
+  }, [canvasId, isOwner, agentNamesHere])
 
   const awaiting = useMemo(() => proposals.filter((p) => p.status === 'pending' || p.status === 'stale'), [proposals])
   const pendingCanvas = useMemo(() => canvasProposals.filter((p) => p.status === 'pending'), [canvasProposals])
@@ -260,10 +380,100 @@ export function ReviewPanel() {
     return [...byKey.entries()]
   }, [awaiting])
 
+  /* The leash rows are the server's list, in its order: it is the only place
+     an agent id and a level come from together. Presence only says which of
+     those agents is in the room right now — a level outlives the connection,
+     so an agent that stepped away still gets its row. */
+  const agentRows = useMemo<AgentLevelView[]>(
+    () =>
+      (agentLevelRows ?? []).map((row) => ({
+        ...row,
+        live: Object.values(presences).some(
+          (p) => p.kind === 'agent' && p.name === row.name && (!p.owner || !row.owner || p.owner === row.owner),
+        ),
+      })),
+    [agentLevelRows, presences],
+  )
+
+  /* the header mark reads like the policy's shield: the brand while somebody
+     here is leashed, muted while nobody is */
+  const leashed = agentRows.some((r) => r.level !== 'full')
+
   if (!canvasId) return null
 
   function reportSkippedHunks(agentName: string, skipped: { index: number; reason: string }[]) {
-    setHunkReport(skipped.length ? { agentName, skipped } : null)
+    setHunkReports(skipped.length ? [{ agentName, skipped }] : [])
+  }
+
+  /* A bulk decision runs a queue in turn and does not stop at the first
+     refusal: each response lands in the store as it arrives, through the same
+     call the card's own button makes, so the queue and the history move one
+     decision at a time. What the server refused is named under the header that
+     asked for the run; the hunks it dropped are reported as a single card's
+     would be. */
+  async function resolveInTurn<T extends BulkItem>(
+    key: string,
+    items: T[],
+    resolveOne: (item: T) => Promise<HunkReport | null>,
+  ) {
+    if (bulkBusy) return
+    setBulkBusy(key)
+    setBulkErrors((prev) => prev.filter((e) => e.key !== key))
+    const failed: BulkFailure[] = []
+    const reports = new Map<string, { index: number; reason: string }[]>()
+    for (const item of items) {
+      try {
+        const report = await resolveOne(item)
+        if (report) reports.set(report.agentName, [...(reports.get(report.agentName) ?? []), ...report.skipped])
+      } catch (e) {
+        failed.push({
+          key,
+          id: item.id,
+          label: item.label,
+          message: e instanceof ApiError && e.body.error ? String(e.body.error) : 'Could not resolve that proposal.',
+        })
+      }
+    }
+    if (reports.size) setHunkReports([...reports].map(([agentName, skipped]) => ({ agentName, skipped })))
+    if (failed.length) setBulkErrors((prev) => [...prev.filter((e) => e.key !== key), ...failed])
+    setBulkBusy(null)
+  }
+
+  /* Every proposal in one frame's queue, decided in turn. Accepting mirrors the
+     card's own primary action — a stale proposal needs the same force, and a
+     patch carries all of its hunks, because "all" is the whole proposal. */
+  function resolveFrameGroup(key: string, list: FrameProposal[], accept: boolean) {
+    if (!canvasId) return
+    void resolveInTurn(
+      key,
+      list.map((p) => ({ ...p, label: p.summary })),
+      async (p) => {
+        const edits = p.mode === 'patch' ? (p.edits ?? []) : []
+        const res = await api.resolveFrameProposal(canvasId, p.id, accept, {
+          ...(accept && p.status === 'stale' ? { force: true } : {}),
+          ...(accept && edits.length ? { hunks: edits.map((_, index) => ({ index, accept: true })) } : {}),
+        })
+        /* the decision lands in the store from the room's broadcast; taking it
+           from the response too means the queue and the history move even when
+           the socket is between connections */
+        useStore.getState().upsertFrameProposal(res)
+        return res.skipped?.length ? { agentName: p.agentName, skipped: res.skipped } : null
+      },
+    )
+  }
+
+  /* The canvas-level queue, accepted in turn — keyed apart from the frame
+     queues, which key on a frame id. */
+  function resolveCanvasGroup(list: CanvasProposal[]) {
+    if (!canvasId) return
+    void resolveInTurn(
+      'canvas',
+      list.map((p) => ({ ...p, label: canvasHeadline(p, frames) })),
+      async (p) => {
+        useStore.getState().upsertCanvasProposal(await api.resolveCanvasProposal(canvasId, p.id, true))
+        return null
+      },
+    )
   }
 
   /* One write for the whole policy: the setting and its extra tool names are
@@ -295,13 +505,39 @@ export function ReviewPanel() {
     savePolicy(reviewPolicy, [...approvalTools, name])
   }
 
-  /* A tool name typed into the chip input: committed on Enter, comma or blur,
+  /* One tool name typed into the chip input: committed on Enter, comma or blur,
      and dropped when it is already gated — the same name twice is one gate.
      The policy itself is untouched: this only edits the list it gates by. */
   function addApprovalTool() {
     const name = toolDraft.trim().replace(/,+$/, '')
     setToolDraft('')
     addGatedTool(name)
+  }
+
+  /* One agent's leash, saved the way the policy is: the row answers the click,
+     the server's own answer lands over it, and a refused write puts the level
+     back the way it was. `full` is sent like any other — the server drops the
+     row it replaces, so the control and the default agree with no branch. */
+  function saveLevel(row: AgentLevelRow, level: AgentLevel) {
+    if (!canvasId || savingLevel) return
+    const id = row.agent_id
+    const before = agentLevelRows
+    /* the stamp is the server's to write: until its answer lands the row keeps
+       the one it had, and what the click changed is the level */
+    const next = { ...row, level }
+    setSavingLevel(id)
+    setLevelError('')
+    setAgentLevelRows((rows) => withLevelRow(rows, next))
+    api
+      .setAgentLevel(canvasId, id, level)
+      .then((res) => setAgentLevelRows((rows) => withLevelRow(rows, { ...next, set_at: res.set_at })))
+      .catch((e) => {
+        setAgentLevelRows(before)
+        setLevelError(
+          e instanceof ApiError && e.body.error ? String(e.body.error) : 'Could not save that agent’s level.',
+        )
+      })
+      .finally(() => setSavingLevel(null))
   }
 
   /* the declarations the list does not gate yet — a suggestion for a name
@@ -431,6 +667,74 @@ export function ReviewPanel() {
         {policyError && <p className="mt-2 text-[11.5px] leading-[1.45] text-accent-ink">{policyError}</p>}
       </div>
 
+      {/* The leash, under the gate: how far each agent may go here, which only
+          the owner sets. The rows come from the server's own list — presence
+          says who is in the room, but the id a save writes to and the level it
+          writes are the server's to state, and the room carries neither. */}
+      {isOwner && (
+        <div className="border-b border-line-soft px-4 py-3.5">
+          <div className="flex items-start gap-2.5">
+            <span className={cn('mt-px flex-none', leashed ? 'text-brand' : 'text-ink-faint')}>
+              <AgentIcon name="agent" size={15} />
+            </span>
+            <div className="min-w-0 flex-1">
+              <div className="text-[13px] font-bold text-ink">Agent levels</div>
+              <p className="mt-1 text-[11.5px] leading-[1.45] text-ink-soft">{LEVELS_BLURB}</p>
+            </div>
+          </div>
+          {/* nothing is listed until the server's list has been read: a row
+              before that would have no level to show, and a level invented
+              here would be one nobody set */}
+          {agentLevelRows !== null &&
+            (agentRows.length === 0 ? (
+              <p className="mt-2.5 text-[11.5px] leading-[1.45] text-ink-faint">No agents on this canvas yet.</p>
+            ) : (
+              agentRows.map((row) => (
+                <div key={row.agent_id} className="mt-3">
+                  <div className="flex items-baseline gap-2">
+                    <span className="truncate text-[12.5px] font-medium text-ink">{row.name}</span>
+                    {row.owner && <span className="truncate text-[11px] text-ink-faint">via {row.owner}</span>}
+                    {/* the room's own reading of the same agent: the level
+                        stands whether or not it is connected, and a level set
+                        on an agent that is here takes effect on its next call */}
+                    <span
+                      className="ml-auto flex flex-none items-center gap-1.5 text-[10px] font-bold uppercase tracking-[0.08em] text-ink-faint"
+                      title={
+                        row.live ? 'Connected to this canvas now' : 'Not connected — the level is kept for its return'
+                      }
+                    >
+                      <Dot tone={row.live ? 'done' : 'muted'} size="sm" />
+                      {row.live ? 'here' : 'away'}
+                    </span>
+                  </div>
+                  <ToggleChipGroup
+                    className="mt-2 gap-1.5"
+                    value={row.level}
+                    aria-label={`Level for ${row.name}`}
+                    disabled={savingLevel !== null}
+                    onValueChange={(next) => {
+                      if (isAgentLevel(next)) saveLevel(row, next)
+                    }}
+                  >
+                    {AGENT_LEVELS.map((level) => (
+                      <ToggleChipItem
+                        key={level}
+                        value={level}
+                        className="px-2.5 py-1 text-[12px]"
+                        title={levelChipTitle[level]}
+                      >
+                        {levelChipLabel[level]}
+                      </ToggleChipItem>
+                    ))}
+                  </ToggleChipGroup>
+                  <p className="mt-1.5 text-[11.5px] leading-[1.45] text-ink-soft">{levelBlurb[row.level]}</p>
+                </div>
+              ))
+            ))}
+          {levelError && <p className="mt-2 text-[11.5px] leading-[1.45] text-accent-ink">{levelError}</p>}
+        </div>
+      )}
+
       {open.length === 0 && expired.length === 0 && awaiting.length === 0 && pendingCanvas.length === 0 && (
         <div className="px-4 py-6 text-center text-[13px] text-ink-faint">
           {reviewPolicy === 'off'
@@ -439,27 +743,30 @@ export function ReviewPanel() {
         </div>
       )}
 
-      {hunkReport && hunkReport.skipped.length > 0 && (
-        <div className="mx-4 mt-3 rounded-[10px] border border-accent-ink/40 bg-white px-3 py-2.5 text-[11.5px] leading-[1.45]">
+      {hunkReports.map((report) => (
+        <div
+          key={report.agentName}
+          className="mx-4 mt-3 rounded-[10px] border border-accent-ink/40 bg-white px-3 py-2.5 text-[11.5px] leading-[1.45]"
+        >
           <div className="flex items-start gap-2">
             <span className="min-w-0 flex-1 text-ink-soft">
               <b className="text-ink">
-                {hunkReport.skipped.length} hunk{hunkReport.skipped.length === 1 ? '' : 's'} of {hunkReport.agentName}
+                {report.skipped.length} hunk{report.skipped.length === 1 ? '' : 's'} of {report.agentName}
                 &rsquo;s change did not land:
               </b>{' '}
-              {hunkReport.skipped.map((s) => `#${s.index + 1} ${s.reason}`).join(' · ')}
+              {report.skipped.map((s) => `#${s.index + 1} ${s.reason}`).join(' · ')}
             </span>
             <Button
               variant="bare"
               className="flex-none px-1 py-0 text-[11px] hover:bg-transparent"
               title="Dismiss"
-              onClick={() => setHunkReport(null)}
+              onClick={() => setHunkReports((prev) => prev.filter((r) => r.agentName !== report.agentName))}
             >
               ✕
             </Button>
           </div>
         </div>
-      )}
+      ))}
 
       {open.length > 0 && (
         <>
@@ -489,11 +796,40 @@ export function ReviewPanel() {
 
       {groups.map(([key, list]) => {
         const first = list[0]!
+        const stale = list.some((p) => p.status === 'stale')
         return (
           <div key={key} className="mt-3 px-4">
-            <div className="mb-1.5 font-mono text-[10.5px] uppercase tracking-[0.08em] text-ink-faint">
-              {first.frameId ? (frames?.find((f) => f.id === first.frameId)?.name ?? 'frame') : 'new frame'}
+            <div className="mb-1.5 flex items-center gap-1.5">
+              <span className="min-w-0 flex-1 truncate font-mono text-[10.5px] uppercase tracking-[0.08em] text-ink-faint">
+                {first.frameId ? (frames?.find((f) => f.id === first.frameId)?.name ?? 'frame') : 'new frame'}
+              </span>
+              {/* one frame's queue, decided whole: the same resolve each card
+                  runs, in turn, so a refusal leaves the rest of them there */}
+              {!readOnly && (
+                <>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="text-[11.5px]"
+                    disabled={bulkBusy !== null}
+                    onClick={() => resolveFrameGroup(key, list, false)}
+                  >
+                    Reject all
+                  </Button>
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    className="text-[11.5px]"
+                    disabled={bulkBusy !== null}
+                    title={stale ? 'Accepts the stale ones too — they would overwrite newer work' : undefined}
+                    onClick={() => resolveFrameGroup(key, list, true)}
+                  >
+                    Accept all
+                  </Button>
+                </>
+              )}
             </div>
+            <BulkFailures failures={bulkErrors.filter((e) => e.key === key && list.some((p) => p.id === e.id))} />
             {list.map((p) => (
               <ProposalCard key={p.id} canvasId={canvasId} proposal={p} onSkipped={reportSkippedHunks} />
             ))}
@@ -505,9 +841,27 @@ export function ReviewPanel() {
         <>
           <ListSection>
             <span>Canvas changes</span>
-            <Badge tone="accent">{pendingCanvas.length}</Badge>
+            <span className="flex flex-none items-center gap-2">
+              <Badge tone="accent">{pendingCanvas.length}</Badge>
+              {/* the whole canvas queue at once: the changes are independent of
+                  each other, so one refusal must not hold up the rest */}
+              {!readOnly && (
+                <Button
+                  variant="primary"
+                  size="sm"
+                  className="text-[11.5px] font-bold"
+                  disabled={bulkBusy !== null}
+                  onClick={() => resolveCanvasGroup(pendingCanvas)}
+                >
+                  Accept all
+                </Button>
+              )}
+            </span>
           </ListSection>
           <div className="px-4">
+            <BulkFailures
+              failures={bulkErrors.filter((e) => e.key === 'canvas' && pendingCanvas.some((p) => p.id === e.id))}
+            />
             {pendingCanvas.map((p) => (
               <CanvasProposalCard key={p.id} canvasId={canvasId} proposal={p} />
             ))}

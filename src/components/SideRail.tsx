@@ -12,11 +12,13 @@ import { BookmarkIcon, ClientsIcon, PanelExpandRightIcon, PulseIcon, ShieldIcon 
  *  happening. */
 export function SideRail({ onOpen }: { onOpen: () => void }) {
   const setTab = useStore((s) => s.setPanelTab)
-  /* frame changes + open questions an agent is waiting on */
+  /* frame changes + open questions an agent is waiting on, and the claims an
+     agent dropped — the work this rail has to point a human at */
   const pendingReview = useStore(
     (s) =>
       s.frameProposals.filter((p) => p.status === 'pending').length +
-      s.questions.filter((q) => q.status === 'open').length,
+      s.questions.filter((q) => q.status === 'open').length +
+      s.comments.filter((c) => c.failedAt).length,
   )
   const proposalPending = useStore((s) => s.proposals.some((p) => p.status === 'pending'))
 

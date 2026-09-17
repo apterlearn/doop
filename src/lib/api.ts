@@ -18,6 +18,7 @@ import type {
   FrameVersion,
   Page,
   ReviewPolicy,
+  RunEvent,
 } from '../../shared/types'
 
 export type HomeActivity = ActivityItem & { canvasId: string; canvasName: string }
@@ -481,6 +482,16 @@ export interface AssetPage {
   has_more: boolean
 }
 
+/** A page of a canvas's run timeline, newest first. `has_more` is the server's
+ *  own answer on whether older steps still exist, and `next_offset` — present
+ *  exactly when there is one — is the offset that reads them: the panel follows
+ *  it instead of inferring an end from how long its own list is. */
+export interface RunEventPage {
+  events: RunEvent[]
+  has_more: boolean
+  next_offset?: number
+}
+
 /** Raw image bytes POSTed to an asset route: the body is the file itself,
  *  typed by its own mime, and the server sniffs the bytes rather than trusting
  *  the header. Upload and replace answer differently but fail identically, so
@@ -504,6 +515,32 @@ async function postAssetBytes<T>(url: string, blob: Blob): Promise<T> {
     throw new Error(msg)
   }
   return res.json() as Promise<T>
+}
+
+/** How far one agent may go on one canvas, as the owner sets it: `full` is
+ *  the default every agent had before the control existed, so a level is a
+ *  restriction somebody chose. The server enforces it in the MCP tool wrapper,
+ *  the same place the tool whose write it gates is checked. */
+export type AgentLevel = 'full' | 'propose' | 'comment' | 'view'
+
+/** One agent's level on a canvas. `agent_id` is the key and the id the setter
+ *  writes to — the name is the label a person reads, and a reconnecting agent
+ *  keeps its level because the id, not the name, is what the row hangs off. */
+export interface AgentLevelRow {
+  agent_id: string
+  name: string
+  owner: string
+  level: AgentLevel
+  set_at: number
+}
+
+/** What setting a level answers: the row as it now stands. `full` deletes the
+ *  row it replaces — the default, so unsetting is the same call as setting,
+ *  and the agent reads back as unrestricted either way. */
+export interface AgentLevelSet {
+  agent_id: string
+  level: AgentLevel
+  set_at: number
 }
 
 export const api = {
@@ -641,6 +678,17 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ policy, approval_tools: approvalTools }),
     }),
+  /* owner-only: how far each agent may go on this canvas, one row per agent
+     the server knows. An agent nobody has narrowed reads back as `full`, which
+     is the default — so a level in the list is a restriction somebody chose */
+  agentLevels: (canvasId: string) => req<{ levels: AgentLevelRow[] }>(`/api/canvases/${canvasId}/agent-levels`),
+  /* one agent's level: `full` deletes the row it replaces, so unsetting is the
+     same call as setting — what answers either way is the level now in force */
+  setAgentLevel: (canvasId: string, agentId: string, level: AgentLevel) =>
+    req<AgentLevelSet>(`/api/canvases/${canvasId}/agents/${encodeURIComponent(agentId)}/level`, {
+      method: 'PUT',
+      body: JSON.stringify({ level }),
+    }),
   /** the frame's stored verification reports, newest first */
   frameReviews: (frameId: string, limit = 5) =>
     req<(FrameReview & { current: boolean })[]>(`/api/frames/${frameId}/reviews?limit=${limit}`),
@@ -729,6 +777,21 @@ export const api = {
      reached a tool call yet, and steers nobody has read. The run timeline
      polls it, because a press that only toasts is invisible until it lands */
   agentSignals: (canvasId: string) => req<{ signals: AgentSignal[] }>(`/api/canvases/${canvasId}/agent-signals`),
+  /* the timeline read back from the server, newest first, a page at a time.
+     The panel's live slice is the room's own bounded window (the store keeps
+     the newest 200), so this is how the steps behind it are asked for:
+     `offset` counts from the newest step and is what a previous page's
+     `next_offset` says to ask for next, and the answer's own `has_more` is the
+     end of the history — the durable table holds far more than the ring, so
+     nothing here is ever capped by the ring's size. */
+  runEvents: (canvasId: string, opts: { runId?: string; limit?: number; offset?: number } = {}) => {
+    const q = new URLSearchParams()
+    if (opts.runId !== undefined) q.set('run_id', opts.runId)
+    if (opts.limit !== undefined) q.set('limit', String(opts.limit))
+    if (opts.offset !== undefined) q.set('offset', String(opts.offset))
+    const qs = q.toString()
+    return req<RunEventPage>(`/api/canvases/${canvasId}/run-events${qs ? `?${qs}` : ''}`)
+  },
   /* take back everything one run did: the frames it touched return to the
      version each was at before the run started. Frames changed by anyone else
      since are refused rather than clobbered, so the response reports both. */
