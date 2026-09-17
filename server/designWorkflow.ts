@@ -349,13 +349,15 @@ export async function runDesignWorkflow(input: DesignWorkflowInput): Promise<Wor
   const runId = input.runId ?? randomUUID()
   try {
     const result = await runDesignLoop({ ...input, runId })
-    /* a run a human stopped is neither a pass nor a failure: the timeline says
-       who ended it, in the kind the Run tab renders a stop with */
+    /* a run a human stopped is neither a pass nor a failure, and a run the
+       judge passed is not a status line either: each gets the kind the Run tab
+       renders its ending with, so a finished run is never mistaken for one
+       still working */
     runLog.recordStatus(
       input.canvasId,
       runId,
       input.actor.name,
-      result.stopped ? 'stop' : result.ok ? 'status' : 'error',
+      result.stopped ? 'stop' : result.ok ? 'ended' : 'error',
       result.judgeSummary,
       {
         ok: result.ok,

@@ -369,10 +369,23 @@ function ClaimRow({
    older steps fetched behind it on request, as deep as the server's own
    history goes. */
 
+/** Which kinds mean the run is still moving. A stop, an error and the engine's
+ *  own `ended` line are endings; everything else is work in progress. Written
+ *  as a table over the whole union so a kind added later cannot quietly default
+ *  to "live" and offer Stop on a run that is over. */
+const LIVE_RUN_STEP_KINDS: Record<RunEvent['kind'], true | undefined> = {
+  tool: true,
+  status: true,
+  stop: undefined,
+  error: undefined,
+  ended: undefined,
+}
+
 /** What a run step's badge says. A tool call shows the tool's own name — what
- *  the agent did — and the three steps that are not calls show what they are:
- *  a black-on-paper `run ended` for the stop, `error` in the error ink, and a
- *  neutral `status` for a line the server recorded. */
+ *  the agent did — and the four steps that are not calls show what they are:
+ *  a black-on-paper `run ended` for the stop, `error` in the error ink, a
+ *  neutral `status` for a line the server recorded, and `passed` for the
+ *  engine's own ending. */
 const RUN_STEP_BADGE: Record<
   RunEvent['kind'],
   { label: string; tone?: 'default' | 'outline' | 'accent'; className?: string }
@@ -381,6 +394,8 @@ const RUN_STEP_BADGE: Record<
   status: { label: 'status', tone: 'outline' },
   error: { label: 'error', tone: 'accent' },
   stop: { label: 'run ended', className: 'border-ink bg-ink text-paper' },
+  /* the judge passed it: the run ended on its own terms, which is not a stop */
+  ended: { label: 'passed', tone: 'outline' },
 }
 
 /** The run timeline is read a page at a time behind the live window: the room
@@ -581,16 +596,15 @@ function RunGroup({
   /* stop and steer reach an agent at its next tool call, so control needs a
      run that is still moving. Two things say so: the agent is connected right
      now, or the run's newest step is one that only happens while it runs — a
-     tool call or a status line, never the stop or the error that ended it. The
-     second is what a run started from the Brief composer needs: a human starts
-     it, so no agent presence ever carries that name, and the run's steps are
-     filed under the person's own name — which is exactly what the stop and
-     steer routes key on, so the same press reaches it. */
+     tool call or a status line, never a stop, an error or the engine's own
+     `ended` line. The second is what a run started from the Brief composer
+     needs: a human starts it, so no agent presence ever carries that name, and
+     the run's steps are filed under the person's own name — which is exactly
+     what the stop and steer routes key on, so the same press reaches it. */
   const canControl =
     !readOnly &&
     (Object.values(presences).some((p) => p.kind === 'agent' && p.name === run.agentName) ||
-      newest.kind === 'tool' ||
-      newest.kind === 'status')
+      LIVE_RUN_STEP_KINDS[newest.kind] === true)
   /* what the canvas is still holding for this agent: a stop that has not
      reached a tool call yet, and steers nobody has read. The agent name is
      kept with the list so the answer is only ever read against the group that

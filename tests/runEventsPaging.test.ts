@@ -361,7 +361,9 @@ describe('the run-events route pages the timeline', () => {
       'judge reviewing attempt 1',
       'implementing attempt 1/3',
     ])
-    expect(newest.events.every((e) => e.kind === 'status')).toBe(true)
+    /* the run's ending is its own kind, and the two lines behind it are the
+       status lines it wrote while it worked */
+    expect(newest.events.map((e) => e.kind)).toEqual(['ended', 'status', 'status'])
     const ids = newest.events.map((e) => e.id)
 
     /* the rows behind the ring are a write-behind, so the durable answer can

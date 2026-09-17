@@ -286,7 +286,7 @@ it('runs the brief the owner wrote and answers with the run the canvas now holds
     events: { kind: string; summary: string }[]
   }
   expect(page.events.map((event) => `${event.kind}: ${event.summary}`)).toEqual([
-    'status: three tiers, one clear call to action',
+    'ended: three tiers, one clear call to action',
     'status: judge reviewing attempt 1',
     'status: implementing attempt 1/3',
   ])

@@ -532,9 +532,13 @@ export interface RunEvent {
   agentName: string
   at: number
   /** what this step is: a tool call (the common case), a status line the
-   *  server or an agent recorded ('implementing attempt 2/3'), an error, or
-   *  the stop that ended the run */
-  kind: 'tool' | 'status' | 'error' | 'stop'
+   *  server or an agent recorded ('implementing attempt 2/3'), an error, the
+   *  stop that ended the run, or `ended` — the design engine's own ending for a
+   *  run the judge passed. `ended` exists so a finished run is not read as a
+   *  live one: a status line is written while a run is working, and the engine's
+   *  final line used to be one, which left the Run tab offering Stop on a run
+   *  that was already over. */
+  kind: 'tool' | 'status' | 'error' | 'stop' | 'ended'
   /** the tool the agent called */
   name?: string
   ok?: boolean

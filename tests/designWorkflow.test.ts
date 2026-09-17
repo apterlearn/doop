@@ -258,7 +258,7 @@ describe('the design workflow loop', () => {
        top of these — this is about the engine's half. */
     const events = runLog.getRunEvents(canvasId)
     expect(events.map((event) => `${event.kind}: ${event.summary}`)).toEqual([
-      'status: the design meets the brief',
+      'ended: the design meets the brief',
       'status: judge reviewing attempt 2',
       'status: implementing attempt 2/3',
       'status: judge reviewing attempt 1',
@@ -488,7 +488,7 @@ describe('the design workflow loop', () => {
     })
 
     expect(runLog.getRunEvents(humanCanvas).map((e) => `${e.kind}:${e.actorKind}:${e.actorOwner ?? ''}`)).toEqual([
-      'status:human:member-account',
+      'ended:human:member-account',
       'status:human:member-account',
       'status:human:member-account',
     ])
@@ -510,7 +510,7 @@ describe('the design workflow loop', () => {
     })
 
     expect(runLog.getRunEvents(agentCanvas).map((e) => `${e.kind}:${e.actorKind}:${e.actorOwner ?? ''}`)).toEqual([
-      'status:agent:',
+      'ended:agent:',
       'status:agent:',
       'status:agent:',
     ])

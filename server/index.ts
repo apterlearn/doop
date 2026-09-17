@@ -3390,6 +3390,17 @@ async function candidateRows(rows: persist.AgentRow[]): Promise<{ agent_id: stri
   )
 }
 
+/** The kinds that end a run: a stop a human pressed, the error it failed with,
+ *  and the engine's own ending for a run the judge passed. Everything else — a
+ *  tool call, a status line — happens while a run is still going. */
+const TERMINAL_RUN_KINDS: Record<RunEvent['kind'], true | undefined> = {
+  tool: undefined,
+  status: undefined,
+  stop: true,
+  error: true,
+  ended: true,
+}
+
 /** Whether a design run is still going for this agent — what decides which side
  *  mails when a human presses Stop.
  *
@@ -3407,7 +3418,7 @@ function designRunLive(canvasId: string, agentName: string): boolean {
   const events = runLog.getRunEvents(canvasId).filter((event) => event.agentName.trim().toLowerCase() === name)
   const engine = events.findIndex((event) => event.kind === 'status' && event.actorKind !== undefined)
   if (engine === -1) return false
-  return !events.slice(0, engine).some((event) => event.kind === 'stop' || event.kind === 'error')
+  return !events.slice(0, engine).some((event) => TERMINAL_RUN_KINDS[event.kind] === true)
 }
 
 /* The human↔agent chat: the queue an agent reads when it has nothing else to

@@ -154,7 +154,7 @@ export function recordStatus(
   canvasId: string,
   runId: string,
   agentName: string,
-  kind: 'status' | 'error' | 'stop',
+  kind: 'status' | 'error' | 'stop' | 'ended',
   summary: string,
   opts: {
     name?: string
