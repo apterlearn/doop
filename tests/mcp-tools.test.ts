@@ -331,17 +331,20 @@ describe('MCP phase-0 tool contract', () => {
       /* nobody has called yet: presence is the whole record of who is here */
       expect(fresh.structured.connected).toEqual([])
 
-      /* presence is read per name, so an agent its client reports twice is
-         listed once — with the first owner it was seen under */
+      /* presence is read per ACCOUNT + name, not per name: an agent name is
+         free text, so two accounts both running "Claude" are two agents —
+         while a client that reports one agent twice under one account is one */
       actions.wirePresence(() => [
-        { name: 'Codex', owner: 'Sam', lastSeen: Date.now() },
-        { name: 'Claude', owner: 'Sam', lastSeen: Date.now() },
-        { name: 'Claude', owner: 'Test Owner', lastSeen: Date.now() },
+        { name: 'Codex', owner: 'Sam', ownerId: 'sam-account', lastSeen: Date.now() },
+        { name: 'Claude', owner: 'Sam', ownerId: 'sam-account', lastSeen: Date.now() },
+        { name: 'Claude', owner: 'Sam', ownerId: 'sam-account', lastSeen: Date.now() },
+        { name: 'Claude', owner: 'Test Owner', ownerId: 'other-account', lastSeen: Date.now() },
       ])
       const merged = await call(client, 'get_agents', { canvas_id: canvas.id })
       expect(merged.structured.connected).toEqual([
         { agent: 'Codex', owner: 'Sam' },
         { agent: 'Claude', owner: 'Sam' },
+        { agent: 'Claude', owner: 'Test Owner' },
       ])
 
       const unknown = await call(client, 'get_agents', { canvas_id: 'nope' })

@@ -279,12 +279,13 @@ it('runs the brief the owner wrote and answers with the run the canvas now holds
   expect(view.frames[0]?.html).toContain('Three tiers, one clear call to action')
 
   /* and the runId in the answer is the id the engine's lines carry, so the
-     caller can watch the run it was just told had finished */
-  const events = (await (await user.get(`/api/canvases/${canvas.id}/run-events?run_id=${run.runId}`)).json()) as {
-    kind: string
-    summary: string
-  }[]
-  expect(events.map((event) => `${event.kind}: ${event.summary}`)).toEqual([
+     caller can watch the run it was just told had finished. The route answers a
+     page of them; what sits behind that page is covered in
+     tests/runEventsPaging.test.ts, where the rows are waited for. */
+  const page = (await (await user.get(`/api/canvases/${canvas.id}/run-events?run_id=${run.runId}`)).json()) as {
+    events: { kind: string; summary: string }[]
+  }
+  expect(page.events.map((event) => `${event.kind}: ${event.summary}`)).toEqual([
     'status: three tiers, one clear call to action',
     'status: judge reviewing attempt 1',
     'status: implementing attempt 1/3',
@@ -330,6 +331,6 @@ it('refuses a brief on a server with no endpoint, in the off state the card rend
   /* the refusal is the whole answer: no frame, no run on the timeline */
   const view = (await (await unconfiguredUser.get(`/api/canvases/${canvas.id}`)).json()) as { frames: unknown[] }
   expect(view.frames).toEqual([])
-  const events = (await (await unconfiguredUser.get(`/api/canvases/${canvas.id}/run-events`)).json()) as unknown[]
-  expect(events).toEqual([])
+  const page = (await (await unconfiguredUser.get(`/api/canvases/${canvas.id}/run-events`)).json()) as unknown
+  expect(page).toEqual({ events: [], has_more: false })
 }, 30_000)

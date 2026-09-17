@@ -105,6 +105,30 @@ describe('stop-run notifications', () => {
     expect(sendMailMock).not.toHaveBeenCalled()
   })
 
+  it('says a stopped run was stopped, on the switch a stop already uses', async () => {
+    const canvas = seedCanvas()
+    /* the two switches live on different people again: a stopped run routed to
+       the finish switch would reach the member, and a new preference column
+       would reach nobody */
+    seedStorage(
+      new Map([
+        [OWNER_ID, prefs({ agentFailEmail: true })],
+        [MEMBER_ID, prefs({ agentFinishEmail: true })],
+      ]),
+    )
+    const subject = 'Claude stopped the design run for “Hero”'
+
+    await notifyAgentEvent(canvas.id, 'stop', subject, { phase: 'stopped' })
+
+    expect(sendMailMock).toHaveBeenCalledTimes(1)
+    const [mail] = sendMailMock.mock.calls[0]!
+    expect(mail.to).toBe(OWNER_EMAIL)
+    expect(mail.subject).toBe(`[doop] ${subject}`)
+    /* the sentence reads as the human's stop, not as a design that broke */
+    expect(mail.text).toContain('was stopped')
+    expect(mail.text).not.toContain('failed')
+  })
+
   it('lets an explicit run end outrank the kind that carried it', async () => {
     const canvas = seedCanvas()
     /* the two switches live on different people, so which one was read is

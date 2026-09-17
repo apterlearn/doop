@@ -282,6 +282,10 @@ describe('restore_release', () => {
       const releaseId = created.parsed.release_id as unknown as string
 
       actions.updateFrame(frame.id, { html: '<h1>ruined</h1>' }, actions.resolveActor({ name: 'alice', kind: 'user' }))
+      /* the write reaches the database on a debounce, and the restore that
+         follows would otherwise coalesce with it into one save — which is a
+         re-save of the released html, so no version would be appended */
+      await persist.flushFrame(frame.id)
 
       const restored = await callTool(client, 'restore_release', {
         force: true,

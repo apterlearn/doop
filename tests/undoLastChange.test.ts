@@ -238,19 +238,19 @@ describe('undo_last_change', () => {
   })
 
   it('names the history tools when there is nothing older to go back to', async () => {
-    /* a frame the agent created: its own write is the only version */
-    store.createFrame(CANVAS_ID, { name: 'Fresh', html: '<div>fresh</div>' }, 'alice')
-    const fresh = store.getCanvas(CANVAS_ID)!.frames.find((f) => f.name === 'Fresh')!
-    await persist.saveFrame(fresh, true)
-
+    /* a frame the agent created: its own write is the only version, so there is
+       nothing older to go back to. A frame someone else made would have their
+       state behind it — undoing to that is a revert, not this refusal. */
     const { client, close } = await connect()
     try {
-      await callTool(client, 'set_frame_html', {
-        frame_id: fresh.id,
-        html: '<div>agent wrote this</div>',
+      await callTool(client, 'create_frame', {
+        canvas_id: CANVAS_ID,
+        name: 'Fresh',
+        html: '<div>fresh</div>',
         agent_name: 'Claude',
       })
-      await waitForVersions(fresh.id, 2)
+      const fresh = store.getCanvas(CANVAS_ID)!.frames.find((f) => f.name === 'Fresh')!
+      await waitForVersions(fresh.id, 1)
       const undo = await callTool(client, 'undo_last_change', {
         canvas_id: CANVAS_ID,
         frame_id: fresh.id,
@@ -260,7 +260,7 @@ describe('undo_last_change', () => {
       const error = undo.parsed.error as unknown as { code: string; message: string; hint?: string }
       expect(error.code).toBe('not_found')
       expect(`${error.message} ${error.hint ?? ''}`).toContain('get_frame_history')
-      expect(store.getFrame(fresh.id)!.html).toBe('<div>agent wrote this</div>')
+      expect(store.getFrame(fresh.id)!.html).toBe('<div>fresh</div>')
     } finally {
       await close()
     }

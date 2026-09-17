@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import * as actions from '../server/actions.ts'
+import * as agentEvents from '../server/agentEvents.ts'
 import { runDesignWorkflow } from '../server/designWorkflow.ts'
 import { DesignLlmError } from '../server/designLlm.ts'
 import * as review from '../server/review.ts'
@@ -51,6 +52,10 @@ const scripted = vi.hoisted(() => ({
   throws: { implementer: [] as unknown[], judge: [] as unknown[] },
   calls: [] as { model: string; system: string; prompt: string; maxTokens: number }[],
   hold: null as Promise<void> | null,
+  /* Runs once per model call, after the reply is picked: the point in a run
+     where a test can act — a human pressing stop or typing a steer — with the
+     call still the one in flight. */
+  onReply: null as ((call: { model: string; system: string; prompt: string; maxTokens: number }) => void) | null,
 }))
 
 vi.mock('../server/designLlm.ts', async (importOriginal) => ({
@@ -63,6 +68,7 @@ vi.mock('../server/designLlm.ts', async (importOriginal) => ({
     if (thrown !== undefined) throw thrown
     const reply = scripted.replies[role].shift()
     if (reply === undefined) throw new Error(`no scripted reply for ${input.model}`)
+    scripted.onReply?.(input)
     return typeof reply === 'string' ? { text: reply, truncated: false } : reply
   },
 }))
@@ -101,6 +107,23 @@ const renderer = vi.hoisted(() => ({ path: '/usr/bin/chromium' as string | null 
 vi.mock('../server/screenshot.ts', async (importOriginal) => ({
   ...((await importOriginal()) as typeof import('../server/screenshot.ts')),
   findBrowserPath: () => renderer.path,
+}))
+
+/* The run's one mail is fire-and-forget behind a dynamic import and would reach
+   SMTP: stubbed so it can be observed instead. What the engine decides the run
+   ended as is the thing under test here — the wording the mail then carries is
+   notifications.test.ts's business.
+   The factory replaces the module outright rather than spreading the real one
+   in as the other stubs here do: importing the original inside the factory
+   leaves the engine's own dynamic import handed the real module from the second
+   run on, so the mock silently stops answering and every later test sees no
+   mail. Nothing in this file's graph reads the module's other exports. */
+const mailed = vi.hoisted(() => [] as { canvasId: string; kind: string; subject: string; phase?: string }[])
+
+vi.mock('../server/notifications.ts', () => ({
+  notifyAgentEvent: async (canvasId: string, kind: string, subject: string, opts?: { phase?: string }) => {
+    mailed.push({ canvasId, kind, subject, ...(opts?.phase ? { phase: opts.phase } : {}) })
+  },
 }))
 
 const OWNER_ID = 'design-owner'
@@ -151,12 +174,14 @@ beforeEach(() => {
     proposals: new Map(),
   })
   room = []
+  mailed.length = 0
   runLog.wireBroadcast((canvasId, message) => room.push({ canvasId, message }))
   renderer.path = '/usr/bin/chromium'
   /* the beat tests arm timers and one of them moves the clock: every test
      starts on real time with nothing held open */
   vi.useRealTimers()
   scripted.hold = null
+  scripted.onReply = null
   scripted.replies.implementer.length = 0
   scripted.replies.judge.length = 0
   scripted.throws.implementer.length = 0
@@ -291,6 +316,244 @@ describe('the design workflow loop', () => {
     ])
     expect(events[0]?.ok).toBe(false)
     expect(room.filter((entry) => entry.message.type === 'run:event')).toHaveLength(events.length)
+  })
+
+  /* A human pressing stop during a run is the whole point of the button, and
+     an attempt is minutes of model time: the engine has to notice at the
+     boundaries it owns, not after the budget runs out. */
+  it('ends the run on the stop a human pressed, without starting another attempt', async () => {
+    const canvasId = 'c-stop'
+    seed(canvasId)
+    agentEvents.forget(canvasId)
+    /* the stop lands while attempt 1's judge is still answering — the run is
+       mid-attempt, which is when a human actually presses it */
+    scripted.onReply = (call) => {
+      if (call.model === scripted.judge) agentEvents.requestStop(canvasId, AGENT.name, 'Owner')
+    }
+    /* both are scripted, so a run that kept going would spend them */
+    scripted.replies.implementer.push('<h1>one</h1>', '<h1>two</h1>')
+    scripted.replies.judge.push(judgeReply('fail', 'still cramped', ['loosen the spacing']))
+
+    const result = await runDesignWorkflow({
+      canvasId,
+      brief: 'a hero with one headline',
+      frameName: 'Hero',
+      implementerModel: scripted.implementer,
+      judgeModel: scripted.judge,
+      actor: AGENT,
+      maxAttempts: 3,
+    })
+
+    expect(result.stopped).toBe(true)
+    expect(result.ok).toBe(false)
+    /* who stopped it, not the judge's verdict on the attempt that ran */
+    expect(result.judgeSummary).toBe('stopped by Owner')
+    expect(result.attempts).toBe(1)
+    expect(scripted.calls.filter((call) => call.model === scripted.implementer)).toHaveLength(1)
+    expect(scripted.calls.filter((call) => call.model === scripted.judge)).toHaveLength(1)
+    /* the attempt that ran is still on the canvas for a human to look at */
+    expect(store.getFrame(result.frameId)?.html).toBe('<h1>one</h1>')
+
+    /* the run's last line says it was stopped — not an error, which would read
+       as the design failing rather than the human ending it */
+    const events = runLog.getRunEvents(canvasId)
+    expect(events.map((event) => `${event.kind}: ${event.summary}`)).toEqual([
+      'stop: stopped by Owner',
+      'status: judge reviewing attempt 1',
+      'status: implementing attempt 1/3',
+    ])
+    const pinned = actions.getComments(canvasId).filter((comment) => comment.frameId === result.frameId)
+    expect(pinned[0]?.text).toContain('stopped by Owner after 1 attempt')
+    /* consumed as it was acted on: the stop that ended this run does not refuse
+       the next run's first call */
+    expect(agentEvents.pendingStop(canvasId, AGENT.name)).toBeUndefined()
+  })
+
+  it('takes a stop that landed while the implementer was writing, before the judge is paid for', async () => {
+    const canvasId = 'c-stop-mid-attempt'
+    seed(canvasId)
+    agentEvents.forget(canvasId)
+    /* the implementer answered, so its HTML is written — the stop is pending
+       when the engine picks the reply up, and the judge is a model call a
+       stopped run does not owe anyone */
+    scripted.onReply = (call) => {
+      if (call.model === scripted.implementer) agentEvents.requestStop(canvasId, AGENT.name, 'Owner')
+    }
+    scripted.replies.implementer.push('<h1>one</h1>')
+    scripted.replies.judge.push(judgeReply('pass', 'fine'))
+
+    const result = await runDesignWorkflow({
+      canvasId,
+      brief: 'a hero with one headline',
+      frameName: 'Hero',
+      implementerModel: scripted.implementer,
+      judgeModel: scripted.judge,
+      actor: AGENT,
+      maxAttempts: 3,
+    })
+
+    expect(result.stopped).toBe(true)
+    expect(result.ok).toBe(false)
+    expect(result.judgeSummary).toBe('stopped by Owner')
+    expect(scripted.calls.filter((call) => call.model === scripted.judge)).toHaveLength(0)
+    expect(store.getFrame(result.frameId)?.html).toBe('<h1>one</h1>')
+    expect(runLog.getRunEvents(canvasId)[0]?.kind).toBe('stop')
+  })
+
+  /* The Stop button addresses the run's agent by its durable id when the run's
+     steps carry one, while the engine looks the stop up by the name it works
+     under: the registry pairs the two spellings, so the press still lands. */
+  it('honours a stop filed against the agent’s durable id', async () => {
+    const canvasId = 'c-stop-by-id'
+    seed(canvasId)
+    agentEvents.forget(canvasId)
+    agentEvents.aliasAgent(canvasId, 'agent-claude', AGENT.name)
+    scripted.onReply = (call) => {
+      if (call.model === scripted.judge) agentEvents.requestStop(canvasId, 'agent-claude', 'Owner')
+    }
+    scripted.replies.implementer.push('<h1>one</h1>', '<h1>two</h1>')
+    scripted.replies.judge.push(judgeReply('fail', 'still cramped', ['loosen the spacing']))
+
+    const result = await runDesignWorkflow({
+      canvasId,
+      brief: 'a hero with one headline',
+      frameName: 'Hero',
+      implementerModel: scripted.implementer,
+      judgeModel: scripted.judge,
+      actor: AGENT,
+      maxAttempts: 3,
+    })
+
+    expect(result.stopped).toBe(true)
+    expect(result.judgeSummary).toBe('stopped by Owner')
+    expect(scripted.calls.filter((call) => call.model === scripted.implementer)).toHaveLength(1)
+    expect(agentEvents.pendingStop(canvasId, AGENT.name)).toBeUndefined()
+  })
+
+  /* One run sends one mail: how it ended. A run a human stopped is not a run
+     that failed, and a mail that said it failed would report the human's own
+     decision to the people who asked to hear about runs that go wrong. */
+  it('mails a stopped run as stopped rather than as a failure', async () => {
+    const canvasId = 'c-stop-mail'
+    seed(canvasId)
+    agentEvents.forget(canvasId)
+    /* the stop lands while attempt 1's judge is answering — mid-attempt, which
+       is when a human actually presses it */
+    scripted.onReply = (call) => {
+      if (call.model === scripted.judge) agentEvents.requestStop(canvasId, AGENT.name, 'Owner')
+    }
+    scripted.replies.implementer.push('<h1>one</h1>', '<h1>two</h1>')
+    scripted.replies.judge.push(judgeReply('fail', 'still cramped', ['loosen the spacing']))
+
+    const result = await runDesignWorkflow({
+      canvasId,
+      brief: 'a hero with one headline',
+      frameName: 'Hero',
+      implementerModel: scripted.implementer,
+      judgeModel: scripted.judge,
+      actor: AGENT,
+      maxAttempts: 3,
+    })
+
+    expect(result.stopped).toBe(true)
+    /* the mail rides a dynamic import and is never awaited by the run, so wait
+       for the engine's own call rather than assuming it has landed */
+    const mine = (): typeof mailed => mailed.filter((mail) => mail.canvasId === canvasId)
+    await vi.waitFor(() => expect(mine()).toHaveLength(1))
+    expect(mine()).toEqual([
+      { canvasId, kind: 'stop', subject: 'Claude stopped the design run for “Hero”', phase: 'stopped' },
+    ])
+  })
+
+  /* Every line a run writes says who ran it: the Run tab tags the run with it,
+     and the stop route reads the newest one to know a design run is live. A
+     brief is a person's run, an MCP-driven one is the agent's, and the account
+     behind the actor is stamped only when it is not the canvas's own owner. */
+  it('stamps every line it writes with the actor that ran it', async () => {
+    const humanCanvas = 'c-actor-human'
+    seed(humanCanvas)
+    scripted.replies.implementer.push('<h1>one</h1>')
+    scripted.replies.judge.push(judgeReply('pass', 'fine'))
+
+    await runDesignWorkflow({
+      canvasId: humanCanvas,
+      brief: 'a hero with one headline',
+      frameName: 'Hero',
+      implementerModel: scripted.implementer,
+      judgeModel: scripted.judge,
+      /* a member, not the canvas's owner: the account is the half of the
+         identity the timeline has to carry, because the name alone cannot say
+         which person started it */
+      actor: { name: 'Wanda Member', kind: 'user', color: '#111111', ownerId: 'member-account' },
+    })
+
+    expect(runLog.getRunEvents(humanCanvas).map((e) => `${e.kind}:${e.actorKind}:${e.actorOwner ?? ''}`)).toEqual([
+      'status:human:member-account',
+      'status:human:member-account',
+      'status:human:member-account',
+    ])
+
+    const agentCanvas = 'c-actor-agent'
+    seed(agentCanvas)
+    scripted.replies.implementer.push('<h1>two</h1>')
+    scripted.replies.judge.push(judgeReply('pass', 'fine'))
+
+    await runDesignWorkflow({
+      canvasId: agentCanvas,
+      brief: 'a hero with one headline',
+      frameName: 'Hero',
+      implementerModel: scripted.implementer,
+      judgeModel: scripted.judge,
+      /* AGENT works through the canvas owner's own token, so there is no other
+         account to name */
+      actor: AGENT,
+    })
+
+    expect(runLog.getRunEvents(agentCanvas).map((e) => `${e.kind}:${e.actorKind}:${e.actorOwner ?? ''}`)).toEqual([
+      'status:agent:',
+      'status:agent:',
+      'status:agent:',
+    ])
+  })
+
+  it('hands a human’s steer to the next attempt as a mid-run course correction', async () => {
+    const canvasId = 'c-steer'
+    seed(canvasId)
+    agentEvents.forget(canvasId)
+    let steered = false
+    scripted.onReply = (call) => {
+      if (call.model === scripted.judge && !steered) {
+        steered = true
+        agentEvents.requestSteer(canvasId, AGENT.name, 'use the brand blue for the hero', 'Owner')
+      }
+    }
+    scripted.replies.implementer.push('<h1>one</h1>', '<h1>two</h1>')
+    scripted.replies.judge.push(
+      judgeReply('fail', 'still cramped', ['loosen the spacing']),
+      judgeReply('pass', 'good now'),
+    )
+
+    const result = await runDesignWorkflow({
+      canvasId,
+      brief: 'a hero with one headline',
+      frameName: 'Hero',
+      implementerModel: scripted.implementer,
+      judgeModel: scripted.judge,
+      actor: AGENT,
+      maxAttempts: 3,
+    })
+
+    expect(result.ok).toBe(true)
+    expect(result.attempts).toBe(2)
+    const implementerCalls = scripted.calls.filter((call) => call.model === scripted.implementer)
+    /* the attempt that was already being written could not have known */
+    expect(implementerCalls[0]?.prompt).not.toContain('use the brand blue')
+    /* the next one is told, alongside the judge's issue — both are what this
+       attempt has to change */
+    expect(implementerCalls[1]?.prompt).toContain('use the brand blue for the hero')
+    expect(implementerCalls[1]?.prompt).toContain('loosen the spacing')
+    /* drained: the steer is not left waiting for a later run */
+    expect(agentEvents.listSignals(canvasId)).toEqual([])
   })
 
   it('refuses a reply the provider cut off at the token budget instead of writing half a document', async () => {
