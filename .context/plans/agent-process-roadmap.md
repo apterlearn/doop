@@ -111,6 +111,11 @@ Honest edges left in place, each with the reason it was not closed here:
 - **Idempotency is in-process.** `op_id` replay lives in memory with a ten-minute TTL, so a retry
   after a restart re-runs the write. A durable ledger is a data-model decision with its own cost,
   not a line of this work.
+- **Two runs by the same actor share one stop queue.** Signals are keyed by canvas and actor, so
+  when a person starts two briefs at once, Stop ends one of them — whichever reaches a boundary
+  first — rather than naming which. Found while verifying the stop live, with two overlapping
+  briefs running. Serialising runs per canvas (or keying a signal by run id) is the fix, and it is
+  the same decision the engine's lack of a run lock needs.
 
 ## Not on this roadmap
 
