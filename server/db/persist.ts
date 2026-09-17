@@ -1,7 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { nanoid } from 'nanoid'
-import { and, desc, eq, gte, inArray, isNotNull, isNull, lt, or } from 'drizzle-orm'
+import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, max, or } from 'drizzle-orm'
 import { db } from './index.ts'
 import * as t from './schema.ts'
 import * as authSchema from './auth-schema.ts'
@@ -1126,6 +1126,76 @@ export function pruneRunEvents(before: number) {
   swallow(db.delete(t.runEvents).where(lt(t.runEvents.at, before)))
 }
 
+/** A stored run-event row as the in-memory shape, the five version/frame
+ *  fields and the actor identity included. Shared by the boot hydrate and the
+ *  paged read below, so a step the ring never held reads exactly like one it
+ *  did — and a field added here cannot reach one path and miss the other. */
+function toRunEvent(row: typeof t.runEvents.$inferSelect): RunEvent {
+  return {
+    id: row.id,
+    canvasId: row.canvasId,
+    runId: row.runId,
+    agentName: row.agentName,
+    at: row.at,
+    kind: row.kind as RunEvent['kind'],
+    ...(row.name != null ? { name: row.name } : {}),
+    ...(row.ok != null ? { ok: row.ok } : {}),
+    ...(row.ms != null ? { ms: row.ms } : {}),
+    ...(row.summary != null ? { summary: row.summary } : {}),
+    ...(row.args != null ? { args: row.args } : {}),
+    ...(row.actorKind != null ? { actorKind: row.actorKind as RunEvent['actorKind'] } : {}),
+    ...(row.agentId != null ? { agentId: row.agentId } : {}),
+    ...(row.frameId != null ? { frameId: row.frameId } : {}),
+    ...(row.beforeVersionId != null ? { beforeVersionId: row.beforeVersionId } : {}),
+    ...(row.afterVersionId != null ? { afterVersionId: row.afterVersionId } : {}),
+  }
+}
+
+/** How many rows a timeline page holds unless the caller asks for fewer. */
+const DEFAULT_RUN_EVENT_PAGE = 200
+
+/** One page of a canvas's timeline, newest first, with whether a further row
+ *  exists behind it — the caller's `has_more` without a second count query. */
+export interface RunEventPage {
+  events: RunEvent[]
+  hasMore: boolean
+}
+
+/** A page of a canvas's run timeline out of the durable table, newest first,
+ *  optionally one run's. The ring (server/runLog.ts) answers the hot reads and
+ *  is hydrated from the newest rows, so it is a prefix of this order; every
+ *  step behind that prefix is only here, which is what keeps a busy canvas's
+ *  history reachable instead of stopping at the ring's edge.
+ *
+ *  The order is `at` descending with the row id as a tiebreaker: two steps can
+ *  share a millisecond, and an order that is not total would let an offset land
+ *  in the middle of such a group twice — a page repeating a row, or skipping
+ *  one — while stepping `offset` forward. The id is the primary key, so it
+ *  breaks every tie exactly once.
+ *
+ *  Cold path: a page per press of the Run tab's "Load older", not a per-tick
+ *  read. One row past the page is fetched and dropped, which is what answers
+ *  `hasMore` in the same query rather than a second count. */
+export async function listRunEvents(
+  canvasId: string,
+  opts: { runId?: string; limit?: number; offset?: number } = {},
+): Promise<RunEventPage> {
+  const limit = Math.max(opts.limit ?? DEFAULT_RUN_EVENT_PAGE, 1)
+  const offset = Math.max(opts.offset ?? 0, 0)
+  const rows = await db
+    .select()
+    .from(t.runEvents)
+    .where(
+      opts.runId
+        ? and(eq(t.runEvents.canvasId, canvasId), eq(t.runEvents.runId, opts.runId))
+        : eq(t.runEvents.canvasId, canvasId),
+    )
+    .orderBy(desc(t.runEvents.at), desc(t.runEvents.id))
+    .offset(offset)
+    .limit(limit + 1)
+  return { events: rows.slice(0, limit).map(toRunEvent), hasMore: rows.length > limit }
+}
+
 /** Per-user mail preferences, one switch per class of agent event. All
  *  default off, so a user with no row wants no mail — a caller reads the
  *  absence as all-false rather than as "unset and therefore maybe". */
@@ -1160,6 +1230,323 @@ export async function getNotificationPrefs(): Promise<Map<string, NotificationPr
       { agentEmail: r.agentEmail, agentFinishEmail: r.agentFinishEmail, agentFailEmail: r.agentFailEmail },
     ]),
   )
+}
+
+/* ---- agent identities (agents) ----
+   An agent arrives once per connection and heartbeats rarely, so this is a cold
+   path read straight from the database — the choice the invite surface makes.
+   The one awaited write is the arrival, which answers with the id. */
+
+/** One connected agent as the rest of the server reads it. */
+export interface AgentRow {
+  id: string
+  ownerId: string
+  /** the OAuth client it connected through; absent for an unauthenticated one */
+  clientId?: string
+  name: string
+  createdAt: number
+  lastSeenAt: number
+  /** set once the client behind it was disconnected; absent = live */
+  revokedAt?: number
+}
+
+function toAgent(row: typeof t.agents.$inferSelect): AgentRow {
+  return {
+    id: row.id,
+    ownerId: row.ownerId,
+    name: row.name,
+    createdAt: row.createdAt,
+    lastSeenAt: row.lastSeenAt,
+    ...(row.clientId != null ? { clientId: row.clientId } : {}),
+    ...(row.revokedAt != null ? { revokedAt: row.revokedAt } : {}),
+  }
+}
+
+/** Upsert an agent by (owner_id, name) and answer the row as stored: a name its
+ *  owner has used before keeps its id — that id IS the identity — and only the
+ *  heartbeat and the client move. The caller mints the id and the timestamp, so
+ *  a losing insert costs nothing. Awaited rather than swallowed, unlike the
+ *  write-through helpers, because the caller answers with the id. */
+export async function upsertAgent(row: {
+  id: string
+  ownerId: string
+  name: string
+  clientId?: string
+  at: number
+}): Promise<AgentRow> {
+  const [stored] = await db
+    .insert(t.agents)
+    .values({
+      id: row.id,
+      ownerId: row.ownerId,
+      name: row.name,
+      clientId: row.clientId ?? null,
+      createdAt: row.at,
+      lastSeenAt: row.at,
+      revokedAt: null,
+    })
+    .onConflictDoUpdate({
+      target: [t.agents.ownerId, t.agents.name],
+      set: { clientId: row.clientId ?? null, lastSeenAt: row.at, revokedAt: null },
+    })
+    .returning()
+  if (!stored) throw new Error('agent upsert returned no row')
+  return toAgent(stored)
+}
+
+/** Move the heartbeat. A heartbeat never resurrects a revoked identity — only a
+ *  fresh arrival does, because only a fresh arrival proves a live connection. */
+export async function heartbeatAgent(id: string, at = Date.now()): Promise<void> {
+  await db.update(t.agents).set({ lastSeenAt: at }).where(eq(t.agents.id, id))
+}
+
+/** An owner's agents, most recently seen first. */
+export async function listAgentsForOwner(ownerId: string): Promise<AgentRow[]> {
+  const rows = await db.select().from(t.agents).where(eq(t.agents.ownerId, ownerId)).orderBy(desc(t.agents.lastSeenAt))
+  return rows.map(toAgent)
+}
+
+/** One agent by id — the join the permissions and attribution paths make. */
+export async function getAgent(id: string): Promise<AgentRow | undefined> {
+  const [row] = await db.select().from(t.agents).where(eq(t.agents.id, id)).limit(1)
+  return row ? toAgent(row) : undefined
+}
+
+/** Revoke every identity that connected through one OAuth client — what
+ *  disconnecting the client means. Only the first revocation is stamped, so a
+ *  second one cannot move the time the identity died. */
+export async function revokeAgentsForClient(ownerId: string, clientId: string, at = Date.now()): Promise<void> {
+  await db
+    .update(t.agents)
+    .set({ revokedAt: at })
+    .where(and(eq(t.agents.ownerId, ownerId), eq(t.agents.clientId, clientId), isNull(t.agents.revokedAt)))
+}
+
+/* ---- per-agent permission levels (agent_levels) ----
+   An owner's leash on one agent on one canvas. Cold path, like the identities
+   above: the MCP wrapper looks a level up per call and the panel writes one
+   when the owner moves a chip, so there is nothing hot enough to mirror. A
+   row only ever holds a narrowed level — `full` is the absence of one (see
+   store.setAgentLevel) — which keeps "no row" the single spelling of the
+   default. */
+
+/** The levels an agent can be held to. `full` is the default and is never
+ *  stored: it is what an absent row means. */
+export type AgentLevel = 'full' | 'propose' | 'comment' | 'view'
+
+/** One agent's level on one canvas, as the rest of the server reads it. */
+export interface AgentLevelRow {
+  canvasId: string
+  agentId: string
+  level: AgentLevel
+  /** the owner who set it */
+  setBy: string
+  setAt: number
+}
+
+function toAgentLevel(row: typeof t.agentLevels.$inferSelect): AgentLevelRow {
+  return {
+    canvasId: row.canvasId,
+    agentId: row.agentId,
+    level: row.level as AgentLevel,
+    setBy: row.setBy,
+    setAt: row.setAt,
+  }
+}
+
+/** Upsert one agent's level and answer the row as stored. Awaited rather than
+ *  swallowed: the caller answers the REST route with what was actually
+ *  written, and the panel must not show a chip the server did not take. The
+ *  caller stamps `at`, so nothing is computed here that a conflict discards. */
+export async function setAgentLevel(row: {
+  canvasId: string
+  agentId: string
+  level: AgentLevel
+  setBy: string
+  at: number
+}): Promise<AgentLevelRow> {
+  const [stored] = await db
+    .insert(t.agentLevels)
+    .values({ canvasId: row.canvasId, agentId: row.agentId, level: row.level, setBy: row.setBy, setAt: row.at })
+    .onConflictDoUpdate({
+      target: [t.agentLevels.canvasId, t.agentLevels.agentId],
+      set: { level: row.level, setBy: row.setBy, setAt: row.at },
+    })
+    .returning()
+  if (!stored) throw new Error('agent level upsert returned no row')
+  return toAgentLevel(stored)
+}
+
+/** Back to the default: the row is dropped, and the agent is `full` again. */
+export async function clearAgentLevel(canvasId: string, agentId: string): Promise<void> {
+  await db.delete(t.agentLevels).where(and(eq(t.agentLevels.canvasId, canvasId), eq(t.agentLevels.agentId, agentId)))
+}
+
+/** One agent's level on one canvas; absent = `full`. */
+export async function getAgentLevel(canvasId: string, agentId: string): Promise<AgentLevelRow | undefined> {
+  const [row] = await db
+    .select()
+    .from(t.agentLevels)
+    .where(and(eq(t.agentLevels.canvasId, canvasId), eq(t.agentLevels.agentId, agentId)))
+    .limit(1)
+  return row ? toAgentLevel(row) : undefined
+}
+
+/** Every narrowed level on a canvas, most recently set first — the owner's
+ *  panel. Agents at `full` are absent by construction. */
+export async function listAgentLevels(canvasId: string): Promise<AgentLevelRow[]> {
+  const rows = await db
+    .select()
+    .from(t.agentLevels)
+    .where(eq(t.agentLevels.canvasId, canvasId))
+    .orderBy(desc(t.agentLevels.setAt))
+  return rows.map(toAgentLevel)
+}
+
+/** A canvas is gone: the leashes its owner set go with it. */
+export function deleteAgentLevelsForCanvas(canvasId: string) {
+  swallow(db.delete(t.agentLevels).where(eq(t.agentLevels.canvasId, canvasId)))
+}
+
+/* ---- the agent↔human bus (agent_events / agent_signals) ----
+   The bus and its stop/steer registry live in server/agentEvents.ts as
+   in-process state; these are the durable halves of both. An event is written
+   behind, like the run timeline: the ring already holds it, and losing
+   durability must not fail the tool call that published it. A signal is never
+   deleted on the way out — it is stamped taken — so a restart cannot hand the
+   same stop to the agent twice. Both are read once at boot, by
+   agentEvents.hydrate. */
+
+/** One published bus event, as the row stores it. */
+export interface AgentEventRow {
+  canvasId: string
+  seq: number
+  kind: string
+  at: number
+  /** the human-readable field the event carried (a comment's text, a steer's
+   *  message); absent when the event has none */
+  summary?: string
+  /** the agent or role the event was addressed to; absent = everyone */
+  targetAgent?: string
+}
+
+export function saveAgentEvent(row: AgentEventRow) {
+  swallow(
+    db.insert(t.agentEvents).values({
+      canvasId: row.canvasId,
+      seq: row.seq,
+      kind: row.kind,
+      at: row.at,
+      summary: row.summary ?? null,
+      targetAgent: row.targetAgent ?? null,
+    }),
+  )
+}
+
+/** The highest sequence each canvas ever published — the counter a restart
+ *  resumes from, so a seq an agent took before the restart still means "I have
+ *  seen up to here". A canvas with no rows is absent from the map: its counter
+ *  starts at 1. */
+export async function agentEventCursors(): Promise<Map<string, number>> {
+  const rows = await db
+    .select({ canvasId: t.agentEvents.canvasId, seq: max(t.agentEvents.seq) })
+    .from(t.agentEvents)
+    .groupBy(t.agentEvents.canvasId)
+  const cursors = new Map<string, number>()
+  for (const row of rows) if (row.seq != null) cursors.set(row.canvasId, Number(row.seq))
+  return cursors
+}
+
+/** Retention: drop bus events at or before a cutoff — the same seven-day
+ *  window the run timeline keeps. */
+export function pruneAgentEvents(before: number) {
+  swallow(db.delete(t.agentEvents).where(lte(t.agentEvents.at, before)))
+}
+
+/** A canvas is gone: its bus events go with it. */
+export function deleteAgentEventsForCanvas(canvasId: string) {
+  swallow(db.delete(t.agentEvents).where(eq(t.agentEvents.canvasId, canvasId)))
+}
+
+/** One stop or steer, as the row stores it. `target` is the registry key the
+ *  in-process map files it under — the agent name trimmed and lowercased, the
+ *  same string `signalKeys` looks a signal up by. */
+export interface AgentSignalRow {
+  canvasId: string
+  target: string
+  kind: 'stop' | 'steer'
+  message?: string
+  /** who asked — the human's display name */
+  by: string
+  at: number
+}
+
+export function saveAgentSignal(row: AgentSignalRow) {
+  swallow(
+    db.insert(t.agentSignals).values({
+      canvasId: row.canvasId,
+      target: row.target,
+      kind: row.kind,
+      message: row.message ?? null,
+      by: row.by,
+      at: row.at,
+      takenAt: null,
+    }),
+  )
+}
+
+/** Every signal still waiting for its agent, oldest first — what boot rebuilds
+ *  the registry from. */
+export async function listPendingAgentSignals(): Promise<AgentSignalRow[]> {
+  const rows = await db
+    .select()
+    .from(t.agentSignals)
+    .where(isNull(t.agentSignals.takenAt))
+    .orderBy(asc(t.agentSignals.at))
+  return rows.map((row) => ({
+    canvasId: row.canvasId,
+    target: row.target,
+    kind: row.kind === 'stop' ? ('stop' as const) : ('steer' as const),
+    ...(row.message != null ? { message: row.message } : {}),
+    by: row.by,
+    at: row.at,
+  }))
+}
+
+/** Stamp a signal consumed, by the registry keys the caller looked it up
+ *  under. A taken row is not deleted: it is what tells this process, and the
+ *  next boot, that the signal is done; the retention pass drops it. */
+export function markAgentSignalsTaken(
+  canvasId: string,
+  targets: string[],
+  kind: 'stop' | 'steer',
+  at = Date.now(),
+): void {
+  if (targets.length === 0) return
+  swallow(
+    db
+      .update(t.agentSignals)
+      .set({ takenAt: at })
+      .where(
+        and(
+          eq(t.agentSignals.canvasId, canvasId),
+          eq(t.agentSignals.kind, kind),
+          inArray(t.agentSignals.target, targets),
+          isNull(t.agentSignals.takenAt),
+        ),
+      ),
+  )
+}
+
+/** A canvas is gone: the stops and steers queued for its agents go with it. */
+export function deleteAgentSignalsForCanvas(canvasId: string) {
+  swallow(db.delete(t.agentSignals).where(eq(t.agentSignals.canvasId, canvasId)))
+}
+
+/** Retention: drop signals at or before a cutoff, taken or not — a signal that
+ *  old is aimed at a run that ended long ago. */
+export function pruneAgentSignals(before: number) {
+  swallow(db.delete(t.agentSignals).where(lte(t.agentSignals.at, before)))
 }
 
 /* Streaming appends update a frame's html on every chunk — debounce per frame
@@ -1328,6 +1715,7 @@ export function hardDeleteCanvas(canvasId: string) {
   swallow(db.delete(t.pages).where(eq(t.pages.canvasId, canvasId)))
   swallow(db.delete(t.canvasMembers).where(eq(t.canvasMembers.canvasId, canvasId)))
   swallow(db.delete(t.canvasInvites).where(eq(t.canvasInvites.canvasId, canvasId)))
+  deleteAgentLevelsForCanvas(canvasId)
   /* Credentials follow the canvas they grant access to: a design-sync key is a
      write-only capability for THIS canvas and a GitHub connection is a repo
      import source for it, so a purged canvas must not strand either. The key's
@@ -1897,7 +2285,9 @@ export async function hydrate(): Promise<Hydrated> {
     db.select().from(t.frameProposals).orderBy(desc(t.frameProposals.at)),
     db.select().from(t.canvasProposals).orderBy(desc(t.canvasProposals.createdAt)),
     db.select().from(t.agentQuestions).orderBy(desc(t.agentQuestions.at)),
-    db.select().from(t.runEvents).orderBy(desc(t.runEvents.at)),
+    /* the same total order the paged read uses (see listRunEvents), so the
+       ring the boot builds is a prefix of the pages a client asks for */
+    db.select().from(t.runEvents).orderBy(desc(t.runEvents.at), desc(t.runEvents.id)),
     db.select().from(t.notificationPrefs),
     db.select().from(t.components),
     db.select().from(t.userMemory).orderBy(desc(t.userMemory.createdAt)),
@@ -2202,21 +2592,7 @@ export async function hydrate(): Promise<Hydrated> {
   for (const row of runEventRows) {
     const list = runEvents.get(row.canvasId) ?? []
     if (list.length >= 200) continue
-    list.push({
-      id: row.id,
-      canvasId: row.canvasId,
-      runId: row.runId,
-      agentName: row.agentName,
-      at: row.at,
-      kind: row.kind as RunEvent['kind'],
-      ...(row.name != null ? { name: row.name } : {}),
-      ...(row.ok != null ? { ok: row.ok } : {}),
-      ...(row.ms != null ? { ms: row.ms } : {}),
-      ...(row.summary != null ? { summary: row.summary } : {}),
-      ...(row.frameId != null ? { frameId: row.frameId } : {}),
-      ...(row.beforeVersionId != null ? { beforeVersionId: row.beforeVersionId } : {}),
-      ...(row.afterVersionId != null ? { afterVersionId: row.afterVersionId } : {}),
-    })
+    list.push(toRunEvent(row))
     runEvents.set(row.canvasId, list)
   }
 

@@ -511,7 +511,9 @@ export interface AgentQuestion {
   /** an answer outside choices is allowed (default: not) */
   allowOther?: boolean
   at: number
-  status: 'open' | 'answered' | 'expired'
+  /** `withdrawn` is the asker taking its own question back: closed to
+   *  answering, and gone from the room's open list */
+  status: 'open' | 'answered' | 'expired' | 'withdrawn'
   answer?: string
   answeredBy?: string
   answeredAt?: number
@@ -539,8 +541,23 @@ export interface RunEvent {
   ms?: number
   /** one-line result summary (≤200 chars) */
   summary?: string
+  /** the JSON of the arguments the tool call carried, cut at 2048 bytes so a
+   *  step's payload cannot bloat the timeline. Only a tool step has one: a
+   *  status/error/stop line records none. */
+  args?: string
   /** the frame this step wrote, when it wrote one */
   frameId?: string
+  /** who the run's actor was: an agent working over MCP, or the person who
+   *  started a design run from the canvas. Absent on steps recorded before
+   *  this was tracked, which reads as an agent (the only kind there was).
+   *  Spelled `'human'` where `ActorKind` says `'user'`: this names the person
+   *  behind the run, that one the kind of session in the room. */
+  actorKind?: 'human' | 'agent'
+  /** the account behind the actor, when it is not the canvas owner */
+  actorOwner?: string
+  /** the agents row behind an agent actor — what addresses the right agent
+   *  when two accounts share a display name. Absent for a human actor. */
+  agentId?: string
   /** the frame version the step started from and the one it produced — what
    *  makes a step diffable against its predecessor with diff_frame */
   beforeVersionId?: string

@@ -1,4 +1,15 @@
-import { pgTable, text, doublePrecision, bigint, boolean, integer, index, primaryKey, jsonb } from 'drizzle-orm/pg-core'
+import {
+  pgTable,
+  text,
+  doublePrecision,
+  bigint,
+  boolean,
+  integer,
+  index,
+  primaryKey,
+  uniqueIndex,
+  jsonb,
+} from 'drizzle-orm/pg-core'
 
 /**
  * One Postgres-dialect schema for every environment: PGlite (embedded, file
@@ -663,6 +674,17 @@ export const runEvents = pgTable(
     ok: boolean('ok'),
     ms: integer('ms'),
     summary: text('summary'),
+    /** the JSON of the arguments a tool call carried, cut at 2048 bytes;
+     *  null for every non-tool kind (a status/error/stop line has none) */
+    args: text('args'),
+    /** who the run's actor was: an agent working over MCP, or the person who
+     *  started a design run from the canvas. Null on steps recorded before
+     *  this was tracked, which reads as an agent (the only kind there was). */
+    actorKind: text('actor_kind'),
+    /** the agents row behind an agent actor: the join key that tells two
+     *  accounts' agents apart when they share a display name. Null for a
+     *  human actor, and for a step recorded without an identity. */
+    agentId: text('agent_id'),
     /** the frame this step touched, when it wrote one — the replay cursor */
     frameId: text('frame_id'),
     /** the frame_versions row the step started from / produced, so step N can
@@ -769,3 +791,98 @@ export const designWorkflowSettings = pgTable('design_workflow_settings', {
   judgeModel: text('judge_model'),
   updatedAt: bigint('updated_at', { mode: 'number' }).notNull(),
 })
+
+/** A durable identity for one connected agent, keyed by the `agent_name` its
+ *  owner chose — the name is unique per owner, so a client that reconnects
+ *  under the same name is the same agent, and the id is what per-agent
+ *  permissions, stop/steer and attribution key on (the name stays the display).
+ *  Read straight from the database rather than mirrored in memory: an agent
+ *  arrives once and heartbeats rarely, like an invitation. */
+export const agents = pgTable(
+  'agents',
+  {
+    id: text('id').primaryKey(),
+    ownerId: text('owner_id').notNull(),
+    /** the OAuth client the agent connected through; null for a connection
+     *  that was not authenticated as an app */
+    clientId: text('client_id'),
+    name: text('name').notNull(),
+    createdAt: bigint('created_at', { mode: 'number' }).notNull(),
+    lastSeenAt: bigint('last_seen_at', { mode: 'number' }).notNull(),
+    /** epoch ms the connection behind this identity was disconnected; null =
+     *  live. A fresh arrival clears it (the revoked client's tokens are gone,
+     *  so only a new connection can be asking), a heartbeat does not. */
+    revokedAt: bigint('revoked_at', { mode: 'number' }),
+  },
+  (t) => [uniqueIndex('agents_owner_name_idx').on(t.ownerId, t.name)],
+)
+
+/** How far one agent may go on one canvas — the owner's leash, keyed by the
+ *  durable agent id so a reconnecting agent keeps it. An absent row means
+ *  'full', which is what every agent had before this table existed; the level
+ *  narrows what the MCP tool wrapper lets the agent do. Cold path, read
+ *  straight from the database: the wrapper looks one up per call, no mirror
+ *  keeps it in step with the panel. */
+export const agentLevels = pgTable(
+  'agent_levels',
+  {
+    canvasId: text('canvas_id').notNull(),
+    agentId: text('agent_id').notNull(),
+    /** 'full' | 'propose' | 'comment' | 'view' */
+    level: text('level').notNull(),
+    /** the owner who set it — the panel names them on the chip */
+    setBy: text('set_by').notNull(),
+    setAt: bigint('set_at', { mode: 'number' }).notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.canvasId, t.agentId] })],
+)
+
+/** The agent↔human event bus, durable: one row per published event. The
+ *  per-canvas ring stays the read path; this is what makes a cursor mean the
+ *  same thing after a restart. Without it the sequence restarts at 1 while
+ *  every connected agent still holds a cursor from the previous process, and
+ *  `wait`/`matching` drop every event whose seq is not past it — an agent that
+ *  went silently deaf until the counter climbed back. `seq` is per canvas and
+ *  assigned from the durable maximum, so the log is append-only and ordered.
+ *  Pruned on the same seven-day clock as run_events. */
+export const agentEvents = pgTable(
+  'agent_events',
+  {
+    canvasId: text('canvas_id').notNull(),
+    seq: bigint('seq', { mode: 'number' }).notNull(),
+    kind: text('kind').notNull(),
+    at: bigint('at', { mode: 'number' }).notNull(),
+    /** the human-readable field the event carried (a comment's text, a
+     *  steer's message); null when the event has none */
+    summary: text('summary'),
+    /** the agent name or role the event was addressed to; null = everyone */
+    targetAgent: text('target_agent'),
+  },
+  (t) => [index('agent_events_canvas_seq_idx').on(t.canvasId, t.seq)],
+)
+
+/** A stop or a steer a human aimed at an agent, kept until the agent sees it:
+ *  MCP is pull-based, so an agent between calls has nothing parked to wake and
+ *  the only thing that reaches it is the call it is about to make. Durable
+ *  because a restart must not lose a pending stop — the run it was aimed at is
+ *  ended by the same restart's client, not by us. `target` is the registry key
+ *  the signal is filed under (the agent name lowercased), which is exactly
+ *  what `signalKeys`/`pendingStop` look a signal up by; `taken_at` marks a
+ *  signal the agent has consumed, so hydrate does not resurrect it. */
+export const agentSignals = pgTable(
+  'agent_signals',
+  {
+    canvasId: text('canvas_id').notNull(),
+    target: text('target').notNull(),
+    /** 'stop' | 'steer' */
+    kind: text('kind').notNull(),
+    message: text('message'),
+    /** who asked — the human's display name, for the run timeline */
+    by: text('by').notNull(),
+    at: bigint('at', { mode: 'number' }).notNull(),
+    /** epoch ms the agent consumed it (a stop it acted on, steers it drained);
+     *  null = still pending */
+    takenAt: bigint('taken_at', { mode: 'number' }),
+  },
+  (t) => [index('agent_signals_canvas_target_idx').on(t.canvasId, t.target)],
+)

@@ -1302,6 +1302,127 @@ class Store {
     persist.saveCanvas(c)
     return live
   }
+
+  /* ---- agent identities (agents) ----
+     Durable identity for a connected agent, keyed by (ownerId, name). Cold
+     path, read straight from the database rather than mirrored in memory: an
+     agent arrives once per connection and heartbeats rarely, so there is no
+     live graph for a mirror to keep in step with. */
+
+  /** The agent's identity, created on first sight and heartbeaten after that.
+   *  A reconnecting agent keeps the id it had, which is what lets permissions
+   *  and stop/steer outlive the connection. */
+  upsertAgent(input: { ownerId: string; name: string; clientId?: string }): Promise<persist.AgentRow> {
+    return persist.upsertAgent({ id: nanoid(10), ...input, at: Date.now() })
+  }
+
+  /** A liveness ping from a connected agent. */
+  heartbeatAgent(id: string): Promise<void> {
+    return persist.heartbeatAgent(id)
+  }
+
+  /** The owner's agents, most recently seen first. */
+  listAgentsForOwner(ownerId: string): Promise<persist.AgentRow[]> {
+    return persist.listAgentsForOwner(ownerId)
+  }
+
+  /** An OAuth client was disconnected: every identity it created is stamped
+   *  revoked, so its agents stop reading as live connections. */
+  revokeAgentsForClient(ownerId: string, clientId: string): Promise<void> {
+    return persist.revokeAgentsForClient(ownerId, clientId)
+  }
+
+  /* ---- per-agent permission levels (agent_levels) ----
+     The owner's leash on one agent on one canvas. Cold path, read straight
+     from the database rather than mirrored in memory, like the identities it
+     hangs off: the MCP wrapper looks a level up per call and the panel writes
+     one when a chip moves. `full` is the default and is stored as no row at
+     all, so `setAgentLevel` normalises it to a clear and answers undefined —
+     one spelling of "back to full" for every caller, and the panel's list can
+     read an absent agent as full without a special case. */
+
+  /** Set the agent's level on one canvas and answer the row as stored; `full`
+   *  drops the row instead and answers undefined. Awaited, unlike the
+   *  write-through helpers: the REST route reports what was actually written,
+   *  so the panel never shows a chip the server did not take. */
+  async setAgentLevel(input: {
+    canvasId: string
+    agentId: string
+    level: persist.AgentLevel
+    setBy: string
+    at?: number
+  }): Promise<persist.AgentLevelRow | undefined> {
+    if (input.level !== 'full') return persist.setAgentLevel({ ...input, at: input.at ?? Date.now() })
+    await this.clearAgentLevel(input.canvasId, input.agentId)
+    return undefined
+  }
+
+  /** Back to the default: the agent is `full` again. */
+  clearAgentLevel(canvasId: string, agentId: string): Promise<void> {
+    return persist.clearAgentLevel(canvasId, agentId)
+  }
+
+  /** One agent's level on one canvas; absent = `full`. */
+  getAgentLevel(canvasId: string, agentId: string): Promise<persist.AgentLevelRow | undefined> {
+    return persist.getAgentLevel(canvasId, agentId)
+  }
+
+  /** Every narrowed level on a canvas, most recently set first. Agents at
+   *  `full` have no row and are therefore absent. */
+  listAgentLevels(canvasId: string): Promise<persist.AgentLevelRow[]> {
+    return persist.listAgentLevels(canvasId)
+  }
+
+  /* ---- the agent↔human bus (agent_events / agent_signals) ----
+     The durable halves of agentEvents.ts's in-process bus and stop/steer
+     registry: written behind while the server runs, read once at boot by
+     agentEvents.hydrate. That module owns the ring and the maps; these are the
+     copy a restart resumes from, so a cursor still means "I have seen up to
+     here" and a queued stop is still queued. */
+
+  saveAgentEvent(row: persist.AgentEventRow): void {
+    persist.saveAgentEvent(row)
+  }
+
+  /** canvasId -> the highest seq that canvas published, the counter a restart
+   *  must resume from. */
+  listAgentEventCursors(): Promise<Map<string, number>> {
+    return persist.agentEventCursors()
+  }
+
+  /** Drop bus events at or before a cutoff. */
+  pruneAgentEvents(before: number): void {
+    persist.pruneAgentEvents(before)
+  }
+
+  /** A canvas is gone: its bus events go with it. */
+  deleteAgentEventsForCanvas(canvasId: string): void {
+    persist.deleteAgentEventsForCanvas(canvasId)
+  }
+
+  saveAgentSignal(row: persist.AgentSignalRow): void {
+    persist.saveAgentSignal(row)
+  }
+
+  /** Signals still waiting for their agent, oldest first. */
+  listPendingAgentSignals(): Promise<persist.AgentSignalRow[]> {
+    return persist.listPendingAgentSignals()
+  }
+
+  /** Stamp a signal consumed, by the registry keys it was looked up under. */
+  markAgentSignalsTaken(canvasId: string, targets: string[], kind: 'stop' | 'steer'): void {
+    persist.markAgentSignalsTaken(canvasId, targets, kind)
+  }
+
+  /** A canvas is gone: the stops and steers queued for its agents go with it. */
+  deleteAgentSignalsForCanvas(canvasId: string): void {
+    persist.deleteAgentSignalsForCanvas(canvasId)
+  }
+
+  /** Drop signals at or before a cutoff, taken or not. */
+  pruneAgentSignals(before: number): void {
+    persist.pruneAgentSignals(before)
+  }
 }
 
 export const store = new Store()

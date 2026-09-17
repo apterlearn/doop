@@ -267,6 +267,41 @@
       "when": 1789514518886,
       "tag": "0037_mysterious_violations",
       "breakpoints": true
+    },
+    {
+      "idx": 38,
+      "version": "7",
+      "when": 1789555096328,
+      "tag": "0038_long_peter_parker",
+      "breakpoints": true
+    },
+    {
+      "idx": 39,
+      "version": "7",
+      "when": 1789555959223,
+      "tag": "0039_known_thor",
+      "breakpoints": true
+    },
+    {
+      "idx": 40,
+      "version": "7",
+      "when": 1789557174857,
+      "tag": "0040_eager_sabretooth",
+      "breakpoints": true
+    },
+    {
+      "idx": 41,
+      "version": "7",
+      "when": 1789559221931,
+      "tag": "0041_absurd_edwin_jarvis",
+      "breakpoints": true
+    },
+    {
+      "idx": 42,
+      "version": "7",
+      "when": 1789560905507,
+      "tag": "0042_reflective_tusk",
+      "breakpoints": true
     }
   ]
 }

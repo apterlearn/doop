@@ -13,15 +13,19 @@ import type { AgentEventKind } from '../shared/types.ts'
  * or a failed one over it.
  */
 
-/** How a run ended. Neither is an `AgentEventKind` — nothing parks waiting for
- *  a run to be over — so a caller passes one alongside the event that carried
- *  it, while the kinds that ARE on the bus (`question`, `stop`) are read from
- *  the kind alone. */
-export type NotificationPhase = 'finished' | 'failed'
+/** How a run ended. None of these is an `AgentEventKind` — nothing parks waiting
+ *  for a run to be over — so a caller passes one alongside the event that
+ *  carried it, while the kinds that ARE on the bus (`question`, `stop`) are
+ *  read from the kind alone. A run a human stopped is an ending of its own: the
+ *  engine reports the stop as a stop, and the mail has to say the same thing. */
+export type NotificationPhase = 'finished' | 'failed' | 'stopped'
 
 const RUN_END_LABELS: Record<NotificationPhase, string> = {
   finished: 'finished its run',
   failed: 'failed its run',
+  /* the same words the bus's own `stop` label uses: one human's stop reads the
+     same whether the REST route or the engine is reporting it */
+  stopped: 'was stopped',
 }
 
 /** The bus kinds a human opted into being emailed about. Every other kind
@@ -35,12 +39,15 @@ const EVENT_LABELS: Partial<Record<AgentEventKind, string>> = {
 }
 
 /** Which of a user's switches covers an event: questions have their own,
- *  a finished run has its own, and a failure or a human's stop share the
- *  "something went wrong" one — a stop is the run not finishing, and the
- *  person who pressed it already knows why. */
+ *  a finished run has its own, and everything else that ends a run — a failure,
+ *  and a human's stop whether it arrives as the bare kind or as the run's own
+ *  ending — shares the "something went wrong" one: a stop is the run not
+ *  finishing, and the person who pressed it already knows why. */
 function switchFor(kind: AgentEventKind, phase: NotificationPhase | undefined): keyof NotificationPrefs {
   if (phase === 'finished') return 'agentFinishEmail'
-  if (phase === 'failed') return 'agentFailEmail'
+  /* a stopped run is not a finished one: it is the switch a stop has always
+     used, so a stop does not need a preference of its own */
+  if (phase === 'failed' || phase === 'stopped') return 'agentFailEmail'
   return kind === 'question' ? 'agentEmail' : 'agentFailEmail'
 }
 

@@ -20,6 +20,16 @@ const CAP = 500
 /** How many events a read returns unless the caller asks for fewer. */
 const DEFAULT_LIMIT = 200
 
+/** The bound a step's argument JSON is cut to, in bytes. A tool call's
+ *  arguments are what makes the Run tab's detail pane worth opening; they are
+ *  also the one field a caller cannot be trusted to bound, so the cut happens
+ *  here, at the write boundary, rather than at each call site. */
+export const ARGS_CAP = 2048
+
+/** Strict decoder: a byte sequence cut mid-character throws rather than
+ *  decoding to U+FFFD, which is how the cut below knows to step back. */
+const utf8 = new TextDecoder('utf-8', { fatal: true })
+
 const runLog = new Map<string, RunEvent[]>() // canvasId -> events (newest first)
 
 /** Where a recorded event is announced to the canvas's ws room. Wired by the
@@ -48,11 +58,45 @@ function writeBehind(statement: () => Promise<unknown>): void {
 
 /** Append one event to a canvas's timeline and return it as stored. `kind`
  *  defaults to `'tool'`, so the common case — a tool call — need not spell it
- *  out, and the status/error/stop lines `recordStatus` writes do. */
+ *  out, and the status/error/stop lines `recordStatus` writes do.
+ *
+ *  `args` is the caller's argument JSON as a string, the same way `summary` is
+ *  a string the caller has already written out. It is cut to ARGS_CAP bytes
+ *  here, at the write boundary, because that is the one bound a caller cannot
+ *  be trusted to apply: the JSON is stored and rendered as text, so a tail cut
+ *  mid-value is cosmetic, but the bytes straddling the cut are walked back off
+ *  a multi-byte character so what lands in the column is always valid UTF-8.
+ *  Only a tool step keeps arguments — a status, error or stop line records
+ *  none — and the ring and the row are cut the same way, so a restart rebuilds
+ *  the timeline the run actually showed. */
 export function record(
   event: Omit<RunEvent, 'id' | 'at' | 'kind'> & { kind?: RunEvent['kind']; at?: number },
 ): RunEvent {
-  const full: RunEvent = { ...event, kind: event.kind ?? 'tool', id: nanoid(8), at: event.at ?? Date.now() }
+  const { args: rawArgs, ...step } = event
+  const kind = step.kind ?? 'tool'
+  let args: string | undefined
+  if (kind === 'tool' && rawArgs !== undefined) {
+    args = rawArgs
+    const bytes = Buffer.from(rawArgs, 'utf8')
+    if (bytes.length > ARGS_CAP) {
+      let end = ARGS_CAP
+      for (;;) {
+        try {
+          args = utf8.decode(bytes.subarray(0, end))
+          break
+        } catch {
+          end--
+        }
+      }
+    }
+  }
+  const full: RunEvent = {
+    ...step,
+    kind,
+    id: nanoid(8),
+    at: step.at ?? Date.now(),
+    ...(args !== undefined ? { args } : {}),
+  }
   const list = runLog.get(full.canvasId) ?? []
   list.unshift(full)
   if (list.length > CAP) list.length = CAP
@@ -69,6 +113,16 @@ export function record(
       ok: full.ok ?? null,
       ms: full.ms ?? null,
       summary: full.summary ?? null,
+      /* a tool call's arguments, already cut above; null for every other kind */
+      args: full.args ?? null,
+      /* who the actor was — the run's own identity, not the canvas's. A step
+         recorded without one comes back without one rather than as a
+         fabricated default. */
+      actorKind: full.actorKind ?? null,
+      agentId: full.agentId ?? null,
+      /* `actorOwner` is deliberately not a column: the id above joins to the
+         agents row the account lives on, so the display string stays in the
+         ring (and the broadcast) and is re-derived rather than duplicated. */
       /* the replay cursor: which frame this step touched and the versions it
          started from and produced. A field left out of this list lives in the
          ring only — the row would come back from a restart without it. */
@@ -88,14 +142,28 @@ export function record(
  *  The summary is flattened to one line and cut at 200 characters — the bound
  *  a tool result summary carries and what the Run tab renders. A status line
  *  is often a human's sentence and an error is often a multi-line stack;
- *  neither should reach the ring raw. */
+ *  neither should reach the ring raw.
+ *
+ *  `opts.actorKind`, `opts.agentId` and `opts.actorOwner` stamp the run's own
+ *  identity on the line, so the design engine's status lines say who is
+ *  running them and a client can address the right agent when two share a
+ *  display name. All three are optional and left out rather than defaulted;
+ *  `actorOwner` rides the ring and the broadcast only, since the id is what
+ *  joins back to the account. */
 export function recordStatus(
   canvasId: string,
   runId: string,
   agentName: string,
   kind: 'status' | 'error' | 'stop',
   summary: string,
-  opts: { name?: string; ok?: boolean; frameId?: string } = {},
+  opts: {
+    name?: string
+    ok?: boolean
+    frameId?: string
+    actorKind?: RunEvent['actorKind']
+    agentId?: string
+    actorOwner?: string
+  } = {},
 ): RunEvent {
   return record({
     canvasId,
@@ -106,6 +174,9 @@ export function recordStatus(
     ...(opts.name ? { name: opts.name } : {}),
     ...(opts.ok !== undefined ? { ok: opts.ok } : {}),
     ...(opts.frameId ? { frameId: opts.frameId } : {}),
+    ...(opts.actorKind ? { actorKind: opts.actorKind } : {}),
+    ...(opts.agentId ? { agentId: opts.agentId } : {}),
+    ...(opts.actorOwner ? { actorOwner: opts.actorOwner } : {}),
   })
 }
 
