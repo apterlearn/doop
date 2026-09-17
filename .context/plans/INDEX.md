@@ -6,4 +6,6 @@ lists every file in this folder.
 
 ## Active
 
-(none yet)
+- [agent-process-roadmap.md](agent-process-roadmap.md) - The execution strategy for the agentic
+  design process gaps: phase order, what each step has to prove, and the standing rules for
+  adding a tool, a table or a write.

@@ -8,4 +8,5 @@ lists every file in this folder.
 
 - [agent-process-features.md](agent-process-features.md) - Must-have features for the agentic design
   process — intent enforcement, agent identity/permissions, human-triggered workflow,
-  trash/canvas-version tools, durable signals, timeline detail.
+  trash/canvas-version tools, durable signals, timeline detail — plus the second-wave gaps
+  (interruptible runs, a durable event bus, the agent recovery and supervision surfaces).
