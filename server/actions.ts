@@ -70,6 +70,9 @@ export function wire(b: Broadcast, t: AgentTouch, w?: MarkWaiting) {
 export interface AgentPresenceEntry {
   name: string
   owner?: string
+  /** the account whose token the agent connected with: an agent name is free
+   *  text, so this is what separates two accounts' same-named agents */
+  ownerId?: string
   frameId?: string | null
   waiting?: boolean
   lastSeen: number
@@ -199,6 +202,17 @@ export function resolveActor(
   const kind = raw?.kind === 'agent' ? 'agent' : raw?.kind === 'user' ? 'user' : 'agent'
   const name = raw?.name?.trim() || (kind === 'agent' ? 'AI Agent' : 'Anonymous')
   return { name, kind, color: colorFor(name), clientId: raw?.clientId, owner: raw?.owner, ownerId: raw?.ownerId }
+}
+
+/** Whether this actor is the one a record names: a comment's author, the agent
+ *  holding a claim, a question's asker. The name is the attribution the room
+ *  reads, and the account behind it is what tells two callers of the same name
+ *  apart — the pairing the claim path records as claimedBy + claimedByOwner.
+ *  An account is only compared when both sides carry one, so a record made
+ *  before accounts were recorded still belongs to its writer. */
+function isActor(name: string, accountId: string | undefined, actor: Actor): boolean {
+  if (name !== actor.name) return false
+  return !accountId || !actor.ownerId || accountId === actor.ownerId
 }
 
 /* ------------------------------------------------------------------ */
@@ -343,6 +357,9 @@ const TOOL_NAME = {
      of its own — agents restack one frame at a time with reorder_frame — but
      the review gate and the approval list still speak a tool name. */
   setFrameOrder: 'set_frame_order',
+  /* the whole-canvas rollback: one tool, one write per frame, so the approval
+     list can gate the rollback itself */
+  restoreCanvasVersion: 'restore_canvas_version',
   setTokens: 'set_tokens',
   setGuideline: 'set_guidelines',
   recordChatDecision: 'save_decision',
@@ -625,6 +642,47 @@ export function expireQuestion(questionId: string): AgentQuestion | undefined {
   return undefined
 }
 
+/** A question is the asker's own: withdrawing somebody else's would take a
+ *  decision out of the room's hands. Typed so the caller can say whose it is. */
+export class NotQuestionAskerError extends Error {
+  readonly questionId: string
+  readonly asker: string
+  constructor(question: AgentQuestion) {
+    super(`only ${question.agentName} can withdraw this question — it is not yours`)
+    this.name = 'NotQuestionAskerError'
+    this.questionId = question.id
+    this.asker = question.agentName
+  }
+}
+
+/** Take back a question the asker no longer needs answered — it worked the
+ *  ambiguity out itself, or the work moved on. A withdrawn question is closed
+ *  to answering (answerQuestion only settles an open one) and stops counting as
+ *  open in the Review tab and the inbox. The room hears the same `question`
+ *  update every other status change pushes, and a parked wait_for_events sees
+ *  the same event kind an answer rides — with no `answer` field, so a parked
+ *  ask_human reads a settlement rather than a phantom answer. */
+export function withdrawQuestion(questionId: string, actor: Actor): AgentQuestion | undefined {
+  for (const [canvasId, list] of questionLog) {
+    const q = list.find((x) => x.id === questionId)
+    if (!q) continue
+    if (!isActor(q.agentName, q.ownerId, actor)) throw new NotQuestionAskerError(q)
+    /* already answered, expired or withdrawn: the caller gets the question as
+       it stands, the way answering an already-settled one does */
+    if (q.status !== 'open') return q
+    q.status = 'withdrawn'
+    persist.saveQuestion(q)
+    broadcast(canvasId, { type: 'question', question: q })
+    agentEvents.push(canvasId, {
+      kind: 'question_answer',
+      targetAgent: q.agentName,
+      data: { questionId: q.id, withdrawn: true, by: actor.name },
+    })
+    return q
+  }
+  return undefined
+}
+
 /* ------------------------------------------------------------------ */
 
 /* Element comments: pinned to a specific element inside a frame.      */
@@ -872,6 +930,81 @@ export function resolveComment(commentId: string, actor: Actor): ElementComment 
     return c
   }
   return undefined
+}
+
+/* ------------------------------------------------------------------ */
+/* Comment lifecycle: rewriting your own note, and giving a claim     */
+/* back. Both are the author's/claimant's own act, so both refuse a   */
+/* caller the record does not belong to.                              */
+/* ------------------------------------------------------------------ */
+
+/** A comment is its author's to edit. Typed so the caller can name the author
+ *  in its answer instead of parsing prose. */
+export class NotCommentAuthorError extends Error {
+  readonly commentId: string
+  /** who actually wrote it */
+  readonly author: string
+  constructor(comment: ElementComment) {
+    super(`only ${comment.from} can edit this comment — it is not yours`)
+    this.name = 'NotCommentAuthorError'
+    this.commentId = comment.id
+    this.author = comment.from
+  }
+}
+
+/** A claim is the claimant's to give back: the agent that took the note is the
+ *  only one that knows it stopped working on it. */
+export class NotCommentClaimantError extends Error {
+  readonly commentId: string
+  /** the agent holding it, when one does */
+  readonly claimant?: string
+  constructor(comment: ElementComment) {
+    super(
+      comment.claimedBy
+        ? `only ${comment.claimedBy} can release this claim — it is not yours`
+        : 'this comment is not claimed — there is nothing to release',
+    )
+    this.name = 'NotCommentClaimantError'
+    this.commentId = comment.id
+    this.claimant = comment.claimedBy
+  }
+}
+
+/** Rewrite the text of a comment the actor wrote. The edit is the same pin, not
+ *  a new one: the id, the anchor and the thread position stay, so the replies
+ *  under it keep their place and an agent that already read the note reads the
+ *  correction on its next call. A comment carries no edited-at column (nothing
+ *  has needed one), so the text is all that changes. */
+export function updateElementComment(commentId: string, text: string, actor: Actor): ElementComment | undefined {
+  const comment = findComment(commentId)
+  if (!comment) return undefined
+  if (!isActor(comment.from, comment.fromUserId, actor)) throw new NotCommentAuthorError(comment)
+  const clean = text.trim()
+  /* an edit to nothing is refused the way an empty comment is: there is no
+     text to store, so the note keeps what it said */
+  if (!clean) return undefined
+  comment.text = clean
+  persist.saveComment(comment)
+  broadcast(comment.canvasId, { type: 'comment', comment })
+  return comment
+}
+
+/** Give a claimed note back — the inverse of `takeAgentCommentsFor`, clearing
+ *  the claim fields exactly as it wrote them and telling the room, so the pin
+ *  goes back to "nobody is on it" and another agent can take it. The failure
+ *  marker is left alone: a note an agent failed on stays failed until a human
+ *  retries it, and unclaiming it is not a retry. */
+export function unclaimComment(commentId: string, actor: Actor): ElementComment | undefined {
+  const comment = findComment(commentId)
+  if (!comment) return undefined
+  if (!comment.claimedBy || !isActor(comment.claimedBy, comment.claimedByOwner, actor))
+    throw new NotCommentClaimantError(comment)
+  delete comment.claimedBy
+  delete comment.claimedByOwner
+  delete comment.claimedAt
+  persist.saveComment(comment)
+  broadcast(comment.canvasId, { type: 'comment', comment })
+  return comment
 }
 
 /* ------------------------------------------------------------------ */
@@ -1402,65 +1535,111 @@ function noteFrameWrite(canvasId: string, by: string) {
   snapshotCanvas(canvasId, 'auto', by)
 }
 
+/** One frame a canvas-version restore could not put back, with the refusal it
+ *  met. Reported rather than thrown: a frame someone else holds, or one the
+ *  canvas's review policy gates, is left exactly as it is while the rest of the
+ *  canvas rolls back. */
+export interface SkippedRestoreFrame {
+  frame_id: string
+  reason: string
+}
+
+/** The gates a restored frame runs, in the order every other frame write runs
+ *  them: the canvas's review policy, the frame's own user lock, then whoever
+ *  holds it. A restore applies them per frame, and what they refuse is reported
+ *  in `skipped` — one frame another agent is holding must not abort the
+ *  rollback of the rest. A frame the snapshot revives is checked the same way:
+ *  its id can still be held, and putting a frame back under an agent that is
+ *  working on that id is what the holder's lock is there to refuse. */
+function assertRestorable(canvasId: string, actor: Actor, frameId: string, live?: Frame) {
+  assertAgentWriteAllowed(canvasId, actor, TOOL_NAME.restoreCanvasVersion)
+  if (live?.locked) throw new FrameLockedByUserError(live.id, live.name)
+  assertUnlocked(frameId, actor)
+}
+
+/** The words a per-frame refusal carries, or undefined when the error is not
+ *  one of the three a frame write can meet — a restore reports those and
+ *  throws everything else, because a snapshot that cannot be read is not one
+ *  frame's problem, it is the restore's. */
+function restoreRefusal(e: unknown): string | undefined {
+  if (e instanceof frameLocks.FrameLockedError || e instanceof FrameLockedByUserError || e instanceof ReviewModeError)
+    return e.message
+  return undefined
+}
+
 /** Put a snapshot back on the live canvas, as ordinary writes. Frames the
  *  snapshot holds come back with their ids — the id is the frame's identity to
  *  every agent and version row holding it, so a missing one is recreated under
  *  that same id rather than a fresh one. Frames added since the snapshot are
  *  left alone: a restore is a rollback of what the snapshot knew, never a
  *  demolition of what came after. The restore records its own snapshot, so the
- *  state it replaced is one click away. */
+ *  state it replaced is one click away.
+ *
+ *  Every frame goes through the gates an ordinary write meets, and one they
+ *  refuse — held by another agent, frozen by the user's lock, or gated by the
+ *  canvas's review policy — is reported in `skipped` and left as it is, so a
+ *  single refusal cannot throw away the rollback of every other frame. */
 export async function restoreCanvasVersion(
   canvasId: string,
   versionId: string,
   actor: Actor,
-): Promise<{ restored: number; created: number } | undefined> {
+): Promise<{ restored: number; created: number; skipped: SkippedRestoreFrame[] } | undefined> {
   const c = store.getCanvas(canvasId)
   if (!c) return undefined
   const version = await persist.getCanvasVersion(versionId)
   if (!version || version.canvasId !== canvasId) return undefined
   let restored = 0
   let created = 0
+  const skipped: SkippedRestoreFrame[] = []
   for (const snapshot of persist.releaseFrames(version)) {
-    const live = store.getFrame(snapshot.id)
-    if (!live) {
-      const revived = store.restoreFrameFromSnapshot(snapshot, actor.name)
-      if (!revived) continue
-      broadcast(canvasId, { type: 'frame:created', frame: revived, actor })
+    try {
+      const live = store.getFrame(snapshot.id)
+      if (!live) {
+        assertRestorable(canvasId, actor, snapshot.id)
+        const revived = store.restoreFrameFromSnapshot(snapshot, actor.name)
+        if (!revived) continue
+        broadcast(canvasId, { type: 'frame:created', frame: revived, actor })
+        restored += 1
+        created += 1
+        continue
+      }
+      const next = {
+        name: snapshot.name,
+        x: snapshot.x,
+        y: snapshot.y,
+        width: snapshot.width,
+        height: snapshot.height,
+        html: snapshot.html,
+        z: snapshot.z,
+        locked: snapshot.locked,
+        hidden: snapshot.hidden,
+        rotation: snapshot.rotation,
+        opacity: snapshot.opacity,
+        /* a snapshot with no page leaves the live frame's page alone rather than
+           clearing it — the same rule the release-restore route documents for a
+           field a snapshot predates */
+        ...(snapshot.pageId ? { pageId: snapshot.pageId } : {}),
+      }
+      const changed = (Object.keys(next) as (keyof typeof next)[]).some((k) => live[k] !== next[k])
+      if (!changed) continue
+      /* the gates, then straight through the store: a restore is a repair of the
+         whole canvas, so it deliberately skips the per-frame side effects of the
+         write path (a version row, an activity line, a presence touch) and
+         announces itself once below rather than once per frame */
+      assertRestorable(canvasId, actor, snapshot.id, live)
+      const updated = store.updateFrame(snapshot.id, next, actor.name)!
+      broadcast(canvasId, { type: 'frame:updated', frame: updated, actor })
       restored += 1
-      created += 1
-      continue
+    } catch (e) {
+      const reason = restoreRefusal(e)
+      if (!reason) throw e
+      skipped.push({ frame_id: snapshot.id, reason })
     }
-    const next = {
-      name: snapshot.name,
-      x: snapshot.x,
-      y: snapshot.y,
-      width: snapshot.width,
-      height: snapshot.height,
-      html: snapshot.html,
-      z: snapshot.z,
-      locked: snapshot.locked,
-      hidden: snapshot.hidden,
-      rotation: snapshot.rotation,
-      opacity: snapshot.opacity,
-      /* a snapshot with no page leaves the live frame's page alone rather than
-         clearing it — the same rule the release-restore route documents for a
-         field a snapshot predates */
-      ...(snapshot.pageId ? { pageId: snapshot.pageId } : {}),
-    }
-    const changed = (Object.keys(next) as (keyof typeof next)[]).some((k) => live[k] !== next[k])
-    if (!changed) continue
-    /* straight through the store: a restore is a repair of the whole canvas, so
-       it deliberately does not run the per-frame write gates (a frame locked
-       since the snapshot is part of what is being rolled back), and it
-       announces itself once below rather than once per frame */
-    const updated = store.updateFrame(snapshot.id, next, actor.name)!
-    broadcast(canvasId, { type: 'frame:updated', frame: updated, actor })
-    restored += 1
   }
   if (version.tokens) store.setTokens(canvasId, version.tokens, actor.name)
   snapshotCanvas(canvasId, 'restore', actor.name)
   logActivity(canvasId, actor, `restored a version from ${new Date(version.createdAt).toLocaleString()}`)
-  return { restored, created }
+  return { restored, created, skipped }
 }
 
 /* ------------------------------------------------------------------ */
