@@ -17,8 +17,9 @@ import { Client, startServer, type Server } from './harness.ts'
  *  2. the id an agent answers with is its identity, not its connection: it
  *     survives a reconnect through a new OAuth client, and a restart;
  *  3. what a human presses stop against is a NAME on a canvas, so a stop aimed
- *     at one agent leaves a differently-named one alone — while two same-named
- *     agents are still one target (the residual limitation, pinned as it is);
+ *     at one agent leaves a differently-named one alone; a name two agents
+ *     share is refused with both candidates rather than guessed, and the same
+ *     press aimed at an id reaches exactly the agent it names;
  *  4. disconnecting an OAuth client revokes the identities that connected
  *     through it, in the store rather than only in the token rows.
  */
@@ -232,21 +233,29 @@ describe('agent identity is durable and per account', () => {
     expect(fine.isError, fine.raw).toBe(false)
   })
 
-  it('cannot yet separate two same-named agents when a stop is pressed', async () => {
-    /* The stop registry keys canvas + name, so a stop aimed at "Claude" lands
-       on whichever of the two Claude connections calls next — here the
-       member's, not the owner's. This is the residual limitation of F2 as it
-       stands (identity-keyed signals are not implemented); what it pins is that
-       the stop is delivered exactly once, to the name. */
-    expect((await owner.post(`/api/canvases/${canvasId}/agents/Claude/stop`, {})).status).toBe(200)
+  it('refuses an ambiguous name and stops exactly one agent when aimed by id', async () => {
+    /* Two accounts both work as "Claude" on this canvas, so a stop aimed at the
+       name is a stop aimed at two agents. The route refuses it and names both
+       rather than guessing: stopping the wrong agent's run is not recoverable. */
+    const ambiguous = await owner.post(`/api/canvases/${canvasId}/agents/Claude/stop`, {})
+    expect(ambiguous.status).toBe(409)
+    const body = (await ambiguous.json()) as { candidates: { agent_id: string; owner: string }[] }
+    expect(body.candidates).toHaveLength(2)
+    expect(body.candidates.map((c) => c.agent_id)).toContain(claudeId)
+
+    /* Aimed by id, the same press reaches the one it names. */
+    expect((await owner.post(`/api/canvases/${canvasId}/agents/${claudeId}/stop`, {})).status).toBe(200)
 
     const memberCall = await mcpCall(memberClaudeToken, 'get_canvas', { canvas_id: canvasId, agent_name: 'Claude' })
-    expect(memberCall.isError).toBe(true)
-    expect(memberCall.error?.code).toBe('stopped')
+    expect(memberCall.isError, memberCall.raw).toBe(false)
 
-    /* delivered once, so the run that ended is not the next one's refusal */
     const ownerCall = await mcpCall(ownerClaudeToken, 'get_canvas', { canvas_id: canvasId, agent_name: 'Claude' })
-    expect(ownerCall.isError, ownerCall.raw).toBe(false)
+    expect(ownerCall.isError).toBe(true)
+    expect(ownerCall.error?.code).toBe('stopped')
+
+    /* delivered once: the run it ended is not the next run's refusal */
+    const after = await mcpCall(ownerClaudeToken, 'get_canvas', { canvas_id: canvasId, agent_name: 'Claude' })
+    expect(after.isError, after.raw).toBe(false)
   })
 
   it('lists every agent the canvas knows and narrows one by id', async () => {

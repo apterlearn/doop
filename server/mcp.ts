@@ -567,8 +567,8 @@ function eventField(data: unknown, field: string): unknown {
  *  handed over — the call that reads a steer is the call it was meant to
  *  change — and only attached to a result that landed, so a refused call does
  *  not swallow the instruction. */
-function withSteers<T extends CallToolResult>(result: T, canvasId: string, agentName: string): T {
-  const steers = agentEvents.takeSteers(canvasId, agentName)
+function withSteers<T extends CallToolResult>(result: T, canvasId: string, agentName: string, agentId?: string): T {
+  const steers = agentEvents.takeSteers(canvasId, agentName, agentId)
   if (steers.length === 0) return result
   const lines = steers.map(
     (steer) => `- ${steer.by} at ${new Date(steer.at).toISOString()}: ${steer.message || '(no message)'}`,
@@ -1749,7 +1749,7 @@ export function buildMcpServer(
       const canvasId = canvasArgOf(record)
       /* A human's steer outranks the focus nudge: one is the run being
          redirected, the other is where someone's cursor is. */
-      if (canvasId) out = withSteers(out, canvasId, record.agent_name)
+      if (canvasId) out = withSteers(out, canvasId, record.agent_name, session.agentId)
       if (canvasId) out = withFocusNudge(out, canvasId, session)
     }
     /* A canvas-scoped call is where attribution matters, so an unresolved name
@@ -1852,7 +1852,7 @@ export function buildMcpServer(
    * asked. Consumed as it is delivered (`clearStop`), so the stop that ended
    * one run never refuses the next one's first call.
    */
-  const stopRefusal = (args: unknown): CallToolResult | undefined => {
+  const stopRefusal = async (args: unknown): Promise<CallToolResult | undefined> => {
     if (!args || typeof args !== 'object') return undefined
     const record = args as Record<string, unknown>
     if (typeof record.agent_name !== 'string') return undefined
@@ -1860,7 +1860,12 @@ export function buildMcpServer(
        stopped agent is stopped on any call, not only one that names its canvas */
     const canvasId = canvasFor(canvasArgOf(record) ?? session.lastCanvasId ?? '')?.id
     if (!canvasId) return undefined
-    const stop = agentEvents.pendingStop(canvasId, record.agent_name)
+    /* The identity is resolved here rather than left to the gate that follows:
+       this check runs first, and on a session's first call there is no id yet.
+       A stop filed against the id must not be missed — nor handed to a
+       different agent that happens to work under the same name. */
+    const agentId = session.agentId ?? (await agentIdentity(ownerId, record.agent_name, clientId))
+    const stop = agentEvents.pendingStop(canvasId, record.agent_name, agentId)
     if (!stop) return undefined
     agentEvents.clearStop(canvasId, record.agent_name, session.runId)
     return err('stopped', `this run was stopped by ${stop.by}`, {
@@ -2117,7 +2122,7 @@ export function buildMcpServer(
         /* A human's stop ends the run here, before the call can touch anything:
            a replay included — the run is over either way, and the human asked
            for it to stop. */
-        const stopped = stopRefusal(args)
+        const stopped = await stopRefusal(args)
         if (stopped) {
           recordToolCall(name, false, Date.now() - started, 'stopped')
           recordRunEvent(name, args, false, Date.now() - started, 'refused: a human stopped the run')

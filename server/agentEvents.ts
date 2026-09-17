@@ -361,6 +361,10 @@ const aliases = new Map<string, Map<string, Set<string>>>() // canvasId -> key -
  *  agent they aimed at rather than the id the route resolved. */
 const agentNames = new Map<string, Map<string, string>>() // canvasId -> id spelling -> name
 
+/** Which agents answer to a name, per canvas: a name is free text, so this is
+ *  what tells a private name from one two accounts both work under. */
+const nameOwners = new Map<string, Map<string, Set<string>>>() // canvasId -> name spelling -> ids
+
 /** Every other spelling the registry knows addresses this agent. Looked up in
  *  both cases, because a lookup may come by either. */
 function aliasSet(canvasId: string, key: string): Set<string> {
@@ -391,6 +395,25 @@ export function aliasAgent(canvasId: string, id: string, name: string): void {
   }
   const names = perAgent(agentNames, canvasId)
   for (const key of new Set([left, left.toLowerCase()])) names.set(key, right)
+  /* A name is free text: two accounts may both work as "Claude", and then it
+     addresses two agents. Counted here so a lookup that knows its own id can
+     tell a shared name from a private one — the name is not a key for a shared
+     one, or a stop aimed at one Claude would end the other's run. */
+  const owners = perAgent(nameOwners, canvasId)
+  for (const key of new Set([right, right.toLowerCase()])) {
+    const ids = owners.get(key) ?? new Set<string>()
+    ids.add(left)
+    owners.set(key, ids)
+  }
+}
+
+/** Whether more than one agent answers to this name on this canvas — the
+ *  question that decides if the name may stand in for an id. */
+function sharedName(canvasId: string, name: string): boolean {
+  const owners = nameOwners.get(canvasId)
+  if (!owners) return false
+  const ids = owners.get(name.trim()) ?? owners.get(name.trim().toLowerCase())
+  return (ids?.size ?? 0) > 1
 }
 
 /** The spelling a signal reads as: the agent's name when the registry knows the
@@ -427,6 +450,24 @@ function perAgent<T>(index: Map<string, Map<string, T>>, canvasId: string): Map<
   const created = new Map<string, T>()
   index.set(canvasId, created)
   return created
+}
+
+/** The registry keys a caller's own lookup may answer to.
+ *
+ *  When the caller has a durable id, the id is what decides: it is unique, so
+ *  it cannot reach another agent. The name joins the lookup only when it
+ *  addresses this agent alone — a name two accounts both work under is two
+ *  agents, and delivering one Claude's stop to the other is exactly the mistake
+ *  the id exists to prevent. A caller with no id (an unregistered name) looks up
+ *  by spelling, as it always has.
+ */
+function lookupKeys(canvasId: string, agentName: string, agentId?: string): string[] {
+  if (!agentId) return signalKeys(canvasId, agentName)
+  const name = displayName(canvasId, agentId)
+  if (!sharedName(canvasId, name)) return signalKeys(canvasId, agentId)
+  const out = new Set<string>([agentId, agentId.toLowerCase()])
+  for (const spelling of namesFor({ agentName: name })) out.add(spelling)
+  return [...out]
 }
 
 /** Ask an agent to stop. Delivered at once to a parked waiter, remembered
@@ -481,10 +522,10 @@ export function requestSteer(canvasId: string, target: string, message: string, 
 }
 
 /** The pending stop for this agent, if any — what a tool call checks first. */
-export function pendingStop(canvasId: string, agentName: string): AgentSignal | undefined {
+export function pendingStop(canvasId: string, agentName: string, agentId?: string): AgentSignal | undefined {
   const index = stops.get(canvasId)
   if (!index) return undefined
-  for (const key of signalKeys(canvasId, agentName)) {
+  for (const key of lookupKeys(canvasId, agentName, agentId)) {
     const signal = index.get(key)
     if (signal) return signal
   }
@@ -517,10 +558,10 @@ export function clearStop(canvasId: string, agentName: string, runId?: string): 
  *  call that drains a steer is the call it was meant to change. The durable
  *  rows are stamped taken on the way out, so a restart cannot hand the same
  *  steer over twice. */
-export function takeSteers(canvasId: string, agentName: string): AgentSignal[] {
+export function takeSteers(canvasId: string, agentName: string, agentId?: string): AgentSignal[] {
   const index = steers.get(canvasId)
   if (!index) return []
-  const keys = new Set(signalKeys(canvasId, agentName))
+  const keys = new Set(lookupKeys(canvasId, agentName, agentId))
   const taken: AgentSignal[] = []
   for (const key of keys) taken.push(...(index.get(key) ?? []))
   if (taken.length === 0) return []
