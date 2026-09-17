@@ -1,5 +1,63 @@
 # Changelog
 
+## [0.5.0](https://github.com/apterlearn/doop/compare/v0.4.0...v0.5.0) (2026-09-17)
+
+
+### Features
+
+* **agents:** identity, permissions, signals and timeline detail that outlive the process ([22a02f8](https://github.com/apterlearn/doop/commit/22a02f8d0db13b20cd235ed6ce392c5c5fa812b5))
+* **agents:** review mode, run logs, and a richer human-in-the-loop workflow ([261c301](https://github.com/apterlearn/doop/commit/261c3019c9b0d874fcac73faf3b1515d813fe5f1))
+* **agents:** stop runs mid-stream, MCP comment tools, connected-clients panel ([7fcab49](https://github.com/apterlearn/doop/commit/7fcab497beb47f221972a247bba03f4dfd10539d))
+* canvas checkpoints, trash, invites, chat and frame presentation ([4268218](https://github.com/apterlearn/doop/commit/426821839576c9afa98fd8aeb4741da9989de072))
+* **canvas:** comment and question hygiene in the action layer ([ca64dfc](https://github.com/apterlearn/doop/commit/ca64dfc85c936c1213e16dd922ba4ac81e5882b3))
+* **canvas:** design from a brief, and agent presence freshness ([99e942e](https://github.com/apterlearn/doop/commit/99e942e65b3f273e1a8938ba1597a1e6c9a724e6))
+* **canvas:** surface the agent run timeline, and insert components from the app ([04ee179](https://github.com/apterlearn/doop/commit/04ee17939bb75417139f68817d06f86965d52f5a))
+* **canvas:** verification gate, frozen releases, element editing, and design-system handoff ([bb97ed9](https://github.com/apterlearn/doop/commit/bb97ed9087445dae1e2c008156dd730c056ce419))
+* **components:** let a human rename, edit and delete a library entry ([416c0d3](https://github.com/apterlearn/doop/commit/416c0d3c4e13b112e153eff0ee2e76b6fcb6d322))
+* **mcp:** board card tools for outside agents (list/take/complete) ([959c280](https://github.com/apterlearn/doop/commit/959c280978e987ed1400b71e491c7aa144f92cd4))
+* **mcp:** canvas/release/asset lifecycle, copy_frame, capabilities catalog, zip url ([497cfd5](https://github.com/apterlearn/doop/commit/497cfd5d5c7499e48618b2e3411eab1963783d80))
+* **mcp:** complete the agentic design loop, drop the server-side agent ([d82ef93](https://github.com/apterlearn/doop/commit/d82ef930df738f6c5a11ebad808ccd832186cbe3))
+* **mcp:** component library, brand/motion analysis, persistent runs, review policy ([6effdb4](https://github.com/apterlearn/doop/commit/6effdb45bba2542be98c2781698fc547d25f0be9))
+* **mcp:** enforce the caller's intent on every tool ([6858fee](https://github.com/apterlearn/doop/commit/6858fee9fef9eaafc954e1f84b2837dd65af905b))
+* **mcp:** focus channel, session context, css/breakpoint/search tools, human-triggered checks ([df897b5](https://github.com/apterlearn/doop/commit/df897b5a023f2868c1fe74b22aefe2865da28cd7))
+* **mcp:** op_id idempotency for all writes, apply_ops rollback, dry_run, interaction-state renders ([2a51632](https://github.com/apterlearn/doop/commit/2a51632c5e68bde0272af40aea4b388d83190497))
+* **mcp:** repo recon tools over github connection ([366a716](https://github.com/apterlearn/doop/commit/366a716881a07b3d2ad0263ea22fde2845191e27))
+* **mcp:** run changes, resident locks, pause/resume, steering depth ([88e14c4](https://github.com/apterlearn/doop/commit/88e14c4118d94ff55d77d3f43bceb6d480b20909))
+* **mcp:** run_design_workflow, a server-side implementer + judge pipeline ([d127f02](https://github.com/apterlearn/doop/commit/d127f02b82c40bc88867046733d31f391659f1f3))
+* **mcp:** shared contracts, frame CSS and text editing, html diff, store lifecycle primitives ([a6ecf89](https://github.com/apterlearn/doop/commit/a6ecf89f901f27e263f5e789eb0e2c488f8fba41))
+* **mcp:** the identity gate, the leash, and the tools an agent was missing ([5b6c6d0](https://github.com/apterlearn/doop/commit/5b6c6d0f38bc40368d8568dba47249c6e6bb914b))
+* **panel:** a supervision surface that says who ran what, and what changed ([c725f41](https://github.com/apterlearn/doop/commit/c725f4146f27c2066739abb627ee23a323add2a5))
+* **runs:** a stop that stops, and a stop that mails the truth ([656e0ad](https://github.com/apterlearn/doop/commit/656e0ad4b6a0b22ee91032f03b79d9bdc0ab4fbd))
+* **server:** checkpoint compare, page and component trash, and the two ceilings ([a99ec92](https://github.com/apterlearn/doop/commit/a99ec92cb7ad779d6f18cf050513d94282cc3714))
+* **share:** admin powers, ticket renewal, and the page you are actually on ([f52d40f](https://github.com/apterlearn/doop/commit/f52d40ff73bdadd0fd9c534aca63a1761d257b68))
+* **web:** remove the board and the floating prompt bar ([96cb619](https://github.com/apterlearn/doop/commit/96cb6190ee48aef369b91de01aee28a60f195a97))
+* **web:** ship, checks, review and composer surfaces ([29c1857](https://github.com/apterlearn/doop/commit/29c1857509cdca6d630887b1a611cc02e73ef9c6))
+
+
+### Bug Fixes
+
+* **agents:** deliver a stop to the agent it names, not to whoever shares its name ([38d942c](https://github.com/apterlearn/doop/commit/38d942c495973bf9752d4595eff6854ab98ef8cb))
+* **canvas:** repair the run timeline, the component insert, and the panel tabs ([5d3d976](https://github.com/apterlearn/doop/commit/5d3d976b016ef7b532f123093c8e3cb94b23ba27))
+* **canvas:** rotate, constrain the drag axis, and order distribute by position ([c726a44](https://github.com/apterlearn/doop/commit/c726a44f4a500560d38f5265726c1a1b96fa788f))
+* **ci:** budget a cold browser launch in the test timeout ([7c6ee6f](https://github.com/apterlearn/doop/commit/7c6ee6f14e253b1781e6fd4af9a060a9357a2585))
+* **comments:** make claim_comment's nudge match who it actually claims for ([1172d58](https://github.com/apterlearn/doop/commit/1172d58066f43768d6fce2632ec3c0929d76f479))
+* **comments:** resolve an agent's identity one way, in one place ([8808da8](https://github.com/apterlearn/doop/commit/8808da8fdb7b56789b96d46fa99e0042d53bee5a))
+* **db:** wait for in-flight writes before the database closes ([9576eac](https://github.com/apterlearn/doop/commit/9576eac63f0535eb21cffff5a8e3d7aceeef618b))
+* **mcp:** finish the board cutover in the agent-facing surface ([8c406b6](https://github.com/apterlearn/doop/commit/8c406b60ce3a4fc15ef11f0debb94449b270904f))
+* **mcp:** wake a parked agent on a role mention ([bb6b45d](https://github.com/apterlearn/doop/commit/bb6b45d18d5b186e8fed0dd04707c5908e522cbe))
+* **panel:** a run that passed is over, and the Run tab says so ([cd23f03](https://github.com/apterlearn/doop/commit/cd23f03b375eaf9fcbf90281dd7fa707bddac01e))
+* **test:** remove a stopped server's data directory after it exits ([ef1dd3e](https://github.com/apterlearn/doop/commit/ef1dd3ec692487b9b0f9a9427e35164148b5d482))
+
+
+### Documentation
+
+* correct comments that still describe the board ([136b50e](https://github.com/apterlearn/doop/commit/136b50ecaa2d78a7671157a7d56b1c0f2461708e))
+* **mcp:** stop overstating what omitting `role` costs ([813df8c](https://github.com/apterlearn/doop/commit/813df8cfac3be189ff7a9d372bad4976b3117f38))
+* **plans:** the residuals the live verification found ([7625b4e](https://github.com/apterlearn/doop/commit/7625b4e334ae3997570171d96782c51866dd772a))
+* **specs:** record how a stop reaches the agent it names ([52b95e1](https://github.com/apterlearn/doop/commit/52b95e18746ac592e8285b62b4f22266eeaafa2e))
+* **specs:** the agentic design process feature list ([76e6c00](https://github.com/apterlearn/doop/commit/76e6c002fcbeb00ad637e6b3ba8059ae65335e91))
+* **specs:** the second-wave gaps and the roadmap that orders them ([66b7ea5](https://github.com/apterlearn/doop/commit/66b7ea5ea16a01b23b3e7278a59e51bbb916376a))
+
 ## [0.4.0](https://github.com/kgoedecke/doop/compare/v0.3.0...v0.4.0) (2026-09-10)
 
 
