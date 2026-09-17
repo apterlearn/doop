@@ -329,7 +329,11 @@ revokes its agents (`server/index.ts:1309` → `store.revokeAgentsForClient`, se
 
 F2's acceptance stands — two accounts posting as "Claude" stay distinct rows, and a stop aimed at
 one leaves the other running — with `tests/mcpAgentIdentity.test.ts` pinning it and the migration
-applying cleanly to both PGlite and Postgres.
+applying cleanly to both PGlite and Postgres. Delivering the stop needed one more step than the
+table: the registry paired an id with the agent's name so a name-carrying call could find it, and a
+name two accounts share then delivered one agent's stop to the other. It now counts who answers to
+a name, looks up by identity whenever the caller has one, and lets the name stand in for an id only
+when it addresses that agent alone — an unregistered name keys by spelling as before.
 
 #### Touches
 
