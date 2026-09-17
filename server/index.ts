@@ -23,6 +23,7 @@ import type {
   DesignTokens,
   Frame,
   FrameProposal,
+  RunEvent,
 } from '../shared/types.ts'
 /* the per-kind mail switches are the storage's own record — persist declares
    them, index.ts reads and writes them through it */
@@ -83,7 +84,7 @@ import { nanoid } from 'nanoid'
 import { cssForTokens } from '../shared/tokens.ts'
 import { SNAPSHOT_CSP } from './snapshotCsp.ts'
 import { frameSha, reviewFrame, reviewToRecord } from './review.ts'
-import { handleMcpRequest, wireBroadcast as wireMcpBroadcast } from './mcp.ts'
+import { handleMcpRequest, wireBroadcast as wireMcpBroadcast, forgetAgentArrivals } from './mcp.ts'
 import { replaceInFrames } from './findReplace.ts'
 import { groupClients } from './mcpClients.ts'
 import { DESTRUCTIVE_TOOLS } from './mcpPolicy.ts'
@@ -174,6 +175,9 @@ actions.hydrateLogs({
   proposals: data.proposals,
 })
 runLog.hydrate(data.runEvents)
+/* the agent↔human bus: the seq each canvas resumes from, and the stops and
+   steers a human queued before the restart */
+await agentEvents.hydrate()
 actions.hydrateUserMemory([...(data.userMemory?.values() ?? [])].flat())
 store.initComponents([...(data.components?.values() ?? [])].flat())
 seed()
@@ -214,15 +218,21 @@ if (ASSET_GC) setInterval(runAssetGc, 24 * 60 * 60 * 1000).unref()
 /* The trash's retention clock: a boot sweep, then one a day. Rows and frames
    past TRASH_RETENTION_DAYS are removed for good — the same in-process timer
    convention the run-event pruning uses, which fits the single-instance
-   architecture this server is built as. */
-const purgeTrash = () =>
-  persist
+   architecture this server is built as.
+
+   The bus's own seven-day window rides the same clock: agent_events and the
+   signals queued on it are trimmed here rather than by a timer of their own,
+   so a stopped server prunes nothing and a running one prunes daily. */
+const purgeTrash = () => {
+  agentEvents.pruneOlderThan(7 * 24 * 60 * 60 * 1000)
+  return persist
     .purgeTrash()
     .then((purged) => {
       const total = purged.canvases + purged.frames + purged.pages + purged.components + purged.guidelines
       if (total) console.log(`[trash] purged ${JSON.stringify(purged)}`)
     })
     .catch((e) => console.error('[trash] purge failed', e))
+}
 void purgeTrash()
 setInterval(purgeTrash, 24 * 60 * 60 * 1000).unref()
 
@@ -289,11 +299,23 @@ function broadcast(canvasId: string, msg: ServerMessage, excludeClientId?: strin
 /* Agents show up in presence while they are actively calling tools. */
 interface AgentPresence extends Presence {
   lastSeen: number
+  /** the account whose token the agent connected with — half of its identity,
+   *  and the half that separates two accounts both working as "Claude" */
+  ownerId?: string
   /** set by wait_for_events: the agent is parked but alive, so the 60s TTL
    *  applies instead of the 20s idle sweep */
   waiting?: boolean
 }
-const agentPresences = new Map<string, Map<string, AgentPresence>>() // canvasId -> name -> presence
+const agentPresences = new Map<string, Map<string, AgentPresence>>() // canvasId -> owner::name -> presence
+
+/** An agent presence as the ROOM sees it. The account id behind the agent is
+ *  the MCP surface's half of its identity — the join key for the agents table
+ *  and for a per-agent level — and is not something a share-link visitor, who
+ *  is deliberately not told who is on the canvas, is handed. */
+function presenceWire(p: AgentPresence): Presence {
+  const { ownerId: _ownerId, ...wire } = p
+  return wire
+}
 
 /** What each connected client is looking at: frame, element and page. Kept
  *  per canvas and swept with presence — a client that left is not still
@@ -316,6 +338,7 @@ function agentTouch(canvasId: string, agentName: string, frameId?: string | null
       color: colorFor(agentName),
       kind: 'agent',
       owner,
+      ownerId,
       lastSeen: Date.now(),
       activeFrameId: frameId ?? null,
     }
@@ -324,9 +347,10 @@ function agentTouch(canvasId: string, agentName: string, frameId?: string | null
   p.lastSeen = Date.now()
   if (frameId !== undefined && frameId !== null) p.waiting = false
   if (owner && !p.owner) p.owner = owner
+  if (ownerId && !p.ownerId) p.ownerId = ownerId
   if (frameId !== undefined) p.activeFrameId = frameId
   if (isNew) {
-    broadcast(canvasId, { type: 'presence:join', presence: p })
+    broadcast(canvasId, { type: 'presence:join', presence: presenceWire(p) })
   } else if (frameId !== undefined) {
     broadcast(canvasId, { type: 'editing', clientId: p.clientId, frameId: p.activeFrameId ?? null })
   }
@@ -380,6 +404,9 @@ actions.wirePresence((canvasId) =>
   [...(agentPresences.get(canvasId)?.values() ?? [])].map((p) => ({
     name: p.name,
     ...(p.owner ? { owner: p.owner } : {}),
+    /* the account behind the name: what tells two same-named agents of two
+       accounts apart, and the key the durable identity is looked up by */
+    ...(p.ownerId ? { ownerId: p.ownerId } : {}),
     frameId: p.activeFrameId ?? null,
     ...(p.waiting ? { waiting: true } : {}),
     lastSeen: p.lastSeen,
@@ -1276,6 +1303,14 @@ app.delete('/api/mcp-agents/:clientId', async (req, res) => {
       ),
     )
     .returning({ id: authSchema.oauthAccessToken.id })
+  /* Disconnecting a client is meant to stop the agent, so the identities that
+     connected through it are stamped revoked with it — the token rows are what
+     the next call is refused by, and the agent rows are what the owner's panel
+     reads as "no longer connected". */
+  await store.revokeAgentsForClient(req.user!.id, req.params.clientId)
+  /* ...and the connection it made is no longer an arrival, so re-approving the
+     client writes its identity back rather than replaying a stale memo */
+  forgetAgentArrivals(req.user!.id, req.params.clientId)
   res.json({ ok: true, revoked: revoked.length })
 })
 
@@ -1457,6 +1492,11 @@ app.post('/api/canvases/:id/brief', async (req, res) => {
      frame from another canvas would be judged against the wrong design system */
   if (frameId && store.getFrame(frameId)?.canvasId !== c.id) return res.status(404).json({ error: 'frame not found' })
   if (pageId && !c.pages?.some((page) => page.id === pageId)) return res.status(404).json({ error: 'page not found' })
+  /* The person running the brief, as the timeline records them. Their account id
+     is the half of the identity a reader cannot type: the engine stamps it on
+     the run's lines when the run is not the canvas owner's own, which is what
+     tells a brief a member started from the owner's. */
+  const actor = { ...resolveActorFromReq(req), ownerId: req.user!.id }
   /* The engine opens its frame on the canvas's first page. A human composing
      while looking at another page means that page, so the frame is created
      here — the same one the engine would have made, at the engine's own size
@@ -1467,7 +1507,7 @@ app.post('/api/canvases/:id/brief', async (req, res) => {
       ? (actions.createFrame(
           c.id,
           { name: BRIEF_FRAME_NAME, html: '', width: FRAME_WIDTH, height: FRAME_HEIGHT, pageId },
-          resolveActorFromReq(req),
+          actor,
         )?.id ?? '')
       : '')
   /* the run id is minted here rather than inside the engine, so the answer can
@@ -1480,7 +1520,7 @@ app.post('/api/canvases/:id/brief', async (req, res) => {
       frameName: BRIEF_FRAME_NAME,
       implementerModel: prefs.implementerModel,
       judgeModel: prefs.judgeModel,
-      actor: resolveActorFromReq(req),
+      actor,
       ...(target ? { frameId: target } : {}),
       runId,
     })
@@ -2890,6 +2930,75 @@ app.post('/api/canvases/:id/review-mode', (req, res) => {
   res.json({ reviewMode: on })
 })
 
+/** Owner-only: how each agent on this canvas is held back — a leash per
+ *  identity, where review mode is a leash on the canvas.
+ *
+ *  Every agent the canvas knows is listed: the ones live on it right now,
+ *  plus any that already carries a level here. `full` is the default and is
+ *  stored as no row at all, so it is reported rather than looked up, and an
+ *  agent narrowed here and since disconnected stays listed — its id is the
+ *  only way back to that row. */
+app.get('/api/canvases/:id/agent-levels', async (req, res) => {
+  const c = requireCanvasIntent(req, res, req.params.id, 'edit')
+  if (!c) return
+  if (c.ownerId !== req.user!.id) return res.status(403).json({ error: 'only the owner can see agent levels' })
+  const levels = await store.listAgentLevels(c.id)
+  const narrowed = new Map(levels.map((l) => [l.agentId, l]))
+  /* Presence says WHO is here; the agents table says what each of them is,
+     which is the id a level hangs off. Two accounts can run the same name, so
+     the join is (account, name), never the name alone. */
+  const present = actions.listAgentPresence(c.id)
+  const live = new Map(present.map((p) => [`${p.ownerId ?? ''}\u0000${p.name}`, p.owner]))
+  const owners = [...new Set(present.map((p) => p.ownerId).filter((id): id is string => !!id))]
+  const known = new Map<string, persist.AgentRow>()
+  for (const row of (await Promise.all(owners.map((ownerId) => store.listAgentsForOwner(ownerId)))).flat()) {
+    if (live.has(`${row.ownerId}\u0000${row.name}`)) known.set(row.id, row)
+  }
+  for (const l of levels) {
+    if (known.has(l.agentId)) continue
+    const row = await persist.getAgent(l.agentId)
+    if (row) known.set(row.id, row)
+  }
+  const names = new Map(
+    await Promise.all(
+      [...new Set([...known.values()].map((row) => row.ownerId))].map(
+        async (id) => [id, await getUserName(id)] as const,
+      ),
+    ),
+  )
+  res.json({
+    levels: [...known.values()].map((row) => {
+      const level = narrowed.get(row.id)
+      return {
+        agent_id: row.id,
+        name: row.name,
+        owner: names.get(row.ownerId) ?? live.get(`${row.ownerId}\u0000${row.name}`) ?? '',
+        level: level?.level ?? 'full',
+        set_at: level?.setAt ?? 0,
+      }
+    }),
+  })
+})
+
+/** Owner-only: hold one agent back on this canvas. `full` is the default, so
+ *  it clears the row instead of storing one — either way the answer is the
+ *  level now in force, which is what the panel re-renders from. */
+app.put('/api/canvases/:id/agents/:agentId/level', async (req, res) => {
+  const c = requireCanvasIntent(req, res, req.params.id, 'edit')
+  if (!c) return
+  if (c.ownerId !== req.user!.id) return res.status(403).json({ error: 'only the owner can set an agent level' })
+  const level = req.body?.level
+  if (level !== 'full' && level !== 'propose' && level !== 'comment' && level !== 'view')
+    return res.status(400).json({ error: "level must be 'full', 'propose', 'comment' or 'view'" })
+  const { agentId } = req.params
+  /* a level is filed against a real identity: an id the agents table does not
+     know would be a row no panel could ever list or clear */
+  if (!(await persist.getAgent(agentId))) return res.status(404).json({ error: 'no such agent' })
+  const at = Date.now()
+  const row = await store.setAgentLevel({ canvasId: c.id, agentId, level, setBy: req.user!.name, at })
+  res.json({ agent_id: agentId, level, set_at: row?.setAt ?? at })
+})
+
 /** The canvas design tokens. Any collaborator may edit them: they are the
  *  canvas's shared palette/type/scale, and the panel is where a human sets
  *  them without an agent in the loop. Validation errors come back verbatim. */
@@ -3156,11 +3265,57 @@ app.get('/api/components/:id', (req, res) => {
   res.json(component)
 })
 
-/** A run's tool-call timeline, newest first. */
-app.get('/api/canvases/:id/run-events', (req, res) => {
+/** A timeline page's size, and the ceiling on what a caller may ask for. The
+ *  ring's own cap is the same 500, so no page is bigger than the live window
+ *  one offset can address. */
+const RUN_EVENT_PAGE = 200
+const RUN_EVENT_PAGE_MAX = 500
+
+/** A timeline page as the Run tab reads it: the steps, the server's own answer
+ *  on whether older ones exist, and the offset to ask for next. Same
+ *  vocabulary as the other paged reads (get_run_events, and the asset list's
+ *  own `has_more`): `next_offset` rides only when there is something behind it,
+ *  so a client follows it instead of guessing from a length. */
+function runEventPage(events: RunEvent[], hasMore: boolean, nextOffset: number) {
+  return {
+    events,
+    has_more: hasMore,
+    ...(hasMore ? { next_offset: nextOffset } : {}),
+  }
+}
+
+/** A run's tool-call timeline, newest first, one page at a time. Offset 0 is
+ *  served from the live ring: it holds the freshest steps, including ones whose
+ *  write-behind row has not landed yet, and it is what the Run tab's window was
+ *  seeded from. Everything behind it comes out of the durable table, so a
+ *  canvas whose history is longer than the ring stays reachable — the ring is
+ *  hydrated from the newest rows only, and a busy canvas has far more than it
+ *  can hold.
+ *
+ *  The offset counts steps from the newest across both reads, so `next_offset`
+ *  is the continuation of what the caller already holds. An offset past the
+ *  last durable row answers an empty page with `has_more: false` — the end of
+ *  the retained history, which the retention pass has pruned to a week. */
+app.get('/api/canvases/:id/run-events', async (req, res) => {
   if (!requireCanvas(req, res, req.params.id)) return
+  const canvasId = req.params.id
   const runId = typeof req.query.run_id === 'string' ? req.query.run_id : undefined
-  res.json(runLog.getRunEvents(req.params.id, { runId, limit: Math.min(500, Number(req.query.limit) || 200) }))
+  const limit = Math.min(Math.max(Number(req.query.limit) || RUN_EVENT_PAGE, 1), RUN_EVENT_PAGE_MAX)
+  const offset = Math.max(Math.floor(Number(req.query.offset) || 0), 0)
+  if (offset === 0) {
+    const live = runLog.getRunEvents(canvasId, { runId, limit })
+    /* a ring page with anything in it is page 0. Whether there is something
+       behind it is the durable table's answer, not the ring's: the ring holds
+       the newest rows, not all of them, so a full page from it is not the end
+       of the history — and a ring with nothing to answer with at all still has
+       the table behind it, which is what the fall-through reads. */
+    if (live.length > 0) {
+      const behind = await persist.listRunEvents(canvasId, { runId, limit: 1, offset: live.length })
+      return res.json(runEventPage(live, behind.events.length > 0, live.length))
+    }
+  }
+  const durable = await persist.listRunEvents(canvasId, { runId, limit, offset })
+  res.json(runEventPage(durable.events, durable.hasMore, offset + durable.events.length))
 })
 
 /** The run an agent is on right now: the newest timeline event recorded under
@@ -3182,6 +3337,77 @@ function decodeAgentName(raw: string): string {
   } catch {
     return raw
   }
+}
+
+/** The durable identities behind the agents working this canvas right now.
+ *  Presence says who is here, the agents table says what each of them is, and
+ *  the join is (account, name) — never the name alone, because two accounts can
+ *  both run an agent called "Claude". */
+async function agentsOnCanvas(canvasId: string): Promise<persist.AgentRow[]> {
+  const present = actions.listAgentPresence(canvasId)
+  const live = new Set(present.map((p) => `${p.ownerId ?? ''}\u0000${p.name}`))
+  const owners = [...new Set(present.map((p) => p.ownerId).filter((id): id is string => !!id))]
+  const rows = (await Promise.all(owners.map((ownerId) => store.listAgentsForOwner(ownerId)))).flat()
+  return rows.filter((row) => live.has(`${row.ownerId}\u0000${row.name}`))
+}
+
+/** What the `:agentName` segment of a stop or steer names, as the identity
+ *  behind it.
+ *
+ *  The segment is an agent id or the name a human reads on the canvas, and both
+ *  have to land on ONE agent. An id is the identity itself and wins outright; a
+ *  name resolves only while exactly one agent here carries it — two of them make
+ *  the press ambiguous rather than a coin flip, because stopping the wrong agent
+ *  is worse than refusing. A name no identity carries resolves to nothing, and
+ *  the registry's own name-keyed behaviour takes over, which is how a stop for
+ *  an actor that never connected through MCP (the person who started a brief
+ *  run) still lands. */
+async function resolveAgentTarget(
+  canvas: Canvas,
+  raw: string,
+): Promise<{ id: string; name: string } | { candidates: persist.AgentRow[] } | undefined> {
+  const wanted = raw.trim()
+  if (!wanted) return undefined
+  const known = await agentsOnCanvas(canvas.id)
+  const byId =
+    known.find((row) => row.id === wanted) ??
+    /* an id the table knows is the identity itself even when the agent is not
+       live here right now: the run it names may still be going, and the press
+       is aimed at that identity wherever it is */
+    (await persist.getAgent(wanted).catch(() => undefined))
+  if (byId && canvasAccess(byId.ownerId, canvas) !== null) return { id: byId.id, name: byId.name }
+  const byName = known.filter((row) => row.name.trim().toLowerCase() === wanted.toLowerCase())
+  if (byName.length === 1) return { id: byName[0]!.id, name: byName[0]!.name }
+  if (byName.length > 1) return { candidates: byName }
+  return undefined
+}
+
+/** The candidates an ambiguous press has to name back: what the humans need to
+ *  pick the agent they meant, which is the id and whose account it is. */
+async function candidateRows(rows: persist.AgentRow[]): Promise<{ agent_id: string; name: string; owner: string }[]> {
+  return Promise.all(
+    rows.map(async (row) => ({ agent_id: row.id, name: row.name, owner: (await getUserName(row.ownerId)) ?? '' })),
+  )
+}
+
+/** Whether a design run is still going for this agent — what decides which side
+ *  mails when a human presses Stop.
+ *
+ *  The engine mails a run's ending itself (`<agent> stopped the design run for
+ *  “<frame>”`), so the route's own mail must not go out for the same press. The
+ *  route cannot ask the engine — the run is a model call away — but the timeline
+ *  already says it: the newest line the engine wrote for this agent is a status
+ *  line that declares the run's actor, the line it writes before every model
+ *  call, and nothing terminal (a stop, or the error the run failed with) has
+ *  been recorded since. A plain MCP agent records no such line — its steps are
+ *  tool rows the engine never mails about — so a stop on it keeps the route's
+ *  mail, exactly as before. */
+function designRunLive(canvasId: string, agentName: string): boolean {
+  const name = agentName.trim().toLowerCase()
+  const events = runLog.getRunEvents(canvasId).filter((event) => event.agentName.trim().toLowerCase() === name)
+  const engine = events.findIndex((event) => event.kind === 'status' && event.actorKind !== undefined)
+  if (engine === -1) return false
+  return !events.slice(0, engine).some((event) => event.kind === 'stop' || event.kind === 'error')
 }
 
 /* The human↔agent chat: the queue an agent reads when it has nothing else to
@@ -3248,29 +3474,56 @@ app.get('/api/canvases/:id/agent-signals', (req, res) => {
   res.json({ signals: agentEvents.listSignals(c.id) })
 })
 
-app.post('/api/canvases/:id/agents/:agentName/stop', (req, res) => {
+app.post('/api/canvases/:id/agents/:agentName/stop', async (req, res) => {
   const c = requireCanvasIntent(req, res, req.params.id, 'edit')
   if (!c) return
-  const agentName = decodeAgentName(req.params.agentName)
-  agentEvents.requestStop(c.id, agentName, req.user!.name)
+  const aimed = decodeAgentName(req.params.agentName)
+  const target = await resolveAgentTarget(c, aimed)
+  if (target && 'candidates' in target)
+    return res.status(409).json({
+      error: `${aimed} names ${target.candidates.length} agents on this canvas — stop the one you mean by its id`,
+      candidates: await candidateRows(target.candidates),
+    })
+  /* the durable id is what the signal is filed against when the press resolved
+     to one; the name is the fallback for an actor the agents table does not know
+     (a brief run's human). Either way the registry pairs the id and the name, so
+     the agent's own call finds the stop under the spelling it carries. */
+  if (target) agentEvents.aliasAgent(c.id, target.id, target.name)
+  const key = target ? target.id : aimed
+  const agentName = target ? target.name : aimed
+  agentEvents.requestStop(c.id, key, req.user!.name)
   const runId = currentRunId(c.id, agentName)
+  /* read before this press writes its own line: the route's stop line is the
+     newest step the moment it lands, and it is terminal */
+  const engineWillMail = designRunLive(c.id, agentName)
   if (runId) runLog.recordStatus(c.id, runId, agentName, 'stop', `${req.user!.name} stopped the run`)
-  /* A human pressed stop, so the people opted into "a run failed or was
-     stopped" hear about it here — fire-and-forget, exactly as the question
-     path does: mail must never hold up the stop it reports. */
-  import('./notifications.ts')
-    .then((n) => n.notifyAgentEvent(c.id, 'stop', `${req.user!.name} stopped ${agentName}`))
-    .catch(() => {})
+  /* One stop, one mail. A design run's ending is the engine's to report — it is
+     the only side that knows the run was live — so the route stays quiet for
+     one, and this mail is for the stop that has nothing else reporting it: an
+     agent with no run going, or one the engine never started. */
+  if (!engineWillMail)
+    import('./notifications.ts')
+      .then((n) => n.notifyAgentEvent(c.id, 'stop', `${req.user!.name} stopped ${agentName}`))
+      .catch(() => {})
   res.json({ ok: true })
 })
 
-app.post('/api/canvases/:id/agents/:agentName/steer', (req, res) => {
+app.post('/api/canvases/:id/agents/:agentName/steer', async (req, res) => {
   const c = requireCanvasIntent(req, res, req.params.id, 'edit')
   if (!c) return
-  const agentName = decodeAgentName(req.params.agentName)
+  const aimed = decodeAgentName(req.params.agentName)
   const message = typeof req.body?.message === 'string' ? req.body.message.trim() : ''
   if (!message) return res.status(400).json({ error: 'message is required' })
-  agentEvents.requestSteer(c.id, agentName, message, req.user!.name)
+  const target = await resolveAgentTarget(c, aimed)
+  if (target && 'candidates' in target)
+    return res.status(409).json({
+      error: `${aimed} names ${target.candidates.length} agents on this canvas — steer the one you mean by its id`,
+      candidates: await candidateRows(target.candidates),
+    })
+  if (target) agentEvents.aliasAgent(c.id, target.id, target.name)
+  const key = target ? target.id : aimed
+  const agentName = target ? target.name : aimed
+  agentEvents.requestSteer(c.id, key, message, req.user!.name)
   const runId = currentRunId(c.id, agentName)
   if (runId) runLog.recordStatus(c.id, runId, agentName, 'status', `${req.user!.name} steered the run`)
   res.json({ ok: true })
@@ -4135,7 +4388,7 @@ wss.on('connection', (ws, upgradeReq) => {
       const others = room(msg.canvasId)
         .filter((c) => c.ws !== ws && !c.silent && !c.reader)
         .map((c) => c.presence)
-      const agents = [...(agentPresences.get(msg.canvasId)?.values() ?? [])]
+      const agents = [...(agentPresences.get(msg.canvasId)?.values() ?? [])].map(presenceWire)
       send(ws, {
         type: 'init',
         canvas: canvasForClient(canvas),

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import * as actions from './actions.ts'
+import * as agentEvents from './agentEvents.ts'
 import { DesignLlmError, designComplete } from './designLlm.ts'
 import * as frameLocks from './frameLocks.ts'
 import { MAX_FRAME_HTML_BYTES } from './limits.ts'
@@ -49,6 +50,9 @@ export interface WorkflowResult {
   judgeVerdict: 'pass' | 'fail'
   judgeSummary: string
   issues: WorkflowIssue[]
+  /** true when a human's stop ended the run rather than the attempt budget:
+   *  the run is over but nothing failed, so the caller reports it as a stop */
+  stopped?: boolean
 }
 
 const DEFAULT_MAX_ATTEMPTS = 3
@@ -288,6 +292,20 @@ async function withPresence<T>(canvasId: string, actor: Actor, work: () => Promi
   }
 }
 
+/** The run's own identity, as the timeline records it. `Actor.kind` says
+ *  'user' for a person and 'agent' for an MCP connection, while the timeline
+ *  spells the person `'human'`; an absent kind reads as an agent, the only kind
+ *  there was before it was tracked, so every line this engine writes declares
+ *  one. The account behind the actor is stamped only when it is not the canvas's
+ *  own owner — the owner's runs are the canvas's own work, and their name is
+ *  what the reader already has. */
+function actorStamp(canvasId: string, actor: Actor): { actorKind: 'human' | 'agent'; actorOwner?: string } {
+  return {
+    actorKind: actor.kind === 'user' ? 'human' : 'agent',
+    ...(actor.ownerId && actor.ownerId !== store.getCanvas(canvasId)?.ownerId ? { actorOwner: actor.ownerId } : {}),
+  }
+}
+
 /** What a run is given. `runId` names that run on the canvas timeline: the MCP
  *  wrapper's session run id when the caller has one, so the engine's lines land
  *  in the same run as the tool call that started it. A caller with no run id of
@@ -310,10 +328,12 @@ interface DesignWorkflowInput {
  *  (no SMTP, nobody opted in) is not the run's business, and the engine does
  *  not carry notifications.ts's part of the graph for it. `stop` is the closest
  *  kind the union has to a run being over; `phase` is what decides both the
- *  switch and the label, so the mail reads "finished its run" or "failed its
- *  run" whatever the kind. */
+ *  switch and the label, so the mail reads "finished its run", "failed its run"
+ *  or "was stopped" whatever the kind. */
 function notifyRunEnd(canvasId: string, agentName: string, frameName: string, phase: NotificationPhase): void {
-  const ending = phase === 'finished' ? 'finished' : 'failed'
+  /* the sentence's verb, in the phase's own words: a run a human ended was not
+     a run that failed, and the mail must not read as one */
+  const ending = phase === 'finished' ? 'finished' : phase === 'stopped' ? 'stopped' : 'failed'
   import('./notifications.ts')
     .then((n) =>
       n.notifyAgentEvent(canvasId, 'stop', `${agentName} ${ending} the design run for “${frameName}”`, { phase }),
@@ -329,11 +349,24 @@ export async function runDesignWorkflow(input: DesignWorkflowInput): Promise<Wor
   const runId = input.runId ?? randomUUID()
   try {
     const result = await runDesignLoop({ ...input, runId })
-    runLog.recordStatus(input.canvasId, runId, input.actor.name, result.ok ? 'status' : 'error', result.judgeSummary, {
-      ok: result.ok,
-      ...(result.frameId ? { frameId: result.frameId } : {}),
-    })
-    notifyRunEnd(input.canvasId, input.actor.name, input.frameName, result.ok ? 'finished' : 'failed')
+    /* a run a human stopped is neither a pass nor a failure: the timeline says
+       who ended it, in the kind the Run tab renders a stop with */
+    runLog.recordStatus(
+      input.canvasId,
+      runId,
+      input.actor.name,
+      result.stopped ? 'stop' : result.ok ? 'status' : 'error',
+      result.judgeSummary,
+      {
+        ok: result.ok,
+        ...(result.frameId ? { frameId: result.frameId } : {}),
+        ...actorStamp(input.canvasId, input.actor),
+      },
+    )
+    /* the mail says the same thing the timeline does: a run a human stopped is
+       neither a pass nor a failure, so it is not filed under a failure */
+    const phase: NotificationPhase = result.ok ? 'finished' : result.stopped ? 'stopped' : 'failed'
+    notifyRunEnd(input.canvasId, input.actor.name, input.frameName, phase)
     return result
   } catch (error) {
     runLog.recordStatus(
@@ -342,7 +375,7 @@ export async function runDesignWorkflow(input: DesignWorkflowInput): Promise<Wor
       input.actor.name,
       'error',
       error instanceof Error ? error.message : 'the design workflow failed',
-      { ok: false },
+      { ok: false, ...actorStamp(input.canvasId, input.actor) },
     )
     notifyRunEnd(input.canvasId, input.actor.name, input.frameName, 'failed')
     throw error
@@ -364,8 +397,25 @@ async function runDesignLoop(input: DesignWorkflowInput & { runId: string }): Pr
   let judgeVerdict: 'pass' | 'fail' = 'fail'
   let judgeSummary = ''
   let attempts = 0
+  let stopped = false
+  /* A human's stop is a fact about the run, not about one attempt: MCP is
+     pull-based and the endpoint is stateless, so the stop cannot interrupt the
+     call in flight — it is checked at each boundary the loop owns and consumed
+     as it is acted on, so the stop that ended this run cannot refuse the next
+     run's first call. */
+  const takeStop = (): boolean => {
+    const stop = agentEvents.pendingStop(input.canvasId, input.actor.name)
+    if (!stop) return false
+    agentEvents.clearStop(input.canvasId, input.actor.name, input.runId)
+    judgeSummary = `stopped by ${stop.by}`
+    stopped = true
+    return true
+  }
 
   for (let attempt = 1; attempt <= budget; attempt++) {
+    /* a stop that landed since the last attempt ends the run here, before
+       another one is paid for */
+    if (takeStop()) break
     attempts = attempt
     /* the run timeline is where a human watches this happen, and an attempt is
        minutes of model time: it says so before the call, not after */
@@ -375,8 +425,22 @@ async function runDesignLoop(input: DesignWorkflowInput & { runId: string }): Pr
       input.actor.name,
       'status',
       `implementing attempt ${attempt}/${budget}`,
+      actorStamp(input.canvasId, input.actor),
     )
-    const previous = issues.length ? issues[issues.length - 1]!.judgeFeedback : ''
+    /* A steer is a human's mid-run course correction, so it rides the slot the
+       judge's issues ride: from the second attempt on there is work to correct,
+       and the implementer reads both as what this attempt has to change. A
+       steer nobody has read yet is drained here — the attempt it reaches is
+       the one it was meant to change. */
+    const steers = attempt > 1 ? agentEvents.takeSteers(input.canvasId, input.actor.name) : []
+    const steered = steers.length
+      ? `STEERED — a human redirected this run while it was in progress:\n${steers
+          .map((steer) => `- ${steer.by}: ${steer.message || '(no message)'}`)
+          .join('\n')}`
+      : ''
+    const previous = [issues.length ? issues[issues.length - 1]!.judgeFeedback : '', steered]
+      .filter(Boolean)
+      .join('\n\n')
     const canvas = store.getCanvas(input.canvasId)
     /* the artboard the design must fit: a redesign answers to the frame that is
        already there, a new design to the size this run will create */
@@ -497,12 +561,26 @@ async function runDesignLoop(input: DesignWorkflowInput & { runId: string }): Pr
       break
     }
 
+    /* A stop that landed while the implementer was writing ends the attempt
+       here, ahead of the review render and the judge call: both are work a
+       stopped run does not owe anyone, and the judge would be a paid model
+       call on a design nobody asked to finish. The HTML that did arrive stays
+       on the canvas for a human, exactly as a failed run's last design does. */
+    if (takeStop()) break
+
     /* the review reads through the attempt's canvas reference: `getCanvas`
        hands back the live canvas — the store mutates tokens and breakpoints in
        place rather than replacing it — so this measures the canvas as it stands
        at review time, agreeing with the `review_frame` a human runs next */
     const evidence = await reviewEvidence(frame, canvas?.tokens, breakpoints)
-    runLog.recordStatus(input.canvasId, input.runId, input.actor.name, 'status', `judge reviewing attempt ${attempt}`)
+    runLog.recordStatus(
+      input.canvasId,
+      input.runId,
+      input.actor.name,
+      'status',
+      `judge reviewing attempt ${attempt}`,
+      actorStamp(input.canvasId, input.actor),
+    )
     let judgeReply: { text: string; truncated: boolean }
     try {
       judgeReply = await calls.judge(html, evidence)
@@ -554,7 +632,8 @@ async function runDesignLoop(input: DesignWorkflowInput & { runId: string }): Pr
   /* The comment is a report ON the run — the frame is already written and the
      result already decided, so it may not fail it. The run's terminal timeline
      line is not written here: the entry point records this same summary once
-     the run is over, as a status when it passed and an error when it did not. */
+     the run is over, as a status when it passed, a stop when a human ended it
+     and an error when it did not. */
   if (frameId) {
     try {
       actions.addElementComment(
@@ -562,7 +641,11 @@ async function runDesignLoop(input: DesignWorkflowInput & { runId: string }): Pr
         {
           selector: 'body',
           snippet: '',
-          text: `Design workflow: judge verdict ${judgeVerdict} after ${attempts} ${attemptWord} — ${summary}`,
+          /* a stopped run reached no verdict, so reporting one would credit the
+             judge with an answer it never gave */
+          text: stopped
+            ? `Design workflow: ${summary} after ${attempts} ${attemptWord}`
+            : `Design workflow: judge verdict ${judgeVerdict} after ${attempts} ${attemptWord} — ${summary}`,
         },
         input.actor,
       )
@@ -571,5 +654,5 @@ async function runDesignLoop(input: DesignWorkflowInput & { runId: string }): Pr
     }
   }
 
-  return { ok, attempts, frameId, htmlBytes, judgeVerdict, judgeSummary, issues }
+  return { ok, attempts, frameId, htmlBytes, judgeVerdict, judgeSummary, issues, ...(stopped ? { stopped } : {}) }
 }
